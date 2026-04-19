@@ -4,11 +4,6 @@
 [Claude Code](https://www.anthropic.com/claude-code) with your ChatGPT Plus or
 Pro subscription.
 
-If you want Claude Code's UX with its TUI, slash commands, hooks, skills, and
-plugins, but you don't want to be limited to the Codex CLI or Opencode, this
-proxy makes Claude Code speak to OpenAI's Codex Responses backend using your
-ChatGPT OAuth session.
-
 <img src="meta/claude-code-screenshot.webp" alt="Claude Code running through claude-codex-proxy" width="630" />
 
 [Quick start](#quick-start) · [How it works](#how-it-works) ·
@@ -43,15 +38,6 @@ curl -fsSL https://raw.githubusercontent.com/raine/claude-codex-proxy/main/scrip
 
 **Manual:** download a prebuilt binary for your platform from the
 [releases page](https://github.com/raine/claude-codex-proxy/releases).
-
-**From source** (requires [Bun](https://bun.sh) 1.3+):
-
-```sh
-git clone https://github.com/raine/claude-codex-proxy
-cd claude-codex-proxy
-bun install
-bun src/cli.ts --version
-```
 
 ### 2. Authenticate with ChatGPT
 
@@ -301,7 +287,8 @@ Settings are environment variables on the proxy process, not a config file.
 ## Limitations
 
 - **Terms of service:** using the Codex backend from a non-official client is
-  the same gray area opencode occupies. Use at your own risk.
+  the same gray area OpenCode occupies, although OpenAI seems to be cool with
+  OpenCode. Use at your own risk.
 - **Rate limits:** shared across all clients of your ChatGPT account.
   `codex.rate_limits.limit_reached` is surfaced as HTTP 429 with `retry-after`.
 - **Image inputs in tool results:** Responses API `function_call_output` only
