@@ -17,6 +17,8 @@ export function translateStream(
   opts: {
     messageId: string
     model: string
+    reqId: string
+    sessionId?: string
     onFinish?: (finish: { stopReason: "end_turn" | "tool_use" | "max_tokens"; usage?: Parameters<typeof mapUsageToAnthropic>[0] }) => void
   },
 ): ReadableStream<Uint8Array> {
@@ -26,6 +28,7 @@ export function translateStream(
       const emit = (event: string, data: unknown) => {
         controller.enqueue(encoder.encode(encodeSseEvent(event, data)))
       }
+      const activeTools = new Map<number, { id: string; name: string }>()
       let messageStarted = false
       const ensureMessageStart = () => {
         if (messageStarted) return
@@ -73,6 +76,7 @@ export function translateStream(
               emit("content_block_stop", { type: "content_block_stop", index: e.index })
               break
             case "tool-start":
+              activeTools.set(e.index, { id: e.id, name: e.name })
               ensureMessageStart()
               emit("content_block_start", {
                 type: "content_block_start",
@@ -93,6 +97,7 @@ export function translateStream(
               })
               break
             case "tool-stop":
+              activeTools.delete(e.index)
               emit("content_block_stop", { type: "content_block_stop", index: e.index })
               break
             case "finish":
@@ -108,8 +113,17 @@ export function translateStream(
           }
         }
       } catch (err) {
+        const activeToolNames = Array.from(activeTools.values(), (tool) => tool.name)
+        const activeToolCalls = Array.from(activeTools.values())
         if (err instanceof UpstreamStreamError) {
-          log.warn("upstream stream error", { kind: err.kind, message: err.message })
+          log.warn("upstream stream error", {
+            reqId: opts.reqId,
+            sessionId: opts.sessionId,
+            kind: err.kind,
+            message: err.message,
+            activeToolNames,
+            activeToolCalls,
+          })
           ensureMessageStart()
           emit("error", {
             type: "error",
@@ -119,7 +133,13 @@ export function translateStream(
             },
           })
         } else {
-          log.error("stream translation error", { err: String(err) })
+          log.error("stream translation error", {
+            reqId: opts.reqId,
+            sessionId: opts.sessionId,
+            err: String(err),
+            activeToolNames,
+            activeToolCalls,
+          })
           ensureMessageStart()
           emit("error", {
             type: "error",

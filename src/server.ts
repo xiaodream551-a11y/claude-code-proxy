@@ -169,6 +169,8 @@ async function handleMessages(req: Request, reqId: string): Promise<Response> {
     const stream = translateStream(upstream.body, {
       messageId,
       model: body.model,
+      reqId,
+      sessionId,
       onFinish: LOG_COMPACTION
         ? (finish) => {
             log.info("compaction telemetry", {
