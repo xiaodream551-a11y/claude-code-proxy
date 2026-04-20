@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.0.3 (2026-04-20)
+
+- Renamed to `claude-code-proxy` to reflect multi-provider support
+- Added Kimi (kimi.com) as a provider, with device-code login via the install
+  script and support for Kimi's chat models
+- Requests are now routed to providers based on the requested model, so a single
+  proxy can serve both Codex and Kimi models simultaneously
+- Improved token counting accuracy and fixed cached token usage reporting
+- Added MIT license
+
 ## v0.0.2 (2026-04-19)
 
 - Accept Claude-style model aliases (`haiku`, `sonnet`, `opus`, and `claude-*`
