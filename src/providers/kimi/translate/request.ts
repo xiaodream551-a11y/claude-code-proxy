@@ -65,30 +65,19 @@ export interface TranslateOptions {
   sessionId?: string
 }
 
-export interface TranslateResult {
-  body: KimiChatRequest
-  thinking: {
-    requested: boolean
-    effective: boolean
-    degraded: boolean
-  }
-}
-
 const DEFAULT_MAX_TOKENS = 32000
 
+// Kimi's `kimi-for-coding` is a reasoning model: it always produces
+// reasoning_content and its server always enforces that prior assistant
+// tool_call messages carry reasoning_content back. The `thinking` /
+// `reasoning_effort` flags on the request don't gate that contract —
+// they're a model-level property. So we always enable thinking on the
+// outbound Kimi request and always forward/replay reasoning end-to-end.
 export function translateRequest(
   req: AnthropicRequest,
   opts: TranslateOptions = {},
-): TranslateResult {
-  const requested = req.thinking?.type === "enabled"
-  // Kimi rejects requests where any prior assistant-tool-call turn lacks
-  // reasoning_content while thinking is enabled. If the history doesn't
-  // carry reasoning we must degrade this turn to non-thinking rather than
-  // 400 the user.
-  const degraded = requested && hasToolCallTurnWithoutThinking(req.messages)
-  const effective = requested && !degraded
-
-  const messages = buildMessages(req, { includeReasoning: effective })
+): KimiChatRequest {
+  const messages = buildMessages(req)
   const tools = req.tools?.map(toKimiTool)
 
   const out: KimiChatRequest = {
@@ -97,31 +86,14 @@ export function translateRequest(
     stream: true,
     stream_options: { include_usage: true },
     max_tokens: clampMaxTokens(req.max_tokens),
-  }
-  if (effective) {
-    out.reasoning_effort = req.output_config?.effort ?? "medium"
-    out.thinking = { type: "enabled" }
+    reasoning_effort: req.output_config?.effort ?? "medium",
+    thinking: { type: "enabled" },
   }
   if (tools && tools.length) out.tools = tools
   const tool_choice = mapToolChoice(req.tool_choice)
   if (tool_choice !== "auto") out.tool_choice = tool_choice
   if (opts.sessionId) out.prompt_cache_key = opts.sessionId
-  return {
-    body: out,
-    thinking: { requested, effective, degraded },
-  }
-}
-
-function hasToolCallTurnWithoutThinking(messages: AnthropicMessage[]): boolean {
-  for (const msg of messages) {
-    if (msg.role !== "assistant") continue
-    const blocks = normalizeContent(msg.content)
-    const hasToolCall = blocks.some((b) => b.type === "tool_use")
-    if (!hasToolCall) continue
-    const hasThinking = blocks.some((b) => b.type === "thinking" && (b as { thinking?: string }).thinking)
-    if (!hasThinking) return true
-  }
-  return false
+  return out
 }
 
 function clampMaxTokens(requested: number | undefined): number {
@@ -157,10 +129,7 @@ export function buildSystemMessage(system: AnthropicRequest["system"]): string |
   return texts.join("\n\n")
 }
 
-function buildMessages(
-  req: AnthropicRequest,
-  opts: { includeReasoning: boolean },
-): KimiMessage[] {
+function buildMessages(req: AnthropicRequest): KimiMessage[] {
   const out: KimiMessage[] = []
   const system = buildSystemMessage(req.system)
   if (system) out.push({ role: "system", content: system })
@@ -170,7 +139,7 @@ function buildMessages(
     if (msg.role === "user") {
       pushUserMessages(out, blocks)
     } else {
-      pushAssistantMessage(out, blocks, opts.includeReasoning)
+      pushAssistantMessage(out, blocks)
     }
   }
   return out
@@ -215,11 +184,7 @@ function pushUserMessages(out: KimiMessage[], blocks: AnthropicContentBlock[]): 
   flushBuffer()
 }
 
-function pushAssistantMessage(
-  out: KimiMessage[],
-  blocks: AnthropicContentBlock[],
-  includeReasoning: boolean,
-): void {
+function pushAssistantMessage(out: KimiMessage[], blocks: AnthropicContentBlock[]): void {
   const textParts: string[] = []
   const thinkingParts: string[] = []
   const toolCalls: KimiAssistantToolCall[] = []
@@ -227,7 +192,7 @@ function pushAssistantMessage(
     if (block.type === "text") {
       if (block.text) textParts.push(block.text)
     } else if (block.type === "thinking") {
-      if (includeReasoning && block.thinking) thinkingParts.push(block.thinking)
+      if (block.thinking) thinkingParts.push(block.thinking)
     } else if (block.type === "tool_use") {
       toolCalls.push({
         id: block.id,
