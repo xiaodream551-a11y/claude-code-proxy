@@ -1,6 +1,6 @@
 import { encodeSseEvent } from "../../../sse.ts"
 import type { Logger } from "../../../log.ts"
-import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError } from "./reducer.ts"
+import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError, type KimiUsage } from "./reducer.ts"
 import { makeThinkingSignature } from "./signature.ts"
 
 /**
