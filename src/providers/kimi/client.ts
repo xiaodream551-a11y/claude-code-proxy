@@ -58,6 +58,8 @@ export async function postKimi(
 
   if (!resp.body) throw new KimiError(500, "Upstream returned no body")
 
+  log.debug("upstream response", { status: resp.status })
+
   return { body: resp.body, status: resp.status, headers: resp.headers }
 }
 
