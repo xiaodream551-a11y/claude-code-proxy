@@ -3,6 +3,10 @@ import type { Logger } from "../../../log.ts"
 import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError, type KimiUsage } from "./reducer.ts"
 import { makeThinkingSignature } from "./signature.ts"
 
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError"
+}
+
 /**
  * Translate a Kimi chat-completions SSE stream into Anthropic SSE events.
  * HTTP status 200 is already committed before the first upstream event is
@@ -161,7 +165,9 @@ export function translateStream(
       } catch (err) {
         const activeToolNames = Array.from(activeTools.values(), (t) => t.name)
         const activeToolCalls = Array.from(activeTools.values())
-        if (err instanceof UpstreamStreamError) {
+        if (isAbortError(err)) {
+          opts.log.info("client disconnected")
+        } else if (err instanceof UpstreamStreamError) {
           opts.log.warn("upstream stream error", {
             kind: err.kind,
             message: err.message,
@@ -204,7 +210,11 @@ export function translateStream(
           stopReason: finishStopReason,
           usage: finishUsage,
         })
-        controller.close()
+        try {
+          controller.close()
+        } catch {
+          // ignore if controller already errored or cancelled
+        }
       }
     },
   })

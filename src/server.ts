@@ -36,9 +36,15 @@ export function startServer(opts: ServeOptions): { stop: () => void; port: numbe
       })
       try {
         const resp = await route(req, url, reqId)
-        rootLog.info("response", { reqId, status: resp.status, ms: Date.now() - start })
-        return resp
+        const ms = Date.now() - start
+        rootLog.info("response", { reqId, status: resp.status, ms })
+        if (!resp.body) return resp
+        return wrapStreamResponse(resp, reqId, start, rootLog)
       } catch (err) {
+        if (isAbortError(err)) {
+          rootLog.info("client disconnected", { reqId, ms: Date.now() - start })
+          return new Response(null, { status: 499 })
+        }
         rootLog.error("handler error", { reqId, err: String(err), stack: (err as Error)?.stack })
         return jsonError(500, "internal_error", String(err))
       }
@@ -134,6 +140,48 @@ async function parseJsonBody(req: Request): Promise<AnthropicRequest | Response>
   } catch (err) {
     return jsonError(400, "invalid_request_error", `Invalid JSON: ${err}`)
   }
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError"
+}
+
+function wrapStreamResponse(
+  resp: Response,
+  reqId: string,
+  start: number,
+  log: ReturnType<typeof createLogger>,
+): Response {
+  const body = resp.body!
+  const reader = body.getReader()
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) {
+          log.info("request_completed", { reqId, status: resp.status, ms: Date.now() - start })
+          controller.close()
+          return
+        }
+        controller.enqueue(value)
+      } catch (err) {
+        if (isAbortError(err)) {
+          log.info("client disconnected", { reqId, ms: Date.now() - start })
+        } else {
+          log.error("stream error", { reqId, err: String(err) })
+        }
+        controller.error(err)
+      }
+    },
+    cancel() {
+      reader.cancel().catch(() => {})
+    },
+  })
+  return new Response(stream, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers: resp.headers,
+  })
 }
 
 function jsonError(status: number, type: string, message: string): Response {
