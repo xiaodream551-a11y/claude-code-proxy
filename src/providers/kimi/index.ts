@@ -114,6 +114,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       messageId,
       model: body.model,
       log: ctx.childLogger("kimi.stream"),
+      requestStartTime: upstream.requestStartTime,
       onFinish: (finish) => {
         const mappedUsage = finish.usage ? mapUsageToAnthropic(finish.usage) : undefined
         log.debug("stream finish", {

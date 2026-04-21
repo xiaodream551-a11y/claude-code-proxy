@@ -15,6 +15,7 @@ export function translateStream(
     messageId: string
     model: string
     log: Logger
+    requestStartTime?: number
     onFinish?: (finish: {
       stopReason: "end_turn" | "tool_use" | "max_tokens"
       usage?: Parameters<typeof mapUsageToAnthropic>[0]
@@ -188,10 +189,15 @@ export function translateStream(
           })
         }
       } finally {
+        const now = Date.now()
+        const timeToFirstChunkMs = opts.requestStartTime && firstChunkAt
+          ? firstChunkAt - opts.requestStartTime
+          : undefined
         opts.log.debug("stream summary", {
           chunkCount: stats.chunkCount,
-          firstChunkMs: firstChunkAt ? firstChunkAt - streamStart : undefined,
-          totalMs: Date.now() - streamStart,
+          timeToFirstChunkMs,
+          streamDurationMs: firstChunkAt ? now - firstChunkAt : undefined,
+          totalMs: opts.requestStartTime ? now - opts.requestStartTime : now - streamStart,
           reasoningChars,
           contentChars,
           toolCount,
