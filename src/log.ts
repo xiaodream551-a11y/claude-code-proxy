@@ -6,7 +6,6 @@ import { homedir } from "node:os"
 const MAX_LOG_BYTES = 20 * 1024 * 1024 // 20 MiB
 const REDACT_KEYS = new Set([
   "authorization",
-  "Authorization",
   "access",
   "access_token",
   "refresh",
@@ -14,7 +13,6 @@ const REDACT_KEYS = new Set([
   "id_token",
   "code",
   "code_verifier",
-  "ChatGPT-Account-Id",
   "chatgpt-account-id",
   "x-api-key",
 ])
@@ -76,7 +74,7 @@ function redact(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) return value.map((v) => redact(v, depth + 1))
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (REDACT_KEYS.has(k)) {
+    if (REDACT_KEYS.has(k.toLowerCase())) {
       out[k] = typeof v === "string" ? `[redacted len=${v.length}]` : "[redacted]"
     } else {
       out[k] = redact(v, depth + 1)
