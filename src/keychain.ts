@@ -124,8 +124,9 @@ export function keychainDelete(service: string, account: string): void {
   if (s !== errSecSuccess) throw keychainError("find for delete", s)
 
   const itemRef = readPtr(itemBuf)
-  sym().SecKeychainItemDelete(itemRef)
+  const delStatus = sym().SecKeychainItemDelete(itemRef) as number
   sym().CFRelease(itemRef)
+  if (delStatus !== errSecSuccess) throw keychainError("delete", delStatus)
 }
 
 function keychainError(op: string, code: number): Error {
