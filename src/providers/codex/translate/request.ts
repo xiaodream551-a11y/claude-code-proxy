@@ -6,9 +6,10 @@ import type {
   AnthropicTextBlock,
   AnthropicTool,
 } from "../../../anthropic/schema.ts"
-import { codexEffort } from "../../../config.ts"
+import { codexEffort, codexServiceTier } from "../../../config.ts"
 
 export type Effort = "none" | "low" | "medium" | "high" | "xhigh"
+export type ServiceTier = "priority" | "flex"
 
 // Keep this aligned to the upstream Codex ResponsesApiRequest field set.
 // Do not add plausible-looking top-level fields without source support or a confirmed live test.
@@ -27,7 +28,7 @@ export interface ResponsesRequest {
   store: false
   stream: true
   include?: string[]
-  service_tier?: string
+  service_tier?: ServiceTier
   prompt_cache_key?: string
   text?: {
     verbosity?: "low" | "medium" | "high"
@@ -78,6 +79,8 @@ const VALID_EFFORTS = new Set<Effort>(["none", "low", "medium", "high", "xhigh"]
 
 const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "max"])
 
+const VALID_SERVICE_TIERS = new Set(["fast", "priority", "flex"])
+
 function assertValidEffort(effort: unknown): void {
   if (effort !== undefined && !ANTHROPIC_EFFORTS.has(effort as string)) {
     throw new Error(
@@ -104,6 +107,17 @@ function resolveEffort(effort?: Effort): Effort | undefined {
     )
   }
   return override as Effort
+}
+
+function resolveServiceTier(): ServiceTier | undefined {
+  const tier = codexServiceTier()
+  if (tier === undefined) return undefined
+  if (!VALID_SERVICE_TIERS.has(tier)) {
+    throw new Error(
+      `Invalid service tier override: "${tier}". Must be one of: ${Array.from(VALID_SERVICE_TIERS).join(", ")}`,
+    )
+  }
+  return tier === "flex" ? "flex" : "priority"
 }
 
 export function translateRequest(req: AnthropicRequest, opts: TranslateOptions = {}): ResponsesRequest {
@@ -134,6 +148,8 @@ export function translateRequest(req: AnthropicRequest, opts: TranslateOptions =
   if (instructions) out.instructions = instructions
   if (tools && tools.length) out.tools = tools
   if (opts.sessionId) out.prompt_cache_key = opts.sessionId
+  const serviceTier = resolveServiceTier()
+  if (serviceTier) out.service_tier = serviceTier
   assertValidEffort(req.output_config?.effort)
   const effort = resolveEffort(toCodexEffort(req.output_config?.effort))
   if (effort) {

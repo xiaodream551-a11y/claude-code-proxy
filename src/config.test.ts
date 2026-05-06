@@ -9,6 +9,7 @@ import {
   codexUserAgent,
   codexModel,
   codexEffort,
+  codexServiceTier,
   kimiUserAgent,
   kimiOauthHost,
   kimiBaseUrl,
@@ -43,6 +44,7 @@ describe("config defaults", () => {
     expect(codexUserAgent("default-ua")).toBe("default-ua")
     expect(codexModel()).toBeUndefined()
     expect(codexEffort()).toBeUndefined()
+    expect(codexServiceTier()).toBeUndefined()
     expect(kimiUserAgent("default-kimi-ua")).toBe("default-kimi-ua")
     expect(kimiOauthHost()).toBe("https://auth.kimi.com")
     expect(kimiBaseUrl()).toBe("https://api.kimi.com/coding/v1")
@@ -65,6 +67,12 @@ describe("file overrides default", () => {
     )
     setEnv({})
     expect(codexUserAgent("default")).toBe("ccp/file")
+  })
+
+  it("codex.serviceTier from config.json", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { serviceTier: "fast" } }))
+    setEnv({})
+    expect(codexServiceTier()).toBe("fast")
   })
 
   it("kimi.oauthHost from config.json", () => {
@@ -99,6 +107,12 @@ describe("env overrides file", () => {
     expect(codexUserAgent("default")).toBe("from-env")
   })
 
+  it("CCP_CODEX_SERVICE_TIER env wins over config", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { serviceTier: "flex" } }))
+    setEnv({ CCP_CODEX_SERVICE_TIER: "fast" })
+    expect(codexServiceTier()).toBe("fast")
+  })
+
   it("CCP_USER_AGENT env (generic fallback) is preferred over file", () => {
     writeFileSync(
       configPath,
@@ -126,6 +140,12 @@ describe("empty-string semantics", () => {
   it("empty CCP_CODEX_MODEL env with no file value returns undefined", () => {
     setEnv({ CCP_CODEX_MODEL: "" })
     expect(codexModel()).toBeUndefined()
+  })
+
+  it("empty CCP_CODEX_SERVICE_TIER env falls through to file value", () => {
+    writeFileSync(configPath, JSON.stringify({ codex: { serviceTier: "flex" } }))
+    setEnv({ CCP_CODEX_SERVICE_TIER: "" })
+    expect(codexServiceTier()).toBe("flex")
   })
 
   it("empty PORT env falls through to file value", () => {

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added `codex.serviceTier` / `CCP_CODEX_SERVICE_TIER` to request Codex service
+  tiers. The Codex-style `fast` value is sent upstream as `priority`, matching
+  the first-party Codex client.
+
 ## v0.0.9 (2026-05-03)
 
 - Kimi debugging overrides now use `CCP_KIMI_OAUTH_HOST` and `CCP_KIMI_BASE_URL`, matching the proxy's `CCP_` environment variable naming.

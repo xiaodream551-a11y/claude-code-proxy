@@ -16,6 +16,7 @@ export interface FileConfig {
     userAgent?: string
     model?: string
     effort?: string
+    serviceTier?: string
   }
   kimi?: {
     userAgent?: string
@@ -87,11 +88,12 @@ function validate(raw: unknown): FileConfig {
     return acc as NonNullable<FileConfig[K]>
   }
 
-  const codex = validateStringSection("codex", ["originator", "userAgent", "model", "effort"], {
+  const codex = validateStringSection("codex", ["originator", "userAgent", "model", "effort", "serviceTier"], {
     originator: "string",
     userAgent: "string",
     model: "string",
     effort: "string",
+    serviceTier: "string",
   })
   if (codex) out.codex = codex
 
@@ -191,6 +193,11 @@ export function codexModel(): string | undefined {
 export function codexEffort(): string | undefined {
   const c = getConfig()
   return emptyOrUnset(c.env.CCP_CODEX_EFFORT) ?? emptyOrUnset(c.file.codex?.effort)
+}
+
+export function codexServiceTier(): string | undefined {
+  const c = getConfig()
+  return emptyOrUnset(c.env.CCP_CODEX_SERVICE_TIER) ?? emptyOrUnset(c.file.codex?.serviceTier)
 }
 
 export function kimiUserAgent(defaultValue: string): string {
