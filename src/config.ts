@@ -17,6 +17,7 @@ export interface FileConfig {
     model?: string
     effort?: string
     serviceTier?: string
+    baseUrl?: string
   }
   kimi?: {
     userAgent?: string
@@ -88,13 +89,18 @@ function validate(raw: unknown): FileConfig {
     return acc as NonNullable<FileConfig[K]>
   }
 
-  const codex = validateStringSection("codex", ["originator", "userAgent", "model", "effort", "serviceTier"], {
-    originator: "string",
-    userAgent: "string",
-    model: "string",
-    effort: "string",
-    serviceTier: "string",
-  })
+  const codex = validateStringSection(
+    "codex",
+    ["originator", "userAgent", "model", "effort", "serviceTier", "baseUrl"],
+    {
+      originator: "string",
+      userAgent: "string",
+      model: "string",
+      effort: "string",
+      serviceTier: "string",
+      baseUrl: "string",
+    },
+  )
   if (codex) out.codex = codex
 
   const kimi = validateStringSection("kimi", ["userAgent", "oauthHost", "baseUrl"], {
@@ -198,6 +204,11 @@ export function codexEffort(): string | undefined {
 export function codexServiceTier(): string | undefined {
   const c = getConfig()
   return emptyOrUnset(c.env.CCP_CODEX_SERVICE_TIER) ?? emptyOrUnset(c.file.codex?.serviceTier)
+}
+
+export function codexBaseUrl(defaultValue: string): string {
+  const c = getConfig()
+  return c.env.CCP_CODEX_BASE_URL ?? c.file.codex?.baseUrl ?? defaultValue
 }
 
 export function kimiUserAgent(defaultValue: string): string {

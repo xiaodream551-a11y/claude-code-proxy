@@ -1,5 +1,5 @@
 import { CODEX_API_ENDPOINT, ORIGINATOR as ORIGINATOR_DEFAULT } from "./auth/constants.ts"
-import { codexOriginator, codexUserAgent } from "../../config.ts"
+import { codexBaseUrl, codexOriginator, codexUserAgent } from "../../config.ts"
 declare const BUILD_VERSION: string | undefined
 const PROXY_VERSION = typeof BUILD_VERSION === "string" ? BUILD_VERSION : "dev"
 import { forceRefresh, getAuth } from "./auth/manager.ts"
@@ -93,14 +93,16 @@ async function doFetch(
     headers.set("x-codex-window-id", `${sessionId}:0`)
   }
 
+  const codexUrl = codexBaseUrl(CODEX_API_ENDPOINT)
+
   log.debug("posting to codex", {
-    url: CODEX_API_ENDPOINT,
+    url: codexUrl,
     model: body.model,
     inputCount: body.input.length,
     toolCount: body.tools?.length ?? 0,
   })
 
-  return fetch(CODEX_API_ENDPOINT, {
+  return fetch(codexUrl, {
     method: "POST",
     headers,
     body: JSON.stringify(body),

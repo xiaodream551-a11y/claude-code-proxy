@@ -137,6 +137,9 @@ function printConfigSummary(): void {
   if (cfg.env.CCP_CODEX_SERVICE_TIER) overrides.push("CCP_CODEX_SERVICE_TIER (env)")
   else if (fromFile.codex?.serviceTier) overrides.push("codex.serviceTier (config)")
 
+  if (cfg.env.CCP_CODEX_BASE_URL) overrides.push("CCP_CODEX_BASE_URL (env)")
+  else if (fromFile.codex?.baseUrl) overrides.push("codex.baseUrl (config)")
+
   if (cfg.env.CCP_LOG_VERBOSE !== undefined) overrides.push("CCP_LOG_VERBOSE (env)")
   else if (fromFile.log?.verbose) overrides.push("log.verbose (config)")
 
