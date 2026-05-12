@@ -21,7 +21,7 @@ export interface AnthropicToolUseBlock {
 export interface AnthropicToolResultBlock {
   type: "tool_result"
   tool_use_id: string
-  content: string | Array<AnthropicTextBlock | AnthropicImageBlock>
+  content: string | AnthropicToolResultContentBlock[]
   is_error?: boolean
 }
 
@@ -30,6 +30,14 @@ export interface AnthropicThinkingBlock {
   thinking: string
   signature?: string
 }
+
+export type AnthropicToolResultContentBlock =
+  | AnthropicTextBlock
+  | AnthropicImageBlock
+  | AnthropicToolUseBlock
+  | AnthropicToolResultBlock
+  | AnthropicThinkingBlock
+  | (Record<string, unknown> & { type?: unknown })
 
 export type AnthropicContentBlock =
   | AnthropicTextBlock

@@ -5,6 +5,7 @@ import type {
   AnthropicRequest,
   AnthropicTextBlock,
   AnthropicTool,
+  AnthropicToolResultContentBlock,
 } from "../../../anthropic/schema.ts"
 import { codexEffort, codexServiceTier } from "../../../config.ts"
 
@@ -261,16 +262,47 @@ function imageToUrl(block: Extract<AnthropicContentBlock, { type: "image" }>): s
   return `data:${block.source.media_type};base64,${block.source.data}`
 }
 
+function unsupportedToolResultBlockToString(block: AnthropicToolResultContentBlock): string {
+  const type = typeof block.type === "string" ? block.type : "unknown"
+  return `[unsupported content block omitted: ${type}]`
+}
+
+function isToolResultTextBlock(
+  block: AnthropicToolResultContentBlock,
+): block is AnthropicTextBlock {
+  return block.type === "text" && typeof block.text === "string"
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object"
+}
+
+function isToolResultImageBlock(
+  block: AnthropicToolResultContentBlock,
+): block is AnthropicImageBlock {
+  if (block.type !== "image") return false
+  const source = block.source
+  if (!isRecord(source)) return false
+  if (source.type === "url") return typeof source.url === "string"
+  return (
+    source.type === "base64" &&
+    typeof source.media_type === "string" &&
+    typeof source.data === "string"
+  )
+}
+
 export function toolResultToString(
-  content: string | Array<AnthropicTextBlock | AnthropicImageBlock>,
+  content: string | AnthropicToolResultContentBlock[],
 ): string {
   if (typeof content === "string") return content
   return content
     .map((b) => {
-      if (b.type === "text") return b.text
-      const mt =
-        b.source.type === "base64" ? b.source.media_type : "url"
-      return `[image omitted: ${mt}]`
+      if (isToolResultTextBlock(b)) return b.text
+      if (isToolResultImageBlock(b)) {
+        const mt = b.source.type === "base64" ? b.source.media_type : "url"
+        return `[image omitted: ${mt}]`
+      }
+      return unsupportedToolResultBlockToString(b)
     })
     .join("\n")
 }
