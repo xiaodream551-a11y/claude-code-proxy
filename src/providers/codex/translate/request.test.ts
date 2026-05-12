@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test"
 import { loadConfig } from "../../../config.ts"
 import type { AnthropicRequest } from "../../../anthropic/schema.ts"
-import { InvalidServiceTierError, translateRequest } from "./request.ts"
+import { countTokens } from "../count-tokens.ts"
+import { InvalidServiceTierError, toolResultToString, translateRequest } from "./request.ts"
 const baseRequest: AnthropicRequest = {
   model: "claude-sonnet-4-6",
   messages: [{ role: "user", content: "hello" }],
@@ -66,6 +67,79 @@ describe("translateRequest", () => {
 
     expect(() => translateRequest(baseRequest)).toThrow(InvalidServiceTierError)
     expect(() => translateRequest(baseRequest)).toThrow('Invalid service tier override: "standard"')
+  })
+
+  it("translates unsupported tool result content blocks without throwing", () => {
+    const translated = translateRequest({
+      ...baseRequest,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_1",
+              content: [
+                { type: "text", text: "visible output" },
+                { type: "thinking", thinking: "hidden thought" },
+              ],
+            },
+          ],
+        },
+      ],
+    })
+
+    expect(translated.input).toEqual([
+      {
+        type: "function_call_output",
+        call_id: "toolu_1",
+        output: "visible output\n[unsupported content block omitted: thinking]",
+      },
+    ])
+  })
+
+  it("preserves text and image tool result stringification", () => {
+    expect(
+      toolResultToString([
+        { type: "text", text: "caption" },
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: "abc" },
+        },
+        { type: "image", source: { type: "url", url: "https://example.invalid/a.png" } },
+      ]),
+    ).toBe("caption\n[image omitted: image/png]\n[image omitted: url]")
+  })
+
+  it("counts unsupported tool result content blocks without throwing", () => {
+    expect(
+      countTokens({
+        ...baseRequest,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_1",
+                content: [{ type: "thinking", thinking: "hidden thought" }],
+              },
+            ],
+          },
+        ],
+      }),
+    ).toBeGreaterThan(0)
+  })
+
+  it("treats malformed tool result content blocks as unsupported", () => {
+    expect(
+      toolResultToString([
+        { type: "text" },
+        { type: "image" },
+      ]),
+    ).toBe(
+      "[unsupported content block omitted: text]\n[unsupported content block omitted: image]",
+    )
   })
 
   it("returns only the expected top-level upstream request fields", () => {

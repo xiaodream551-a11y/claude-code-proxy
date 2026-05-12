@@ -5,6 +5,7 @@ import type {
   AnthropicRequest,
   AnthropicTextBlock,
   AnthropicTool,
+  AnthropicToolResultContentBlock,
 } from "../../../anthropic/schema.ts"
 
 // OpenAI-compatible chat-completions request shape used by Kimi.
@@ -250,8 +251,37 @@ function imageToUrl(block: Extract<AnthropicContentBlock, { type: "image" }>): s
   return `data:${block.source.media_type};base64,${block.source.data}`
 }
 
+function unsupportedToolResultBlockToString(block: AnthropicToolResultContentBlock): string {
+  const type = typeof block.type === "string" ? block.type : "unknown"
+  return `[unsupported content block omitted: ${type}]`
+}
+
+function isToolResultTextBlock(
+  block: AnthropicToolResultContentBlock,
+): block is AnthropicTextBlock {
+  return block.type === "text" && typeof block.text === "string"
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object"
+}
+
+function isToolResultImageBlock(
+  block: AnthropicToolResultContentBlock,
+): block is AnthropicImageBlock {
+  if (block.type !== "image") return false
+  const source = block.source
+  if (!isRecord(source)) return false
+  if (source.type === "url") return typeof source.url === "string"
+  return (
+    source.type === "base64" &&
+    typeof source.media_type === "string" &&
+    typeof source.data === "string"
+  )
+}
+
 export function toolResultContent(
-  content: string | Array<AnthropicTextBlock | AnthropicImageBlock>,
+  content: string | AnthropicToolResultContentBlock[],
   isError: boolean | undefined,
 ): string | KimiToolResultPart[] {
   const prefix = isError ? "[tool execution error]\n" : ""
@@ -260,12 +290,12 @@ export function toolResultContent(
   const parts: KimiToolResultPart[] = []
   if (prefix) parts.push({ type: "text", text: prefix })
   for (const b of content) {
-    if (b.type === "text") {
+    if (isToolResultTextBlock(b)) {
       parts.push({ type: "text", text: b.text })
-    } else {
-      // Kimi accepts image_url parts inside role="tool" content (its own
-      // ReadMediaFile tool uses exactly this shape).
+    } else if (isToolResultImageBlock(b)) {
       parts.push({ type: "image_url", image_url: { url: imageToUrl(b) } })
+    } else {
+      parts.push({ type: "text", text: unsupportedToolResultBlockToString(b) })
     }
   }
   if (parts.length === 1 && parts[0]!.type === "text") return parts[0]!.text
@@ -273,15 +303,18 @@ export function toolResultContent(
 }
 
 export function toolResultToString(
-  content: string | Array<AnthropicTextBlock | AnthropicImageBlock>,
+  content: string | AnthropicToolResultContentBlock[],
 ): string {
   // Kept for the token counter, which wants a flat string.
   if (typeof content === "string") return content
   return content
     .map((b) => {
-      if (b.type === "text") return b.text
-      const mt = b.source.type === "base64" ? b.source.media_type : "url"
-      return `[image omitted: ${mt}]`
+      if (isToolResultTextBlock(b)) return b.text
+      if (isToolResultImageBlock(b)) {
+        const mt = b.source.type === "base64" ? b.source.media_type : "url"
+        return `[image omitted: ${mt}]`
+      }
+      return unsupportedToolResultBlockToString(b)
     })
     .join("\n")
 }
