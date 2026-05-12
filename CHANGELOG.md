@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.0.12 (2026-05-12)
+
+- Codex requests can now use `gpt-5.3-codex-spark` as a supported model. ([#14](https://github.com/raine/claude-code-proxy/pull/14))
+
 ## v0.0.11 (2026-05-12)
 
 - Claude-style aliases such as `haiku`, `sonnet`, and `opus` now default to Codex while still following the provider already active in the current Claude Code session.
