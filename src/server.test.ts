@@ -27,8 +27,12 @@ describe("server session-aware alias routing", () => {
     servers.push(server)
 
     const sessionId = crypto.randomUUID()
+    const fallback = await countTokens(server.port, "sonnet")
+    expect(fallback.status).toBe(400)
+    const fallbackBody = (await fallback.json()) as { error: { message: string } }
+    expect(fallbackBody.error.message).toContain("Invalid service tier override")
+
     expect((await countTokens(server.port, "kimi-for-coding", sessionId)).status).toBe(200)
     expect((await countTokens(server.port, "sonnet", sessionId)).status).toBe(200)
-    expect((await countTokens(server.port, "sonnet")).status).toBe(400)
   })
 })

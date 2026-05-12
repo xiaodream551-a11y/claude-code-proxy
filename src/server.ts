@@ -21,35 +21,47 @@ interface SessionState {
   lastSeen: number
 }
 
-const SESSION_IDLE_TTL_MS = 24 * 60 * 60 * 1000
+const SESSION_IDLE_TTL_MS = 30 * 60 * 1000
 const MAX_SESSIONS = 10_000
 const sessions = new Map<string, SessionState>()
 
-function currentSession(sessionId: string | undefined, now = Date.now()): SessionState | undefined {
+function existingSession(sessionId: string | undefined, now = Date.now()): SessionState | undefined {
   if (!sessionId) return undefined
-  const existing = sessions.get(sessionId)
-  if (existing && now - existing.lastSeen > SESSION_IDLE_TTL_MS) sessions.delete(sessionId)
-  const state = sessions.get(sessionId) ?? { seq: 0, lastSeen: now }
+  const state = sessions.get(sessionId)
+  if (!state) return undefined
+  if (now - state.lastSeen <= SESSION_IDLE_TTL_MS) return state
+  sessions.delete(sessionId)
+  return undefined
+}
+
+function recordSessionRequest(
+  sessionId: string | undefined,
+  session: SessionState | undefined,
+  providerName: string,
+  model: string,
+  now = Date.now(),
+): SessionState | undefined {
+  if (!sessionId) return undefined
+  const state = session ?? { seq: 0, lastSeen: now }
   state.seq += 1
   state.lastSeen = now
+  const affinityProvider = affinityProviderFor(providerName)
+  if (affinityProvider && !ANTHROPIC_STYLE_ALIASES.has(model)) {
+    state.affinityProvider = affinityProvider
+  }
   sessions.set(sessionId, state)
-  evictSessions(now)
+  evictOldestSessions()
   return state
 }
 
-function evictSessions(now: number): void {
-  for (const [sessionId, state] of sessions) {
-    if (now - state.lastSeen > SESSION_IDLE_TTL_MS) sessions.delete(sessionId)
-  }
+function affinityProviderFor(providerName: string): AliasProvider | undefined {
+  if (providerName === "codex" || providerName === "kimi") return providerName
+  return undefined
+}
+
+function evictOldestSessions(): void {
   while (sessions.size > MAX_SESSIONS) {
-    let oldestSessionId: string | undefined
-    let oldestLastSeen = Infinity
-    for (const [sessionId, state] of sessions) {
-      if (state.lastSeen < oldestLastSeen) {
-        oldestSessionId = sessionId
-        oldestLastSeen = state.lastSeen
-      }
-    }
+    const oldestSessionId = sessions.keys().next().value
     if (!oldestSessionId) return
     sessions.delete(oldestSessionId)
   }
@@ -104,11 +116,11 @@ async function route(req: Request, url: URL, reqId: string): Promise<Response> {
     const body = await parseJsonBody(req)
     if (body instanceof Response) return body
     const sessionId = req.headers.get("x-claude-code-session-id") || undefined
-    const session = currentSession(sessionId)
+    const session = existingSession(sessionId)
     const provider = routeProvider(body, reqId, session?.affinityProvider)
     if (provider instanceof Response) return provider
-    updateSessionAffinity(session, body.model, provider.name)
-    const ctx = buildCtx(req, reqId, provider.name, sessionId, session)
+    const current = recordSessionRequest(sessionId, session, provider.name, body.model)
+    const ctx = buildCtx(req, reqId, provider.name, sessionId, current)
     ctx.childLogger("server").info("dispatch", { model: body.model })
     return provider.handleCountTokens(body, ctx)
   }
@@ -117,11 +129,11 @@ async function route(req: Request, url: URL, reqId: string): Promise<Response> {
     const body = await parseJsonBody(req)
     if (body instanceof Response) return body
     const sessionId = req.headers.get("x-claude-code-session-id") || undefined
-    const session = currentSession(sessionId)
+    const session = existingSession(sessionId)
     const provider = routeProvider(body, reqId, session?.affinityProvider)
     if (provider instanceof Response) return provider
-    updateSessionAffinity(session, body.model, provider.name)
-    const ctx = buildCtx(req, reqId, provider.name, sessionId, session)
+    const current = recordSessionRequest(sessionId, session, provider.name, body.model)
+    const ctx = buildCtx(req, reqId, provider.name, sessionId, current)
     ctx.childLogger("server").info("dispatch", { model: body.model })
     return provider.handleMessages(body, ctx)
   }
@@ -154,15 +166,6 @@ function buildCtx(
 // future version or a different client includes it.
 export function normalizeIncomingModel(model: string): string {
   return model.replace(/\[1m\]$/i, "")
-}
-
-function updateSessionAffinity(
-  session: SessionState | undefined,
-  model: string,
-  providerName: string,
-): void {
-  if (!session || ANTHROPIC_STYLE_ALIASES.has(model)) return
-  session.affinityProvider = providerName as AliasProvider
 }
 
 function routeProvider(
