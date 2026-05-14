@@ -214,7 +214,7 @@ async function parseJsonBody(req: Request): Promise<AnthropicRequest | Response>
   try {
     return (await req.json()) as AnthropicRequest;
   } catch (err) {
-    return jsonError(400, "invalid_request_error", `Invalid JSON: ${err}`);
+    return jsonError(400, "invalid_request_error", `Invalid JSON: ${String(err)}`);
   }
 }
 

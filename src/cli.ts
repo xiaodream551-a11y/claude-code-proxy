@@ -5,12 +5,7 @@ import { port as configPort, getConfig, aliasProvider as configAliasProvider } f
 import { configDir } from "./paths.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import {
-  allProviders,
-  allSupportedModels,
-  getProvider,
-  listProviders,
-} from "./providers/registry.ts";
+import { allSupportedModels, getProvider, listProviders } from "./providers/registry.ts";
 import type { CliHandlers } from "./providers/types.ts";
 
 declare const BUILD_VERSION: string | undefined;

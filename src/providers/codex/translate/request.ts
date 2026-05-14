@@ -91,7 +91,7 @@ const VALID_SERVICE_TIERS = new Set(["fast", "priority", "flex"]);
 function assertValidEffort(effort: unknown): void {
   if (effort !== undefined && !ANTHROPIC_EFFORTS.has(effort as string)) {
     throw new Error(
-      `Invalid output_config.effort: "${effort}". Must be one of: ${Array.from(ANTHROPIC_EFFORTS).join(", ")}`,
+      `Invalid output_config.effort: ${JSON.stringify(effort)}. Must be one of: ${Array.from(ANTHROPIC_EFFORTS).join(", ")}`,
     );
   }
 }

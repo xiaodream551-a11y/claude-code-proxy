@@ -16,6 +16,16 @@ const silentLog = {
   child: () => silentLog,
 };
 
+async function expectRejects(promise: Promise<unknown>, check: (err: unknown) => void) {
+  try {
+    await promise;
+  } catch (err) {
+    check(err);
+    return;
+  }
+  throw new Error("Expected promise to reject");
+}
+
 describe("computeBackoffDelay", () => {
   it("uses jittered exponential backoff without retry-after", () => {
     // equal jitter: result is in [cap/2, cap]
@@ -61,14 +71,14 @@ describe("sleep", () => {
   it("rejects if signal already aborted", async () => {
     const c = new AbortController();
     c.abort();
-    await expect(sleep(1000, c.signal)).rejects.toThrow();
+    await expectRejects(sleep(1000, c.signal), (err) => expect(err).toBeInstanceOf(Error));
   });
 
   it("rejects when aborted mid-sleep", async () => {
     const c = new AbortController();
     const p = sleep(1000, c.signal);
     setTimeout(() => c.abort(), 10);
-    await expect(p).rejects.toThrow();
+    await expectRejects(p, (err) => expect(err).toBeInstanceOf(Error));
   });
 });
 
@@ -98,7 +108,7 @@ describe("retryOn429", () => {
   it("retries up to MAX_RATE_LIMIT_RETRIES then throws", async () => {
     let calls = 0;
     const start = Date.now();
-    await expect(
+    await expectRejects(
       retryOn429(
         async () => {
           calls++;
@@ -110,14 +120,15 @@ describe("retryOn429", () => {
             err instanceof FakeRateLimit ? { retryAfter: err.retryAfter } : undefined,
         },
       ),
-    ).rejects.toBeInstanceOf(FakeRateLimit);
+      (err) => expect(err).toBeInstanceOf(FakeRateLimit),
+    );
     expect(calls).toBe(MAX_RATE_LIMIT_RETRIES + 1);
     expect(Date.now() - start).toBeLessThan(2000);
   });
 
   it("gives up immediately when retry-after exceeds budget", async () => {
     let calls = 0;
-    await expect(
+    await expectRejects(
       retryOn429(
         async () => {
           calls++;
@@ -129,13 +140,14 @@ describe("retryOn429", () => {
             err instanceof FakeRateLimit ? { retryAfter: err.retryAfter } : undefined,
         },
       ),
-    ).rejects.toBeInstanceOf(FakeRateLimit);
+      (err) => expect(err).toBeInstanceOf(FakeRateLimit),
+    );
     expect(calls).toBe(1);
   });
 
   it("does not retry non-rate-limit errors", async () => {
     let calls = 0;
-    await expect(
+    await expectRejects(
       retryOn429(
         async () => {
           calls++;
@@ -146,7 +158,8 @@ describe("retryOn429", () => {
           classify: () => undefined,
         },
       ),
-    ).rejects.toThrow("other");
+      (err) => expect(err).toEqual(new Error("other")),
+    );
     expect(calls).toBe(1);
   });
 

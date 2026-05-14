@@ -91,7 +91,6 @@ async function refreshNow(current: StoredAuth): Promise<StoredAuth> {
   }
   const headers = await commonHeaders();
 
-  let lastErr: unknown;
   for (let attempt = 0; attempt < MAX_REFRESH_ATTEMPTS; attempt++) {
     let resp: Response;
     try {
@@ -105,7 +104,6 @@ async function refreshNow(current: StoredAuth): Promise<StoredAuth> {
         }).toString(),
       });
     } catch (err) {
-      lastErr = err;
       log.warn("refresh network error", { attempt, err: String(err) });
       await backoff(attempt);
       continue;
@@ -138,7 +136,6 @@ async function refreshNow(current: StoredAuth): Promise<StoredAuth> {
       throw new Error(`Token refresh failed: ${resp.status}`);
     }
 
-    lastErr = new Error(`Token refresh failed: ${resp.status}`);
     log.warn("refresh retryable error", { attempt, status: resp.status });
     await backoff(attempt);
   }

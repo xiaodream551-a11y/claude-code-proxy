@@ -18,12 +18,15 @@ const formatExtensions = new Set([
   ".jsonc",
 ]);
 
-function git(args: string[], options: { env?: NodeJS.ProcessEnv; input?: string | Buffer } = {}) {
+function git(
+  args: string[],
+  options: { env?: NodeJS.ProcessEnv; input?: string | Uint8Array } = {},
+) {
   const result = spawnSync("git", args, {
     cwd: repoRoot,
     env: { ...process.env, ...options.env },
     input: options.input,
-    encoding: options.input instanceof Buffer ? "buffer" : "utf8",
+    encoding: typeof options.input === "string" ? "utf8" : "buffer",
     stdio: options.input === undefined ? ["ignore", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
   });
 
