@@ -3,5 +3,5 @@
 // stable per (messageId, blockIndex) and identical between the streaming
 // and non-streaming paths.
 export function makeThinkingSignature(messageId: string, index: number): string {
-  return Buffer.from(`ccp:kimi:v1:${messageId}:${index}`).toString("base64url")
+  return Buffer.from(`ccp:kimi:v1:${messageId}:${index}`).toString("base64url");
 }

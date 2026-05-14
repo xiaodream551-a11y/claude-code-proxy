@@ -1,6 +1,6 @@
-export const KIMI_DEFAULT_MODEL = "kimi-for-coding"
+export const KIMI_DEFAULT_MODEL = "kimi-for-coding";
 
-export const ALLOWED_MODELS = new Set([KIMI_DEFAULT_MODEL])
+export const ALLOWED_MODELS = new Set([KIMI_DEFAULT_MODEL]);
 
 // Every incoming model name collapses to kimi-for-coding — the only model
 // Kimi Code exposes. Explicit aliases exist so `ANTHROPIC_MODEL=haiku` works
@@ -14,19 +14,19 @@ const ALIAS_TARGETS: Record<string, string> = {
   opus: KIMI_DEFAULT_MODEL,
   "claude-opus-4-7": KIMI_DEFAULT_MODEL,
   "kimi-for-coding": KIMI_DEFAULT_MODEL,
-}
+};
 
 export function resolveModel(model: string): string {
-  return ALIAS_TARGETS[model] ?? KIMI_DEFAULT_MODEL
+  return ALIAS_TARGETS[model] ?? KIMI_DEFAULT_MODEL;
 }
 
 export function assertAllowedModel(model: string): void {
-  if (!ALLOWED_MODELS.has(model)) throw new ModelNotAllowedError(model)
+  if (!ALLOWED_MODELS.has(model)) throw new ModelNotAllowedError(model);
 }
 
 export class ModelNotAllowedError extends Error {
   constructor(public model: string) {
-    super(`Model not allowed: ${model}`)
-    this.name = "ModelNotAllowedError"
+    super(`Model not allowed: ${model}`);
+    this.name = "ModelNotAllowedError";
   }
 }

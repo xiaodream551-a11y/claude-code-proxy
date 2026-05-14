@@ -1,7 +1,7 @@
-import { describe, expect, it } from "bun:test"
-import type { AnthropicRequest } from "../../../anthropic/schema.ts"
-import { countTokens } from "../count-tokens.ts"
-import { translateRequest } from "./request.ts"
+import { describe, expect, it } from "bun:test";
+import type { AnthropicRequest } from "../../../anthropic/schema.ts";
+import { countTokens } from "../count-tokens.ts";
+import { translateRequest } from "./request.ts";
 
 describe("translateRequest", () => {
   it("translates unsupported tool result content blocks as text parts", () => {
@@ -22,7 +22,7 @@ describe("translateRequest", () => {
           ],
         },
       ],
-    }
+    };
 
     expect(translateRequest(req).messages).toEqual([
       {
@@ -33,8 +33,8 @@ describe("translateRequest", () => {
           { type: "text", text: "[unsupported content block omitted: thinking]" },
         ],
       },
-    ])
-  })
+    ]);
+  });
 
   it("preserves image tool result content parts", () => {
     const req: AnthropicRequest = {
@@ -57,7 +57,7 @@ describe("translateRequest", () => {
           ],
         },
       ],
-    }
+    };
 
     expect(translateRequest(req).messages).toEqual([
       {
@@ -68,8 +68,8 @@ describe("translateRequest", () => {
           { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
         ],
       },
-    ])
-  })
+    ]);
+  });
 
   it("counts unsupported tool result content blocks without throwing", () => {
     const req: AnthropicRequest = {
@@ -86,8 +86,8 @@ describe("translateRequest", () => {
           ],
         },
       ],
-    }
+    };
 
-    expect(countTokens(req)).toBeGreaterThan(0)
-  })
-})
+    expect(countTokens(req)).toBeGreaterThan(0);
+  });
+});

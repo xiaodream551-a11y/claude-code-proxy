@@ -1,10 +1,15 @@
-import { encodeSseEvent } from "../../../sse.ts"
-import type { Logger } from "../../../log.ts"
-import { mapUsageToAnthropic, reduceUpstream, UpstreamStreamError, type KimiUsage } from "./reducer.ts"
-import { makeThinkingSignature } from "./signature.ts"
+import { encodeSseEvent } from "../../../sse.ts";
+import type { Logger } from "../../../log.ts";
+import {
+  mapUsageToAnthropic,
+  reduceUpstream,
+  UpstreamStreamError,
+  type KimiUsage,
+} from "./reducer.ts";
+import { makeThinkingSignature } from "./signature.ts";
 
 function isAbortError(err: unknown): boolean {
-  return err instanceof Error && err.name === "AbortError"
+  return err instanceof Error && err.name === "AbortError";
 }
 
 /**
@@ -16,27 +21,27 @@ function isAbortError(err: unknown): boolean {
 export function translateStream(
   upstream: ReadableStream<Uint8Array>,
   opts: {
-    messageId: string
-    model: string
-    log: Logger
-    requestStartTime?: number
+    messageId: string;
+    model: string;
+    log: Logger;
+    requestStartTime?: number;
     onFinish?: (finish: {
-      stopReason: "end_turn" | "tool_use" | "max_tokens"
-      usage?: Parameters<typeof mapUsageToAnthropic>[0]
-    }) => void
+      stopReason: "end_turn" | "tool_use" | "max_tokens";
+      usage?: Parameters<typeof mapUsageToAnthropic>[0];
+    }) => void;
   },
 ): ReadableStream<Uint8Array> {
-  const encoder = new TextEncoder()
+  const encoder = new TextEncoder();
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const emit = (event: string, data: unknown) => {
-        controller.enqueue(encoder.encode(encodeSseEvent(event, data)))
-      }
-      const activeTools = new Map<number, { id: string; name: string }>()
-      let messageStarted = false
+        controller.enqueue(encoder.encode(encodeSseEvent(event, data)));
+      };
+      const activeTools = new Map<number, { id: string; name: string }>();
+      let messageStarted = false;
       const ensureMessageStart = () => {
-        if (messageStarted) return
-        messageStarted = true
+        if (messageStarted) return;
+        messageStarted = true;
         emit("message_start", {
           type: "message_start",
           message: {
@@ -54,40 +59,40 @@ export function translateStream(
               cache_read_input_tokens: 0,
             },
           },
-        })
-        emit("ping", { type: "ping" })
-      }
+        });
+        emit("ping", { type: "ping" });
+      };
 
-      const streamStart = Date.now()
-      let firstChunkAt: number | undefined
-      let reasoningChars = 0
-      let contentChars = 0
-      let toolCount = 0
-      let finishUsage: KimiUsage | undefined
-      let finishStopReason: string | undefined
-      const stats = { chunkCount: 0 }
+      const streamStart = Date.now();
+      let firstChunkAt: number | undefined;
+      let reasoningChars = 0;
+      let contentChars = 0;
+      let toolCount = 0;
+      let finishUsage: KimiUsage | undefined;
+      let finishStopReason: string | undefined;
+      const stats = { chunkCount: 0 };
 
       try {
         for await (const e of reduceUpstream(upstream, stats, opts.log)) {
-          if (firstChunkAt === undefined) firstChunkAt = Date.now()
+          if (firstChunkAt === undefined) firstChunkAt = Date.now();
 
           switch (e.kind) {
             case "thinking-start":
-              ensureMessageStart()
+              ensureMessageStart();
               emit("content_block_start", {
                 type: "content_block_start",
                 index: e.index,
                 content_block: { type: "thinking", thinking: "" },
-              })
-              break
+              });
+              break;
             case "thinking-delta":
-              reasoningChars += e.text.length
+              reasoningChars += e.text.length;
               emit("content_block_delta", {
                 type: "content_block_delta",
                 index: e.index,
                 delta: { type: "thinking_delta", thinking: e.text },
-              })
-              break
+              });
+              break;
             case "thinking-stop":
               // Emit the signature as a separate signature_delta right
               // before content_block_stop — matches Anthropic's native
@@ -100,32 +105,32 @@ export function translateStream(
                   type: "signature_delta",
                   signature: makeThinkingSignature(opts.messageId, e.index),
                 },
-              })
-              emit("content_block_stop", { type: "content_block_stop", index: e.index })
-              break
+              });
+              emit("content_block_stop", { type: "content_block_stop", index: e.index });
+              break;
             case "text-start":
-              ensureMessageStart()
+              ensureMessageStart();
               emit("content_block_start", {
                 type: "content_block_start",
                 index: e.index,
                 content_block: { type: "text", text: "" },
-              })
-              break
+              });
+              break;
             case "text-delta":
-              contentChars += e.text.length
+              contentChars += e.text.length;
               emit("content_block_delta", {
                 type: "content_block_delta",
                 index: e.index,
                 delta: { type: "text_delta", text: e.text },
-              })
-              break
+              });
+              break;
             case "text-stop":
-              emit("content_block_stop", { type: "content_block_stop", index: e.index })
-              break
+              emit("content_block_stop", { type: "content_block_stop", index: e.index });
+              break;
             case "tool-start":
-              toolCount++
-              activeTools.set(e.index, { id: e.id, name: e.name })
-              ensureMessageStart()
+              toolCount++;
+              activeTools.set(e.index, { id: e.id, name: e.name });
+              ensureMessageStart();
               emit("content_block_start", {
                 type: "content_block_start",
                 index: e.index,
@@ -135,70 +140,69 @@ export function translateStream(
                   name: e.name,
                   input: {},
                 },
-              })
-              break
+              });
+              break;
             case "tool-delta":
               emit("content_block_delta", {
                 type: "content_block_delta",
                 index: e.index,
                 delta: { type: "input_json_delta", partial_json: e.partialJson },
-              })
-              break
+              });
+              break;
             case "tool-stop":
-              activeTools.delete(e.index)
-              emit("content_block_stop", { type: "content_block_stop", index: e.index })
-              break
+              activeTools.delete(e.index);
+              emit("content_block_stop", { type: "content_block_stop", index: e.index });
+              break;
             case "finish":
-              ensureMessageStart()
-              finishUsage = e.usage
-              finishStopReason = e.stopReason
-              opts.onFinish?.({ stopReason: e.stopReason, usage: e.usage })
+              ensureMessageStart();
+              finishUsage = e.usage;
+              finishStopReason = e.stopReason;
+              opts.onFinish?.({ stopReason: e.stopReason, usage: e.usage });
               emit("message_delta", {
                 type: "message_delta",
                 delta: { stop_reason: e.stopReason, stop_sequence: null },
                 usage: mapUsageToAnthropic(e.usage),
-              })
-              emit("message_stop", { type: "message_stop" })
-              break
+              });
+              emit("message_stop", { type: "message_stop" });
+              break;
           }
         }
       } catch (err) {
-        const activeToolNames = Array.from(activeTools.values(), (t) => t.name)
-        const activeToolCalls = Array.from(activeTools.values())
+        const activeToolNames = Array.from(activeTools.values(), (t) => t.name);
+        const activeToolCalls = Array.from(activeTools.values());
         if (isAbortError(err)) {
-          opts.log.info("client disconnected")
+          opts.log.info("client disconnected");
         } else if (err instanceof UpstreamStreamError) {
           opts.log.warn("upstream stream error", {
             kind: err.kind,
             message: err.message,
             activeToolNames,
             activeToolCalls,
-          })
-          ensureMessageStart()
+          });
+          ensureMessageStart();
           emit("error", {
             type: "error",
             error: {
               type: err.kind === "rate_limit" ? "rate_limit_error" : "api_error",
               message: err.message,
             },
-          })
+          });
         } else {
           opts.log.error("stream translation error", {
             err: String(err),
             activeToolNames,
             activeToolCalls,
-          })
-          ensureMessageStart()
+          });
+          ensureMessageStart();
           emit("error", {
             type: "error",
             error: { type: "api_error", message: String(err) },
-          })
+          });
         }
       } finally {
-        const now = Date.now()
-        const timeToFirstChunkMs = opts.requestStartTime && firstChunkAt
-          ? firstChunkAt - opts.requestStartTime
-          : undefined
+        const now = Date.now();
+        const timeToFirstChunkMs =
+          opts.requestStartTime && firstChunkAt ? firstChunkAt - opts.requestStartTime : undefined;
         opts.log.debug("stream summary", {
           chunkCount: stats.chunkCount,
           timeToFirstChunkMs,
@@ -209,13 +213,13 @@ export function translateStream(
           toolCount,
           stopReason: finishStopReason,
           usage: finishUsage,
-        })
+        });
         try {
-          controller.close()
+          controller.close();
         } catch {
           // ignore if controller already errored or cancelled
         }
       }
     },
-  })
+  });
 }

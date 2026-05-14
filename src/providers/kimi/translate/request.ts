@@ -6,67 +6,67 @@ import type {
   AnthropicTextBlock,
   AnthropicTool,
   AnthropicToolResultContentBlock,
-} from "../../../anthropic/schema.ts"
+} from "../../../anthropic/schema.ts";
 
 // OpenAI-compatible chat-completions request shape used by Kimi.
 // Only the fields kimi-cli is known to send are included; unknown
 // fields are not forwarded.
 export interface KimiChatRequest {
-  model: string
-  messages: KimiMessage[]
-  tools?: KimiTool[]
-  tool_choice?: KimiToolChoice
-  stream: true
-  stream_options: { include_usage: true }
-  max_tokens: number
-  reasoning_effort?: "low" | "medium" | "high"
-  thinking?: { type: "enabled" }
-  prompt_cache_key?: string
+  model: string;
+  messages: KimiMessage[];
+  tools?: KimiTool[];
+  tool_choice?: KimiToolChoice;
+  stream: true;
+  stream_options: { include_usage: true };
+  max_tokens: number;
+  reasoning_effort?: "low" | "medium" | "high";
+  thinking?: { type: "enabled" };
+  prompt_cache_key?: string;
 }
 
 export type KimiToolChoice =
   | "auto"
   | "none"
   | "required"
-  | { type: "function"; function: { name: string } }
+  | { type: "function"; function: { name: string } };
 
 export type KimiAssistantMessage = {
-  role: "assistant"
-  content?: string | null
-  reasoning_content?: string
-  tool_calls?: KimiAssistantToolCall[]
-}
+  role: "assistant";
+  content?: string | null;
+  reasoning_content?: string;
+  tool_calls?: KimiAssistantToolCall[];
+};
 
 export type KimiMessage =
   | { role: "system"; content: string }
   | { role: "user"; content: string | KimiUserContentPart[] }
   | KimiAssistantMessage
-  | { role: "tool"; tool_call_id: string; content: string | KimiToolResultPart[] }
+  | { role: "tool"; tool_call_id: string; content: string | KimiToolResultPart[] };
 
 export type KimiUserContentPart =
   | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string } }
+  | { type: "image_url"; image_url: { url: string } };
 
 export type KimiToolResultPart =
   | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string } }
+  | { type: "image_url"; image_url: { url: string } };
 
 export interface KimiAssistantToolCall {
-  id: string
-  type: "function"
-  function: { name: string; arguments: string }
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
 }
 
 export interface KimiTool {
-  type: "function"
-  function: { name: string; description?: string; parameters: unknown }
+  type: "function";
+  function: { name: string; description?: string; parameters: unknown };
 }
 
 export interface TranslateOptions {
-  sessionId?: string
+  sessionId?: string;
 }
 
-const DEFAULT_MAX_TOKENS = 32000
+const DEFAULT_MAX_TOKENS = 32000;
 
 // Kimi's `kimi-for-coding` is a reasoning model: it always produces
 // reasoning_content and its server always enforces that prior assistant
@@ -78,10 +78,10 @@ export function translateRequest(
   req: AnthropicRequest,
   opts: TranslateOptions = {},
 ): KimiChatRequest {
-  const messages = buildMessages(req)
-  const tools = req.tools?.map(toKimiTool)
+  const messages = buildMessages(req);
+  const tools = req.tools?.map(toKimiTool);
 
-  assertValidEffort(req.output_config?.effort)
+  assertValidEffort(req.output_config?.effort);
   const out: KimiChatRequest = {
     model: req.model,
     messages,
@@ -90,26 +90,26 @@ export function translateRequest(
     max_tokens: clampMaxTokens(req.max_tokens),
     reasoning_effort: mapReasoningEffort(req.output_config?.effort),
     thinking: { type: "enabled" },
-  }
-  if (tools && tools.length) out.tools = tools
-  const tool_choice = mapToolChoice(req.tool_choice)
-  if (tool_choice !== "auto") out.tool_choice = tool_choice
-  if (opts.sessionId) out.prompt_cache_key = opts.sessionId
-  return out
+  };
+  if (tools && tools.length) out.tools = tools;
+  const tool_choice = mapToolChoice(req.tool_choice);
+  if (tool_choice !== "auto") out.tool_choice = tool_choice;
+  if (opts.sessionId) out.prompt_cache_key = opts.sessionId;
+  return out;
 }
 
 function clampMaxTokens(requested: number | undefined): number {
-  if (!requested || requested <= 0) return DEFAULT_MAX_TOKENS
-  return Math.min(requested, DEFAULT_MAX_TOKENS)
+  if (!requested || requested <= 0) return DEFAULT_MAX_TOKENS;
+  return Math.min(requested, DEFAULT_MAX_TOKENS);
 }
 
-const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "max"])
+const ANTHROPIC_EFFORTS = new Set(["low", "medium", "high", "max"]);
 
 function assertValidEffort(effort: unknown): void {
   if (effort !== undefined && !ANTHROPIC_EFFORTS.has(effort as string)) {
     throw new Error(
       `Invalid output_config.effort: "${effort}". Must be one of: ${Array.from(ANTHROPIC_EFFORTS).join(", ")}`,
-    )
+    );
   }
 }
 
@@ -119,52 +119,50 @@ function assertValidEffort(effort: unknown): void {
 function mapReasoningEffort(
   effort: NonNullable<AnthropicRequest["output_config"]>["effort"],
 ): "low" | "medium" | "high" {
-  if (effort === "max") return "high"
-  return effort ?? "medium"
+  if (effort === "max") return "high";
+  return effort ?? "medium";
 }
 
 function mapToolChoice(choice: AnthropicRequest["tool_choice"]): KimiToolChoice {
-  if (!choice) return "auto"
+  if (!choice) return "auto";
   switch (choice.type) {
     case "auto":
-      return "auto"
+      return "auto";
     case "none":
-      return "none"
+      return "none";
     case "any":
-      return "required"
+      return "required";
     case "tool":
-      return choice.name
-        ? { type: "function", function: { name: choice.name } }
-        : "required"
+      return choice.name ? { type: "function", function: { name: choice.name } } : "required";
   }
 }
 
 export function buildSystemMessage(system: AnthropicRequest["system"]): string | undefined {
-  if (!system) return undefined
+  if (!system) return undefined;
   const blocks: AnthropicTextBlock[] =
-    typeof system === "string" ? [{ type: "text", text: system }] : system
+    typeof system === "string" ? [{ type: "text", text: system }] : system;
   const texts = blocks
     .filter((b) => b && b.type === "text" && typeof b.text === "string")
     .map((b) => b.text)
-    .filter((t) => !t.startsWith("x-anthropic-billing-header:"))
-  if (!texts.length) return undefined
-  return texts.join("\n\n")
+    .filter((t) => !t.startsWith("x-anthropic-billing-header:"));
+  if (!texts.length) return undefined;
+  return texts.join("\n\n");
 }
 
 function buildMessages(req: AnthropicRequest): KimiMessage[] {
-  const out: KimiMessage[] = []
-  const system = buildSystemMessage(req.system)
-  if (system) out.push({ role: "system", content: system })
+  const out: KimiMessage[] = [];
+  const system = buildSystemMessage(req.system);
+  if (system) out.push({ role: "system", content: system });
 
   for (const msg of req.messages) {
-    const blocks = normalizeContent(msg.content)
+    const blocks = normalizeContent(msg.content);
     if (msg.role === "user") {
-      pushUserMessages(out, blocks)
+      pushUserMessages(out, blocks);
     } else {
-      pushAssistantMessage(out, blocks)
+      pushAssistantMessage(out, blocks);
     }
   }
-  return out
+  return out;
 }
 
 // In Anthropic-land a single user message can carry a mix of text, image,
@@ -172,49 +170,49 @@ function buildMessages(req: AnthropicRequest): KimiMessage[] {
 // results to be their own role="tool" messages, so we split on tool_result
 // boundaries, preserving order.
 function pushUserMessages(out: KimiMessage[], blocks: AnthropicContentBlock[]): void {
-  let buffer: KimiUserContentPart[] = []
+  let buffer: KimiUserContentPart[] = [];
   const flushBuffer = () => {
-    if (!buffer.length) return
+    if (!buffer.length) return;
     // Collapse to a string when every part is text — matches what kimi-cli
     // sends and keeps the wire payload compact.
-    const allText = buffer.every((p) => p.type === "text")
+    const allText = buffer.every((p) => p.type === "text");
     if (allText) {
       out.push({
         role: "user",
         content: buffer.map((p) => (p as { type: "text"; text: string }).text).join(""),
-      })
+      });
     } else {
-      out.push({ role: "user", content: buffer })
+      out.push({ role: "user", content: buffer });
     }
-    buffer = []
-  }
+    buffer = [];
+  };
 
   for (const block of blocks) {
     if (block.type === "text") {
-      buffer.push({ type: "text", text: block.text })
+      buffer.push({ type: "text", text: block.text });
     } else if (block.type === "image") {
-      buffer.push({ type: "image_url", image_url: { url: imageToUrl(block) } })
+      buffer.push({ type: "image_url", image_url: { url: imageToUrl(block) } });
     } else if (block.type === "tool_result") {
-      flushBuffer()
+      flushBuffer();
       out.push({
         role: "tool",
         tool_call_id: block.tool_use_id,
         content: toolResultContent(block.content, block.is_error),
-      })
+      });
     }
   }
-  flushBuffer()
+  flushBuffer();
 }
 
 function pushAssistantMessage(out: KimiMessage[], blocks: AnthropicContentBlock[]): void {
-  const textParts: string[] = []
-  const thinkingParts: string[] = []
-  const toolCalls: KimiAssistantToolCall[] = []
+  const textParts: string[] = [];
+  const thinkingParts: string[] = [];
+  const toolCalls: KimiAssistantToolCall[] = [];
   for (const block of blocks) {
     if (block.type === "text") {
-      if (block.text) textParts.push(block.text)
+      if (block.text) textParts.push(block.text);
     } else if (block.type === "thinking") {
-      if (block.thinking) thinkingParts.push(block.thinking)
+      if (block.thinking) thinkingParts.push(block.thinking);
     } else if (block.type === "tool_use") {
       toolCalls.push({
         id: block.id,
@@ -223,100 +221,98 @@ function pushAssistantMessage(out: KimiMessage[], blocks: AnthropicContentBlock[
           name: block.name,
           arguments: JSON.stringify(block.input ?? {}),
         },
-      })
+      });
     }
     // image blocks from the assistant are dropped — Kimi's assistant
     // schema does not express them.
   }
 
-  if (!textParts.length && !toolCalls.length && !thinkingParts.length) return
+  if (!textParts.length && !toolCalls.length && !thinkingParts.length) return;
 
-  const msg: KimiAssistantMessage = { role: "assistant" }
-  msg.content = textParts.length ? textParts.join("") : ""
+  const msg: KimiAssistantMessage = { role: "assistant" };
+  msg.content = textParts.length ? textParts.join("") : "";
   // Kimi accepts one reasoning_content string per assistant turn. If a turn
   // has multiple interleaved thinking blocks we concatenate in order —
   // exact block/tool_use pairing can't be preserved over the wire.
-  if (thinkingParts.length) msg.reasoning_content = thinkingParts.join("\n\n")
-  if (toolCalls.length) msg.tool_calls = toolCalls
-  out.push(msg)
+  if (thinkingParts.length) msg.reasoning_content = thinkingParts.join("\n\n");
+  if (toolCalls.length) msg.tool_calls = toolCalls;
+  out.push(msg);
 }
 
 export function normalizeContent(content: AnthropicMessage["content"]): AnthropicContentBlock[] {
-  if (typeof content === "string") return [{ type: "text", text: content }]
-  return content
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  return content;
 }
 
 function imageToUrl(block: Extract<AnthropicContentBlock, { type: "image" }>): string {
-  if (block.source.type === "url") return block.source.url
-  return `data:${block.source.media_type};base64,${block.source.data}`
+  if (block.source.type === "url") return block.source.url;
+  return `data:${block.source.media_type};base64,${block.source.data}`;
 }
 
 function unsupportedToolResultBlockToString(block: AnthropicToolResultContentBlock): string {
-  const type = typeof block.type === "string" ? block.type : "unknown"
-  return `[unsupported content block omitted: ${type}]`
+  const type = typeof block.type === "string" ? block.type : "unknown";
+  return `[unsupported content block omitted: ${type}]`;
 }
 
 function isToolResultTextBlock(
   block: AnthropicToolResultContentBlock,
 ): block is AnthropicTextBlock {
-  return block.type === "text" && typeof block.text === "string"
+  return block.type === "text" && typeof block.text === "string";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object"
+  return !!value && typeof value === "object";
 }
 
 function isToolResultImageBlock(
   block: AnthropicToolResultContentBlock,
 ): block is AnthropicImageBlock {
-  if (block.type !== "image") return false
-  const source = block.source
-  if (!isRecord(source)) return false
-  if (source.type === "url") return typeof source.url === "string"
+  if (block.type !== "image") return false;
+  const source = block.source;
+  if (!isRecord(source)) return false;
+  if (source.type === "url") return typeof source.url === "string";
   return (
     source.type === "base64" &&
     typeof source.media_type === "string" &&
     typeof source.data === "string"
-  )
+  );
 }
 
 export function toolResultContent(
   content: string | AnthropicToolResultContentBlock[],
   isError: boolean | undefined,
 ): string | KimiToolResultPart[] {
-  const prefix = isError ? "[tool execution error]\n" : ""
-  if (typeof content === "string") return prefix + content
+  const prefix = isError ? "[tool execution error]\n" : "";
+  if (typeof content === "string") return prefix + content;
 
-  const parts: KimiToolResultPart[] = []
-  if (prefix) parts.push({ type: "text", text: prefix })
+  const parts: KimiToolResultPart[] = [];
+  if (prefix) parts.push({ type: "text", text: prefix });
   for (const b of content) {
     if (isToolResultTextBlock(b)) {
-      parts.push({ type: "text", text: b.text })
+      parts.push({ type: "text", text: b.text });
     } else if (isToolResultImageBlock(b)) {
-      parts.push({ type: "image_url", image_url: { url: imageToUrl(b) } })
+      parts.push({ type: "image_url", image_url: { url: imageToUrl(b) } });
     } else {
-      parts.push({ type: "text", text: unsupportedToolResultBlockToString(b) })
+      parts.push({ type: "text", text: unsupportedToolResultBlockToString(b) });
     }
   }
-  if (parts.length === 1 && parts[0]!.type === "text") return parts[0]!.text
-  return parts
+  if (parts.length === 1 && parts[0]!.type === "text") return parts[0]!.text;
+  return parts;
 }
 
-export function toolResultToString(
-  content: string | AnthropicToolResultContentBlock[],
-): string {
+export function toolResultToString(content: string | AnthropicToolResultContentBlock[]): string {
   // Kept for the token counter, which wants a flat string.
-  if (typeof content === "string") return content
+  if (typeof content === "string") return content;
   return content
     .map((b) => {
-      if (isToolResultTextBlock(b)) return b.text
+      if (isToolResultTextBlock(b)) return b.text;
       if (isToolResultImageBlock(b)) {
-        const mt = b.source.type === "base64" ? b.source.media_type : "url"
-        return `[image omitted: ${mt}]`
+        const mt = b.source.type === "base64" ? b.source.media_type : "url";
+        return `[image omitted: ${mt}]`;
       }
-      return unsupportedToolResultBlockToString(b)
+      return unsupportedToolResultBlockToString(b);
     })
-    .join("\n")
+    .join("\n");
 }
 
 function toKimiTool(tool: AnthropicTool): KimiTool {
@@ -327,5 +323,5 @@ function toKimiTool(tool: AnthropicTool): KimiTool {
       description: tool.description,
       parameters: tool.input_schema,
     },
-  }
+  };
 }
