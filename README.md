@@ -506,27 +506,26 @@ affecting other keys.
 ### Files
 
 - `proxy.log` — JSON-lines log, rotated at 20 MiB. It lives at
+  `$XDG_STATE_HOME/claude-code-proxy/proxy.log` on macOS/Linux and at
   `%LOCALAPPDATA%\claude-code-proxy\proxy.log` on Windows (falling back to
-  `%APPDATA%`), and at `$XDG_STATE_HOME/claude-code-proxy/proxy.log` on
-  macOS/Linux. Secrets (`authorization`, `access`, `refresh`, `id_token`,
+  `%APPDATA%`). Secrets (`authorization`, `access`, `refresh`, `id_token`,
   `ChatGPT-Account-Id`, …) are redacted before write.
 - `config.json` — optional configuration file (see table above). It lives at
-  `%APPDATA%\claude-code-proxy\config.json` on Windows,
-  `~/.config/claude-code-proxy/config.json` on macOS, and
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/config.json` on Linux.
+  `~/.config/claude-code-proxy/config.json` on macOS,
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/config.json` on Linux,
+  and `%APPDATA%\claude-code-proxy\config.json` on Windows.
 - Codex tokens — macOS uses Keychain under service `claude-code-proxy.codex`.
-  Windows uses `%APPDATA%\claude-code-proxy\codex\auth.json`; Linux uses
+  Linux uses
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/codex/auth.json`.
-  Pre-existing files at the legacy path
-  `~/.config/claude-code-proxy/codex/auth.json` are read as a fallback.
+  Windows uses `%APPDATA%\claude-code-proxy\codex\auth.json`.
 - Kimi tokens — macOS uses Keychain under service `claude-code-proxy.kimi`.
-  Windows uses `%APPDATA%\claude-code-proxy\kimi\auth.json`; Linux uses
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/auth.json`. Same
-  legacy-path fallback as above.
-- Kimi device ID — persistent UUID bound into the Kimi JWT at login. Windows
-  uses `%APPDATA%\claude-code-proxy\kimi\device_id`; Linux uses
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/device_id`. Reused
-  for the lifetime of the install.
+  Linux uses
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/auth.json`.
+  Windows uses `%APPDATA%\claude-code-proxy\kimi\auth.json`.
+- Kimi device ID — persistent UUID bound into the Kimi JWT at login. Linux uses
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/device_id`; Windows
+  uses `%APPDATA%\claude-code-proxy\kimi\device_id`. Reused for the lifetime
+  of the install.
 
 ## Limitations
 
