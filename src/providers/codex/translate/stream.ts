@@ -1,3 +1,6 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { stateDir } from "../../../paths.ts";
 import { encodeSseEvent } from "../../../sse.ts";
 import type { Logger } from "../../../log.ts";
 import {
@@ -21,6 +24,7 @@ export function translateStream(
     messageId: string;
     model: string;
     log: Logger;
+    reqId?: string;
     signal?: AbortSignal;
     upstreamHeaders?: Headers;
     onFinish?: (finish: {
@@ -63,11 +67,6 @@ export function translateStream(
       };
 
       try {
-        opts.log.info("upstream stream start", {
-          upstreamHeaders: opts.upstreamHeaders
-            ? Object.fromEntries(opts.upstreamHeaders.entries())
-            : undefined,
-        });
         for await (const e of reduceUpstream(upstream, opts.log, diagnostics)) {
           switch (e.kind) {
             case "text-start":
@@ -129,14 +128,17 @@ export function translateStream(
         const activeToolNames = Array.from(activeTools.values(), (tool) => tool.name);
         const activeToolCalls = Array.from(activeTools.values());
         if (err instanceof UpstreamStreamError) {
-          opts.log.warn("upstream stream error", {
+          const detail = {
             kind: err.kind,
             message: err.message,
             activeToolNames,
             activeToolCalls,
             clientAborted: opts.signal?.aborted ?? false,
             diagnostics: describeDiagnostics(diagnostics),
-          });
+            upstreamHeaders: describeHeaders(opts.upstreamHeaders),
+          };
+          const diagnosticFile = await writeDiagnosticFile(opts.reqId, "upstream-stream-error", detail);
+          opts.log.warn("upstream stream error", { ...detail, diagnosticFile });
           ensureMessageStart();
           emit("error", {
             type: "error",
@@ -146,13 +148,16 @@ export function translateStream(
             },
           });
         } else {
-          opts.log.error("stream translation error", {
+          const detail = {
             err: describeError(err),
             activeToolNames,
             activeToolCalls,
             clientAborted: opts.signal?.aborted ?? false,
             diagnostics: describeDiagnostics(diagnostics),
-          });
+            upstreamHeaders: describeHeaders(opts.upstreamHeaders),
+          };
+          const diagnosticFile = await writeDiagnosticFile(opts.reqId, "stream-translation-error", detail);
+          opts.log.error("stream translation error", { ...detail, diagnosticFile });
           ensureMessageStart();
           emit("error", {
             type: "error",
@@ -160,7 +165,6 @@ export function translateStream(
           });
         }
       } finally {
-        opts.log.info("upstream stream end", { diagnostics: describeDiagnostics(diagnostics) });
         controller.close();
       }
     },
@@ -179,6 +183,32 @@ function describeDiagnostics(diagnostics: ReturnType<typeof createUpstreamStream
     lastEventType: diagnostics.lastEventType,
     sawTerminalEvent: diagnostics.sawTerminalEvent,
   };
+}
+
+function describeHeaders(headers: Headers | undefined): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of headers) {
+    out[key] = value;
+  }
+  return out;
+}
+
+async function writeDiagnosticFile(
+  reqId: string | undefined,
+  kind: string,
+  detail: Record<string, unknown>,
+): Promise<string | undefined> {
+  try {
+    const dir = join(stateDir(), "diagnostics");
+    await mkdir(dir, { recursive: true });
+    const safeReqId = reqId?.replace(/[^a-zA-Z0-9._-]/g, "_") || "unknown";
+    const file = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${safeReqId}-${kind}.json`);
+    await writeFile(file, JSON.stringify({ t: new Date().toISOString(), kind, reqId, ...detail }, null, 2));
+    return file;
+  } catch {
+    return undefined;
+  }
 }
 
 function describeError(err: unknown) {

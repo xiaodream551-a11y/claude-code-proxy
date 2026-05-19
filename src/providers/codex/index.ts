@@ -261,6 +261,7 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       messageId,
       model: body.model,
       log: ctx.childLogger("codex.stream"),
+      reqId: ctx.reqId,
       signal: ctx.signal,
       upstreamHeaders: upstream.headers,
       onFinish: logVerbose()
