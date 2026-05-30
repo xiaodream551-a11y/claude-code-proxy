@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.15 (2026-05-30)
+
+- Non-streaming Anthropic requests now return non-streamed responses unless streaming is explicitly requested.
+- Codex now follows Claude Code's selected reasoning effort by default, while still respecting explicit effort overrides.
+
 ## v0.0.14 (2026-05-30)
 
 - Codex streaming now stays responsive during long `Read` tool calls by sending keepalive pings while tool arguments are buffered.
