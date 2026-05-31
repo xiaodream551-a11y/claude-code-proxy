@@ -6,6 +6,7 @@ export interface TrafficCapture {
   writeJson(name: string, value: unknown): void;
   writeText(name: string, value: string): void;
   writeBytes(name: string, value: Uint8Array): void;
+  writeJsonEvent(name: string, value: unknown): void;
 }
 
 export interface RequestContext {

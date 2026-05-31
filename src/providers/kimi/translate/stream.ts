@@ -37,7 +37,7 @@ export function translateStream(
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const emit = (event: string, data: unknown) => {
-        opts.traffic?.writeJson("050-downstream-event", { event, data });
+        opts.traffic?.writeJsonEvent("050-downstream-event", { event, data });
         controller.enqueue(encoder.encode(encodeSseEvent(event, data)));
       };
       const activeTools = new Map<number, { id: string; name: string }>();

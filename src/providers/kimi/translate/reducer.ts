@@ -121,7 +121,7 @@ export async function* reduceUpstream(
 
     if (stats) {
       stats.chunkCount++;
-      stats.traffic?.writeJson("040-upstream-event", chunk);
+      stats.traffic?.writeJsonEvent("040-upstream-event", chunk);
     }
 
     if (chunk.error) {

@@ -520,7 +520,9 @@ affecting other keys.
 - `traffic/` — per-request captures written when `CCP_TRAFFIC_LOG=1` is set.
   Captures live under the state directory, grouped by Claude Code session and
   request sequence. They include inbound Anthropic requests, translated upstream
-  requests, upstream headers, upstream events, and downstream events. Token and
+  requests, upstream headers, upstream events, and downstream events. Stream
+  events are written under each request's `events/` directory with monotonic
+  sequence numbers so sorted filenames preserve emission order. Token and
   account headers are redacted, but prompt and tool content are intentionally
   preserved for debugging.
 - `config.json` — optional configuration file (see table above). It lives at

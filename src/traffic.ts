@@ -23,25 +23,38 @@ export function createTrafficCapture(opts: {
   const providerPart = sanitizePathPart(opts.provider || "unknown-provider");
   const reqPart = sanitizePathPart(opts.reqId);
   const dir = join(stateDir(), "traffic", sessionPart, `${seqPart}-${providerPart}-${reqPart}`);
-  let counter = 0;
+  let artifactCounter = 0;
+  let eventCounter = 0;
 
-  const filePath = (name: string) => {
-    counter += 1;
-    return join(dir, `${String(counter).padStart(3, "0")}-${sanitizePathPart(name)}`);
+  const artifactPath = (name: string) => {
+    artifactCounter += 1;
+    return join(dir, `${String(artifactCounter).padStart(3, "0")}-${sanitizePathPart(name)}`);
+  };
+  const eventPath = (name: string) => {
+    eventCounter += 1;
+    return join(
+      dir,
+      "events",
+      `${String(eventCounter).padStart(6, "0")}-${sanitizePathPart(name)}`,
+    );
   };
 
   return {
     writeJson(name, value) {
-      const path = filePath(ensureExtension(name, ".json"));
+      const path = artifactPath(ensureExtension(name, ".json"));
       void writeCaptureFile(path, JSON.stringify(redactTraffic(value), null, 2));
     },
     writeText(name, value) {
-      const path = filePath(ensureExtension(name, ".txt"));
+      const path = artifactPath(ensureExtension(name, ".txt"));
       void writeCaptureFile(path, value);
     },
     writeBytes(name, value) {
-      const path = filePath(name);
+      const path = artifactPath(name);
       void writeCaptureFile(path, value);
+    },
+    writeJsonEvent(name, value) {
+      const path = eventPath(ensureExtension(name, ".json"));
+      void writeCaptureFile(path, JSON.stringify(redactTraffic(value), null, 2));
     },
   };
 }

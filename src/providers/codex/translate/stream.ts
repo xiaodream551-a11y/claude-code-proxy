@@ -64,7 +64,7 @@ export function translateStream(
       const emit = (event: string, data: unknown) => {
         if (closed || opts.signal?.aborted || controller.desiredSize === null) return false;
         try {
-          opts.traffic?.writeJson("050-downstream-event", { event, data });
+          opts.traffic?.writeJsonEvent("050-downstream-event", { event, data });
           controller.enqueue(encoder.encode(encodeSseEvent(event, data)));
           lastEmitAt = Date.now();
           lastEmitEvent = event;

@@ -234,7 +234,7 @@ export async function* reduceUpstream(
     }
     const t: string = p.type || evt.event || "";
     diagnostics.lastEventType = t;
-    diagnostics.traffic?.writeJson("040-upstream-event", p);
+    diagnostics.traffic?.writeJsonEvent("040-upstream-event", p);
 
     if (logVerbose())
       log.debug("upstream event", { type: t, output_index: p.output_index, item_id: p.item_id });
