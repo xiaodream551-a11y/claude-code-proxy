@@ -274,12 +274,19 @@ class CodexWebSocketConnection {
       return;
     }
     this.enqueue(active, new TextEncoder().encode(encodeSse(text)));
-    if (!active.settled) {
+    if (!active.settled && shouldExposeStream(event)) {
       active.settled = true;
       active.chunksExposed = true;
       active.resolve(active.stream);
     }
-    if (isTerminalEvent(event.type)) this.finishActive();
+    if (isTerminalEvent(event.type)) {
+      if (!active.settled) {
+        active.settled = true;
+        active.chunksExposed = true;
+        active.resolve(active.stream);
+      }
+      this.finishActive();
+    }
   }
 
   private resetIdle(active: ActiveRequest): void {
@@ -464,6 +471,11 @@ export async function codexWebSocketRequest(
 export function isPreviousResponseMissingError(err: unknown): boolean {
   if (!(err instanceof CodexWebSocketSetupError)) return false;
   return isPreviousResponseMissingMessage(err.message) || err.code === "previous_response_not_found";
+}
+
+function shouldExposeStream(event: { type?: string }): boolean {
+  const type = event.type;
+  return !!type && type !== "codex.rate_limits" && type !== "response.created" && type !== "response.in_progress";
 }
 
 function isSetupErrorEvent(event: {

@@ -192,6 +192,34 @@ describe("Codex WebSocket helpers", () => {
     }
   });
 
+  it("exposes response errors as SSE events", async () => {
+    const server = await withServer(async (socket, requestBody) => {
+      await requestBody;
+      socket.send(
+        JSON.stringify({
+          type: "error",
+          error: { code: "invalid_request", message: "bad request" },
+        }),
+      );
+    });
+    try {
+      const stream = await codexWebSocketRequest({
+        url: server.url,
+        headers: new Headers(),
+        body: body(),
+        ctx: ctx(),
+        connectTimeoutMs: 1_000,
+        idleTimeoutMs: 1_000,
+      });
+
+      await expect(collect(stream)).resolves.toBe(
+        'data: {"type":"error","error":{"code":"invalid_request","message":"bad request"}}\n\n',
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
   it("reuses a pooled websocket", async () => {
     let sockets = 0;
     const server = await withServer((socket) => {
