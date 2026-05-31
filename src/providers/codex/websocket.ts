@@ -107,7 +107,6 @@ export async function codexWebSocketRequest(
       if (done) return;
       done = true;
       cleanup();
-      enqueue(encoder.encode("data: [DONE]\n\n"));
       closeController();
       socket.close();
     };

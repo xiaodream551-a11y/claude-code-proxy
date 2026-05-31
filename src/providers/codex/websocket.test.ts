@@ -135,7 +135,7 @@ describe("Codex WebSocket helpers", () => {
       });
 
       await expect(collect(stream)).resolves.toBe(
-        'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\ndata: [DONE]\n\n',
+        'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n',
       );
     } finally {
       await server.close();
