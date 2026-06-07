@@ -37,17 +37,32 @@ export function allProviders(): Provider[] {
   return Object.values(PROVIDERS);
 }
 
+export function normalizeIncomingModel(model: string): string {
+  return model.replace(/\[1m\]$/i, "");
+}
+
 export function providerForModel(
   model: string,
   aliasProviderOverride?: AliasProvider,
 ): Provider | undefined {
-  if (ANTHROPIC_STYLE_ALIASES.has(model))
+  const normalizedModel = normalizeIncomingModel(model);
+  if (ANTHROPIC_STYLE_ALIASES.has(normalizedModel))
     return getProvider(aliasProviderOverride ?? aliasProvider());
-  if (isCursorModel(model)) return cursorProvider;
+  if (isCursorModel(normalizedModel)) return cursorProvider;
   for (const p of allProviders()) {
-    if (p.supportedModels.has(model)) return p;
+    if (p.supportedModels.has(normalizedModel)) return p;
   }
   return undefined;
+}
+
+export function groupSupportedModelsByProvider(): Map<string, string[]> {
+  const groups = new Map<string, string[]>();
+  for (const { model, provider } of allSupportedModels()) {
+    const models = groups.get(provider) ?? [];
+    models.push(model);
+    groups.set(provider, models);
+  }
+  return groups;
 }
 
 export function allSupportedModels(): Array<{ model: string; provider: string }> {

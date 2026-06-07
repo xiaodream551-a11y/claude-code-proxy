@@ -13,7 +13,12 @@ import {
 import { configDir } from "./paths.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { allSupportedModels, getProvider, listProviders } from "./providers/registry.ts";
+import {
+  allSupportedModels,
+  getProvider,
+  groupSupportedModelsByProvider,
+  listProviders,
+} from "./providers/registry.ts";
 import type { CliHandlers } from "./providers/types.ts";
 
 declare const BUILD_VERSION: string | undefined;
@@ -113,12 +118,7 @@ Models:    ${models}
 }
 
 function printSupportedModels(): void {
-  const groups = new Map<string, string[]>();
-  for (const { model, provider } of allSupportedModels()) {
-    const models = groups.get(provider) ?? [];
-    models.push(model);
-    groups.set(provider, models);
-  }
+  const groups = groupSupportedModelsByProvider();
   for (const provider of listProviders()) {
     const models = groups.get(provider) ?? [];
     console.log(`  ${provider}: ${models.join(", ")}`);

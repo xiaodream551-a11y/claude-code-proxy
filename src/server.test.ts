@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { loadConfig } from "./config.ts";
 import type { createLogger } from "./log.ts";
 import { startServer, normalizeIncomingModel, wrapStreamResponse } from "./server.ts";
+import { groupSupportedModelsByProvider } from "./providers/registry.ts";
 import { startTestServer } from "./test/server.ts";
 
 const servers: Array<{ stop: () => void }> = [];
@@ -75,6 +76,36 @@ describe("server error responses", () => {
     expect(resp.status).toBe(400);
     expect(resp.headers.get("content-type")).toBe("application/json");
     expect(body.error.type).toBe("invalid_request_error");
+  });
+
+  it("uses active alias-provider grouping in unknown-model errors", async () => {
+    loadConfig({ env: { CCP_ALIAS_PROVIDER: "kimi" }, forceReload: true });
+    const server = startTestServer(startServer);
+    servers.push(server);
+
+    const resp = await fetch(`http://127.0.0.1:${server.port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "not-a-real-model",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    const body = (await resp.json()) as { error: { message: string } };
+
+    const parts: string[] = [];
+    for (const [provider, models] of groupSupportedModelsByProvider()) {
+      parts.push(`${provider}: ${models.join(", ")}`);
+    }
+
+    expect(resp.status).toBe(400);
+    expect(body.error.message).toBe(
+      `Unknown model "not-a-real-model". Supported: ${parts.join("; ")}.`,
+    );
+    expect([...groupSupportedModelsByProvider().keys()]).toEqual(["codex", "kimi", "cursor"]);
+    expect(groupSupportedModelsByProvider().get("kimi")).toEqual(
+      expect.arrayContaining(["haiku", "sonnet", "opus"]),
+    );
   });
 });
 

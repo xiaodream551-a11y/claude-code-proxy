@@ -6,10 +6,13 @@ import type { AnthropicRequest } from "./anthropic/schema.ts";
 import type { AliasProvider } from "./config.ts";
 import type { Provider, RequestContext } from "./providers/types.ts";
 import {
-  allSupportedModels,
   ANTHROPIC_STYLE_ALIASES,
+  groupSupportedModelsByProvider,
+  normalizeIncomingModel,
   providerForModel,
 } from "./providers/registry.ts";
+
+export { normalizeIncomingModel };
 
 const rootLog = createLogger("server");
 
@@ -190,12 +193,6 @@ function captureInboundTraffic(
   ctx.traffic.writeJson("010-anthropic-request", body);
 }
 
-// Claude Code may append a [1m] suffix to model names as a local compaction
-// hint. The suffix is not part of the upstream model id.
-export function normalizeIncomingModel(model: string): string {
-  return model.replace(/\[1m\]$/i, "");
-}
-
 function routeProvider(
   body: AnthropicRequest,
   reqId: string,
@@ -222,14 +219,8 @@ function routeProvider(
 }
 
 function knownModelsMessage(): string {
-  const groups = new Map<string, string[]>();
-  for (const { model, provider } of allSupportedModels()) {
-    const list = groups.get(provider) ?? [];
-    list.push(model);
-    groups.set(provider, list);
-  }
   const parts: string[] = [];
-  for (const [provider, models] of groups) {
+  for (const [provider, models] of groupSupportedModelsByProvider()) {
     parts.push(`${provider}: ${models.join(", ")}`);
   }
   return `Supported: ${parts.join("; ")}.`;

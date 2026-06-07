@@ -2,9 +2,14 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { allSupportedModels, ANTHROPIC_STYLE_ALIASES, providerForModel } from "./registry.ts";
+import {
+  allSupportedModels,
+  ANTHROPIC_STYLE_ALIASES,
+  groupSupportedModelsByProvider,
+  normalizeIncomingModel,
+  providerForModel,
+} from "./registry.ts";
 import { loadConfig } from "../config.ts";
-import { normalizeIncomingModel } from "../server.ts";
 
 afterEach(() => {
   loadConfig({ forceReload: true });
@@ -18,10 +23,8 @@ function providersFor(model: string): string[] {
 
 describe("provider routing", () => {
   it("routes fast Codex model aliases after context suffix normalization", () => {
-    const model = normalizeIncomingModel("gpt-5.4-fast[1m]");
-
-    expect(model).toBe("gpt-5.4-fast");
-    expect(providerForModel(model)?.name).toBe("codex");
+    expect(normalizeIncomingModel("gpt-5.4-fast[1m]")).toBe("gpt-5.4-fast");
+    expect(providerForModel("gpt-5.4-fast[1m]")?.name).toBe("codex");
   });
 
   it("routes Anthropic-style aliases to Codex by default", () => {
@@ -74,6 +77,23 @@ describe("provider routing", () => {
     loadConfig({ env: { CCP_ALIAS_PROVIDER: "codex" }, forceReload: true });
 
     expect(providersFor("sonnet")).toEqual(["codex"]);
+  });
+
+  it("groups supported models without changing provider or model order", () => {
+    loadConfig({ env: { CCP_ALIAS_PROVIDER: "kimi" }, forceReload: true });
+
+    const grouped = groupSupportedModelsByProvider();
+    const expected = new Map<string, string[]>();
+    for (const { model, provider } of allSupportedModels()) {
+      const models = expected.get(provider) ?? [];
+      models.push(model);
+      expected.set(provider, models);
+    }
+
+    expect([...grouped.keys()]).toEqual([...expected.keys()]);
+    expect([...grouped.entries()]).toEqual([...expected.entries()]);
+    expect(grouped.get("kimi")).toEqual(expect.arrayContaining([...ANTHROPIC_STYLE_ALIASES]));
+    expect(grouped.get("codex") ?? []).not.toEqual(expect.arrayContaining(["sonnet"]));
   });
 
   it("does not duplicate supported model entries", () => {
