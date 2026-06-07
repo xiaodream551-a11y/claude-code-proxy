@@ -1,7 +1,8 @@
-import { readFile, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { keychainGet, keychainDelete } from "../../../keychain.ts";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { cursorBaseUrl } from "../../../config.ts";
+import { keychainDelete, keychainGet, keychainSet } from "../../../keychain.ts";
+import { cursorAuthFile, legacyConfigDir } from "../../../paths.ts";
 import { parseJwtClaims, tokenExpiryMs } from "./jwt.ts";
 
 export interface CursorAuth {
@@ -20,32 +21,27 @@ interface CursorAuthFile {
   apiKey?: string;
 }
 
-const CURSOR_KEYCHAIN_ACCOUNT = "cursor-user";
-const ACCESS_TOKEN_SERVICE = "cursor-access-token";
-const REFRESH_TOKEN_SERVICE = "cursor-refresh-token";
-const API_KEY_SERVICE = "cursor-api-key";
+const KEYCHAIN_SERVICE = "claude-code-proxy.cursor";
+const KEYCHAIN_ACCOUNT = "auth";
+const REFRESH_EXPIRY_SKEW_MS = 60_000;
 
 export async function loadCursorAuth(env: NodeJS.ProcessEnv = process.env): Promise<CursorAuth | undefined> {
   const envToken = env.CCP_CURSOR_AUTH_TOKEN || env.CURSOR_AUTH_TOKEN;
   if (envToken) return authFromToken(envToken, "environment");
 
   if (process.platform === "darwin") {
-    const accessToken = keychainGet(ACCESS_TOKEN_SERVICE, CURSOR_KEYCHAIN_ACCOUNT);
-    if (accessToken) {
-      return enrich({
-        accessToken,
-        refreshToken: keychainGet(REFRESH_TOKEN_SERVICE, CURSOR_KEYCHAIN_ACCOUNT),
-        apiKey: keychainGet(API_KEY_SERVICE, CURSOR_KEYCHAIN_ACCOUNT),
-        source: "macOS Keychain",
-      });
-    }
+    const raw = keychainGet(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
+    if (!raw) return undefined;
+    const parsed = JSON.parse(raw) as CursorAuthFile;
+    if (!parsed.accessToken) return undefined;
+    return refreshIfNeeded(enrich({ ...parsed, accessToken: parsed.accessToken, source: cursorAuthLocation() }));
   }
 
-  for (const path of cursorAuthFileCandidates(env)) {
+  for (const path of authFileCandidates()) {
     try {
       const raw = await readFile(path, "utf8");
       const parsed = JSON.parse(raw) as CursorAuthFile;
-      if (parsed.accessToken) return enrich({ ...parsed, accessToken: parsed.accessToken, source: path });
+      if (parsed.accessToken) return refreshIfNeeded(enrich({ ...parsed, accessToken: parsed.accessToken, source: path }));
     } catch (err: any) {
       if (err?.code !== "ENOENT") throw err;
     }
@@ -56,13 +52,11 @@ export async function loadCursorAuth(env: NodeJS.ProcessEnv = process.env): Prom
 
 export async function clearCursorAuth(): Promise<void> {
   if (process.platform === "darwin") {
-    keychainDelete(ACCESS_TOKEN_SERVICE, CURSOR_KEYCHAIN_ACCOUNT);
-    keychainDelete(REFRESH_TOKEN_SERVICE, CURSOR_KEYCHAIN_ACCOUNT);
-    keychainDelete(API_KEY_SERVICE, CURSOR_KEYCHAIN_ACCOUNT);
+    keychainDelete(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
     return;
   }
 
-  for (const path of cursorAuthFileCandidates(process.env)) {
+  for (const path of authFileCandidates()) {
     try {
       await unlink(path);
     } catch (err: any) {
@@ -71,21 +65,36 @@ export async function clearCursorAuth(): Promise<void> {
   }
 }
 
+export async function saveCursorAuth(auth: CursorAuthFile): Promise<CursorAuth> {
+  if (!auth.accessToken) throw new Error("Cursor auth accessToken is required");
+  if (process.platform === "darwin") {
+    keychainSet(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, JSON.stringify(auth));
+    return enrich({ ...auth, accessToken: auth.accessToken, source: cursorAuthLocation() });
+  }
+
+  const path = cursorAuthFile();
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, JSON.stringify(auth, null, 2), { encoding: "utf8", mode: 0o600 });
+  await rename(tmp, path);
+  return enrich({ ...auth, accessToken: auth.accessToken, source: path });
+}
+
 export function cursorAuthLocation(): string {
-  return process.platform === "darwin" ? "Cursor macOS Keychain" : cursorAuthFileCandidates(process.env)[0]!;
+  return process.platform === "darwin" ? "macOS Keychain (claude-code-proxy.cursor)" : cursorAuthFile();
 }
 
 export function missingAuthMessage(): string {
   return [
     "Cursor authentication was not found.",
-    "Run `cursor-agent login` once, or set CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN.",
-    "On macOS the provider reads Keychain services cursor-access-token, cursor-refresh-token, and cursor-api-key for account cursor-user.",
+    "Run `claude-code-proxy cursor auth login`, or set CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN.",
+    "The proxy stores Cursor credentials in its own claude-code-proxy.cursor storage, not Cursor Agent's Keychain/auth.json.",
   ].join(" ");
 }
 
 export function expiredAuthMessage(auth: CursorAuth): string {
   const expires = auth.expires ? new Date(auth.expires).toISOString() : "unknown";
-  return `Cursor access token from ${auth.source} is expired or near expiry (${expires}). Run \`cursor-agent login\` again or set CCP_CURSOR_AUTH_TOKEN.`;
+  return `Cursor access token from ${auth.source} is expired or near expiry (${expires}). Run \`claude-code-proxy cursor auth login\` again or set CCP_CURSOR_AUTH_TOKEN.`;
 }
 
 function authFromToken(accessToken: string, source: string): CursorAuth {
@@ -102,14 +111,41 @@ function enrich(auth: Omit<CursorAuth, "expires" | "userId" | "email"> & Partial
   };
 }
 
-function cursorAuthFileCandidates(env: NodeJS.ProcessEnv): string[] {
-  if (process.platform === "win32") {
-    const appData = env.APPDATA || join(homedir(), "AppData", "Roaming");
-    return [join(appData, "Cursor", "auth.json")];
+async function refreshIfNeeded(auth: CursorAuth): Promise<CursorAuth> {
+  if (!auth.refreshToken || !auth.expires || auth.expires > Date.now() + REFRESH_EXPIRY_SKEW_MS) {
+    return auth;
   }
-  if (process.platform === "darwin") {
-    return [join(homedir(), ".cursor", "auth.json")];
+  const refreshed = await refreshCursorAuth(auth.refreshToken);
+  if (!refreshed) return auth;
+  return saveCursorAuth({
+    accessToken: refreshed.accessToken,
+    refreshToken: refreshed.refreshToken,
+    apiKey: auth.apiKey,
+  });
+}
+
+async function refreshCursorAuth(refreshToken: string): Promise<{ accessToken: string; refreshToken: string } | undefined> {
+  const resp = await fetch(`${cursorBaseUrl().replace(/\/$/, "")}/auth/refresh`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${refreshToken}`,
+    },
+    body: JSON.stringify({}),
+  });
+  if (!resp.ok) return undefined;
+  const parsed = await resp.json();
+  if (parsed && typeof parsed === "object") {
+    const obj = parsed as Record<string, unknown>;
+    if (typeof obj.accessToken === "string" && typeof obj.refreshToken === "string") {
+      return { accessToken: obj.accessToken, refreshToken: obj.refreshToken };
+    }
   }
-  const configHome = env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return [join(configHome, "cursor", "auth.json")];
+  return undefined;
+}
+
+function authFileCandidates(): string[] {
+  const primary = cursorAuthFile();
+  const legacy = join(legacyConfigDir(), "cursor", "auth.json");
+  return legacy === primary ? [primary] : [primary, legacy];
 }

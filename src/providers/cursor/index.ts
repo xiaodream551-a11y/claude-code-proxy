@@ -15,6 +15,7 @@ import {
   missingAuthMessage,
   clearCursorAuth,
 } from "./auth/token-store.ts";
+import { runCursorLogin } from "./auth/login.ts";
 import { renderCursorPrompt } from "./translate/request.ts";
 import { CURSOR_SUPPORTED_MODELS, resolveCursorModel } from "./translate/model.ts";
 import {
@@ -153,9 +154,16 @@ async function handleMessages(
 
 const cli: CliHandlers = {
   async login() {
-    console.log("Cursor login is managed by Cursor Agent.");
-    console.log("Run: cursor-agent login");
-    console.log("Or set CCP_CURSOR_AUTH_TOKEN/CURSOR_AUTH_TOKEN for this proxy.");
+    const auth = await runCursorLogin();
+    if (!auth) {
+      console.error("Cursor login did not complete.");
+      process.exit(1);
+    }
+    console.log();
+    console.log(`Logged in. Storage: ${auth.source}`);
+    if (auth.email) console.log(`Email: ${auth.email}`);
+    if (auth.userId) console.log(`User: ${auth.userId}`);
+    if (auth.expires) console.log(`Expires: ${new Date(auth.expires).toISOString()}`);
   },
   async status() {
     const auth = await loadCursorAuth();

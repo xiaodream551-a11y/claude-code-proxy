@@ -65,6 +65,10 @@ export function kimiAuthFile(deps: DirResolverEnv = defaults()): string {
   return pathFor(deps.platform).join(resolveConfigDir(deps), "kimi", "auth.json");
 }
 
+export function cursorAuthFile(deps: DirResolverEnv = defaults()): string {
+  return pathFor(deps.platform).join(resolveConfigDir(deps), "cursor", "auth.json");
+}
+
 export function kimiDeviceIdFile(deps: DirResolverEnv = defaults()): string {
   return pathFor(deps.platform).join(resolveConfigDir(deps), "kimi", "device_id");
 }

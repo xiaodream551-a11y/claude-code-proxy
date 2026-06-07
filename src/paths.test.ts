@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   codexAuthFile,
+  cursorAuthFile,
   kimiAuthFile,
   kimiDeviceIdFile,
   legacyConfigDir,
@@ -96,6 +97,9 @@ describe("provider paths", () => {
     );
     expect(kimiAuthFile(deps)).toBe(
       "C:\\Users\\u\\AppData\\Roaming\\claude-code-proxy\\kimi\\auth.json",
+    );
+    expect(cursorAuthFile(deps)).toBe(
+      "C:\\Users\\u\\AppData\\Roaming\\claude-code-proxy\\cursor\\auth.json",
     );
     expect(kimiDeviceIdFile(deps)).toBe(
       "C:\\Users\\u\\AppData\\Roaming\\claude-code-proxy\\kimi\\device_id",

@@ -71,14 +71,13 @@ it in any browser, confirm the code, and the CLI polls until done.
 **Cursor Agent:**
 
 ```sh
-cursor-agent login
+claude-code-proxy cursor auth login
 claude-code-proxy cursor auth status
 ```
 
-Cursor authentication is managed by Cursor Agent. The proxy discovers the same
-stored credentials (`cursor-access-token` on macOS Keychain, or Cursor's
-`auth.json` on other platforms). You can also set `CCP_CURSOR_AUTH_TOKEN` for
-the proxy process.
+Cursor authentication uses Cursor's browser login, but the proxy stores its own
+tokens. It does not read Cursor Agent's Keychain/auth.json. You can also set
+`CCP_CURSOR_AUTH_TOKEN` for the proxy process.
 
 On macOS credentials go to Keychain. On Windows they are written under
 `%APPDATA%\claude-code-proxy\<provider>\auth.json`; on Linux they are written
@@ -109,7 +108,7 @@ upstream for each request is chosen from `ANTHROPIC_MODEL`.
 
 - `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4-mini`, `gpt-5.2` → **codex**
 - `kimi-for-coding`, `kimi-k2.6`, `k2.6` → **kimi**
-- `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5-fast`, `cursor:<raw-model>` → **cursor**
+- `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5-fast`, `cursor:<model-id>`, `cursor-plan:<model-id>`, `cursor-ask:<model-id>` → **cursor**
 
 An unknown model returns a 400 listing the supported ids. There is no
 implicit default provider.
@@ -329,8 +328,16 @@ Supported proxy model ids:
 - `cursor-plan` — same model with Cursor `AGENT_MODE_PLAN`
 - `cursor-ask` — same model with Cursor `AGENT_MODE_ASK`
 - `composer-2.5`, `composer-2.5-fast`
-- `cursor:<raw-model>` — send a raw Cursor model id, with a trailing `-fast`
-  converted into Cursor's `fast=true` model parameter
+- `cursor:<model-id>` — force any Cursor Agent model id through Cursor
+- `cursor-plan:<model-id>` — same model with Cursor `AGENT_MODE_PLAN`
+- `cursor-ask:<model-id>` — same model with Cursor `AGENT_MODE_ASK`
+
+The prefixed forms are the recommended way to select Cursor's full model
+catalog. They avoid collisions with other proxy providers, for example
+`gpt-5.2` can remain a Codex model while `cursor:gpt-5.2` forces Cursor.
+The catalog advertised by `/v1/models` is generated from
+`cursor-agent --list-models`; unknown future ids are still accepted with
+`cursor:<raw-model>`.
 
 Plan mode can also be selected per request with metadata:
 
@@ -352,9 +359,9 @@ Auth:
 
 | Command              | What it does                                                        |
 | -------------------- | ------------------------------------------------------------------- |
-| `cursor auth login`  | Prints the required `cursor-agent login` command                    |
-| `cursor auth status` | Shows discovered Cursor credential source and token expiry          |
-| `cursor auth logout` | Clears discovered Cursor credentials from Cursor's local auth store |
+| `cursor auth login`  | Browser login and proxy-owned Cursor token storage                  |
+| `cursor auth status` | Shows proxy-owned Cursor credential source and token expiry         |
+| `cursor auth logout` | Clears proxy-owned Cursor credentials                               |
 
 ## How it works
 
@@ -389,7 +396,7 @@ sequenceDiagram
 | [`serve`](#serve)                                   | Start the proxy on `PORT` |
 | `codex auth login` / `device` / `status` / `logout` | Codex OAuth management    |
 | `kimi  auth login` / `status` / `logout`            | Kimi OAuth management     |
-| `cursor auth login` / `status` / `logout`           | Cursor credential status  |
+| `cursor auth login` / `status` / `logout`           | Cursor OAuth management   |
 
 ---
 
@@ -521,15 +528,13 @@ Removes stored auth credentials (Keychain entry on macOS, file elsewhere). Run
 
 #### `cursor auth login`
 
-Cursor login is handled by Cursor Agent itself:
-
 ```sh
-cursor-agent login
+claude-code-proxy cursor auth login
 ```
 
-The proxy command prints that setup instruction and exits. This avoids using
-`cursor-agent` as a request upstream while still matching Cursor Agent's
-credential storage.
+Starts Cursor's browser login flow, polls `api2.cursor.sh/auth/poll`, and
+stores the resulting Cursor access/refresh tokens in the proxy's own auth
+store. The proxy does not read or write Cursor Agent's Keychain/auth.json.
 
 #### `cursor auth status`
 
@@ -547,7 +552,7 @@ claude-code-proxy cursor auth logout
 ```
 
 Clears Cursor credentials from the discovered local auth store. Run
-`cursor-agent login` again to re-authenticate.
+`claude-code-proxy cursor auth login` again to re-authenticate.
 
 ---
 
@@ -625,7 +630,7 @@ Windows, and at
 | `CCP_CURSOR_BASE_URL`            | `cursor.baseUrl`           | `https://api2.cursor.sh`                          | Override Cursor's API base URL                                                                                                   |
 | `CCP_CURSOR_CLIENT_VERSION`      | `cursor.clientVersion`     | `cli-2026.06.04-5fd875e`                          | Override Cursor client version headers                                                                                           |
 | `CCP_CURSOR_AGENT_BUNDLE`        | `cursor.agentBundle`       | auto-detected                                     | Path to Cursor Agent's bundled `index.js` used only for protobuf schemas                                                         |
-| `CCP_CURSOR_AUTH_TOKEN`          | —                          | unset                                             | Use this Cursor bearer token instead of local Cursor Agent credential storage                                                     |
+| `CCP_CURSOR_AUTH_TOKEN`          | —                          | unset                                             | Use this Cursor bearer token instead of local claude-code-proxy Cursor auth storage                                               |
 | `CCP_ORIGINATOR`                 | —                          | `claude-code-proxy`                               | Fallback for `CCP_CODEX_ORIGINATOR`                                                                                              |
 | `CCP_USER_AGENT`                 | —                          | unset                                             | Fallback for `CCP_CODEX_USER_AGENT` and `CCP_KIMI_USER_AGENT`                                                                    |
 
@@ -679,12 +684,11 @@ sticky sessions or shared state before enabling continuation.
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/device_id`; Windows
   uses `%APPDATA%\claude-code-proxy\kimi\device_id`. Reused for the lifetime
   of the install.
-- Cursor tokens — discovered from Cursor Agent's auth store, not stored under
-  `claude-code-proxy`. On macOS the provider reads Keychain account
-  `cursor-user` with services `cursor-access-token`, `cursor-refresh-token`,
-  and `cursor-api-key`. On Linux it reads
-  `${XDG_CONFIG_HOME:-$HOME/.config}/cursor/auth.json`; on Windows it reads
-  `%APPDATA%\Cursor\auth.json`. `CCP_CURSOR_AUTH_TOKEN` overrides discovery.
+- Cursor tokens — macOS uses Keychain under service
+  `claude-code-proxy.cursor`. Linux uses
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/cursor/auth.json`.
+  Windows uses `%APPDATA%\claude-code-proxy\cursor\auth.json`.
+  `CCP_CURSOR_AUTH_TOKEN` overrides local proxy-owned storage.
 
 ## Limitations
 
