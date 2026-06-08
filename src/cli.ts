@@ -8,7 +8,6 @@ import {
 } from "./config.ts";
 import { existsSync } from "node:fs";
 import {
-  allSupportedModels,
   getProvider,
   groupSupportedModelsByProvider,
   listProviders,
@@ -49,6 +48,11 @@ async function main() {
       `  export ANTHROPIC_SMALL_FAST_MODEL="gpt-5.4-mini"          # background / title-gen`,
     );
     console.log(`  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"`);
+    return;
+  }
+
+  if (first === "models") {
+    printSupportedModels({ full: rest.includes("--full") });
     return;
   }
 
@@ -93,12 +97,12 @@ async function runProviderCommand(name: string, cli: CliHandlers, args: string[]
 
 function usageAndExit(): never {
   const providers = listProviders().join("|");
-  const models = allSupportedModels()
-    .map((m) => `${m.model} (${m.provider})`)
-    .join(", ");
+  const models = compactSupportedModelsSummary();
   console.log(`Usage:
   claude-code-proxy serve                      Run proxy (PORT env or config.json port, default 18765)
                                                Upstream is chosen per-request from ANTHROPIC_MODEL.
+  claude-code-proxy models                     Show compact model list
+  claude-code-proxy models --full              Show every supported model alias
   claude-code-proxy <provider> auth login      Browser OAuth
   claude-code-proxy <provider> auth device     Device-code OAuth
   claude-code-proxy <provider> auth status     Show current auth
@@ -106,17 +110,54 @@ function usageAndExit(): never {
   claude-code-proxy --version                  Show version
 
 Providers: ${providers}
-Models:    ${models}
+Models:
+${models}
 `);
   process.exit(2);
 }
 
-function printSupportedModels(): void {
+function printSupportedModels(opts: { full?: boolean } = {}): void {
   const groups = groupSupportedModelsByProvider();
   for (const provider of listProviders()) {
     const models = groups.get(provider) ?? [];
-    console.log(`  ${provider}: ${models.join(", ")}`);
+    console.log(`  ${provider}: ${formatProviderModels(provider, models, opts)}`);
   }
+}
+
+function compactSupportedModelsSummary(): string {
+  const groups = groupSupportedModelsByProvider();
+  return listProviders()
+    .map((provider) => `  ${provider}: ${formatProviderModels(provider, groups.get(provider) ?? [])}`)
+    .join("\n");
+}
+
+function formatProviderModels(provider: string, models: string[], opts: { full?: boolean } = {}): string {
+  if (opts.full || provider !== "cursor") return models.join(", ");
+  return formatCursorModels(models);
+}
+
+function formatCursorModels(models: string[]): string {
+  const legacy = models.filter((model) => !model.includes(":"));
+  const rawIds = new Set<string>();
+  for (const model of models) {
+    for (const prefix of ["cursor:", "cursor-plan:", "cursor-ask:"]) {
+      if (model.startsWith(prefix)) rawIds.add(model.slice(prefix.length));
+    }
+  }
+
+  const examples = [
+    "cursor:gemini-3.1-pro",
+    "cursor:gpt-5.5-high",
+    "cursor-plan:gpt-5.5-high",
+    "cursor-ask:gpt-5.5-high",
+  ].filter((model) => models.includes(model));
+
+  return [
+    ...legacy,
+    examples.length ? `examples: ${examples.join(", ")}` : undefined,
+    `${rawIds.size} Cursor catalog models via cursor:<id>, cursor-plan:<id>, cursor-ask:<id>`,
+    "run `claude-code-proxy models --full` for all aliases",
+  ].filter(Boolean).join("; ");
 }
 
 function printConfigSummary(): void {
