@@ -255,7 +255,16 @@ export async function* reduceUpstream(
     });
   }
 
-  for await (const evt of parseSseStream(upstream, diagnostics.stats)) {
+  const events = parseSseStream(upstream, diagnostics.stats);
+  while (true) {
+    let next: Awaited<ReturnType<typeof events.next>>;
+    try {
+      next = await events.next();
+    } catch (err) {
+      throw upstreamReadError(err);
+    }
+    if (next.done) break;
+    const evt = next.value;
     if (!evt.data) continue;
     let p: any;
     try {
@@ -494,6 +503,12 @@ export async function* reduceUpstream(
     responseId,
     outputItems,
   };
+}
+
+function upstreamReadError(err: unknown): Error {
+  if (err instanceof UpstreamStreamError) return err;
+  const message = err instanceof Error ? err.message : String(err);
+  return new UpstreamStreamError("failed", `Upstream stream read failed: ${message}`);
 }
 
 export function mapUsageToAnthropic(u: CodexUsage | undefined): {

@@ -159,7 +159,7 @@ describe("translateStream", () => {
     expect(output).not.toContain("event: message_stop");
   });
 
-  it("closes an active Read block before non-client upstream errors", async () => {
+  it("reports upstream read failures as upstream stream errors", async () => {
     const chunks = [
       sse("response.output_item.added", {
         output_index: 0,
@@ -168,18 +168,25 @@ describe("translateStream", () => {
       sse("response.function_call_arguments.delta", { output_index: 0, delta: "{\"file_path\"" }),
     ];
     const err = new DOMException("The connection was closed.", "AbortError");
+    const logs: Array<{ msg: string; fields: unknown }> = [];
+    const log = {
+      ...silentLog,
+      warn: (msg: string, fields: unknown) => logs.push({ msg, fields }),
+    };
 
     const output = await collect(
       translateStream(upstreamThatErrorsAfterChunks(chunks, err), {
         messageId: "msg_1",
         model: "gpt-5.5",
-        log: silentLog,
+        log,
       }),
     );
 
     expect(output.indexOf("event: content_block_stop")).toBeLessThan(output.indexOf("event: error"));
     expect(output).toContain("event: error");
+    expect(output).toContain("Upstream stream read failed: The connection was closed.");
     expect(output).not.toContain("input_json_delta");
+    expect(logs.some((entry) => entry.msg === "upstream stream error")).toBe(true);
   });
 
   it("fails buffered Read arguments that exceed the safe duration", async () => {
