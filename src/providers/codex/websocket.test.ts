@@ -20,6 +20,11 @@ const silentLog = {
   child: () => silentLog,
 };
 
+const websocketTimeoutMs = {
+  connect: 1_000,
+  idle: 1_000,
+};
+
 function ctx(): RequestContext {
   return {
     reqId: "req_1",
@@ -50,6 +55,21 @@ async function collect(stream: ReadableStream<Uint8Array>): Promise<string> {
     if (done) return out;
     out += decoder.decode(value, { stream: true });
   }
+}
+
+function webSocketRequest(
+  url: string,
+  options: { poolKey?: string } = {},
+): ReturnType<typeof codexWebSocketRequest> {
+  return codexWebSocketRequest({
+    url,
+    headers: new Headers(),
+    body: body(),
+    ctx: ctx(),
+    connectTimeoutMs: websocketTimeoutMs.connect,
+    idleTimeoutMs: websocketTimeoutMs.idle,
+    ...options,
+  });
 }
 
 async function withServer(
@@ -86,6 +106,21 @@ async function withServer(
           else server.close((closeErr) => (closeErr ? reject(closeErr) : resolve()));
         });
       }),
+  };
+}
+
+async function withCompletionServer(
+  onConnection: (socket: WebSocket, socketIndex: number) => void,
+): Promise<{ url: string; close: () => Promise<void>; sockets: () => number }> {
+  let sockets = 0;
+  const server = await withServer((socket, requestBody, request) => {
+    const socketIndex = ++sockets;
+    onConnection(socket, socketIndex);
+  });
+  return {
+    url: server.url,
+    close: server.close,
+    sockets: () => sockets,
   };
 }
 
@@ -139,14 +174,7 @@ describe("Codex WebSocket helpers", () => {
       socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_1" } }));
     });
     try {
-      const stream = await codexWebSocketRequest({
-        url: server.url,
-        headers: new Headers(),
-        body: body(),
-        ctx: ctx(),
-        connectTimeoutMs: 1_000,
-        idleTimeoutMs: 1_000,
-      });
+      const stream = await webSocketRequest(server.url);
 
       await expect(collect(stream)).resolves.toBe(
         'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n',
@@ -170,14 +198,7 @@ describe("Codex WebSocket helpers", () => {
     try {
       let caught: unknown;
       try {
-        await codexWebSocketRequest({
-          url: server.url,
-          headers: new Headers(),
-          body: body(),
-          ctx: ctx(),
-          connectTimeoutMs: 1_000,
-          idleTimeoutMs: 1_000,
-        });
+        await webSocketRequest(server.url);
       } catch (err) {
         caught = err;
       }
@@ -203,14 +224,7 @@ describe("Codex WebSocket helpers", () => {
       );
     });
     try {
-      const stream = await codexWebSocketRequest({
-        url: server.url,
-        headers: new Headers(),
-        body: body(),
-        ctx: ctx(),
-        connectTimeoutMs: 1_000,
-        idleTimeoutMs: 1_000,
-      });
+      const stream = await webSocketRequest(server.url);
 
       await expect(collect(stream)).resolves.toBe(
         'data: {"type":"error","error":{"code":"invalid_request","message":"bad request"}}\n\n',
@@ -221,29 +235,23 @@ describe("Codex WebSocket helpers", () => {
   });
 
   it("reuses a pooled websocket", async () => {
-    let sockets = 0;
-    const server = await withServer((socket) => {
-      sockets++;
+    const server = await withCompletionServer((socket, socketIndex) => {
       socket.on("message", () => {
-        socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_${sockets}` } }));
+        socket.send(
+          JSON.stringify({ type: "response.completed", response: { id: `resp_${socketIndex}` } }),
+        );
       });
     });
     try {
       const request = () =>
-        codexWebSocketRequest({
-          url: server.url,
-          headers: new Headers(),
-          body: body(),
-          ctx: ctx(),
-          connectTimeoutMs: 1_000,
-          idleTimeoutMs: 1_000,
+        webSocketRequest(server.url, {
           poolKey: "session-1",
         });
 
       await collect(await request());
       await collect(await request());
 
-      expect(sockets).toBe(1);
+      expect(server.sockets()).toBe(1);
     } finally {
       clearCodexWebSocketPoolForTests();
       await server.close();
@@ -251,27 +259,19 @@ describe("Codex WebSocket helpers", () => {
   });
 
   it("does not pool websocket requests without a pool key", async () => {
-    let sockets = 0;
-    const server = await withServer((socket) => {
-      sockets++;
+    const server = await withCompletionServer((socket, socketIndex) => {
       socket.on("message", () => {
-        socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_${sockets}` } }));
+        socket.send(
+          JSON.stringify({ type: "response.completed", response: { id: `resp_${socketIndex}` } }),
+        );
       });
     });
     try {
-      const makeRequest = () =>
-        codexWebSocketRequest({
-          url: server.url,
-          headers: new Headers(),
-          body: body(),
-          ctx: ctx(),
-          connectTimeoutMs: 1_000,
-          idleTimeoutMs: 1_000,
-        }).then(collect);
+      const makeRequest = () => webSocketRequest(server.url).then(collect);
 
       await makeRequest();
       await makeRequest();
-      expect(sockets).toBe(2);
+      expect(server.sockets()).toBe(2);
     } finally {
       await server.close();
     }

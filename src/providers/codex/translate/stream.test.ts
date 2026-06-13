@@ -12,96 +12,109 @@ import {
 let now = 0;
 const realNow = Date.now;
 
+async function withMockNow<T>(run: () => Promise<T>): Promise<T> {
+  Date.now = () => now;
+  try {
+    return await run();
+  } finally {
+    Date.now = realNow;
+    now = 0;
+  }
+}
+
+function readChunks(deltas: string[], includeDone = true): string[] {
+  return [
+    sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", call_id: "call_read", name: "Read" },
+    }),
+    ...deltas.map((delta) =>
+      sse("response.function_call_arguments.delta", { output_index: 0, delta }),
+    ),
+    ...(includeDone
+      ? [
+          sse("response.output_item.done", {
+            output_index: 0,
+            item: { type: "function_call", arguments: "{\"file_path\":\"/tmp/a\"}" },
+          }),
+        ]
+      : []),
+  ];
+}
+
+function collectFromChunks(
+  chunks: string[],
+  options?: {
+    advance?: () => void;
+    log?: typeof silentLog;
+    signal?: AbortSignal;
+  },
+): Promise<string> {
+  const upstream = options?.advance
+    ? upstreamFromChunks(chunks, options.advance)
+    : upstreamFromChunks(chunks);
+  return collect(
+    translateStream(upstream, {
+      messageId: "msg_1",
+      model: "gpt-5.5",
+      log: options?.log ?? silentLog,
+      ...(options?.signal ? { signal: options.signal } : {}),
+    }),
+  );
+}
+
 describe("translateStream", () => {
   it("emits keepalive pings while Read arguments are buffered", async () => {
-    Date.now = () => now;
-    try {
-      const chunks = [
-        sse("response.output_item.added", {
-          output_index: 0,
-          item: { type: "function_call", call_id: "call_read", name: "Read" },
-        }),
-        sse("response.function_call_arguments.delta", { output_index: 0, delta: "{\"file_path\"" }),
-        sse("response.function_call_arguments.delta", { output_index: 0, delta: ":\"/tmp/a\"}" }),
-        sse("response.output_item.done", {
-          output_index: 0,
-          item: { type: "function_call", arguments: "{\"file_path\":\"/tmp/a\"}" },
-        }),
-        sse("response.completed", { response: { usage: {} } }),
-      ];
+    const chunks = [
+      ...readChunks(["{\"file_path\"", "\":\"/tmp/a\"}"]),
+      sse("response.completed", { response: { usage: {} } }),
+    ];
 
-      const output = await collect(
-        translateStream(upstreamFromChunks(chunks, () => {
+    const output = await withMockNow(() =>
+      collectFromChunks(chunks, {
+        advance: () => {
           now += 16_000;
-        }), {
-          messageId: "msg_1",
-          model: "gpt-5.5",
-          log: silentLog,
-        }),
-      );
+        },
+      }),
+    );
 
-      expect(output).toContain("event: content_block_start");
-      expect(output).toContain("event: content_block_delta");
-      expect(output.match(/event: ping/g)?.length).toBeGreaterThanOrEqual(2);
-      expect(output).toContain("event: message_stop");
-    } finally {
-      Date.now = realNow;
-      now = 0;
-    }
+    expect(output).toContain("event: content_block_start");
+    expect(output).toContain("event: content_block_delta");
+    expect(output.match(/event: ping/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(output).toContain("event: message_stop");
   });
 
   it("emits keepalive pings for upstream keepalive events", async () => {
-    Date.now = () => now;
-    try {
-      const chunks = [
-        sse("response.output_item.added", {
-          output_index: 0,
-          item: { type: "message", id: "msg_upstream" },
-        }),
-        sse("keepalive", {}),
-        sse("keepalive", {}),
-        sse("response.output_item.done", {
-          output_index: 0,
-          item: { type: "message", id: "msg_upstream" },
-        }),
-        sse("response.completed", { response: { usage: {} } }),
-      ];
-
-      const output = await collect(
-        translateStream(upstreamFromChunks(chunks, () => {
-          now += 16_000;
-        }), {
-          messageId: "msg_1",
-          model: "gpt-5.5",
-          log: silentLog,
-        }),
-      );
-
-      expect(output.match(/event: ping/g)?.length).toBeGreaterThanOrEqual(2);
-      expect(output).toContain("event: message_stop");
-    } finally {
-      Date.now = realNow;
-      now = 0;
-    }
-  });
-
-  it("emits an error instead of message_stop when upstream ends with an open Read block", async () => {
     const chunks = [
       sse("response.output_item.added", {
         output_index: 0,
-        item: { type: "function_call", call_id: "call_read", name: "Read" },
+        item: { type: "message", id: "msg_upstream" },
       }),
-      sse("response.function_call_arguments.delta", { output_index: 0, delta: "{\"file_path\"" }),
-      sse("response.function_call_arguments.delta", { output_index: 0, delta: ":\"/tmp/a\"" }),
+      sse("keepalive", {}),
+      sse("keepalive", {}),
+      sse("response.output_item.done", {
+        output_index: 0,
+        item: { type: "message", id: "msg_upstream" },
+      }),
+      sse("response.completed", { response: { usage: {} } }),
     ];
 
-    const output = await collect(
-      translateStream(upstreamFromChunks(chunks), {
-        messageId: "msg_1",
-        model: "gpt-5.5",
-        log: silentLog,
+    const output = await withMockNow(() =>
+      collectFromChunks(chunks, {
+        advance: () => {
+          now += 16_000;
+        },
       }),
     );
+
+    expect(output.match(/event: ping/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(output).toContain("event: message_stop");
+  });
+
+  it("emits an error instead of message_stop when upstream ends with an open Read block", async () => {
+    const chunks = readChunks(["{\"file_path\"", ':"/tmp/a"'], false);
+
+    const output = await collectFromChunks(chunks);
 
     expect(output).toContain("event: content_block_start");
     expect(output).toContain("event: content_block_stop");
@@ -112,13 +125,7 @@ describe("translateStream", () => {
   });
 
   it("reports upstream read failures as upstream stream errors", async () => {
-    const chunks = [
-      sse("response.output_item.added", {
-        output_index: 0,
-        item: { type: "function_call", call_id: "call_read", name: "Read" },
-      }),
-      sse("response.function_call_arguments.delta", { output_index: 0, delta: "{\"file_path\"" }),
-    ];
+    const chunks = readChunks(["{\"file_path\""], false);
     const err = new DOMException("The connection was closed.", "AbortError");
     const logs: Array<{ msg: string; fields: unknown }> = [];
     const log = {
@@ -142,36 +149,21 @@ describe("translateStream", () => {
   });
 
   it("fails buffered Read arguments that exceed the safe duration", async () => {
-    Date.now = () => now;
-    try {
-      const chunks = [
-        sse("response.output_item.added", {
-          output_index: 0,
-          item: { type: "function_call", call_id: "call_read", name: "Read" },
-        }),
-        sse("response.function_call_arguments.delta", { output_index: 0, delta: "{\"file_path\"" }),
-        sse("response.function_call_arguments.delta", { output_index: 0, delta: ":\"/tmp/a\"" }),
-      ];
+    const chunks = readChunks(["{\"file_path\"", ':"/tmp/a"'], false);
 
-      const output = await collect(
-        translateStream(upstreamFromChunks(chunks, () => {
+    const output = await withMockNow(() =>
+      collectFromChunks(chunks, {
+        advance: () => {
           now += 121_000;
-        }), {
-          messageId: "msg_1",
-          model: "gpt-5.5",
-          log: silentLog,
-        }),
-      );
+        },
+      }),
+    );
 
-      expect(output).toContain("Buffered Read tool arguments exceeded safe limits");
-      expect(output).toContain("event: content_block_stop");
-      expect(output).toContain("event: error");
-      expect(output).not.toContain("input_json_delta");
-      expect(output).not.toContain("event: message_stop");
-    } finally {
-      Date.now = realNow;
-      now = 0;
-    }
+    expect(output).toContain("Buffered Read tool arguments exceeded safe limits");
+    expect(output).toContain("event: content_block_stop");
+    expect(output).toContain("event: error");
+    expect(output).not.toContain("input_json_delta");
+    expect(output).not.toContain("event: message_stop");
   });
 
   it("treats aborted upstream reads as cancellation", async () => {
