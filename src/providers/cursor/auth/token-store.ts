@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { cursorBaseUrl } from "../../../config.ts";
 import { keychainDelete, keychainGet, keychainSet } from "../../../keychain.ts";
 import { cursorAuthFile, legacyConfigDir } from "../../../paths.ts";
+import { parseCursorAuthTokens } from "./token-parser.ts";
 import { parseJwtClaims, tokenExpiryMs } from "./jwt.ts";
 
 export interface CursorAuth {
@@ -135,13 +136,7 @@ async function refreshCursorAuth(refreshToken: string): Promise<{ accessToken: s
   });
   if (!resp.ok) return undefined;
   const parsed = await resp.json();
-  if (parsed && typeof parsed === "object") {
-    const obj = parsed as Record<string, unknown>;
-    if (typeof obj.accessToken === "string" && typeof obj.refreshToken === "string") {
-      return { accessToken: obj.accessToken, refreshToken: obj.refreshToken };
-    }
-  }
-  return undefined;
+  return parseCursorAuthTokens(parsed);
 }
 
 function authFileCandidates(): string[] {

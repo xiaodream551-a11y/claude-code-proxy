@@ -4,6 +4,7 @@ import { platform } from "node:os";
 import { promisify } from "node:util";
 import { cursorBaseUrl } from "../../../config.ts";
 import { saveCursorAuth, type CursorAuth } from "./token-store.ts";
+import { parseCursorAuthTokens } from "./token-parser.ts";
 
 const execFileAsync = promisify(execFile);
 const CURSOR_WEBSITE_URL = "https://cursor.com";
@@ -72,13 +73,9 @@ export async function waitForCursorLogin(
         continue;
       }
       const parsed = await resp.json();
-      if (parsed && typeof parsed === "object") {
-        const obj = parsed as Record<string, unknown>;
-        if (typeof obj.accessToken === "string" && typeof obj.refreshToken === "string") {
-          return { accessToken: obj.accessToken, refreshToken: obj.refreshToken };
-        }
-      }
-      return undefined;
+      const parsedTokens = parseCursorAuthTokens(parsed);
+      if (!parsedTokens) return undefined;
+      return parsedTokens;
     } catch {
       consecutiveErrors += 1;
       if (consecutiveErrors >= 3) return undefined;
