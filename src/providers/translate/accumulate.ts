@@ -33,6 +33,76 @@ export interface BlockAccumulator {
   orderedBlocks(): readonly AccumulatedBlock[];
 }
 
+export interface AnthropicNonStreamUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+}
+
+export interface CachedInputUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedInputTokens?: number;
+}
+
+export type TextToolReducerEvent =
+  | { kind: "text-start"; index: number }
+  | { kind: "text-delta"; index: number; text: string }
+  | { kind: "text-stop"; index: number }
+  | { kind: "tool-start"; index: number; id: string; name: string }
+  | { kind: "tool-delta"; index: number; partialJson: string }
+  | { kind: "tool-stop"; index: number };
+
+export function defaultAnthropicNonStreamUsage(): AnthropicNonStreamUsage {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  };
+}
+
+export function mapCachedInputUsageToAnthropicUsage(
+  usage: CachedInputUsage = {},
+): AnthropicNonStreamUsage {
+  const inputTokens = usage.inputTokens ?? 0;
+  const outputTokens = usage.outputTokens ?? 0;
+  const cachedTokens = Math.max(0, usage.cachedInputTokens ?? 0);
+  return {
+    input_tokens: Math.max(0, inputTokens - cachedTokens),
+    output_tokens: outputTokens,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: cachedTokens,
+  };
+}
+
+export function collectAnthropicContentFromAccumulatedBlocks<TContent>(
+  blocks: readonly AccumulatedBlock[],
+  handlers: {
+    onThinking?: (index: number, text: string) => TContent | undefined;
+    onText: (index: number, text: string) => TContent | undefined;
+    onTool: (index: number, id: string, name: string, args: string) => TContent | undefined;
+  },
+): TContent[] {
+  const content: TContent[] = [];
+  for (const block of blocks) {
+    if (block.kind === "thinking") {
+      const item = handlers.onThinking?.(block.index, block.text);
+      if (item !== undefined) content.push(item);
+      continue;
+    }
+    if (block.kind === "text") {
+      const item = handlers.onText(block.index, block.text);
+      if (item !== undefined) content.push(item);
+      continue;
+    }
+    const item = handlers.onTool(block.index, block.id, block.name, block.args);
+    if (item !== undefined) content.push(item);
+  }
+  return content;
+}
+
 export function createBlockAccumulator(options?: { includeThinking?: boolean }): BlockAccumulator {
   const ordered: number[] = [];
   const blocks = new Map<number, AccumulatedBlock>();

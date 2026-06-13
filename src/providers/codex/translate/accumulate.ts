@@ -3,7 +3,12 @@ import type { CodexUsage, ReducerEvent } from "./reducer.ts";
 import type { Logger } from "../../../log.ts";
 import type { TrafficCapture } from "../../types.ts";
 import { attachTrafficCapture, createUpstreamStreamDiagnostics } from "./reducer.ts";
-import { createBlockAccumulator, parseToolInputJsonOrRaw } from "../../translate/accumulate.ts";
+import {
+  collectAnthropicContentFromAccumulatedBlocks,
+  createBlockAccumulator,
+  defaultAnthropicNonStreamUsage,
+  parseToolInputJsonOrRaw,
+} from "../../translate/accumulate.ts";
 
 export { UpstreamStreamError } from "./reducer.ts";
 
@@ -88,19 +93,18 @@ export async function accumulateResponse(
     }
   }
 
-  const content: AnthropicNonStreamResponse["content"] = [];
-  for (const b of blockAccumulator.orderedBlocks()) {
-    if (b.kind === "text") {
-      if (b.text) content.push({ type: "text", text: b.text });
-    } else if (b.kind === "tool") {
-      content.push({
+  const content = collectAnthropicContentFromAccumulatedBlocks<AnthropicNonStreamResponse["content"][number]>(
+    blockAccumulator.orderedBlocks(),
+    {
+      onText: (_index, text) => (text ? { type: "text", text } : undefined),
+      onTool: (_index, id, name, args) => ({
         type: "tool_use",
-        id: b.id,
-        name: b.name,
-        input: parseToolInputJsonOrRaw(b.args),
-      });
-    }
-  }
+        id,
+        name,
+        input: parseToolInputJsonOrRaw(args),
+      }),
+    },
+  );
 
   return {
     rawUsage,
@@ -116,12 +120,7 @@ export async function accumulateResponse(
       content,
       stop_reason: stopReason,
       stop_sequence: null,
-      usage: usage ?? {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-      },
+      usage: usage ?? defaultAnthropicNonStreamUsage(),
     },
   };
 }

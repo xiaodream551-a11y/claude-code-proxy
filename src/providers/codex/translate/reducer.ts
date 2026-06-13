@@ -2,6 +2,8 @@ import { createSseStreamStats, parseSseStream, type SseStreamStats } from "../..
 import type { Logger } from "../../../log.ts";
 import { logVerbose } from "../../../config.ts";
 import type { TrafficCapture } from "../../types.ts";
+import type { TextToolReducerEvent } from "../../translate/accumulate.ts";
+import { mapCachedInputUsageToAnthropicUsage } from "../../translate/accumulate.ts";
 import type { ResponsesInputItem } from "./request.ts";
 
 export class UpstreamStreamError extends Error {
@@ -26,14 +28,9 @@ export type StopReason = "end_turn" | "tool_use" | "max_tokens";
 export type TerminalType = "response.completed" | "response.incomplete" | "response.done";
 
 export type ReducerEvent =
-  | { kind: "text-start"; index: number }
-  | { kind: "text-delta"; index: number; text: string }
-  | { kind: "text-stop"; index: number }
-  | { kind: "tool-start"; index: number; id: string; name: string }
-  | { kind: "tool-delta"; index: number; partialJson: string }
+  | TextToolReducerEvent
   | { kind: "tool-progress"; index: number }
   | { kind: "progress" }
-  | { kind: "tool-stop"; index: number }
   | {
       kind: "finish";
       stopReason: StopReason;
@@ -517,17 +514,14 @@ export function mapUsageToAnthropic(u: CodexUsage | undefined): {
   cache_creation_input_tokens: number;
   cache_read_input_tokens: number;
 } {
-  const cachedTokens = u?.input_tokens_details?.cached_tokens ?? 0;
-  const totalInputTokens = u?.input_tokens ?? 0;
-  return {
-    // OpenAI-style usage reports cached prompt tokens inside input_tokens.
-    // Anthropic-style usage reports cache reads separately, and Claude Code
-    // sums input_tokens + cache_read_input_tokens when deciding context size.
-    // Subtract cached reads here so the downstream total matches the real
-    // prompt window instead of double-counting cached context.
-    input_tokens: Math.max(0, totalInputTokens - cachedTokens),
-    output_tokens: u?.output_tokens ?? 0,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: cachedTokens,
-  };
+  // OpenAI-style usage reports cached prompt tokens inside input_tokens.
+  // Anthropic-style usage reports cache reads separately, and Claude Code
+  // sums input_tokens + cache_read_input_tokens when deciding context size.
+  // Subtract cached reads here so the downstream total matches the real
+  // prompt window instead of double-counting cached context.
+  return mapCachedInputUsageToAnthropicUsage({
+    inputTokens: u?.input_tokens,
+    outputTokens: u?.output_tokens,
+    cachedInputTokens: u?.input_tokens_details?.cached_tokens,
+  });
 }

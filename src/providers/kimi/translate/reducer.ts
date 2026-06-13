@@ -1,6 +1,8 @@
 import { parseSseStream } from "../../../sse.ts";
 import type { Logger } from "../../../log.ts";
 import type { TrafficCapture } from "../../types.ts";
+import type { TextToolReducerEvent } from "../../translate/accumulate.ts";
+import { mapCachedInputUsageToAnthropicUsage } from "../../translate/accumulate.ts";
 
 export class UpstreamStreamError extends Error {
   constructor(
@@ -28,12 +30,7 @@ export type ReducerEvent =
   | { kind: "thinking-start"; index: number }
   | { kind: "thinking-delta"; index: number; text: string }
   | { kind: "thinking-stop"; index: number }
-  | { kind: "text-start"; index: number }
-  | { kind: "text-delta"; index: number; text: string }
-  | { kind: "text-stop"; index: number }
-  | { kind: "tool-start"; index: number; id: string; name: string }
-  | { kind: "tool-delta"; index: number; partialJson: string }
-  | { kind: "tool-stop"; index: number }
+  | TextToolReducerEvent
   | { kind: "finish"; stopReason: StopReason; usage: KimiUsage | undefined };
 
 interface StreamChunk {
@@ -208,10 +205,9 @@ export function mapUsageToAnthropic(u: KimiUsage | undefined): {
 } {
   const cached = u?.prompt_tokens_details?.cached_tokens ?? u?.cached_tokens ?? 0;
   const totalPrompt = u?.prompt_tokens ?? 0;
-  return {
-    input_tokens: Math.max(0, totalPrompt - cached),
-    output_tokens: u?.completion_tokens ?? 0,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: cached,
-  };
+  return mapCachedInputUsageToAnthropicUsage({
+    inputTokens: totalPrompt,
+    outputTokens: u?.completion_tokens,
+    cachedInputTokens: cached,
+  });
 }
