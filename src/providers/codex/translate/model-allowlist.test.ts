@@ -15,6 +15,21 @@ afterEach(() => {
   loadConfig({ forceReload: true });
 });
 
+function withTempCodexConfig(
+  env: Record<string, string> | undefined,
+  callback: () => void,
+) {
+  const dir = mkdtempSync(join(tmpdir(), "ccp-model-"));
+  const path = join(dir, "config.json");
+  writeFileSync(path, JSON.stringify({ codex: { model: "gpt-5.5" } }));
+  try {
+    loadConfig({ configPath: path, env: env ?? {}, forceReload: true });
+    callback();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 describe("resolveModel", () => {
   it("returns alias when no override is set", () => {
     loadConfig({ env: {}, forceReload: true });
@@ -27,32 +42,16 @@ describe("resolveModel", () => {
   });
 
   it("config.json codex.model overrides aliases", () => {
-    const dir = mkdtempSync(join(tmpdir(), "ccp-model-"));
-    const path = join(dir, "config.json");
-    writeFileSync(path, JSON.stringify({ codex: { model: "gpt-5.5" } }));
-    try {
-      loadConfig({ configPath: path, env: {}, forceReload: true });
+    withTempCodexConfig({}, () => {
       expect(resolveModel("sonnet")).toBe("gpt-5.5");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   it("empty CCP_CODEX_MODEL env is treated as unset (no regression)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "ccp-model-"));
-    const path = join(dir, "config.json");
-    writeFileSync(path, JSON.stringify({ codex: { model: "gpt-5.5" } }));
-    try {
-      loadConfig({
-        configPath: path,
-        env: { CCP_CODEX_MODEL: "" },
-        forceReload: true,
-      });
+    withTempCodexConfig({ CCP_CODEX_MODEL: "" }, () => {
       // Empty env should fall through to file value
       expect(resolveModel("sonnet")).toBe("gpt-5.5");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    });
   });
 
   it("empty env and no file value falls through to alias", () => {
