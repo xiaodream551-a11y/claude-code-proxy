@@ -34,6 +34,39 @@ function setEnv(env: NodeJS.ProcessEnv) {
   loadConfig({ configPath, env, forceReload: true });
 }
 
+function writeConfigSummaryFixture(overrides: { log?: { stderr?: boolean } } = {}) {
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      codex: {
+        originator: "file-originator",
+        userAgent: "file-codex-ua",
+        model: "gpt-5.2",
+        effort: "high",
+        serviceTier: "flex",
+        baseUrl: "https://codex-file.example.com",
+        transport: "http",
+        previousResponseId: false,
+      },
+      kimi: {
+        userAgent: "file-kimi-ua",
+        oauthHost: "https://kimi-auth-file.example.com",
+        baseUrl: "https://kimi-file.example.com",
+      },
+      cursor: {
+        baseUrl: "https://cursor-file.example.com",
+        clientVersion: "cli-file",
+        agentBundle: "/file/index.js",
+      },
+      aliasProvider: "kimi",
+      log: {
+        verbose: true,
+        ...(overrides.log ? overrides.log : {}),
+      },
+    }),
+  );
+}
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "ccp-config-"));
   configPath = join(dir, "config.json");
@@ -332,33 +365,7 @@ describe("config summary", () => {
   });
 
   it("summarizes file override lines with existing labels", () => {
-    writeFileSync(
-      configPath,
-      JSON.stringify({
-        codex: {
-          originator: "file-originator",
-          userAgent: "file-codex-ua",
-          model: "gpt-5.2",
-          effort: "high",
-          serviceTier: "flex",
-          baseUrl: "https://codex-file.example.com",
-          transport: "http",
-          previousResponseId: false,
-        },
-        kimi: {
-          userAgent: "file-kimi-ua",
-          oauthHost: "https://kimi-auth-file.example.com",
-          baseUrl: "https://kimi-file.example.com",
-        },
-        cursor: {
-          baseUrl: "https://cursor-file.example.com",
-          clientVersion: "cli-file",
-          agentBundle: "/file/index.js",
-        },
-        aliasProvider: "kimi",
-        log: { verbose: true, stderr: true },
-      }),
-    );
+    writeConfigSummaryFixture({ log: { stderr: true } });
     setEnv({});
 
     expect(configOverrideSummaryLines(getConfig())).toEqual([
@@ -383,33 +390,7 @@ describe("config summary", () => {
   });
 
   it("summarizes env override lines with current precedence and display values", () => {
-    writeFileSync(
-      configPath,
-      JSON.stringify({
-        codex: {
-          originator: "file-originator",
-          userAgent: "file-codex-ua",
-          model: "gpt-5.2",
-          effort: "high",
-          serviceTier: "flex",
-          baseUrl: "https://codex-file.example.com",
-          transport: "http",
-          previousResponseId: false,
-        },
-        kimi: {
-          userAgent: "file-kimi-ua",
-          oauthHost: "https://kimi-auth-file.example.com",
-          baseUrl: "https://kimi-file.example.com",
-        },
-        cursor: {
-          baseUrl: "https://cursor-file.example.com",
-          clientVersion: "cli-file",
-          agentBundle: "/file/index.js",
-        },
-        aliasProvider: "kimi",
-        log: { verbose: true, stderr: false },
-      }),
-    );
+    writeConfigSummaryFixture({ log: { stderr: false } });
     setEnv({
       CCP_CODEX_ORIGINATOR: "env-originator",
       CCP_CODEX_USER_AGENT: "env-codex-ua",
