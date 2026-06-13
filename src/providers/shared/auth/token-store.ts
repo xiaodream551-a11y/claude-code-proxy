@@ -1,6 +1,6 @@
-import { mkdir, readFile, writeFile, unlink, rename } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile, unlink } from "node:fs/promises";
 import { keychainGet, keychainSet, keychainDelete } from "../../../keychain.ts";
+import { writeAtomicJson } from "./atomic-write.ts";
 
 const KEYCHAIN_ACCOUNT = "auth";
 
@@ -52,11 +52,7 @@ export function createAuthStore<T>(options: AuthStoreOptions): AuthStore<T> {
         return;
       }
 
-      const path = file();
-      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-      const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-      await writeFile(tmp, JSON.stringify(auth, null, 2), { encoding: "utf8", mode: 0o600 });
-      await rename(tmp, path);
+      await writeAtomicJson(file(), auth);
     },
 
     async clearAuth(): Promise<void> {

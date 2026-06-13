@@ -1,8 +1,9 @@
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import { cursorBaseUrl } from "../../../config.ts";
 import { keychainDelete, keychainGet, keychainSet } from "../../../keychain.ts";
 import { cursorAuthFile, legacyConfigDir } from "../../../paths.ts";
+import { writeAtomicJson } from "../../shared/auth/atomic-write.ts";
 import { parseCursorAuthTokens } from "./token-parser.ts";
 import { parseJwtClaims, tokenExpiryMs } from "./jwt.ts";
 
@@ -74,10 +75,7 @@ export async function saveCursorAuth(auth: CursorAuthFile): Promise<CursorAuth> 
   }
 
   const path = cursorAuthFile();
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmp, JSON.stringify(auth, null, 2), { encoding: "utf8", mode: 0o600 });
-  await rename(tmp, path);
+  await writeAtomicJson(path, auth);
   return enrich({ ...auth, accessToken: auth.accessToken, source: path });
 }
 
