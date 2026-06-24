@@ -117,7 +117,90 @@ function webSearchChunks(): string[] {
   ];
 }
 
+function textChunks(text: string): string[] {
+  return [
+    sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "message", id: "msg_upstream" },
+    }),
+    sse("response.output_text.delta", {
+      output_index: 0,
+      delta: text,
+    }),
+    sse("response.output_item.done", {
+      output_index: 0,
+      item: { type: "message", id: "msg_upstream" },
+    }),
+    sse("response.completed", { response: { usage: { input_tokens: 10, output_tokens: 5 } } }),
+  ];
+}
+
+function overloadChunk(): string {
+  return sse("error", {
+    status: 529,
+    error: {
+      type: "overloaded_error",
+      message: "Our servers are currently overloaded. Please try again later.",
+    },
+  });
+}
+
 describe("translateStream", () => {
+  it("retries overloaded stream errors before downstream output starts", async () => {
+    let retryCalls = 0;
+    const logs: Array<{ msg: string; fields: unknown }> = [];
+    const log = {
+      ...silentLog,
+      warn: (msg: string, fields: unknown) => logs.push({ msg, fields }),
+    };
+
+    const output = await collect(
+      translateStream(upstreamFromChunks([overloadChunk()]), {
+        messageId: "msg_1",
+        model: "gpt-5.5",
+        log,
+        retryUpstream: async () => {
+          retryCalls++;
+          return { body: upstreamFromChunks(textChunks("Recovered")) };
+        },
+        computeRetryDelay: () => ({ waitMs: 0, exceedsBudget: false }),
+      }),
+    );
+
+    expect(retryCalls).toBe(1);
+    expect(output).toContain("Recovered");
+    expect(output).toContain("event: message_stop");
+    expect(output).not.toContain("event: error");
+    expect(
+      logs.some(
+        (entry) => entry.msg === "upstream stream error before downstream output, retrying",
+      ),
+    ).toBe(true);
+  });
+
+  it("does not retry overloaded stream errors after downstream output starts", async () => {
+    let retryCalls = 0;
+
+    const output = await collect(
+      translateStream(upstreamFromChunks([...textChunks("Partial").slice(0, 2), overloadChunk()]), {
+        messageId: "msg_1",
+        model: "gpt-5.5",
+        log: silentLog,
+        retryUpstream: async () => {
+          retryCalls++;
+          return { body: upstreamFromChunks(textChunks("Recovered")) };
+        },
+        computeRetryDelay: () => ({ waitMs: 0, exceedsBudget: false }),
+      }),
+    );
+
+    expect(retryCalls).toBe(0);
+    expect(output).toContain("Partial");
+    expect(output).toContain("event: content_block_stop");
+    expect(output).toContain("event: error");
+    expect(output).toContain('"type":"overloaded_error"');
+  });
+
   it("emits keepalive pings while Read arguments are buffered", async () => {
     const chunks = [
       ...readChunks(['{"file_path"', '":"/tmp/a"}']),

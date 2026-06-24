@@ -38,5 +38,13 @@ export function mapUpstreamStreamErrorToResponse(err: UpstreamStreamErrorLike): 
       headers,
     });
   }
+  if (err.kind === "overloaded") {
+    const headers: Record<string, string> = {};
+    if (err.retryAfterSeconds) headers["retry-after"] = String(err.retryAfterSeconds);
+    return jsonResponse(anthropicErrorBody("overloaded_error", err.message), {
+      status: 529,
+      headers,
+    });
+  }
   return jsonError(502, "api_error", err.message);
 }

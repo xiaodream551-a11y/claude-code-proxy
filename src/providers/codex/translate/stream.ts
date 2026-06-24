@@ -15,6 +15,7 @@ import {
 } from "./reducer.ts";
 import { emitMessageStart } from "../../shared/anthropic-sse.ts";
 import { buildWebSearchCompatBlocks } from "./web-search-compat.ts";
+import { computeBackoffDelay, sleep, type BackoffOutcome } from "../../retry.ts";
 
 /**
  * Translate a Codex Responses SSE stream into Anthropic SSE events.
@@ -26,6 +27,13 @@ import { buildWebSearchCompatBlocks } from "./web-search-compat.ts";
  */
 const KEEPALIVE_INTERVAL_MS = 15_000;
 const STREAM_WATCHDOG_INTERVAL_MS = 30_000;
+const MAX_RETRYABLE_STREAM_RETRIES = 10;
+
+interface RetryableUpstream {
+  body: ReadableStream<Uint8Array>;
+  headers?: Headers;
+  requestSize?: CodexRequestSizeSummary;
+}
 
 export function translateStream(
   upstream: ReadableStream<Uint8Array>,
@@ -40,13 +48,16 @@ export function translateStream(
     requestSize?: CodexRequestSizeSummary;
     onFinish?: (finish: Extract<ReducerEvent, { kind: "finish" }>) => void;
     onInvalidateContinuation?: () => void;
+    retryUpstream?: () => Promise<RetryableUpstream>;
+    maxRetryableStreamRetries?: number;
+    computeRetryDelay?: (attempt: number, retryAfter?: string) => BackoffOutcome;
   },
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const openBlocks = new Map<number, { type: "text" | "tool"; id?: string; name?: string }>();
-      const diagnostics = attachTrafficCapture(createUpstreamStreamDiagnostics(), opts.traffic);
+      let diagnostics = attachTrafficCapture(createUpstreamStreamDiagnostics(), opts.traffic);
       let closed = false;
       let messageStarted = false;
       let lastEmitAt = 0;
@@ -94,6 +105,12 @@ export function translateStream(
           emit("content_block_stop", { type: "content_block_stop", index });
         }
         openBlocks.clear();
+      };
+      const resetBeforeRetry = () => {
+        openBlocks.clear();
+        webSearchEvents.length = 0;
+        deferredContentEvents.length = 0;
+        lastReducerEvent = undefined;
       };
       const logWatchdog = () => {
         const tools = activeToolCalls();
@@ -213,54 +230,77 @@ export function translateStream(
         }
       };
 
+      let currentUpstream = upstream;
+      let currentUpstreamHeaders = opts.upstreamHeaders;
+      let currentRequestSize = opts.requestSize;
+      let retryAttempt = 0;
+      let terminalError: unknown;
       try {
-        for await (const e of reduceUpstream(upstream, opts.log, diagnostics)) {
-          lastReducerEvent = e.kind;
-          if (e.kind === "web-search") {
-            webSearchEvents.push(e);
-            continue;
-          }
-          if (webSearchEvents.length && isContentEvent(e)) {
-            deferredContentEvents.push(e);
-            continue;
-          }
-          switch (e.kind) {
-            case "text-start":
-            case "text-delta":
-            case "text-stop":
-            case "tool-start":
-            case "tool-delta":
-            case "tool-stop":
-              emitContentEvent(e);
-              break;
-            case "tool-progress":
-            case "progress":
-              emitPingIfStale();
-              break;
-            case "finish":
-              if (openBlocks.size) {
-                throw new UpstreamStreamError("failed", "Stream finished with open content blocks");
+        for (;;) {
+          diagnostics = attachTrafficCapture(createUpstreamStreamDiagnostics(), opts.traffic);
+          try {
+            for await (const e of reduceUpstream(currentUpstream, opts.log, diagnostics)) {
+              lastReducerEvent = e.kind;
+              if (e.kind === "web-search") {
+                webSearchEvents.push(e);
+                continue;
               }
-              emitWebSearchCompatBlocks();
-              for (const event of deferredContentEvents) {
-                emitContentEvent(event);
+              if (webSearchEvents.length && isContentEvent(e)) {
+                deferredContentEvents.push(e);
+                continue;
               }
-              if (openBlocks.size) {
-                throw new UpstreamStreamError("failed", "Stream finished with open content blocks");
+              switch (e.kind) {
+                case "text-start":
+                case "text-delta":
+                case "text-stop":
+                case "tool-start":
+                case "tool-delta":
+                case "tool-stop":
+                  emitContentEvent(e);
+                  break;
+                case "tool-progress":
+                case "progress":
+                  emitPingIfStale();
+                  break;
+                case "finish":
+                  if (openBlocks.size) {
+                    throw new UpstreamStreamError(
+                      "failed",
+                      "Stream finished with open content blocks",
+                    );
+                  }
+                  emitWebSearchCompatBlocks();
+                  for (const event of deferredContentEvents) {
+                    emitContentEvent(event);
+                  }
+                  if (openBlocks.size) {
+                    throw new UpstreamStreamError(
+                      "failed",
+                      "Stream finished with open content blocks",
+                    );
+                  }
+                  ensureMessageStart();
+                  opts.onFinish?.(e);
+                  emit("message_delta", {
+                    type: "message_delta",
+                    delta: { stop_reason: e.stopReason, stop_sequence: null },
+                    usage: mapUsageToAnthropic(e.usage, {
+                      webSearchRequests: e.webSearchRequests,
+                    }),
+                  });
+                  emit("message_stop", { type: "message_stop" });
+                  break;
               }
-              ensureMessageStart();
-              opts.onFinish?.(e);
-              emit("message_delta", {
-                type: "message_delta",
-                delta: { stop_reason: e.stopReason, stop_sequence: null },
-                usage: mapUsageToAnthropic(e.usage, {
-                  webSearchRequests: e.webSearchRequests,
-                }),
-              });
-              emit("message_stop", { type: "message_stop" });
+            }
+            break;
+          } catch (err) {
+            if (!(await retryPreMessageStreamError(err))) {
+              terminalError ??= err;
               break;
+            }
           }
         }
+        if (terminalError) throw terminalError;
       } catch (err) {
         const activeToolCalls = Array.from(openBlocks.values()).filter(
           (block): block is { type: "tool"; id: string; name: string } =>
@@ -291,8 +331,8 @@ export function translateStream(
             openBlocks: openBlockDetails,
             clientAborted: opts.signal?.aborted ?? false,
             diagnostics: describeDiagnostics(diagnostics),
-            upstreamHeaders: describeHeaders(opts.upstreamHeaders),
-            requestSize: opts.requestSize,
+            upstreamHeaders: describeHeaders(currentUpstreamHeaders),
+            requestSize: currentRequestSize,
           };
           const diagnosticFile = await writeDiagnosticFile(
             opts.reqId,
@@ -305,7 +345,7 @@ export function translateStream(
           emit("error", {
             type: "error",
             error: {
-              type: err.kind === "rate_limit" ? "rate_limit_error" : "api_error",
+              type: anthropicStreamErrorType(err),
               message: err.message,
             },
           });
@@ -317,8 +357,8 @@ export function translateStream(
             openBlocks: openBlockDetails,
             clientAborted: opts.signal?.aborted ?? false,
             diagnostics: describeDiagnostics(diagnostics),
-            upstreamHeaders: describeHeaders(opts.upstreamHeaders),
-            requestSize: opts.requestSize,
+            upstreamHeaders: describeHeaders(currentUpstreamHeaders),
+            requestSize: currentRequestSize,
           };
           const diagnosticFile = await writeDiagnosticFile(
             opts.reqId,
@@ -337,8 +377,74 @@ export function translateStream(
         clearInterval(watchdog);
         safeClose();
       }
+
+      async function retryPreMessageStreamError(err: unknown): Promise<boolean> {
+        const retryInfo = retryableStreamErrorInfo(err);
+        const maxRetries = opts.maxRetryableStreamRetries ?? MAX_RETRYABLE_STREAM_RETRIES;
+        if (
+          !retryInfo ||
+          !opts.retryUpstream ||
+          messageStarted ||
+          retryAttempt >= maxRetries ||
+          opts.signal?.aborted
+        ) {
+          return false;
+        }
+        const retryDelay = opts.computeRetryDelay ?? computeBackoffDelay;
+        const { waitMs, exceedsBudget } = retryDelay(retryAttempt, retryInfo.retryAfter);
+        if (exceedsBudget) {
+          opts.log.warn("upstream stream retry-after exceeds budget; giving up", {
+            kind: retryInfo.kind,
+            retryAfter: retryInfo.retryAfter,
+            maxDelayMs: waitMs,
+          });
+          return false;
+        }
+        const nextAttempt = retryAttempt + 1;
+        opts.log.warn("upstream stream error before downstream output, retrying", {
+          kind: retryInfo.kind,
+          attempt: nextAttempt,
+          maxRetries,
+          waitMs,
+          retryAfter: retryInfo.retryAfter,
+          message: retryInfo.message,
+          diagnostics: describeDiagnostics(diagnostics),
+          requestSize: currentRequestSize,
+        });
+        resetBeforeRetry();
+        retryAttempt = nextAttempt;
+        try {
+          await sleep(waitMs, opts.signal);
+          const retry = await opts.retryUpstream();
+          currentUpstream = retry.body;
+          currentUpstreamHeaders = retry.headers ?? currentUpstreamHeaders;
+          currentRequestSize = retry.requestSize ?? currentRequestSize;
+          return true;
+        } catch (retryErr) {
+          terminalError = retryErr;
+          return false;
+        }
+      }
     },
   });
+}
+
+function retryableStreamErrorInfo(
+  err: unknown,
+): { kind: "rate_limit" | "overloaded"; retryAfter?: string; message: string } | undefined {
+  if (!(err instanceof UpstreamStreamError)) return undefined;
+  if (err.kind !== "rate_limit" && err.kind !== "overloaded") return undefined;
+  return {
+    kind: err.kind,
+    retryAfter: err.retryAfterSeconds !== undefined ? String(err.retryAfterSeconds) : undefined,
+    message: err.message,
+  };
+}
+
+function anthropicStreamErrorType(err: UpstreamStreamError): string {
+  if (err.kind === "rate_limit") return "rate_limit_error";
+  if (err.kind === "overloaded") return "overloaded_error";
+  return "api_error";
 }
 
 function isClosedControllerError(err: unknown): boolean {

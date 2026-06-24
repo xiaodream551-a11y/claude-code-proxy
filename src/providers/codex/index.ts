@@ -327,6 +327,14 @@ async function handleMessages(body: AnthropicRequest, ctx: RequestContext): Prom
       upstreamHeaders: upstream.headers,
       traffic: ctx.traffic,
       requestSize,
+      retryUpstream: async () => {
+        const retry = await postCodex(translated, ctx, { continuation });
+        return {
+          body: retry.body,
+          headers: retry.headers,
+          requestSize,
+        };
+      },
       onFinish: (finish) => {
         if (finish.continuationEligible) {
           recordContinuation(ctx.sessionId, translated, finish.responseId, finish.outputItems);

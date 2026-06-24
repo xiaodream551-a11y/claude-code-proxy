@@ -9,7 +9,7 @@ import { serverToolUseIdFromCodexWebSearchId } from "./web-search-compat.ts";
 
 export class UpstreamStreamError extends Error {
   constructor(
-    public kind: "rate_limit" | "failed",
+    public kind: "rate_limit" | "overloaded" | "failed",
     message: string,
     public retryAfterSeconds?: number,
   ) {
@@ -389,7 +389,11 @@ export async function* reduceUpstream(
     }
     if (t === "response.failed" || t === "response.error" || t === "error") {
       const message = p?.response?.error?.message || p?.error?.message || "Upstream error";
-      throw new UpstreamStreamError("failed", message);
+      throw new UpstreamStreamError(
+        upstreamFailureKind(p, message),
+        message,
+        retryAfterSecondsFromPayload(p),
+      );
     }
 
     if (t === "response.output_item.added") {
@@ -651,6 +655,47 @@ function webSearchQuery(item: unknown): string {
     return first ?? "";
   }
   return "";
+}
+
+function upstreamFailureKind(
+  payload: {
+    status?: unknown;
+    status_code?: unknown;
+    response?: { error?: { code?: unknown; type?: unknown } };
+    error?: { code?: unknown; type?: unknown };
+  },
+  message: string,
+): "overloaded" | "failed" {
+  const status = payload.status ?? payload.status_code;
+  const code = payload.response?.error?.code ?? payload.error?.code;
+  const type = payload.response?.error?.type ?? payload.error?.type;
+  const lowerMessage = message.toLowerCase();
+  if (
+    status === 529 ||
+    status === "529" ||
+    code === "overloaded_error" ||
+    type === "overloaded_error" ||
+    lowerMessage.includes("overloaded")
+  ) {
+    return "overloaded";
+  }
+  return "failed";
+}
+
+function retryAfterSecondsFromPayload(payload: {
+  retry_after_seconds?: unknown;
+  headers?: Record<string, unknown>;
+  response?: { error?: { retry_after_seconds?: unknown } };
+  error?: { retry_after_seconds?: unknown };
+}): number | undefined {
+  const raw =
+    payload.response?.error?.retry_after_seconds ??
+    payload.error?.retry_after_seconds ??
+    payload.retry_after_seconds ??
+    payload.headers?.["retry-after"] ??
+    payload.headers?.["Retry-After"];
+  const value = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 function isCodexWebSocketCloseError(err: unknown): boolean {
