@@ -4,6 +4,7 @@ pub mod continuation;
 pub mod count_tokens;
 pub mod request_summary;
 pub mod translate;
+pub mod websocket;
 
 use async_trait::async_trait;
 use axum::Json;
@@ -97,15 +98,18 @@ impl Provider for CodexProvider {
 
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
-        let _continuation = continuation_candidate(
+        let continuation = continuation_candidate(
             ctx.session_id.as_deref(),
             &translated,
             previous_response_id_enabled,
         );
 
-        // Post to upstream
+        // Post to upstream with continuation
         let client = Arc::new(CodexHttpClient::new());
-        let upstream = match client.post_codex(&translated, &ctx).await {
+        let upstream = match client
+            .post_codex(&translated, &ctx, Some(&continuation))
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 clear_continuation(ctx.session_id.as_deref());
@@ -271,7 +275,6 @@ pub(crate) static CODEX_CLI: CodexCli = CodexCli;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn supported_models_includes_fast_variants() {

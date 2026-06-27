@@ -55,6 +55,7 @@ struct CodexConfig {
     pub effort: Option<String>,
     #[serde(rename = "model")]
     pub model: Option<String>,
+    pub transport: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -386,4 +387,123 @@ pub fn codex_model() -> Option<String> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Codex transport config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexTransport {
+    Http,
+    WebSocket,
+    Auto,
+}
+
+impl CodexTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CodexTransport::Http => "http",
+            CodexTransport::WebSocket => "websocket",
+            CodexTransport::Auto => "auto",
+        }
+    }
+}
+
+fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
+    match raw {
+        "http" => Some(CodexTransport::Http),
+        "websocket" => Some(CodexTransport::WebSocket),
+        "auto" => Some(CodexTransport::Auto),
+        _ => None,
+    }
+}
+
+pub fn codex_transport() -> CodexTransport {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_TRANSPORT") {
+        return parse_codex_transport(raw).unwrap_or(CodexTransport::Http);
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir) {
+        if let Some(codex) = file.codex {
+            if let Some(transport) = codex.transport.as_deref().and_then(parse_codex_transport) {
+                return transport;
+            }
+        }
+    }
+    CodexTransport::Http
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var("CCP_CODEX_TRANSPORT");
+        }
+    }
+
+    #[test]
+    fn codex_transport_defaults_to_http() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let result = codex_transport();
+        assert_eq!(result, CodexTransport::Http);
+    }
+
+    #[test]
+    fn codex_transport_reads_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        unsafe {
+            std::env::set_var("CCP_CODEX_TRANSPORT", "auto");
+        }
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+    }
+
+    #[test]
+    fn codex_transport_env_websocket() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        unsafe {
+            std::env::set_var("CCP_CODEX_TRANSPORT", "websocket");
+        }
+        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+    }
+
+    #[test]
+    fn codex_transport_invalid_env_falls_back_to_http() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        unsafe {
+            std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
+        }
+        assert_eq!(codex_transport(), CodexTransport::Http);
+    }
+
+    #[test]
+    fn parse_codex_transport_variants() {
+        assert_eq!(parse_codex_transport("http"), Some(CodexTransport::Http));
+        assert_eq!(
+            parse_codex_transport("websocket"),
+            Some(CodexTransport::WebSocket)
+        );
+        assert_eq!(parse_codex_transport("auto"), Some(CodexTransport::Auto));
+        assert_eq!(parse_codex_transport(""), None);
+        assert_eq!(parse_codex_transport("HTTP"), None);
+        assert_eq!(parse_codex_transport("ws"), None);
+    }
+
+    #[test]
+    fn codex_transport_as_str() {
+        assert_eq!(CodexTransport::Http.as_str(), "http");
+        assert_eq!(CodexTransport::WebSocket.as_str(), "websocket");
+        assert_eq!(CodexTransport::Auto.as_str(), "auto");
+    }
 }
