@@ -2,7 +2,7 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::providers::cursor::client::{
     CursorUpstreamResponse, decode_frame_payload, decode_upstream_frames,
 };
-use crate::providers::cursor::connect::{FLAG_END, parse_connect_error};
+use crate::providers::cursor::connect::{ConnectEndError, FLAG_END, parse_connect_error};
 use crate::providers::cursor::proto::AgentServerMessage;
 
 /// A decoded event from the Cursor upstream response stream.
@@ -26,12 +26,39 @@ pub enum CursorStreamEvent {
     End,
 }
 
+#[derive(Debug, Clone)]
+pub enum CursorDecodeError {
+    ConnectEnd(ConnectEndError),
+    Decode(String),
+}
+
+impl CursorDecodeError {
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            CursorDecodeError::ConnectEnd(err) => Some(err.status),
+            CursorDecodeError::Decode(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CursorDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CursorDecodeError::ConnectEnd(err) => write!(f, "{err}"),
+            CursorDecodeError::Decode(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for CursorDecodeError {}
+
 /// Decode upstream response bytes into a sequence of CursorStreamEvents.
 ///
 /// Returns both the events and the final usage for the response, since the
 /// upstream may send multiple update frames.
-pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, String> {
-    let frames = decode_upstream_frames(body).map_err(|e| e.to_string())?;
+pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, CursorDecodeError> {
+    let frames =
+        decode_upstream_frames(body).map_err(|e| CursorDecodeError::Decode(e.to_string()))?;
     let mut events = Vec::new();
 
     for frame in &frames {
@@ -39,7 +66,7 @@ pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, S
             // Check for Connect error in end frame
             if !frame.payload.is_empty() {
                 if let Some(err) = parse_connect_error(&frame.payload) {
-                    return Err(format!("{err}"));
+                    return Err(CursorDecodeError::ConnectEnd(err));
                 }
             }
             events.push(CursorStreamEvent::End);
@@ -63,7 +90,7 @@ pub fn decode_cursor_upstream(
     upstream: &CursorUpstreamResponse,
     message_id: &str,
     model: &str,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, CursorDecodeError> {
     let events = decode_upstream_response(&upstream.body)?;
 
     let mut text_content = String::new();
@@ -268,7 +295,9 @@ mod tests {
         let frame = encode_connect_frame(&payload, FLAG_END);
         let result = decode_upstream_response(&frame);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("quota exceeded"));
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), Some(429));
+        assert!(err.to_string().contains("quota exceeded"));
     }
 
     #[test]

@@ -20,11 +20,16 @@ use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
-use crate::providers::cursor::auth::load_cursor_token;
+use crate::providers::cursor::auth::{
+    clear_cursor_auth, expired_auth_message, load_cursor_auth, missing_auth_message,
+    run_cursor_login,
+};
 use crate::providers::cursor::client::CursorHttpClient;
 use crate::providers::cursor::model::resolve_cursor_model;
 use crate::providers::cursor::request::render_cursor_prompt;
-use crate::providers::cursor::response::{decode_cursor_upstream, decode_upstream_response};
+use crate::providers::cursor::response::{
+    CursorDecodeError, decode_cursor_upstream, decode_upstream_response,
+};
 use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
     resume_cursor_tool_bridge, start_cursor_tool_bridge,
@@ -101,16 +106,33 @@ impl Provider for CursorProvider {
             }
         }
 
-        let token = match load_cursor_token() {
-            Some(t) => t,
-            None => {
+        let auth = match load_cursor_auth() {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
                 return json_error(
                     StatusCode::UNAUTHORIZED,
                     "authentication_error",
-                    "Cursor auth token not found. Set CCP_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN",
+                    missing_auth_message(),
+                );
+            }
+            Err(err) => {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    format!("Cursor auth failed: {err}"),
                 );
             }
         };
+
+        if matches!(auth.expires, Some(expires) if expires <= now_ms() + 60_000) {
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                expired_auth_message(&auth),
+            );
+        }
+
+        let token = auth.access_token;
 
         let prompt = render_cursor_prompt(&body);
         let images = request::cursor_selected_images(&body);
@@ -133,13 +155,7 @@ impl Provider for CursorProvider {
             if bridge_eligible {
                 let events = match decode_upstream_response(&upstream.body) {
                     Ok(e) => e,
-                    Err(e) => {
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            "api_error",
-                            format!("Response decoding error: {e}"),
-                        );
-                    }
+                    Err(e) => return map_cursor_decode_error_to_response(&e),
                 };
 
                 let allowed = advertised_tool_names(&body);
@@ -200,11 +216,7 @@ impl Provider for CursorProvider {
                     }
                     (StatusCode::OK, Json(json)).into_response()
                 }
-                Err(e) => json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    format!("Response decoding error: {e}"),
-                ),
+                Err(e) => map_cursor_decode_error_to_response(&e),
             }
         }
     }
@@ -227,6 +239,13 @@ impl Provider for CursorProvider {
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
     String::from_utf8_lossy(bytes).matches("event:").count() as u64
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +277,26 @@ fn map_cursor_error_to_response(err: &client::CursorError) -> Response {
     }
 }
 
+fn map_cursor_decode_error_to_response(err: &CursorDecodeError) -> Response {
+    match err.status() {
+        Some(401 | 403) => json_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            err.to_string(),
+        ),
+        Some(429) => json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            err.to_string(),
+        ),
+        _ => json_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            format!("Response decoding error: {err}"),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -266,9 +305,15 @@ pub(crate) struct CursorCli;
 
 impl CliHandlers for CursorCli {
     fn login(&self) -> Result<(), anyhow::Error> {
-        anyhow::bail!(
-            "cursor: browser login not supported; use env CCP_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN"
-        );
+        let auth = run_cursor_login()?.ok_or_else(|| anyhow::anyhow!("Cursor login timed out"))?;
+        println!("Cursor auth saved in {}", auth.source);
+        if let Some(ref user_id) = auth.user_id {
+            println!("User: {user_id}");
+        }
+        if let Some(ref email) = auth.email {
+            println!("Email: {email}");
+        }
+        Ok(())
     }
 
     fn device(&self) -> Result<(), anyhow::Error> {
@@ -276,9 +321,21 @@ impl CliHandlers for CursorCli {
     }
 
     fn status(&self) -> Result<(), anyhow::Error> {
-        match load_cursor_token() {
-            Some(_) => {
-                println!("Cursor auth token: found");
+        match load_cursor_auth()? {
+            Some(auth) => {
+                println!("Auth source: {}", auth.source);
+                if let Some(ref user_id) = auth.user_id {
+                    println!("User: {user_id}");
+                }
+                if let Some(ref email) = auth.email {
+                    println!("Email: {email}");
+                }
+                if let Some(expires) = auth.expires {
+                    let remaining = expires.saturating_sub(now_ms()) / 1000;
+                    println!("Access token expires in: {remaining}s");
+                } else {
+                    println!("Access token expiry: unknown");
+                }
                 Ok(())
             }
             None => {
@@ -288,8 +345,9 @@ impl CliHandlers for CursorCli {
     }
 
     fn logout(&self) -> Result<(), anyhow::Error> {
+        clear_cursor_auth()?;
         println!(
-            "cursor: env-based auth has no persistent file to clear; unset CCP_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN"
+            "Cursor persistent auth cleared. Unset CCP_CURSOR_AUTH_TOKEN or CURSOR_AUTH_TOKEN if using env auth."
         );
         Ok(())
     }
@@ -309,23 +367,6 @@ mod tests {
         assert!(models.contains(&"cursor-agent".to_string()));
         assert!(models.contains(&"cursor-plan".to_string()));
         assert!(models.contains(&"cursor-ask".to_string()));
-    }
-
-    #[test]
-    fn cursor_cli_status_unauthenticated() {
-        // Unset env vars for the test scope
-        unsafe {
-            std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
-            std::env::remove_var("CURSOR_AUTH_TOKEN");
-        }
-        let result = CURSOR_CLI.status();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Not authenticated")
-        );
     }
 
     #[test]

@@ -61,13 +61,13 @@ fn provider_auth_status_unauthenticated_and_logout() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn invalid_provider_login_is_unsupported_exit_two() -> Result<(), Box<dyn std::error::Error>> {
+fn unsupported_provider_auth_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["cursor", "auth", "login"]);
+    cmd.args(["cursor", "auth", "device"]);
     let output = cmd.output()?;
     assert_eq!(output.status.code(), Some(2));
     let out = String::from_utf8(output.stderr)?;
-    assert!(out.contains("not supported") || out.contains("unsupported"));
+    assert!(out.contains("not yet implemented") || out.contains("unsupported"));
     Ok(())
 }
 

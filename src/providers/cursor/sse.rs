@@ -28,7 +28,7 @@ pub fn frame_cursor_stream(
     let events = match decode_upstream_response(&upstream.body) {
         Ok(e) => e,
         Err(e) => {
-            return format_sse_error(&e);
+            return format_sse_error(&e.to_string());
         }
     };
 

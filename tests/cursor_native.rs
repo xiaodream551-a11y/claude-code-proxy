@@ -255,6 +255,200 @@ fn cursor_error_display_works() {
     assert!(display.contains("rate limited"));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
+    use axum::{Router, routing::post};
+    use claude_code_proxy::providers::cursor::client::CursorHttpClient;
+    use claude_code_proxy::providers::cursor::connect::{
+        ConnectFrameDecoder, encode_connect_frame,
+    };
+    use claude_code_proxy::providers::cursor::proto::*;
+    use claude_code_proxy::providers::cursor::request::CursorSelectedImage;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone)]
+    struct ObservedRequest {
+        headers: axum::http::HeaderMap,
+        body: Vec<u8>,
+    }
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let observed: Arc<Mutex<Option<ObservedRequest>>> = Arc::new(Mutex::new(None));
+    let observed_handler = Arc::clone(&observed);
+
+    let response_body = {
+        let msg = AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                thinking_delta: None,
+                text_delta: Some(TextDelta { text: "ok".into() }),
+                turn_ended: Some(TurnEnded {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                }),
+            }),
+            exec_server_message: None,
+        };
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+        let mut body = encode_connect_frame(&payload, 0).to_vec();
+        body.extend_from_slice(&encode_connect_frame(b"", 2));
+        body
+    };
+
+    let app = Router::new().route(
+        "/agent.v1.AgentService/Run",
+        post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let response_body = response_body.clone();
+                let observed_handler = Arc::clone(&observed_handler);
+                async move {
+                    *observed_handler.lock().unwrap() = Some(ObservedRequest {
+                        headers,
+                        body: body.to_vec(),
+                    });
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "application/connect+proto",
+                        )],
+                        response_body,
+                    )
+                }
+            },
+        ),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_url = format!("http://{}", addr);
+
+    unsafe {
+        std::env::set_var("CCP_CURSOR_BASE_URL", &mock_url);
+        std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "test-client-version");
+    }
+
+    let _handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = CursorHttpClient::new();
+    let upstream = client
+        .run_agent(
+            "wire-token",
+            "wire prompt",
+            "cursor:gpt-5.5",
+            &[CursorSelectedImage {
+                data: "aGVsbG8=".into(),
+                uuid: "image-id".into(),
+                path: "claude-image-1.png".into(),
+                mime_type: "image/png".into(),
+            }],
+        )
+        .await
+        .expect("mock upstream request should succeed");
+    assert!(upstream.is_success());
+
+    let observed = observed.lock().unwrap().clone().expect("request captured");
+    assert_eq!(
+        observed
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer wire-token")
+    );
+    assert_eq!(
+        observed
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/connect+proto")
+    );
+    assert_eq!(
+        observed
+            .headers
+            .get("connect-protocol-version")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    assert_eq!(
+        observed
+            .headers
+            .get("x-cursor-client-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("cli")
+    );
+    assert_eq!(
+        observed
+            .headers
+            .get("x-cursor-client-version")
+            .and_then(|v| v.to_str().ok()),
+        Some("test-client-version")
+    );
+    assert_eq!(
+        observed
+            .headers
+            .get("x-cursor-streaming")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    let request_id = observed
+        .headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-request-id");
+    assert_eq!(
+        observed
+            .headers
+            .get("x-original-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some(request_id)
+    );
+
+    let mut decoder = ConnectFrameDecoder::new();
+    let frames = decoder.push(&observed.body).unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].flags, 0);
+    let msg = AgentClientMessage::decode(&frames[0].payload[..]).unwrap();
+    let run = msg.run_request.expect("run request");
+    assert!(msg.client_heartbeat.is_none());
+    assert_eq!(run.conversation_id, "");
+    assert_eq!(run.conversation_group_id, "");
+    assert!(run.client_supports_inline_images);
+    assert!(!run.exclude_workspace_context);
+    assert_eq!(run.requested_model.unwrap().model_id, "gpt-5.5");
+    let user_message = run
+        .action
+        .unwrap()
+        .user_message_action
+        .unwrap()
+        .user_message
+        .unwrap();
+    assert_eq!(user_message.text, "wire prompt");
+    assert_eq!(user_message.message_id, request_id);
+    assert_eq!(user_message.mode, "AGENT_MODE_AGENT");
+    let image = user_message
+        .selected_context
+        .unwrap()
+        .selected_images
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(image.data, "aGVsbG8=");
+    assert_eq!(image.uuid, "image-id");
+    assert_eq!(image.path, "claude-image-1.png");
+    assert_eq!(image.mime_type, "image/png");
+
+    unsafe {
+        std::env::remove_var("CCP_CURSOR_BASE_URL");
+        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Response decoding
 // ---------------------------------------------------------------------------
@@ -694,6 +888,166 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
         "handle_messages returned error status {status}"
     );
 
+    unsafe {
+        std::env::remove_var("CCP_CURSOR_BASE_URL");
+        std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
+        std::env::remove_var("CCP_CURSOR_CLIENT_VERSION");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
+    use axum::{Router, routing::post};
+    use claude_code_proxy::providers::cursor::connect::{
+        ConnectFrameDecoder, encode_connect_frame,
+    };
+    use claude_code_proxy::providers::cursor::proto::*;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone)]
+    struct ObservedRequest {
+        authorization: Option<String>,
+        body: Vec<u8>,
+    }
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let observed: Arc<Mutex<Option<ObservedRequest>>> = Arc::new(Mutex::new(None));
+    let observed_handler = Arc::clone(&observed);
+
+    let response_body = {
+        let text_msg = AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                thinking_delta: None,
+                text_delta: Some(TextDelta {
+                    text: "proxy path works".into(),
+                }),
+                turn_ended: None,
+            }),
+            exec_server_message: None,
+        };
+        let mut text_payload = Vec::new();
+        text_msg.encode(&mut text_payload).unwrap();
+
+        let usage_msg = AgentServerMessage {
+            interaction_update: Some(InteractionUpdate {
+                thinking_delta: None,
+                text_delta: None,
+                turn_ended: Some(TurnEnded {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                }),
+            }),
+            exec_server_message: None,
+        };
+        let mut usage_payload = Vec::new();
+        usage_msg.encode(&mut usage_payload).unwrap();
+
+        let mut body = encode_connect_frame(&text_payload, 0).to_vec();
+        body.extend_from_slice(&encode_connect_frame(&usage_payload, 0));
+        body.extend_from_slice(&encode_connect_frame(b"", 2));
+        body
+    };
+
+    let upstream_app = Router::new().route(
+        "/agent.v1.AgentService/Run",
+        post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let response_body = response_body.clone();
+                let observed_handler = Arc::clone(&observed_handler);
+                async move {
+                    *observed_handler.lock().unwrap() = Some(ObservedRequest {
+                        authorization: headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                        body: body.to_vec(),
+                    });
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "application/connect+proto",
+                        )],
+                        response_body,
+                    )
+                }
+            },
+        ),
+    );
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_url = format!("http://{}", upstream_addr);
+    let _upstream_handle = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream_app).await.unwrap();
+    });
+
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let _proxy_handle = tokio::spawn(async move {
+        claude_code_proxy::server::serve_listener(proxy_listener, None, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    unsafe {
+        std::env::set_var("CCP_CURSOR_BASE_URL", &upstream_url);
+        std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "proxy-token");
+        std::env::set_var("CCP_CURSOR_CLIENT_VERSION", "proxy-test-version");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("authorization", "Bearer ignored")
+        .json(&serde_json::json!({
+            "model": "cursor:gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello over proxy"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["content"][0]["text"], "proxy path works");
+    assert_eq!(json["usage"]["input_tokens"], 12);
+    assert_eq!(json["usage"]["output_tokens"], 3);
+
+    let observed = observed
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream request captured");
+    assert_eq!(
+        observed.authorization.as_deref(),
+        Some("Bearer proxy-token")
+    );
+
+    let mut decoder = ConnectFrameDecoder::new();
+    let frames = decoder.push(&observed.body).unwrap();
+    assert_eq!(frames.len(), 1);
+    let msg = AgentClientMessage::decode(&frames[0].payload[..]).unwrap();
+    let user_message = msg
+        .run_request
+        .unwrap()
+        .action
+        .unwrap()
+        .user_message_action
+        .unwrap()
+        .user_message
+        .unwrap();
+    assert!(user_message.text.contains("hello over proxy"));
+
+    let _ = shutdown_tx.send(());
     unsafe {
         std::env::remove_var("CCP_CURSOR_BASE_URL");
         std::env::remove_var("CCP_CURSOR_AUTH_TOKEN");
