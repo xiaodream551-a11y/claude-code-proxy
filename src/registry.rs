@@ -64,6 +64,7 @@ impl Registry {
             let handler: Arc<dyn Provider> = match name.as_str() {
                 "codex" => Arc::new(crate::providers::codex::CodexProvider::new()),
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
+                "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);

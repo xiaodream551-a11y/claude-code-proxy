@@ -37,6 +37,7 @@ struct FileConfig {
     pub log: Option<FileLog>,
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
+    pub cursor: Option<CursorConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -56,6 +57,16 @@ struct CodexConfig {
     #[serde(rename = "model")]
     pub model: Option<String>,
     pub transport: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+struct CursorConfig {
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    #[serde(rename = "clientVersion")]
+    pub client_version: Option<String>,
+    #[serde(rename = "agentBundle")]
+    pub agent_bundle: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -195,6 +206,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_KIMI_BASE_URL") {
         out.push("kimi.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_CURSOR_BASE_URL") {
+        out.push("cursor.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_CURSOR_CLIENT_VERSION") {
+        out.push("cursor.clientVersion (env)".to_string());
     }
     if env.contains_key("CCP_KIMI_USER_AGENT") {
         out.push("kimi.userAgent (env)".to_string());
@@ -425,6 +442,55 @@ pub fn codex_transport() -> CodexTransport {
         return transport;
     }
     CodexTransport::Http
+}
+
+// ---------------------------------------------------------------------------
+// Cursor config
+// ---------------------------------------------------------------------------
+
+pub fn cursor_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CURSOR_BASE_URL") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(cursor) = file.cursor
+        && let Some(url) = cursor.base_url
+    {
+        return url;
+    }
+    "https://api2.cursor.sh".to_string()
+}
+
+pub fn cursor_client_version() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CURSOR_CLIENT_VERSION") {
+        return raw.clone();
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(cursor) = file.cursor
+        && let Some(version) = cursor.client_version
+    {
+        return version;
+    }
+    "0.48.5".to_string()
+}
+
+pub fn cursor_agent_bundle() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CURSOR_AGENT_BUNDLE") {
+        return Some(raw.clone());
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(cursor) = file.cursor
+        && let Some(bundle) = cursor.agent_bundle
+    {
+        return Some(bundle);
+    }
+    None
 }
 
 #[cfg(test)]

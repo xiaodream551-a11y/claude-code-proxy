@@ -25,15 +25,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "http2"] }
 base64 = "0.22"
 hostname = "0.4"
 once_cell = "1.20"
 regex-lite = "0.1"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 url = "2"
+prost = "0.13"
+flate2 = "1.0"
 
 [dev-dependencies]
 tempfile = "3.14"
 assert_cmd = "2"
 predicates = "3"
+hex = "0.4"
