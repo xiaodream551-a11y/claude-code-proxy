@@ -251,11 +251,17 @@ fn panel(title: &'static str, focused: bool) -> Block<'static> {
         .style(Style::default().bg(PANEL_BG))
 }
 
-fn table_header(cells: impl IntoIterator<Item = &'static str>) -> Row<'static> {
+fn table_header_aligned(
+    cells: impl IntoIterator<Item = (&'static str, Alignment)>,
+) -> Row<'static> {
     Row::new(
         cells
             .into_iter()
-            .map(|cell| Cell::from(Span::styled(cell, Style::default().fg(TEAL))))
+            .map(|(cell, alignment)| {
+                Cell::from(
+                    Line::from(Span::styled(cell, Style::default().fg(TEAL))).alignment(alignment),
+                )
+            })
             .collect::<Vec<_>>(),
     )
     .style(Style::default().add_modifier(Modifier::BOLD))
@@ -411,8 +417,18 @@ fn render_sessions(
             Constraint::Length(10),
         ],
     )
-    .header(table_header([
-        "", "session", "active", "reqs", "fail", "provider", "model", "in", "out", "rate", "status",
+    .header(table_header_aligned([
+        ("", Alignment::Left),
+        ("session", Alignment::Left),
+        ("active", Alignment::Right),
+        ("reqs", Alignment::Right),
+        ("fail", Alignment::Right),
+        ("provider", Alignment::Left),
+        ("model", Alignment::Left),
+        ("in", Alignment::Right),
+        ("out", Alignment::Right),
+        ("rate", Alignment::Right),
+        ("status", Alignment::Left),
     ]))
     .block(panel("Sessions", true));
     frame.render_widget(table, area);
@@ -456,8 +472,14 @@ fn render_active(
             Constraint::Length(9),
         ],
     )
-    .header(table_header([
-        "started", "provider", "model", "endpoint", "status", "rate", "elapsed",
+    .header(table_header_aligned([
+        ("started", Alignment::Left),
+        ("provider", Alignment::Left),
+        ("model", Alignment::Left),
+        ("endpoint", Alignment::Left),
+        ("status", Alignment::Left),
+        ("rate", Alignment::Left),
+        ("elapsed", Alignment::Right),
     ]))
     .block(panel("Active requests", false));
     frame.render_widget(table, area);
@@ -498,8 +520,16 @@ fn render_recent(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
             Constraint::Percentage(28),
         ],
     )
-    .header(table_header([
-        "finished", "status", "provider", "model", "latency", "rate", "in", "out", "details",
+    .header(table_header_aligned([
+        ("finished", Alignment::Left),
+        ("status", Alignment::Left),
+        ("provider", Alignment::Left),
+        ("model", Alignment::Left),
+        ("latency", Alignment::Right),
+        ("rate", Alignment::Right),
+        ("in", Alignment::Right),
+        ("out", Alignment::Right),
+        ("details", Alignment::Left),
     ]))
     .block(panel("Recent requests", false));
     frame.render_widget(table, area);
