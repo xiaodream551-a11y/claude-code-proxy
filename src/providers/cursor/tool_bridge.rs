@@ -299,8 +299,6 @@ pub fn find_tool_result<'a>(
 }
 
 /// Render the content of a `tool_result` block into a string.
-///
-/// Mirrors the TypeScript `renderToolResultContent` function.
 pub fn render_tool_result_content(result: &serde_json::Value) -> String {
     let content = match result.get("content") {
         Some(serde_json::Value::String(s)) => return s.clone(),

@@ -11,9 +11,6 @@ pub struct CursorSelectedImage {
 
 /// Render the full Cursor prompt from an Anthropic MessagesRequest.
 ///
-/// Mirrors the TypeScript `renderCursorPrompt` in
-/// `reference/typescript/src/providers/cursor/translate/request.ts`.
-///
 /// Includes:
 /// - System message (with billing-header filtering)
 /// - Conversation messages with content blocks

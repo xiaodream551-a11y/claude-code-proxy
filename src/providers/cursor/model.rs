@@ -1,6 +1,6 @@
 /// Cursor model catalog -- resolves incoming model names to Cursor model IDs.
 ///
-/// Resolution rules mirror the TypeScript reference:
+/// Resolution rules:
 /// - `cursor:`, `cursor-plan:`, `cursor-ask:` prefixes are stripped and mapped
 ///   to the corresponding agent mode.
 /// - Legacy names like `cursor`, `cursor-agent`, `cursor-composer`,
