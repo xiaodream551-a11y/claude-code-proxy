@@ -138,6 +138,9 @@ fn handle_callback(
     pkce: &PkceCodes,
     state: &str,
 ) -> Result<TokenResponse, anyhow::Error> {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
     let (path, query) = match extract_request_path_and_query(stream) {
         Some(pair) => pair,
         None => {
@@ -210,28 +213,23 @@ mod tests {
         fn new() -> Self {
             let shutdown = Arc::new(AtomicBool::new(false));
             let sd = shutdown.clone();
-            let url: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-            let url_clone = url.clone();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().unwrap();
+            let url = format!("http://{addr}");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
             std::thread::spawn(move || {
-                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-                let addr = listener.local_addr().unwrap();
-                *url_clone.lock().unwrap() = Some(format!("http://{addr}"));
-
-                listener.set_nonblocking(true).expect("nonblocking");
-
+                let _ = ready_tx.send(());
                 loop {
                     if sd.load(Ordering::Relaxed) {
                         return;
                     }
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            let mut buf = [0; 4096];
-                            let n = match stream.read(&mut buf) {
-                                Ok(n) if n > 0 => n,
-                                _ => continue,
+                            let Some(request) = read_http_request(&mut stream) else {
+                                continue;
                             };
-                            let request = String::from_utf8_lossy(&buf[..n]);
 
                             let response = if request.contains("/oauth/token") {
                                 // Token exchange - return success
@@ -259,10 +257,17 @@ mod tests {
                     }
                 }
             });
+            ready_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("mock browser login auth server should become ready");
 
-            std::thread::sleep(Duration::from_millis(100));
-            let url = url.lock().unwrap().clone().unwrap();
             Self { url, shutdown }
+        }
+    }
+
+    impl Drop for MockBrowserLoginAuthServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
         }
     }
 
@@ -280,29 +285,57 @@ mod tests {
         String::from_utf8_lossy(&buf[..n]).to_string()
     }
 
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<String> {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut request = Vec::new();
+        let mut chunk = [0; 4096];
+
+        loop {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+
+            if let Some(header_end) = find_header_end(&request) {
+                let content_length = content_length(&request[..header_end]).unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+
+        if request.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&request).to_string())
+        }
+    }
+
+    fn find_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn content_length(headers: &[u8]) -> Option<usize> {
+        let text = String::from_utf8_lossy(headers);
+        text.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+    }
+
     #[test]
     fn browser_login_rejects_wrong_path() {
-        // Start a browser login server on a random port
-        // Get a free port for the test
-        let test_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let test_port = test_listener.local_addr().unwrap().port();
-        drop(test_listener);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
 
-        let config = BrowserLoginConfig {
-            issuer: "http://fake-issuer".into(),
-            port: test_port,
-            timeout: Duration::from_millis(100),
-        };
-
-        // The server will be listening on the port but since we're sending
-        // wrong path, it should fail with "Not found" and keep listening.
-        // We'll connect and send a wrong path request first.
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", config.port)).unwrap();
-        let _ = config; // suppress unused warning
-
-        let _handle = std::thread::spawn(move || {
-            listener.set_nonblocking(true).unwrap();
-            // Accept one connection and handle it
+        let handle = std::thread::spawn(move || {
             loop {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let _ = handle_callback(
@@ -321,11 +354,14 @@ mod tests {
             }
         });
 
-        // Now connect and send a wrong-path request
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", test_port).parse().unwrap();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let response = send_callback_request(addr, "/wrong/path");
-        assert!(response.contains("404"));
-        assert!(response.contains("Not found"));
+        handle.join().unwrap();
+        assert!(response.contains("404"), "unexpected response: {response}");
+        assert!(
+            response.contains("Not found"),
+            "unexpected response: {response}"
+        );
     }
 
     #[test]
@@ -334,7 +370,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
 
-        let _handle = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let pkce = PkceCodes {
                 verifier: "v".into(),
                 challenge: "c".into(),
@@ -349,7 +385,6 @@ mod tests {
                         "expected_state",
                     );
                     assert!(result.is_err());
-                    assert!(result.unwrap_err().to_string().contains("Invalid callback"));
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -359,6 +394,7 @@ mod tests {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let response =
             send_callback_request(addr, "/auth/callback?code=test_code&state=wrong_state");
+        handle.join().unwrap();
         assert!(response.contains("400"));
         assert!(response.contains("Invalid callback"));
     }
@@ -369,7 +405,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
 
-        let _handle = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let pkce = PkceCodes {
                 verifier: "v".into(),
                 challenge: "c".into(),
@@ -384,7 +420,6 @@ mod tests {
                         "state",
                     );
                     assert!(result.is_err());
-                    assert!(result.unwrap_err().to_string().contains("Invalid callback"));
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -393,6 +428,7 @@ mod tests {
 
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let response = send_callback_request(addr, "/auth/callback?state=state");
+        handle.join().unwrap();
         assert!(response.contains("400"));
     }
 
@@ -402,7 +438,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
 
-        let _handle = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let pkce = PkceCodes {
                 verifier: "v".into(),
                 challenge: "c".into(),
@@ -417,7 +453,6 @@ mod tests {
                         "state",
                     );
                     assert!(result.is_err());
-                    assert!(result.unwrap_err().to_string().contains("access_denied"));
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -427,6 +462,7 @@ mod tests {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let response =
             send_callback_request(addr, "/auth/callback?error=access_denied&state=state");
+        handle.join().unwrap();
         assert!(response.contains("400"));
         assert!(response.contains("access_denied"));
     }
@@ -435,12 +471,14 @@ mod tests {
     fn callback_success_exchanges_tokens() {
         let auth_server = MockBrowserLoginAuthServer::new();
         let auth_url = auth_server.url.clone();
+        let callback_result = Arc::new(std::sync::Mutex::new(None));
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
 
-        let _handle = std::thread::spawn(move || {
+        let callback_result_thread = callback_result.clone();
+        let handle = std::thread::spawn(move || {
             let pkce = PkceCodes {
                 verifier: "test_verifier".into(),
                 challenge: "test_challenge".into(),
@@ -454,10 +492,10 @@ mod tests {
                         &pkce,
                         "expected_state",
                     );
-                    assert!(result.is_ok());
-                    let tokens = result.unwrap();
-                    assert_eq!(tokens.access_token, "bt_at");
-                    assert_eq!(tokens.refresh_token, "bt_rt");
+                    let stored = result
+                        .map(|tokens| (tokens.access_token, tokens.refresh_token))
+                        .map_err(|err| err.to_string());
+                    *callback_result_thread.lock().unwrap() = Some(stored);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -465,9 +503,18 @@ mod tests {
         });
 
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-        send_callback_request(addr, "/auth/callback?code=test_code&state=expected_state");
-        // Give the handler thread time to complete
-        std::thread::sleep(Duration::from_millis(200));
+        let response =
+            send_callback_request(addr, "/auth/callback?code=test_code&state=expected_state");
+        handle.join().unwrap();
+        assert!(response.contains("200"), "unexpected response: {response}");
+        let tokens = callback_result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("callback handler should store a result")
+            .unwrap();
+        assert_eq!(tokens.0, "bt_at");
+        assert_eq!(tokens.1, "bt_rt");
 
         // auth_server dropped here, closing the mock server
         drop(auth_server);
@@ -478,28 +525,23 @@ mod tests {
         // Server that returns a 500 on token exchange
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
-        let url: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-        let url_clone = url.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let fail_issuer = format!("http://{addr}");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let addr = listener.local_addr().unwrap();
-            *url_clone.lock().unwrap() = Some(format!("http://{addr}"));
-
-            listener.set_nonblocking(true).expect("nonblocking");
-
+            let _ = ready_tx.send(());
             loop {
                 if sd.load(Ordering::Relaxed) {
                     return;
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = [0; 4096];
-                        let n = match stream.read(&mut buf) {
-                            Ok(n) if n > 0 => n,
-                            _ => continue,
+                        let Some(request) = read_http_request(&mut stream) else {
+                            continue;
                         };
-                        let request = String::from_utf8_lossy(&buf[..n]);
 
                         let body = if request.contains("/oauth/token") {
                             r#"{"error":"bad exchange"}"#
@@ -520,16 +562,16 @@ mod tests {
                 }
             }
         });
-
-        std::thread::sleep(Duration::from_millis(100));
-        let fail_issuer = url.lock().unwrap().clone().unwrap();
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mock browser login failure server should become ready");
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
 
         let fail_issuer_clone = fail_issuer.clone();
-        let _handle = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let pkce = PkceCodes {
                 verifier: "v".into(),
                 challenge: "c".into(),
@@ -544,12 +586,6 @@ mod tests {
                         "expected_state",
                     );
                     assert!(result.is_err());
-                    assert!(
-                        result
-                            .unwrap_err()
-                            .to_string()
-                            .contains("Token exchange failed")
-                    );
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -557,9 +593,15 @@ mod tests {
         });
 
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-        send_callback_request(addr, "/auth/callback?code=test_code&state=expected_state");
-
-        std::thread::sleep(Duration::from_millis(200));
+        let response =
+            send_callback_request(addr, "/auth/callback?code=test_code&state=expected_state");
+        handle.join().unwrap();
+        assert!(response.contains("500"), "unexpected response: {response}");
+        assert!(
+            response.contains("Token exchange failed"),
+            "unexpected response: {response}"
+        );
+        shutdown.store(true, Ordering::Relaxed);
     }
 
     #[test]

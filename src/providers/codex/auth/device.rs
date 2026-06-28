@@ -221,7 +221,16 @@ impl Default for DeviceAuthClient {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static DEVICE_FLOW_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn device_flow_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        DEVICE_FLOW_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// A sleeper that records durations instead of sleeping.
     #[derive(Default)]
@@ -267,6 +276,52 @@ mod tests {
         )
     }
 
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<String> {
+        use std::io::Read;
+
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut request = Vec::new();
+        let mut chunk = [0; 4096];
+
+        loop {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+
+            if let Some(header_end) = find_header_end(&request) {
+                let content_length = content_length(&request[..header_end]).unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+
+        if request.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&request).to_string())
+        }
+    }
+
+    fn find_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn content_length(headers: &[u8]) -> Option<usize> {
+        let text = String::from_utf8_lossy(headers);
+        text.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+    }
+
     impl MockDeviceServer {
         fn new(scenario: DeviceScenario) -> Self {
             let saw_init = Arc::new(AtomicBool::new(false));
@@ -278,30 +333,24 @@ mod tests {
             let ste = saw_token_exchange.clone();
             let sp = saw_poll.clone();
             let sd = shutdown.clone();
-            let url: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            let addr = listener.local_addr().unwrap();
+            let url = format!("http://{addr}");
+            listener.set_nonblocking(true).expect("set nonblocking");
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
-            let url_clone = url.clone();
             std::thread::spawn(move || {
-                let listener =
-                    std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
-                let addr = listener.local_addr().unwrap();
-                *url_clone.lock().unwrap() = Some(format!("http://{addr}"));
-
-                listener.set_nonblocking(true).expect("set nonblocking");
-
+                let _ = ready_tx.send(());
                 loop {
                     if sd.load(Ordering::Relaxed) {
                         return;
                     }
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            use std::io::{Read, Write};
-                            let mut buf = [0; 4096];
-                            let n = match stream.read(&mut buf) {
-                                Ok(n) if n > 0 => n,
-                                _ => continue,
+                            use std::io::Write;
+                            let Some(request) = read_http_request(&mut stream) else {
+                                continue;
                             };
-                            let request = String::from_utf8_lossy(&buf[..n]);
 
                             let response = match scenario {
                                 DeviceScenario::SuccessAfterPending => {
@@ -331,10 +380,9 @@ mod tests {
                     }
                 }
             });
-
-            // Wait for server to be ready
-            std::thread::sleep(Duration::from_millis(100));
-            let url = url.lock().unwrap().clone().unwrap();
+            ready_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("mock device server should become ready");
 
             Self {
                 url,
@@ -456,8 +504,15 @@ mod tests {
         }
     }
 
+    impl Drop for MockDeviceServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+        }
+    }
+
     #[test]
     fn device_flow_success_after_pending() {
+        let _guard = device_flow_test_lock();
         let server = MockDeviceServer::new(DeviceScenario::SuccessAfterPending);
         let client = DeviceAuthClient::with_issuer(&server.url);
         let tokens = client.run().unwrap();
@@ -470,6 +525,7 @@ mod tests {
 
     #[test]
     fn device_flow_reports_init_failure() {
+        let _guard = device_flow_test_lock();
         let server = MockDeviceServer::new(DeviceScenario::InitFailure);
         let err = DeviceAuthClient::with_issuer(&server.url)
             .run()
@@ -483,6 +539,7 @@ mod tests {
 
     #[test]
     fn device_flow_reports_poll_failure() {
+        let _guard = device_flow_test_lock();
         let server = MockDeviceServer::new(DeviceScenario::PollFailure);
         let err = DeviceAuthClient::with_issuer(&server.url)
             .run()
@@ -497,6 +554,7 @@ mod tests {
 
     #[test]
     fn device_flow_reports_token_exchange_failure() {
+        let _guard = device_flow_test_lock();
         let server = MockDeviceServer::new(DeviceScenario::TokenExchangeFailure);
         let err = DeviceAuthClient::with_issuer(&server.url)
             .run()
@@ -512,6 +570,7 @@ mod tests {
 
     #[test]
     fn device_flow_times_out() {
+        let _guard = device_flow_test_lock();
         let server = MockDeviceServer::new(DeviceScenario::InitThenTimeout);
         let client = DeviceAuthClient {
             issuer: server.url.clone(),
@@ -531,6 +590,7 @@ mod tests {
 
     #[test]
     fn device_flow_polls_403_and_continues() {
+        let _guard = device_flow_test_lock();
         let saw_poll_403 = Arc::new(AtomicBool::new(false));
         let saw_init = Arc::new(AtomicBool::new(false));
         let saw_exchange = Arc::new(AtomicBool::new(false));
@@ -542,32 +602,27 @@ mod tests {
         let sp2 = saw_second_poll.clone();
         let ste = saw_exchange.clone();
         let sd = shutdown.clone();
-        let url: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-        let url_clone = url.clone();
-
         let poll_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let pc = poll_count.clone();
 
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
         std::thread::spawn(move || {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let addr = listener.local_addr().unwrap();
-            *url_clone.lock().unwrap() = Some(format!("http://{addr}"));
-
-            listener.set_nonblocking(true).expect("nonblocking");
-
+            let _ = ready_tx.send(());
             loop {
                 if sd.load(Ordering::Relaxed) {
                     return;
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        use std::io::{Read, Write};
-                        let mut buf = [0; 4096];
-                        let n = match stream.read(&mut buf) {
-                            Ok(n) if n > 0 => n,
-                            _ => continue,
+                        use std::io::Write;
+                        let Some(request) = read_http_request(&mut stream) else {
+                            continue;
                         };
-                        let request = String::from_utf8_lossy(&buf[..n]);
 
                         let response = if request.contains("/api/accounts/deviceauth/usercode") {
                             si.store(true, Ordering::Relaxed);
@@ -607,9 +662,9 @@ mod tests {
                 }
             }
         });
-
-        std::thread::sleep(Duration::from_millis(100));
-        let url = url.lock().unwrap().clone().unwrap();
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mock device server should become ready");
 
         let sleeper = MockSleeper::default();
         let client = DeviceAuthClient {
@@ -627,10 +682,12 @@ mod tests {
         assert!(saw_poll_403.load(Ordering::Relaxed));
         assert!(saw_second_poll.load(Ordering::Relaxed));
         assert!(saw_exchange.load(Ordering::Relaxed));
+        shutdown.store(true, Ordering::Relaxed);
     }
 
     #[test]
     fn device_flow_retries_404() {
+        let _guard = device_flow_test_lock();
         let saw_init = Arc::new(AtomicBool::new(false));
         let saw_poll_404 = Arc::new(AtomicBool::new(false));
         let saw_exchange = Arc::new(AtomicBool::new(false));
@@ -640,32 +697,27 @@ mod tests {
         let sp404 = saw_poll_404.clone();
         let ste = saw_exchange.clone();
         let sd = shutdown.clone();
-        let url: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-        let url_clone = url.clone();
-
         let poll_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let pc = poll_count.clone();
 
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
         std::thread::spawn(move || {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            let addr = listener.local_addr().unwrap();
-            *url_clone.lock().unwrap() = Some(format!("http://{addr}"));
-
-            listener.set_nonblocking(true).expect("nonblocking");
-
+            let _ = ready_tx.send(());
             loop {
                 if sd.load(Ordering::Relaxed) {
                     return;
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        use std::io::{Read, Write};
-                        let mut buf = [0; 4096];
-                        let n = match stream.read(&mut buf) {
-                            Ok(n) if n > 0 => n,
-                            _ => continue,
+                        use std::io::Write;
+                        let Some(request) = read_http_request(&mut stream) else {
+                            continue;
                         };
-                        let request = String::from_utf8_lossy(&buf[..n]);
 
                         let response = if request.contains("/api/accounts/deviceauth/usercode") {
                             si.store(true, Ordering::Relaxed);
@@ -704,9 +756,9 @@ mod tests {
                 }
             }
         });
-
-        std::thread::sleep(Duration::from_millis(100));
-        let url = url.lock().unwrap().clone().unwrap();
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mock device server should become ready");
 
         let sleeper = MockSleeper::default();
         let client = DeviceAuthClient {
@@ -723,6 +775,7 @@ mod tests {
         assert!(saw_init.load(Ordering::Relaxed));
         assert!(saw_poll_404.load(Ordering::Relaxed));
         assert!(saw_exchange.load(Ordering::Relaxed));
+        shutdown.store(true, Ordering::Relaxed);
     }
 
     #[test]
