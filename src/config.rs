@@ -431,8 +431,10 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
 
 pub fn codex_transport() -> CodexTransport {
     let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_TRANSPORT") {
-        return parse_codex_transport(raw).unwrap_or(CodexTransport::Http);
+    if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
+        && let Some(transport) = parse_codex_transport(raw)
+    {
+        return transport;
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
@@ -441,7 +443,7 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
-    CodexTransport::Http
+    CodexTransport::WebSocket
 }
 
 // ---------------------------------------------------------------------------
@@ -508,11 +510,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_defaults_to_http() {
+    fn codex_transport_defaults_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         let result = codex_transport();
-        assert_eq!(result, CodexTransport::Http);
+        assert_eq!(result, CodexTransport::WebSocket);
     }
 
     #[test]
@@ -536,13 +538,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_invalid_env_falls_back_to_http() {
+    fn codex_transport_invalid_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
         }
-        assert_eq!(codex_transport(), CodexTransport::Http);
+        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+    }
+
+    #[test]
+    fn codex_transport_empty_env_falls_back_to_websocket() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        unsafe {
+            std::env::set_var("CCP_CODEX_TRANSPORT", "");
+        }
+        assert_eq!(codex_transport(), CodexTransport::WebSocket);
     }
 
     #[test]

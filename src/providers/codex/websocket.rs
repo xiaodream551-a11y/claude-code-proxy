@@ -315,16 +315,6 @@ pub async fn codex_websocket_request(
             let (sse_body, terminal_event) =
                 collect_ws_events(&mut ws_guard, idle_timeout_ms, pool_key, traffic).await?;
 
-            // Record continuation on success
-            if let Some(terminal) = &terminal_event
-                && terminal.payload.get("response").is_some()
-            {
-                // Record continuation for successful responses
-                if let Some(key) = pool_key {
-                    invalidate_codex_websocket_pool_key(key);
-                }
-            }
-
             // Handle previous response missing
             if let Some(terminal) = &terminal_event
                 && is_previous_response_missing(&terminal.payload)

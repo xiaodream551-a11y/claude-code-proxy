@@ -275,6 +275,12 @@ impl CodexHttpClient {
         })?;
 
         let transport = crate::config::codex_transport();
+        let pool_key = websocket_pool_key(ctx, continuation);
+        if should_reset_websocket_pool(continuation)
+            && let Some(key) = pool_key
+        {
+            super::websocket::invalidate_codex_websocket_pool_key(key);
+        }
 
         for transport_attempt in 0..=3u32 {
             let result = match transport {
@@ -293,11 +299,6 @@ impl CodexHttpClient {
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(body, continuation);
 
-                    let pool_key = ctx.session_id.as_deref();
-                    let pool_key = continuation
-                        .and_then(|c| c.previous_response_id.as_ref())
-                        .and(pool_key);
-
                     super::websocket::codex_websocket_request(
                         &self.base_url,
                         &ws_headers,
@@ -315,11 +316,6 @@ impl CodexHttpClient {
                     let ws_headers = build_codex_headers(&auth, ctx)?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(body, continuation);
-
-                    let pool_key = ctx.session_id.as_deref();
-                    let pool_key = continuation
-                        .and_then(|c| c.previous_response_id.as_ref())
-                        .and(pool_key);
 
                     // Try WebSocket first
                     let ws_result = super::websocket::codex_websocket_request(
@@ -411,9 +407,9 @@ impl CodexHttpClient {
                 Err(err) if err.detail.as_deref() == Some("previous_response_not_found") => {
                     // Previous response missing: clear continuation and retry once with full request
                     clear_continuation(ctx.session_id.as_deref());
-                    super::websocket::invalidate_codex_websocket_pool_key(
-                        ctx.session_id.as_deref().unwrap_or(""),
-                    );
+                    if let Some(key) = pool_key {
+                        super::websocket::invalidate_codex_websocket_pool_key(key);
+                    }
 
                     // Retry with the full body (no continuation) through the relevant transport
                     let retry_headers = build_codex_headers(&auth, ctx)?;
@@ -426,10 +422,10 @@ impl CodexHttpClient {
                     })?;
 
                     match transport {
-                        CodexTransport::Http | CodexTransport::Auto => {
+                        CodexTransport::Http => {
                             return self.attempt_post_http(&auth, &full_body_json, ctx).await;
                         }
-                        CodexTransport::WebSocket => {
+                        CodexTransport::WebSocket | CodexTransport::Auto => {
                             let ws_retry_headers =
                                 super::websocket::codex_websocket_headers(&retry_headers);
                             let ws_retry_body = build_websocket_request(body, None);
@@ -439,7 +435,7 @@ impl CodexHttpClient {
                                 &ws_retry_body,
                                 ctx,
                                 ctx.traffic.as_deref(),
-                                None,
+                                pool_key,
                                 super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                                 super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                                 None,
@@ -694,6 +690,27 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
         || msg.contains("epipe")
 }
 
+fn websocket_pool_key<'a>(
+    ctx: &'a RequestContext,
+    continuation: Option<&super::continuation::ContinuationCandidate>,
+) -> Option<&'a str> {
+    let session_id = ctx.session_id.as_deref()?;
+    let continuation = continuation?;
+    if continuation.disabled_reason.as_deref() == Some("disabled") {
+        return None;
+    }
+    Some(session_id)
+}
+
+fn should_reset_websocket_pool(
+    continuation: Option<&super::continuation::ContinuationCandidate>,
+) -> bool {
+    let Some(reason) = continuation.and_then(|c| c.disabled_reason.as_deref()) else {
+        return false;
+    };
+    !matches!(reason, "missing_state" | "disabled")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +809,68 @@ mod tests {
         );
         assert!(payload.get("stream").is_none());
         assert!(payload.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn websocket_pool_key_tracks_continuation_opt_in() {
+        let ctx = RequestContext {
+            req_id: "r".into(),
+            session_id: Some("session".into()),
+            session_seq: None,
+            provider: "codex".into(),
+            traffic: None,
+        };
+        let disabled = super::super::continuation::ContinuationCandidate {
+            previous_response_id: None,
+            input_delta: None,
+            input_delta_count: 1,
+            disabled_reason: Some("disabled".into()),
+        };
+        let first_enabled = super::super::continuation::ContinuationCandidate {
+            previous_response_id: None,
+            input_delta: None,
+            input_delta_count: 1,
+            disabled_reason: Some("missing_state".into()),
+        };
+        let append = super::super::continuation::ContinuationCandidate {
+            previous_response_id: Some("resp_1".into()),
+            input_delta: None,
+            input_delta_count: 1,
+            disabled_reason: None,
+        };
+
+        assert_eq!(websocket_pool_key(&ctx, Some(&disabled)), None);
+        assert_eq!(
+            websocket_pool_key(&ctx, Some(&first_enabled)),
+            Some("session")
+        );
+        assert_eq!(websocket_pool_key(&ctx, Some(&append)), Some("session"));
+    }
+
+    #[test]
+    fn websocket_pool_reset_ignores_initial_and_disabled_states() {
+        let missing_state = super::super::continuation::ContinuationCandidate {
+            previous_response_id: None,
+            input_delta: None,
+            input_delta_count: 1,
+            disabled_reason: Some("missing_state".into()),
+        };
+        let disabled = super::super::continuation::ContinuationCandidate {
+            previous_response_id: None,
+            input_delta: None,
+            input_delta_count: 1,
+            disabled_reason: Some("disabled".into()),
+        };
+        let prompt_changed = super::super::continuation::ContinuationCandidate {
+            previous_response_id: None,
+            input_delta: None,
+            input_delta_count: 1,
+            disabled_reason: Some("prompt_changed".into()),
+        };
+
+        assert!(!should_reset_websocket_pool(Some(&missing_state)));
+        assert!(!should_reset_websocket_pool(Some(&disabled)));
+        assert!(should_reset_websocket_pool(Some(&prompt_changed)));
     }
 
     #[test]

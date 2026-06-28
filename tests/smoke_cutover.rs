@@ -216,7 +216,9 @@ async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> 
     let addr_str = format!("http://{addr}");
 
     tokio::spawn(async move {
-        for (idx, text) in ["first", "second"].iter().enumerate() {
+        let texts = ["first", "second", "third"];
+        let mut handled = 0usize;
+        while handled < texts.len() {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
@@ -225,37 +227,53 @@ async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> 
             };
             let (mut sender, mut receiver) = ws.split();
 
-            if let Some(Ok(Message::Text(text))) = receiver.next().await
-                && let Ok(json) = serde_json::from_str::<Value>(&text)
-            {
-                let _ = captured.lock().map(|mut g| g.push(json));
-            }
+            while handled < texts.len() {
+                let Some(text) = (loop {
+                    match receiver.next().await {
+                        Some(Ok(Message::Text(text))) => break Some(text),
+                        Some(Ok(Message::Ping(data))) => {
+                            let _ = sender.send(Message::Pong(data)).await;
+                        }
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(_)) => {}
+                        Some(Err(_)) | None => break None,
+                    }
+                }) else {
+                    break;
+                };
+                if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                    let _ = captured.lock().map(|mut g| g.push(json));
+                }
 
-            let response_id = format!("resp_{}", idx + 1);
-            let events = [
-                json!({
-                    "type":"response.output_item.added",
-                    "output_index":0,
-                    "item":{"type":"message","id":format!("msg_up_{idx}")}
-                }),
-                json!({
-                    "type":"response.output_text.delta",
-                    "output_index":0,
-                    "delta":text
-                }),
-                json!({
-                    "type":"response.output_item.done",
-                    "output_index":0,
-                    "item":{"type":"message"}
-                }),
-                json!({
-                    "type":"response.completed",
-                    "response":{"id":response_id,"usage":{"input_tokens":5,"output_tokens":2}}
-                }),
-            ];
+                let idx = handled;
+                let response_text = texts[idx];
+                let response_id = format!("resp_{}", idx + 1);
+                let events = [
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index":0,
+                        "item":{"type":"message","id":format!("msg_up_{idx}")}
+                    }),
+                    json!({
+                        "type":"response.output_text.delta",
+                        "output_index":0,
+                        "delta":response_text
+                    }),
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":{"type":"message"}
+                    }),
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":response_id,"usage":{"input_tokens":5,"output_tokens":2}}
+                    }),
+                ];
 
-            for event in &events {
-                let _ = sender.send(Message::Text(event.to_string())).await;
+                for event in &events {
+                    let _ = sender.send(Message::Text(event.to_string())).await;
+                }
+                handled += 1;
             }
         }
     });
@@ -546,17 +564,46 @@ async fn smoke_codex_websocket_previous_response_id_sends_delta_on_second_turn()
         ]
     }))
     .await;
-    assert_eq!(second.status(), StatusCode::OK);
-    let value: Value = serde_json::from_slice(
-        &axum::body::to_bytes(second.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let second_status = second.status();
+    let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        second_status,
+        StatusCode::OK,
+        "second response body: {}",
+        String::from_utf8_lossy(&second_body)
+    );
+    let value: Value = serde_json::from_slice(&second_body).unwrap();
     assert_eq!(value["content"][0]["text"], "second");
 
+    let third = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "messages": [
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":"first"},
+            {"role":"user","content":"two"},
+            {"role":"assistant","content":"second"},
+            {"role":"user","content":"three"}
+        ]
+    }))
+    .await;
+    let third_status = third.status();
+    let third_body = axum::body::to_bytes(third.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        third_status,
+        StatusCode::OK,
+        "third response body: {}",
+        String::from_utf8_lossy(&third_body)
+    );
+    let value: Value = serde_json::from_slice(&third_body).unwrap();
+    assert_eq!(value["content"][0]["text"], "third");
+
     let guard = captured.lock().unwrap();
-    assert_eq!(guard.len(), 2, "expected two upstream websocket requests");
+    assert_eq!(guard.len(), 3, "expected three upstream websocket requests");
     assert!(guard[0].get("previous_response_id").is_none());
     assert_eq!(guard[1]["previous_response_id"], "resp_1");
     assert_eq!(
@@ -566,6 +613,14 @@ async fn smoke_codex_websocket_previous_response_id_sends_delta_on_second_turn()
     );
     assert_eq!(guard[1]["input"][0]["role"], "user");
     assert_eq!(guard[1]["input"][0]["content"][0]["text"], "two");
+    assert_eq!(guard[2]["previous_response_id"], "resp_2");
+    assert_eq!(
+        guard[2]["input"].as_array().map(Vec::len),
+        Some(1),
+        "third request should keep reusing the pooled websocket continuation"
+    );
+    assert_eq!(guard[2]["input"][0]["role"], "user");
+    assert_eq!(guard[2]["input"][0]["content"][0]["text"], "three");
 
     clear_all_continuations_for_tests();
     clear_codex_websocket_pool_for_tests();
