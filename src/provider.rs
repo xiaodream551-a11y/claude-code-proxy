@@ -1,8 +1,10 @@
 use crate::anthropic::schema::MessagesRequest;
+use crate::traffic::TrafficCapture;
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::response::Response;
 use clap::Subcommand;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommand {
@@ -34,4 +36,5 @@ pub struct RequestContext {
     pub session_id: Option<String>,
     pub session_seq: Option<u64>,
     pub provider: String,
+    pub traffic: Option<Arc<TrafficCapture>>,
 }

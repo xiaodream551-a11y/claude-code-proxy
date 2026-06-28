@@ -1,8 +1,10 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::provider::RequestContext;
 use crate::retry::{compute_backoff_delay, sleep};
+use crate::traffic::TrafficCapture;
 
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR};
 use super::auth::manager::CodexAuthManager;
@@ -301,7 +303,7 @@ impl CodexHttpClient {
                         &ws_headers,
                         &ws_body,
                         ctx,
-                        None, // traffic capture
+                        ctx.traffic.as_deref(),
                         pool_key,
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
@@ -325,7 +327,7 @@ impl CodexHttpClient {
                         &ws_headers,
                         &ws_body,
                         ctx,
-                        None,
+                        ctx.traffic.as_deref(),
                         pool_key,
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
@@ -436,7 +438,7 @@ impl CodexHttpClient {
                                 &ws_retry_headers,
                                 &ws_retry_body,
                                 ctx,
-                                None,
+                                ctx.traffic.as_deref(),
                                 None,
                                 super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                                 super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
@@ -475,34 +477,20 @@ impl CodexHttpClient {
         ctx: &RequestContext,
     ) -> Result<CodexResponse, CodexError> {
         let url = &self.base_url;
+        let headers = build_codex_headers(auth, ctx)?;
+
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_codex_http_request_capture(traffic, url, &headers, body_json);
+        }
 
         // Build headers
-        let mut req_builder = self
-            .client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .header("Authorization", format!("Bearer {}", auth.access))
-            .header("originator", config::codex_originator(ORIGINATOR))
-            .header("openai-beta", "responses=experimental");
-
-        if let Some(ref account_id) = auth.account_id {
-            req_builder = req_builder.header("ChatGPT-Account-Id", account_id);
-        }
-        if let Some(ref session_id) = ctx.session_id {
-            req_builder = req_builder
-                .header("session_id", session_id)
-                .header("x-client-request-id", session_id)
-                .header("x-codex-window-id", format!("{session_id}:0"));
-        }
-
-        let user_agent =
-            config::codex_user_agent(&format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION")));
-        if !user_agent.is_empty() {
-            req_builder = req_builder.header("User-Agent", user_agent);
+        let mut req_builder = self.client.post(url);
+        for (key, value) in headers.iter() {
+            req_builder = req_builder.header(key.as_str(), value.as_bytes());
         }
 
         // Apply header timeout
+        let started_at = Instant::now();
         let send_fut = req_builder.body(body_json.to_string()).send();
         let header_timeout_dur = Duration::from_millis(self.header_timeout_ms);
 
@@ -547,12 +535,140 @@ impl CodexHttpClient {
 
         let body_bytes = resp.bytes().await.unwrap_or_default().to_vec();
 
+        if let Some(traffic) = ctx.traffic.as_deref() {
+            write_upstream_response_capture(
+                traffic,
+                status,
+                started_at.elapsed(),
+                &headers,
+                &body_bytes,
+            );
+        }
+
         Ok(CodexResponse {
             body: body_bytes,
             status,
             headers,
         })
     }
+}
+
+fn write_codex_http_request_capture(
+    traffic: &TrafficCapture,
+    url: &str,
+    headers: &http::HeaderMap,
+    body_json: &str,
+) {
+    let body = serde_json::from_str(body_json).unwrap_or_else(|_| {
+        serde_json::json!({
+            "unparseable": true,
+            "bytes": body_json.len(),
+        })
+    });
+    traffic.write_json("020-upstream-request", &body);
+    traffic.write_json(
+        "021-upstream-request-metadata",
+        &serde_json::json!({
+            "provider": "codex",
+            "transport": "http",
+            "url": url,
+            "method": "POST",
+            "headers": headers_to_json(headers),
+            "size": summarize_json_request_size(&body, body_json),
+        }),
+    );
+}
+
+fn write_upstream_response_capture(
+    traffic: &TrafficCapture,
+    status: u16,
+    elapsed: Duration,
+    headers: &[(String, String)],
+    body: &[u8],
+) {
+    traffic.write_json(
+        "030-upstream-response-headers",
+        &serde_json::json!({
+            "status": status,
+            "elapsedMs": elapsed.as_millis(),
+            "headers": headers_to_json_from_pairs(headers),
+        }),
+    );
+    if status >= 400 {
+        traffic.write_text("031-upstream-error-body", &String::from_utf8_lossy(body));
+    } else {
+        traffic.write_bytes("032-upstream-response-body.sse", body);
+        write_codex_sse_event_capture(traffic, body);
+    }
+}
+
+fn write_codex_sse_event_capture(traffic: &TrafficCapture, body: &[u8]) {
+    for event in parse_sse_events(body) {
+        if event.data == "[DONE]" {
+            traffic.write_json_event(
+                "040-upstream-event",
+                &serde_json::json!({
+                    "event": event.event,
+                    "data": "[DONE]",
+                }),
+            );
+            continue;
+        }
+
+        match serde_json::from_str::<serde_json::Value>(&event.data) {
+            Ok(mut value) => {
+                if let Some(name) = event.event
+                    && let Some(obj) = value.as_object_mut()
+                {
+                    obj.entry("_sse_event").or_insert(serde_json::json!(name));
+                }
+                traffic.write_json_event("040-upstream-event", &value);
+            }
+            Err(_) => {
+                traffic.write_json_event(
+                    "040-upstream-event",
+                    &serde_json::json!({
+                        "event": event.event,
+                        "unparseable": true,
+                        "data": event.data,
+                    }),
+                );
+            }
+        }
+    }
+}
+
+fn headers_to_json(headers: &http::HeaderMap) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (key, value) in headers.iter() {
+        out.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_str().unwrap_or("").to_string()),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+fn headers_to_json_from_pairs(headers: &[(String, String)]) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (key, value) in headers {
+        out.insert(key.clone(), serde_json::Value::String(value.clone()));
+    }
+    serde_json::Value::Object(out)
+}
+
+fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> serde_json::Value {
+    serde_json::json!({
+        "bytes": body_json.len(),
+        "inputCount": body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .map(|items| items.len()),
+        "toolCount": body
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|items| items.len()),
+    })
 }
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
@@ -609,6 +725,7 @@ mod tests {
             session_id: Some("s".into()),
             session_seq: None,
             provider: "codex".into(),
+            traffic: None,
         };
         let headers = build_codex_headers(&auth, &ctx).unwrap();
         assert_eq!(
@@ -631,6 +748,7 @@ mod tests {
             session_id: None,
             session_seq: None,
             provider: "codex".into(),
+            traffic: None,
         };
         let headers = build_codex_headers(&auth, &ctx).unwrap();
         assert!(headers.get("session_id").is_none());
@@ -689,6 +807,7 @@ mod tests {
             session_id: None,
             session_seq: None,
             provider: "codex".into(),
+            traffic: None,
         };
         let result = build_codex_headers(&auth, &ctx);
         assert!(

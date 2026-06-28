@@ -23,10 +23,11 @@ use self::auth::device::DeviceAuthClient;
 use self::auth::manager::CodexAuthManager;
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
-use self::continuation::{clear_continuation, continuation_candidate};
+use self::continuation::{clear_continuation, continuation_candidate, record_continuation};
 use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response;
 use self::translate::model_allowlist::{assert_allowed_model, resolve_model_request};
+use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{TranslateOptions, translate_request};
 use self::translate::stream::translate_stream_bytes;
 
@@ -130,6 +131,7 @@ impl Provider for CodexProvider {
             let sse_bytes = match translate_stream_bytes(&upstream.body, &message_id, model) {
                 Ok(b) => b,
                 Err(e) => {
+                    clear_continuation(ctx.session_id.as_deref());
                     return json_error(
                         StatusCode::BAD_GATEWAY,
                         "api_error",
@@ -137,6 +139,11 @@ impl Provider for CodexProvider {
                     );
                 }
             };
+            update_continuation_from_upstream(
+                ctx.session_id.as_deref(),
+                &translated,
+                &upstream.body,
+            );
 
             let headers = [
                 (http::header::CONTENT_TYPE, "text/event-stream"),
@@ -146,12 +153,22 @@ impl Provider for CodexProvider {
             (headers, sse_bytes).into_response()
         } else {
             match accumulate_response(&upstream.body, &message_id, model) {
-                Ok(json) => (StatusCode::OK, Json(json)).into_response(),
-                Err(e) => json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    format!("Accumulation error: {e}"),
-                ),
+                Ok(json) => {
+                    update_continuation_from_upstream(
+                        ctx.session_id.as_deref(),
+                        &translated,
+                        &upstream.body,
+                    );
+                    (StatusCode::OK, Json(json)).into_response()
+                }
+                Err(e) => {
+                    clear_continuation(ctx.session_id.as_deref());
+                    json_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        format!("Accumulation error: {e}"),
+                    )
+                }
             }
         }
     }
@@ -195,6 +212,24 @@ impl Provider for CodexProvider {
             }),
         )
             .into_response()
+    }
+}
+
+fn update_continuation_from_upstream(
+    session_id: Option<&str>,
+    request_body: &translate::request::ResponsesRequest,
+    upstream_body: &[u8],
+) {
+    match finish_metadata_from_upstream(upstream_body) {
+        Ok(Some(finish)) if finish.continuation_eligible => {
+            record_continuation(
+                session_id,
+                request_body,
+                finish.response_id.as_deref(),
+                &finish.output_items,
+            );
+        }
+        _ => clear_continuation(session_id),
     }
 }
 

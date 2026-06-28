@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use http::HeaderMap;
@@ -260,6 +260,31 @@ pub async fn codex_websocket_request(
         retry_after: None,
         origin: CodexErrorOrigin::WebSocket,
     })?;
+    let body_json = serde_json::to_string(body_value).unwrap_or_default();
+    if let Some(tc) = traffic {
+        tc.write_json("020-upstream-request", body_value);
+        tc.write_json(
+            "021-upstream-request-metadata",
+            &serde_json::json!({
+                "provider": "codex",
+                "transport": "websocket",
+                "url": ws_url,
+                "method": "GET",
+                "headers": headers_to_json(headers),
+                "size": summarize_json_request_size(body_value, &body_json),
+                "continuation": {
+                    "previousResponseId": continuation
+                        .and_then(|c| c.previous_response_id.as_deref()),
+                    "inputDeltaCount": continuation
+                        .and_then(|c| c.input_delta.as_ref())
+                        .map(|items| items.len()),
+                    "disabledReason": continuation
+                        .and_then(|c| c.disabled_reason.as_deref()),
+                },
+            }),
+        );
+    }
+    let started_at = Instant::now();
 
     // Check pool for existing connection
     let pooled = pool_key.and_then(|key| {
@@ -277,7 +302,7 @@ pub async fn codex_websocket_request(
             connect_with_timeout(&ws_url, headers, connect_timeout_ms).await?
         } else {
             // Connection is alive, send the request through it
-            let ws_msg = Message::Text(serde_json::to_string(body_value).unwrap_or_default());
+            let ws_msg = Message::Text(body_json.clone());
             ws_guard.send(ws_msg).await.map_err(|e| CodexError {
                 status: 0,
                 message: format!("WebSocket send error: {e}"),
@@ -288,7 +313,7 @@ pub async fn codex_websocket_request(
 
             // Collect events
             let (sse_body, terminal_event) =
-                collect_ws_events(&mut ws_guard, idle_timeout_ms, pool_key).await?;
+                collect_ws_events(&mut ws_guard, idle_timeout_ms, pool_key, traffic).await?;
 
             // Record continuation on success
             if let Some(terminal) = &terminal_event
@@ -326,14 +351,8 @@ pub async fn codex_websocket_request(
 
             // Write traffic metadata
             if let Some(tc) = traffic {
-                let meta = serde_json::json!({
-                    "provider": "codex",
-                    "transport": "websocket",
-                    "url": ws_url,
-                    "poolKey": pool_key,
-                    "continuation": continuation.map(|c| c.previous_response_id.is_some()),
-                });
-                tc.write_json("022-upstream-websocket-metadata", &meta);
+                write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, true);
+                write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
             }
 
             return Ok(CodexResponse {
@@ -353,7 +372,7 @@ pub async fn codex_websocket_request(
     });
 
     // Send the request
-    let msg = Message::Text(serde_json::to_string(body_value).unwrap_or_default());
+    let msg = Message::Text(body_json);
     {
         let mut ws_guard = entry.ws.lock().await;
         ws_guard.send(msg).await.map_err(|e| CodexError {
@@ -365,7 +384,7 @@ pub async fn codex_websocket_request(
         })?;
 
         let (sse_body, terminal_event) =
-            collect_ws_events(&mut ws_guard, idle_timeout_ms, pool_key).await?;
+            collect_ws_events(&mut ws_guard, idle_timeout_ms, pool_key, traffic).await?;
 
         if let Some(terminal) = &terminal_event
             && is_previous_response_missing(&terminal.payload)
@@ -405,14 +424,8 @@ pub async fn codex_websocket_request(
 
         // Write traffic metadata
         if let Some(tc) = traffic {
-            let meta = serde_json::json!({
-                "provider": "codex",
-                "transport": "websocket",
-                "url": ws_url,
-                "poolKey": pool_key,
-                "continuation": continuation.map(|c| c.previous_response_id.is_some()),
-            });
-            tc.write_json("022-upstream-websocket-metadata", &meta);
+            write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, false);
+            write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
         }
 
         Ok(CodexResponse {
@@ -420,6 +433,60 @@ pub async fn codex_websocket_request(
             status,
             headers: vec![],
         })
+    }
+}
+
+fn write_websocket_metadata_capture(
+    traffic: &TrafficCapture,
+    ws_url: &str,
+    pool_key: Option<&str>,
+    continuation: Option<&ContinuationCandidate>,
+    pooled: bool,
+) {
+    traffic.write_json(
+        "022-upstream-websocket-metadata",
+        &serde_json::json!({
+            "provider": "codex",
+            "transport": "websocket",
+            "url": ws_url,
+            "poolKey": pool_key,
+            "pooled": pooled,
+            "continuation": {
+                "previousResponseId": continuation
+                    .and_then(|c| c.previous_response_id.as_deref()),
+                "inputDeltaCount": continuation
+                    .and_then(|c| c.input_delta.as_ref())
+                    .map(|items| items.len()),
+                "disabledReason": continuation
+                    .and_then(|c| c.disabled_reason.as_deref()),
+            },
+        }),
+    );
+}
+
+fn write_websocket_response_capture(
+    traffic: &TrafficCapture,
+    status: u16,
+    elapsed: Duration,
+    sse_body: &[u8],
+) {
+    traffic.write_json(
+        "030-upstream-response-headers",
+        &serde_json::json!({
+            "status": status,
+            "elapsedMs": elapsed.as_millis(),
+            "headers": {
+                "content-type": "text/event-stream",
+            },
+        }),
+    );
+    if status >= 400 {
+        traffic.write_text(
+            "031-upstream-error-body",
+            &String::from_utf8_lossy(sse_body),
+        );
+    } else {
+        traffic.write_bytes("032-upstream-response-body.sse", sse_body);
     }
 }
 
@@ -521,6 +588,7 @@ async fn collect_ws_events(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     idle_timeout_ms: u64,
     pool_key: Option<&str>,
+    traffic: Option<&TrafficCapture>,
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError> {
     let mut sse_body: Vec<u8> = Vec::new();
     let mut terminal_event: Option<WsEvent> = None;
@@ -548,6 +616,15 @@ async fn collect_ws_events(
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(_) => {
+                        if let Some(tc) = traffic {
+                            tc.write_json_event(
+                                "040-upstream-event",
+                                &serde_json::json!({
+                                    "unparseable": true,
+                                    "data": text,
+                                }),
+                            );
+                        }
                         // Write invalid JSON as-is
                         sse_body.extend_from_slice(&encode_sse(&text));
                         continue;
@@ -556,6 +633,9 @@ async fn collect_ws_events(
 
                 // Convert to SSE bytes
                 sse_body.extend_from_slice(&encode_sse(&text));
+                if let Some(tc) = traffic {
+                    tc.write_json_event("040-upstream-event", &parsed);
+                }
 
                 // Check for terminal events
                 if is_terminal_event(&parsed) {
@@ -623,6 +703,31 @@ async fn collect_ws_events(
     }
 
     Ok((sse_body, terminal_event))
+}
+
+fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (key, value) in headers.iter() {
+        out.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_str().unwrap_or("").to_string()),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> serde_json::Value {
+    serde_json::json!({
+        "bytes": body_json.len(),
+        "inputCount": body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .map(|items| items.len()),
+        "toolCount": body
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|items| items.len()),
+    })
 }
 
 // ---------------------------------------------------------------------------

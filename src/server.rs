@@ -132,13 +132,16 @@ async fn dispatch_request(
         now,
     );
 
-    if let Some(capture) = create_traffic_capture(TrafficCaptureOptions {
+    let traffic = create_traffic_capture(TrafficCaptureOptions {
         req_id: req_id.clone(),
         session_id: session_id.clone(),
         session_seq: current.as_ref().map(|s| s.seq),
         provider: Some(provider.name().to_string()),
         state_dir_override: None,
-    }) {
+    })
+    .map(Arc::new);
+
+    if let Some(capture) = traffic.as_ref() {
         capture.write_json(
             "000-metadata",
             &json!({
@@ -160,6 +163,7 @@ async fn dispatch_request(
         session_id,
         session_seq: current.map(|s| s.seq),
         provider: provider.name().to_string(),
+        traffic,
     };
 
     if count_tokens {

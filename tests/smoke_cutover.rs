@@ -4,10 +4,12 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
+use claude_code_proxy::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_proxy::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -71,6 +73,15 @@ impl Drop for EnvGuard {
 
 /// Send a minimal `POST /v1/messages` through the in-process app.
 async fn call_messages(model: &str) -> Response {
+    call_messages_body(json!({
+        "model": model,
+        "max_tokens": 64,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await
+}
+
+async fn call_messages_body(body: Value) -> Response {
     app(Arc::new(Registry::with_default_alias()))
         .oneshot(
             Request::builder()
@@ -78,18 +89,52 @@ async fn call_messages(model: &str) -> Response {
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .header("x-claude-code-session-id", "smoke-session")
-                .body(Body::from(
-                    json!({
-                        "model": model,
-                        "max_tokens": 64,
-                        "messages": [{"role":"user","content":"hello"}]
-                    })
-                    .to_string(),
-                ))
+                .body(Body::from(body.to_string()))
                 .unwrap(),
         )
         .await
         .unwrap()
+}
+
+fn collect_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(collect_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn traffic_files(state_dir: &Path) -> Vec<PathBuf> {
+    collect_files(
+        &state_dir
+            .join("claude-code-proxy")
+            .join("traffic")
+            .join("smoke-session"),
+    )
+}
+
+fn traffic_file<'a>(files: &'a [PathBuf], suffix: &str) -> &'a Path {
+    files
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(suffix))
+        })
+        .map(PathBuf::as_path)
+        .unwrap_or_else(|| panic!("missing traffic artifact ending in {suffix}; files={files:?}"))
+}
+
+fn traffic_json(files: &[PathBuf], suffix: &str) -> Value {
+    serde_json::from_slice(&std::fs::read(traffic_file(files, suffix)).unwrap()).unwrap()
 }
 
 /// Spawn a mock axum HTTP server that accepts requests at any path, calls
@@ -154,6 +199,59 @@ async fn spawn_websocket_upstream(captured: Arc<Mutex<Option<Value>>>) -> String
                 r#"{"type":"response.output_text.delta","output_index":0,"delta":"codex websocket ok"}"#,
                 r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
                 r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#,
+            ];
+
+            for event in &events {
+                let _ = sender.send(Message::Text(event.to_string())).await;
+            }
+        }
+    });
+
+    addr_str
+}
+
+async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        for (idx, text) in ["first", "second"].iter().enumerate() {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sender, mut receiver) = ws.split();
+
+            if let Some(Ok(Message::Text(text))) = receiver.next().await
+                && let Ok(json) = serde_json::from_str::<Value>(&text)
+            {
+                let _ = captured.lock().map(|mut g| g.push(json));
+            }
+
+            let response_id = format!("resp_{}", idx + 1);
+            let events = [
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"message","id":format!("msg_up_{idx}")}
+                }),
+                json!({
+                    "type":"response.output_text.delta",
+                    "output_index":0,
+                    "delta":text
+                }),
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{"type":"message"}
+                }),
+                json!({
+                    "type":"response.completed",
+                    "response":{"id":response_id,"usage":{"input_tokens":5,"output_tokens":2}}
+                }),
             ];
 
             for event in &events {
@@ -315,6 +413,53 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
     assert_eq!(sent["stream"], true);
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_traffic_capture_writes_upstream_artifacts() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let upstream = spawn_http_upstream(|_body: Value| {
+        concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"codex http ok\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+        )
+        .as_bytes()
+        .to_vec()
+    })
+    .await;
+
+    let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
+    let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages("gpt-5.5").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let files = traffic_files(state.path());
+    let request = traffic_json(&files, "020-upstream-request.json");
+    assert_eq!(request["model"], "gpt-5.5");
+
+    let metadata = traffic_json(&files, "021-upstream-request-metadata.json");
+    assert_eq!(metadata["transport"], "http");
+    assert!(
+        metadata["headers"]["authorization"]
+            .as_str()
+            .unwrap()
+            .contains("redacted")
+    );
+    assert_eq!(
+        traffic_json(&files, "030-upstream-response-headers.json")["status"],
+        200
+    );
+    traffic_file(&files, "032-upstream-response-body.sse");
+    traffic_file(&files, "040-upstream-event.json");
+}
+
 // ---------------------------------------------------------------------------
 // Codex WebSocket smoke: mock upstream verifies request shape and returns
 // Responses events over WebSocket.
@@ -364,4 +509,106 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
     assert_eq!(sent["type"], "response.create");
     assert_eq!(sent["model"], "gpt-5.5");
     assert!(sent.get("stream").is_none());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_previous_response_id_sends_delta_on_second_turn() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_websocket_sequence_upstream(captured.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+
+    let first = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "messages": [{"role":"user","content":"one"}]
+    }))
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "messages": [
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":"first"},
+            {"role":"user","content":"two"}
+        ]
+    }))
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["text"], "second");
+
+    let guard = captured.lock().unwrap();
+    assert_eq!(guard.len(), 2, "expected two upstream websocket requests");
+    assert!(guard[0].get("previous_response_id").is_none());
+    assert_eq!(guard[1]["previous_response_id"], "resp_1");
+    assert_eq!(
+        guard[1]["input"].as_array().map(Vec::len),
+        Some(1),
+        "second request should send only the appended input delta"
+    );
+    assert_eq!(guard[1]["input"][0]["role"], "user");
+    assert_eq!(guard[1]["input"][0]["content"][0]["text"], "two");
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_websocket_upstream(captured.clone()).await;
+
+    let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
+    let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let response = call_messages("gpt-5.5").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let files = traffic_files(state.path());
+    let request = traffic_json(&files, "020-upstream-request.json");
+    assert_eq!(request["type"], "response.create");
+    assert!(request.get("stream").is_none());
+
+    let metadata = traffic_json(&files, "021-upstream-request-metadata.json");
+    assert_eq!(metadata["transport"], "websocket");
+    assert!(
+        metadata["headers"]["authorization"]
+            .as_str()
+            .unwrap()
+            .contains("redacted")
+    );
+    traffic_file(&files, "022-upstream-websocket-metadata.json");
+    assert_eq!(
+        traffic_json(&files, "030-upstream-response-headers.json")["status"],
+        200
+    );
+    traffic_file(&files, "032-upstream-response-body.sse");
+    traffic_file(&files, "040-upstream-event.json");
 }

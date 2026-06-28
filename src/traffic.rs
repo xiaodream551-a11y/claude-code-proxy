@@ -76,7 +76,7 @@ impl TrafficCapture {
     }
 
     pub fn write_bytes(&self, name: &str, value: &[u8]) {
-        let path = self.next_artifact_path(name, true);
+        let path = self.next_artifact_path(name, false);
         let _ = write_bytes(path, value);
     }
 

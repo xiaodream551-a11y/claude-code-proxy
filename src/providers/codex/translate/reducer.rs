@@ -80,6 +80,32 @@ pub enum ReducerEvent {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct FinishMetadata {
+    pub continuation_eligible: bool,
+    pub response_id: Option<String>,
+    pub output_items: Vec<ResponsesInputItem>,
+}
+
+pub fn finish_metadata_from_upstream(
+    input: &[u8],
+) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
+    let events = reduce_upstream_bytes(input)?;
+    Ok(events.into_iter().rev().find_map(|event| match event {
+        ReducerEvent::Finish {
+            continuation_eligible,
+            response_id,
+            output_items,
+            ..
+        } => Some(FinishMetadata {
+            continuation_eligible,
+            response_id,
+            output_items,
+        }),
+        _ => None,
+    }))
+}
+
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
     let sse_events = parse_sse_events(input);
     let mut out = Vec::new();
@@ -969,6 +995,44 @@ mod tests {
         } else {
             panic!("expected Finish");
         }
+    }
+
+    #[test]
+    fn finish_metadata_extracts_continuation_state() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 0,
+                    "item": {"type":"message","id":"msg_up"}
+                })
+            ),
+            sse(
+                "response.output_text.delta",
+                json!({
+                    "output_index":0,"delta":"hello"
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,"item":{"type":"message"}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
+            ),
+        );
+        let metadata = finish_metadata_from_upstream(upstream.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert!(metadata.continuation_eligible);
+        assert_eq!(metadata.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(metadata.output_items.len(), 1);
     }
 
     #[test]
