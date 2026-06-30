@@ -310,6 +310,7 @@ async fn smoke_healthz_returns_ok() {
 
 #[tokio::test]
 async fn smoke_codex_model_routes_to_real_provider() {
+    let _guard = env_lock();
     let response = call_messages("gpt-5.5").await;
     // Should attempt auth (not return 501 placeholder)
     assert!(

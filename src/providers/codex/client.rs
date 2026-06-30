@@ -412,14 +412,12 @@ impl CodexHttpClient {
                     });
                 }
                 Ok(response) => return Ok(response),
-                Err(err) if err.detail.as_deref() == Some("previous_response_not_found") => {
-                    // Previous response missing: clear continuation and retry once with full request
+                Err(err) if should_retry_without_continuation(&err, continuation) => {
                     clear_continuation(ctx.session_id.as_deref());
                     if let Some(key) = pool_key {
                         super::websocket::invalidate_codex_websocket_pool_key(key);
                     }
 
-                    // Retry with the full body (no continuation) through the relevant transport
                     let retry_headers = build_codex_headers(&auth, ctx)?;
                     let full_body_json = serde_json::to_string(body).map_err(|e| CodexError {
                         status: 500,
@@ -711,6 +709,24 @@ fn should_refresh_after_unauthorized(
     }
 }
 
+fn should_retry_without_continuation(
+    err: &CodexError,
+    continuation: Option<&super::continuation::ContinuationCandidate>,
+) -> bool {
+    if continuation
+        .and_then(|c| c.previous_response_id.as_deref())
+        .is_none()
+    {
+        return false;
+    }
+
+    matches!(
+        err.detail.as_deref(),
+        Some("previous_response_not_found")
+            | Some(super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
+    )
+}
+
 fn websocket_pool_key<'a>(
     ctx: &'a RequestContext,
     continuation: Option<&super::continuation::ContinuationCandidate>,
@@ -986,5 +1002,50 @@ mod tests {
         ));
         assert!(!should_refresh_after_unauthorized(&forbidden, 0));
         assert!(!should_refresh_after_unauthorized(&http_unauthorized, 1));
+    }
+
+    #[test]
+    fn continuation_retry_requires_previous_response_id() {
+        let append = super::super::continuation::ContinuationCandidate {
+            previous_response_id: Some("resp_1".into()),
+            input_delta: None,
+            input_delta_count: 1,
+            disabled_reason: None,
+        };
+        let initial = super::super::continuation::ContinuationCandidate {
+            previous_response_id: None,
+            input_delta: None,
+            input_delta_count: 1,
+            disabled_reason: Some("missing_state".into()),
+        };
+        let timeout = CodexError {
+            status: 0,
+            message: "WebSocket response start timeout after 60000ms".to_string(),
+            detail: Some(
+                super::super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string(),
+            ),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+        let missing = CodexError {
+            status: 0,
+            message: "Previous response not found".to_string(),
+            detail: Some("previous_response_not_found".to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+        let idle = CodexError {
+            status: 0,
+            message: "WebSocket idle timeout after 60000ms".to_string(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(should_retry_without_continuation(&timeout, Some(&append)));
+        assert!(should_retry_without_continuation(&missing, Some(&append)));
+        assert!(!should_retry_without_continuation(&idle, Some(&append)));
+        assert!(!should_retry_without_continuation(&timeout, Some(&initial)));
+        assert!(!should_retry_without_continuation(&timeout, None));
     }
 }

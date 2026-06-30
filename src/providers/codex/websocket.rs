@@ -24,6 +24,7 @@ use super::continuation::ContinuationCandidate;
 pub const WEBSOCKET_PROTOCOL_HEADER: &str = "responses_websockets=2026-02-06";
 pub const WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
 pub const WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 60_000;
+pub const WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL: &str = "websocket_response_start_timeout";
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_POOL_ENTRIES: usize = 10_000;
@@ -192,6 +193,14 @@ fn encode_sse(text: &str) -> Vec<u8> {
 fn is_terminal_event(payload: &serde_json::Value) -> bool {
     match payload.get("type").and_then(|v| v.as_str()) {
         Some(t) => TERMINAL_EVENTS.contains(&t),
+        None => false,
+    }
+}
+
+fn is_response_event(payload: &serde_json::Value) -> bool {
+    match payload.get("type").and_then(|v| v.as_str()) {
+        Some("error") => true,
+        Some(t) => t.starts_with("response."),
         None => false,
     }
 }
@@ -432,6 +441,16 @@ fn missing_terminal_error() -> CodexError {
     }
 }
 
+fn response_start_timeout_error(timeout_ms: u64) -> CodexError {
+    CodexError {
+        status: 0,
+        message: format!("WebSocket response start timeout after {timeout_ms}ms"),
+        detail: Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
 fn write_websocket_metadata_capture(
     traffic: &TrafficCapture,
     ws_url: &str,
@@ -593,21 +612,61 @@ async fn collect_ws_events(
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError> {
     let mut sse_body: Vec<u8> = Vec::new();
     let mut terminal_event: Option<WsEvent> = None;
+    let response_event_budget = Duration::from_millis(idle_timeout_ms);
+    let response_wait_started = Instant::now();
+    let mut last_response_event_at = response_wait_started;
+    let mut response_started = false;
 
     loop {
-        let timeout = tokio::time::timeout(Duration::from_millis(idle_timeout_ms), ws.next());
+        let response_deadline_started = if response_started {
+            last_response_event_at
+        } else {
+            response_wait_started
+        };
+        let read_timeout = if response_started {
+            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => {
+                    if let Some(key) = pool_key {
+                        invalidate_codex_websocket_pool_key(key);
+                    }
+                    return Err(CodexError {
+                        status: 0,
+                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    });
+                }
+            }
+        } else {
+            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => {
+                    if let Some(key) = pool_key {
+                        invalidate_codex_websocket_pool_key(key);
+                    }
+                    return Err(response_start_timeout_error(idle_timeout_ms));
+                }
+            }
+        };
+
+        let timeout = tokio::time::timeout(read_timeout, ws.next());
 
         let frame = timeout.await.map_err(|_| {
-            // Idle timeout - invalidate pool
             if let Some(key) = pool_key {
                 invalidate_codex_websocket_pool_key(key);
             }
-            CodexError {
-                status: 0,
-                message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                detail: None,
-                retry_after: None,
-                origin: CodexErrorOrigin::WebSocket,
+            if response_started {
+                CodexError {
+                    status: 0,
+                    message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
+                    detail: None,
+                    retry_after: None,
+                    origin: CodexErrorOrigin::WebSocket,
+                }
+            } else {
+                response_start_timeout_error(idle_timeout_ms)
             }
         })?;
 
@@ -636,6 +695,11 @@ async fn collect_ws_events(
                 sse_body.extend_from_slice(&encode_sse(&text));
                 if let Some(tc) = traffic {
                     tc.write_json_event("040-upstream-event", &parsed);
+                }
+
+                if is_response_event(&parsed) {
+                    response_started = true;
+                    last_response_event_at = Instant::now();
                 }
 
                 // Check for terminal events
@@ -828,6 +892,18 @@ mod tests {
     }
 
     #[test]
+    fn is_response_event_detection() {
+        let rate_limits = serde_json::json!({"type": "codex.rate_limits"});
+        assert!(!is_response_event(&rate_limits));
+
+        let output = serde_json::json!({"type": "response.output_text.delta"});
+        assert!(is_response_event(&output));
+
+        let error = serde_json::json!({"type": "error", "error": {"message": "fail"}});
+        assert!(is_response_event(&error));
+    }
+
+    #[test]
     fn is_previous_response_missing_detection() {
         let by_code = serde_json::json!({
             "type": "error",
@@ -932,6 +1008,111 @@ mod tests {
 
         assert!(err.message.contains("binary frames"));
         assert!(!WS_POOL.lock().unwrap().contains_key("binary-session"));
+    }
+
+    #[tokio::test]
+    async fn response_start_timeout_ignores_rate_limits_and_pings() {
+        clear_codex_websocket_pool_for_tests();
+        let pooled_stream = create_dummy_stream_async().await;
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            guard.insert(
+                "start-timeout-session".to_string(),
+                Arc::new(PoolEntry {
+                    ws: AsyncMutex::new(pooled_stream),
+                    created_at: now_ms(),
+                }),
+            );
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"codex.rate_limits","rate_limits":{"allowed":true}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                if ws.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let err = match collect_ws_events(&mut ws, 50, Some("start-timeout-session"), None).await {
+            Ok(_) => panic!("expected response start timeout"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.detail.as_deref(),
+            Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
+        );
+        assert!(
+            !WS_POOL
+                .lock()
+                .unwrap()
+                .contains_key("start-timeout-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn response_idle_timeout_ignores_pings_after_response_event() {
+        clear_codex_websocket_pool_for_tests();
+        let pooled_stream = create_dummy_stream_async().await;
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            guard.insert(
+                "response-idle-session".to_string(),
+                Arc::new(PoolEntry {
+                    ws: AsyncMutex::new(pooled_stream),
+                    created_at: now_ms(),
+                }),
+            );
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                if ws.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let err = match collect_ws_events(&mut ws, 50, Some("response-idle-session"), None).await {
+            Ok(_) => panic!("expected response idle timeout"),
+            Err(err) => err,
+        };
+
+        assert!(err.message.contains("idle timeout"));
+        assert_eq!(err.detail, None);
+        assert!(
+            !WS_POOL
+                .lock()
+                .unwrap()
+                .contains_key("response-idle-session")
+        );
     }
 
     async fn create_dummy_stream_async() -> WebSocketStream<MaybeTlsStream<TcpStream>> {
