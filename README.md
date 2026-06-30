@@ -270,6 +270,13 @@ the UI as `◐ medium · /effort`) is forwarded as Codex `reasoning.effort` (`lo
 `xhigh`. An explicit `codex.effort` / `CCP_CODEX_EFFORT` override still takes
 precedence and can also force `none`.
 
+Reasoning summaries: when a Codex request has reasoning effort, the proxy asks
+Codex for `reasoning.summary: "auto"` and translates returned summary deltas
+into Anthropic `thinking` content blocks. Codex decides when a summary is useful,
+so simple prompts can emit no thinking block. Set `codex.reasoningSummary` /
+`CCP_CODEX_REASONING_SUMMARY` to `off` or `none` to suppress summaries while
+keeping `reasoning.effort` and encrypted continuation content.
+
 Claude Code's hosted `web_search_20250305` tool is translated to Codex's native
 Responses `web_search` tool, including non-empty domain filters. Codex hosted
 search calls are emitted back to Claude Code as Anthropic `server_tool_use` and
@@ -612,6 +619,7 @@ Windows, and at
     "userAgent": "claude-code-proxy/dev",
     "model": "gpt-5.4",
     "effort": "medium",
+    "reasoningSummary": "auto",
     "serviceTier": "fast",
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
     "transport": "websocket",
@@ -647,6 +655,7 @@ Windows, and at
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                     |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`) |
 | `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`)                                     |
+| `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                          |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                 |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                            |
 | `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                  |
