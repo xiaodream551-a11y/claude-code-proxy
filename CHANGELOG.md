@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Codex WebSocket streaming requests forward Anthropic SSE chunks as upstream
+  events arrive, so long compaction responses show progress before the terminal
+  Codex event.
+
 ## v0.1.2 (2026-06-30)
 
 - Codex WebSocket continuations recover from streams that only deliver rate

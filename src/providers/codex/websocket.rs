@@ -6,6 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use http::HeaderMap;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{self, Message, handshake::client::generate_key},
@@ -36,6 +37,8 @@ const TERMINAL_EVENTS: &[&str] = &[
     "response.failed",
     "error",
 ];
+
+pub type CodexWebSocketEventReceiver = mpsc::Receiver<Result<serde_json::Value, CodexError>>;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -431,6 +434,78 @@ pub async fn codex_websocket_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn codex_websocket_event_stream(
+    url: &str,
+    headers: &HeaderMap,
+    body_value: &serde_json::Value,
+    _ctx: &RequestContext,
+    traffic: Option<Arc<TrafficCapture>>,
+    pool_key: Option<&str>,
+    connect_timeout_ms: u64,
+    idle_timeout_ms: u64,
+    continuation: Option<&ContinuationCandidate>,
+) -> Result<CodexWebSocketEventReceiver, CodexError> {
+    let ws_url = to_websocket_url(url).map_err(|e| CodexError {
+        status: 0,
+        message: e.message,
+        detail: None,
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocket,
+    })?;
+    let body_json = serde_json::to_string(body_value).unwrap_or_default();
+    if let Some(tc) = traffic.as_deref() {
+        tc.write_json("020-upstream-request", body_value);
+        tc.write_json(
+            "021-upstream-request-metadata",
+            &serde_json::json!({
+                "provider": "codex",
+                "transport": "websocket",
+                "url": ws_url,
+                "method": "GET",
+                "headers": headers_to_json(headers),
+                "size": summarize_json_request_size(body_value, &body_json),
+                "continuation": {
+                    "previousResponseId": continuation
+                        .and_then(|c| c.previous_response_id.as_deref()),
+                    "inputDeltaCount": continuation
+                        .and_then(|c| c.input_delta.as_ref())
+                        .map(|items| items.len()),
+                    "disabledReason": continuation
+                        .and_then(|c| c.disabled_reason.as_deref()),
+                },
+            }),
+        );
+        write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, false);
+    }
+
+    let (mut ws_stream, _) = connect_with_timeout(&ws_url, headers, connect_timeout_ms).await?;
+    ws_stream
+        .send(Message::Text(body_json))
+        .await
+        .map_err(|e| CodexError {
+            status: 0,
+            message: format!("WebSocket send error: {e}"),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        })?;
+
+    let (tx, rx) = mpsc::channel(64);
+    let pool_key = pool_key.map(str::to_string);
+    tokio::spawn(async move {
+        stream_ws_events(
+            &mut ws_stream,
+            idle_timeout_ms,
+            pool_key.as_deref(),
+            traffic,
+            tx,
+        )
+        .await;
+    });
+    Ok(rx)
+}
+
 fn missing_terminal_error() -> CodexError {
     CodexError {
         status: 0,
@@ -771,6 +846,161 @@ async fn collect_ws_events(
     }
 
     Ok((sse_body, terminal_event))
+}
+
+async fn stream_ws_events(
+    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    idle_timeout_ms: u64,
+    pool_key: Option<&str>,
+    traffic: Option<Arc<TrafficCapture>>,
+    tx: mpsc::Sender<Result<serde_json::Value, CodexError>>,
+) {
+    let started_at = Instant::now();
+    let mut sse_body: Vec<u8> = Vec::new();
+    let response_event_budget = Duration::from_millis(idle_timeout_ms);
+    let response_wait_started = Instant::now();
+    let mut last_response_event_at = response_wait_started;
+    let mut response_started = false;
+    let mut status = 200u16;
+
+    loop {
+        let response_deadline_started = if response_started {
+            last_response_event_at
+        } else {
+            response_wait_started
+        };
+        let read_timeout =
+            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => {
+                    if let Some(key) = pool_key {
+                        invalidate_codex_websocket_pool_key(key);
+                    }
+                    let err = if response_started {
+                        CodexError {
+                            status: 0,
+                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
+                            detail: None,
+                            retry_after: None,
+                            origin: CodexErrorOrigin::WebSocket,
+                        }
+                    } else {
+                        response_start_timeout_error(idle_timeout_ms)
+                    };
+                    let _ = tx.send(Err(err)).await;
+                    break;
+                }
+            };
+
+        let frame = match tokio::time::timeout(read_timeout, ws.next()).await {
+            Ok(frame) => frame,
+            Err(_) => {
+                if let Some(key) = pool_key {
+                    invalidate_codex_websocket_pool_key(key);
+                }
+                let err = if response_started {
+                    CodexError {
+                        status: 0,
+                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    }
+                } else {
+                    response_start_timeout_error(idle_timeout_ms)
+                };
+                let _ = tx.send(Err(err)).await;
+                break;
+            }
+        };
+
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let parsed: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        if let Some(tc) = traffic.as_deref() {
+                            tc.write_json_event(
+                                "040-upstream-event",
+                                &serde_json::json!({
+                                    "unparseable": true,
+                                    "data": text,
+                                }),
+                            );
+                        }
+                        sse_body.extend_from_slice(&encode_sse(&text));
+                        continue;
+                    }
+                };
+
+                sse_body.extend_from_slice(&encode_sse(&text));
+                if let Some(tc) = traffic.as_deref() {
+                    tc.write_json_event("040-upstream-event", &parsed);
+                }
+
+                if is_response_event(&parsed) {
+                    response_started = true;
+                    last_response_event_at = Instant::now();
+                }
+
+                if parsed.get("type").and_then(|v| v.as_str()) == Some("error") {
+                    status = extract_status_from_error(&parsed).unwrap_or(500);
+                }
+                let terminal = is_terminal_event(&parsed);
+                if tx.send(Ok(parsed)).await.is_err() {
+                    break;
+                }
+                if terminal {
+                    break;
+                }
+            }
+            Some(Ok(Message::Binary(_))) => {
+                if let Some(key) = pool_key {
+                    invalidate_codex_websocket_pool_key(key);
+                }
+                let _ = tx
+                    .send(Err(CodexError {
+                        status: 0,
+                        message: "WebSocket binary frames not supported".to_string(),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    }))
+                    .await;
+                break;
+            }
+            Some(Ok(Message::Ping(data))) => {
+                let _ = ws.send(Message::Pong(data)).await;
+            }
+            Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+            Some(Ok(Message::Close(_))) | None => {
+                if let Some(key) = pool_key {
+                    invalidate_codex_websocket_pool_key(key);
+                }
+                let _ = tx.send(Err(missing_terminal_error())).await;
+                break;
+            }
+            Some(Err(e)) => {
+                if let Some(key) = pool_key {
+                    invalidate_codex_websocket_pool_key(key);
+                }
+                let _ = tx
+                    .send(Err(CodexError {
+                        status: 0,
+                        message: format!("WebSocket stream error: {e}"),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    }))
+                    .await;
+                break;
+            }
+        }
+    }
+
+    if let Some(tc) = traffic.as_deref() {
+        write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
+    }
 }
 
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {

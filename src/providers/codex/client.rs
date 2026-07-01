@@ -472,6 +472,45 @@ impl CodexHttpClient {
         })
     }
 
+    pub async fn stream_codex_websocket_events(
+        &self,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+    ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
+        let auth = self.auth_manager.get_auth().map_err(|e| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(e.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
+
+        let pool_key = websocket_pool_key(ctx, continuation);
+        if should_reset_websocket_pool(continuation)
+            && let Some(key) = pool_key
+        {
+            super::websocket::invalidate_codex_websocket_pool_key(key);
+        }
+
+        let ws_headers = build_codex_headers(&auth, ctx)?;
+        let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
+        let ws_body = build_websocket_request(body, continuation);
+
+        super::websocket::codex_websocket_event_stream(
+            &self.base_url,
+            &ws_headers,
+            &ws_body,
+            ctx,
+            ctx.traffic.clone(),
+            pool_key,
+            super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
+            super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+            continuation,
+        )
+        .await
+    }
+
     async fn attempt_post_http(
         &self,
         auth: &StoredAuth,

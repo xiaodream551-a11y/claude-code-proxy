@@ -8,9 +8,11 @@ use claude_code_proxy::providers::codex::continuation::clear_all_continuations_f
 use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_proxy::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
+use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -203,6 +205,39 @@ async fn spawn_websocket_upstream(captured: Arc<Mutex<Option<Value>>>) -> String
 
             for event in &events {
                 let _ = sender.send(Message::Text(event.to_string())).await;
+            }
+        }
+    });
+
+    addr_str
+}
+
+async fn spawn_websocket_delayed_terminal_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let _ = ws.next().await;
+            let early_events = [
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":"early chunk"}"#,
+            ];
+            for event in &early_events {
+                let _ = ws.send(Message::Text(event.to_string())).await;
+            }
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let terminal_events = [
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+                r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#,
+            ];
+            for event in &terminal_events {
+                let _ = ws.send(Message::Text(event.to_string())).await;
             }
         }
     });
@@ -611,6 +646,56 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
     assert_eq!(sent["type"], "response.create");
     assert_eq!(sent["model"], "gpt-5.5");
     assert!(sent.get("stream").is_none());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+
+    let upstream = spawn_websocket_delayed_terminal_upstream().await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = tokio::time::timeout(
+        Duration::from_millis(500),
+        call_messages_body(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        })),
+    )
+    .await
+    .expect("streaming response should start before terminal upstream event");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body = response.into_body();
+    let mut collected = Vec::new();
+    let read = tokio::time::timeout(Duration::from_millis(500), async {
+        while !String::from_utf8_lossy(&collected).contains("text_delta") {
+            let Some(frame) = body.frame().await else {
+                break;
+            };
+            let frame = frame.unwrap();
+            if let Ok(data) = frame.into_data() {
+                collected.extend_from_slice(&data);
+            }
+        }
+    })
+    .await;
+    assert!(read.is_ok(), "stream did not yield an early text delta");
+    let text = String::from_utf8_lossy(&collected);
+    assert!(text.contains("early chunk"), "stream body: {text}");
+    assert!(
+        !text.contains("message_stop"),
+        "stream finished too early: {text}"
+    );
 }
 
 #[allow(clippy::await_holding_lock)]

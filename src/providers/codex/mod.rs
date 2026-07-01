@@ -8,12 +8,15 @@ pub mod websocket;
 
 use async_trait::async_trait;
 use axum::Json;
+use axum::body::Body;
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use http::StatusCode;
 use std::sync::Arc;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
+use crate::anthropic::sse::encode_sse_event;
 use crate::config;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
@@ -27,6 +30,7 @@ use self::client::CodexHttpClient;
 use self::continuation::{clear_continuation, continuation_candidate, record_continuation};
 use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
+use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{assert_allowed_model, resolve_model_request};
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{TranslateOptions, translate_request};
@@ -121,6 +125,20 @@ impl Provider for CodexProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
+        if want_stream && matches!(config::codex_transport(), config::CodexTransport::WebSocket) {
+            let upstream_events = match client
+                .stream_codex_websocket_events(&translated, &ctx, Some(&continuation))
+                .await
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    clear_continuation(ctx.session_id.as_deref());
+                    return map_codex_error_to_response(&e);
+                }
+            };
+            return live_stream_response(upstream_events, message_id, model, ctx, translated);
+        }
+
         let upstream = match client
             .post_codex(&translated, &ctx, Some(&continuation))
             .await
@@ -256,6 +274,103 @@ fn count_sse_events(bytes: &[u8]) -> u64 {
     String::from_utf8_lossy(bytes).matches("event:").count() as u64
 }
 
+fn live_stream_response(
+    mut upstream_events: websocket::CodexWebSocketEventReceiver,
+    message_id: String,
+    model: &str,
+    ctx: RequestContext,
+    request_body: translate::request::ResponsesRequest,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let req_id = ctx.req_id.clone();
+    let session_id = ctx.session_id.clone();
+    let traffic = ctx.traffic.clone();
+    let monitor = ctx.monitor.clone();
+    let model = model.to_string();
+
+    tokio::spawn(async move {
+        let mut translator = LiveStreamTranslator::new(message_id, model);
+        let mut upstream_body = Vec::new();
+
+        while let Some(item) = upstream_events.recv().await {
+            match item {
+                Ok(payload) => {
+                    upstream_body.extend_from_slice(&encode_sse_event(None, &payload.to_string()));
+                    let terminal = is_codex_terminal_event(&payload);
+                    let chunk = match translator.accept(&payload, traffic.as_deref()) {
+                        Ok(chunk) => chunk,
+                        Err(message) => {
+                            clear_continuation(session_id.as_deref());
+                            let _ = tx.send(Err(stream_error(message))).await;
+                            return;
+                        }
+                    };
+                    if !chunk.is_empty() {
+                        if let Some(monitor) = monitor.as_ref() {
+                            monitor.stream_progress(
+                                &req_id,
+                                chunk.len() as u64,
+                                count_sse_events(&chunk),
+                                None,
+                                None,
+                            );
+                        }
+                        if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
+                            return;
+                        }
+                    }
+                    if terminal {
+                        update_continuation_from_upstream(
+                            session_id.as_deref(),
+                            &request_body,
+                            &upstream_body,
+                        );
+                        return;
+                    }
+                }
+                Err(err) => {
+                    clear_continuation(session_id.as_deref());
+                    let _ = tx.send(Err(stream_error(codex_error_message(&err)))).await;
+                    return;
+                }
+            }
+        }
+
+        clear_continuation(session_id.as_deref());
+        let _ = tx
+            .send(Err(stream_error(
+                "WebSocket connection closed before terminal Codex response event",
+            )))
+            .await;
+    });
+
+    let stream = futures_util::stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let headers = [
+        (http::header::CONTENT_TYPE, "text/event-stream"),
+        (http::header::CACHE_CONTROL, "no-cache"),
+        (http::header::CONNECTION, "keep-alive"),
+    ];
+    (headers, Body::from_stream(stream)).into_response()
+}
+
+fn stream_error(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::other(message.into())
+}
+
+fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload.get("type").and_then(|v| v.as_str()),
+        Some("response.completed")
+            | Some("response.incomplete")
+            | Some("response.done")
+            | Some("response.failed")
+            | Some("response.error")
+            | Some("error")
+    )
+}
+
 fn update_continuation_from_upstream(
     session_id: Option<&str>,
     request_body: &translate::request::ResponsesRequest,
@@ -304,7 +419,7 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
 }
 
 fn codex_error_message(err: &client::CodexError) -> &str {
-    err.detail.as_deref().unwrap_or_else(|| {
+    err.detail.as_deref().unwrap_or({
         if err.status == 0 {
             err.message.as_str()
         } else {

@@ -1,4 +1,5 @@
 pub mod accumulate;
+pub mod live_stream;
 pub mod model_allowlist;
 pub mod reducer;
 pub mod request;
