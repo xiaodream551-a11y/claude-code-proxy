@@ -7,6 +7,9 @@ use super::reducer::{
     CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
 };
 
+const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
+const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
+
 enum LiveBlock {
     Text {
         index: usize,
@@ -63,7 +66,17 @@ impl LiveStreamTranslator {
         let mut out = Vec::new();
 
         match kind {
-            "codex.rate_limits" | "keepalive" => {}
+            "codex.rate_limits" => {
+                if payload
+                    .get("rate_limits")
+                    .and_then(|r| r.get("limit_reached"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                {
+                    return Err("rate limit reached".to_string());
+                }
+            }
+            "keepalive" => {}
             "response.failed" | "response.error" | "error" => {
                 return Err(error_message(payload));
             }
@@ -94,7 +107,7 @@ impl LiveStreamTranslator {
                 self.text_delta(payload, traffic, &mut out);
             }
             "response.function_call_arguments.delta" => {
-                self.tool_delta(payload, traffic, &mut out);
+                self.tool_delta(payload, traffic, &mut out)?;
             }
             "response.function_call_arguments.done" => {
                 self.tool_arguments_done(payload);
@@ -109,6 +122,52 @@ impl LiveStreamTranslator {
         }
 
         Ok(out)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn finish_after_closed_completed_tool_call(
+        &mut self,
+        traffic: Option<&TrafficCapture>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.finished || !self.saw_tool_use || !self.blocks_by_output_index.is_empty() {
+            return out;
+        }
+        self.close_thinking(traffic, &mut out);
+        self.ensure_message_start(traffic, &mut out);
+        self.emit_finish(STOP_TOOL_USE, None, traffic, &mut out);
+        out
+    }
+
+    pub fn error_chunk(
+        &mut self,
+        message: &str,
+        error_type: &str,
+        traffic: Option<&TrafficCapture>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.finished {
+            return out;
+        }
+        self.close_open_blocks(traffic, &mut out);
+        self.ensure_message_start(traffic, &mut out);
+        self.emit(
+            traffic,
+            &mut out,
+            "error",
+            &serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "message": message,
+                }
+            }),
+        );
+        self.finished = true;
+        out
     }
 
     fn ensure_message_start(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
@@ -345,20 +404,22 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), String> {
         let Some(output_index) = payload
             .get("output_index")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
         else {
-            return;
+            return Ok(());
         };
         let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
         if delta.is_empty() {
-            return;
+            return Ok(());
         }
+        let mut repaired_read: Option<(usize, String)> = None;
         let Some(LiveBlock::Tool {
             index,
+            name,
             args_accum,
             had_delta,
             buffer_until_done,
@@ -366,28 +427,67 @@ impl LiveStreamTranslator {
             ..
         }) = self.blocks_by_output_index.get_mut(&output_index)
         else {
-            return;
+            return Ok(());
         };
         args_accum.push_str(delta);
         *had_delta = true;
         if *buffer_until_done {
-            return;
+            if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
+                return Err(format!(
+                    "Buffered {name} tool arguments exceeded safe limits"
+                ));
+            }
+            if let Some(repaired) = repair_whitespace_stalled_read_args(name, args_accum) {
+                *args_accum = repaired.clone();
+                *emitted_args = true;
+                repaired_read = Some((*index, repaired));
+            }
+        } else {
+            *emitted_args = true;
+            let index = *index;
+            self.emit(
+                traffic,
+                out,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": delta
+                    }
+                }),
+            );
+            return Ok(());
         }
-        *emitted_args = true;
-        let index = *index;
-        self.emit(
-            traffic,
-            out,
-            "content_block_delta",
-            &serde_json::json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": delta
-                }
-            }),
-        );
+        if let Some((index, repaired)) = repaired_read {
+            self.blocks_by_output_index.remove(&output_index);
+            self.emit(
+                traffic,
+                out,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": repaired
+                    }
+                }),
+            );
+            self.emit(
+                traffic,
+                out,
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index,
+                }),
+            );
+            self.ensure_message_start(traffic, out);
+            self.emit_finish(STOP_TOOL_USE, None, traffic, out);
+        }
+        Ok(())
     }
 
     fn tool_arguments_done(&mut self, payload: &serde_json::Value) {
@@ -501,25 +601,7 @@ impl LiveStreamTranslator {
         out: &mut Vec<u8>,
     ) {
         self.close_thinking(traffic, out);
-        let open: Vec<usize> = self.blocks_by_output_index.keys().copied().collect();
-        for output_index in open {
-            let Some(state) = self.blocks_by_output_index.remove(&output_index) else {
-                continue;
-            };
-            let index = match state {
-                LiveBlock::Text { index } => index,
-                LiveBlock::Tool { index, .. } => index,
-            };
-            self.emit(
-                traffic,
-                out,
-                "content_block_stop",
-                &serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": index,
-                }),
-            );
-        }
+        self.close_open_blocks(traffic, out);
         self.ensure_message_start(traffic, out);
         let usage = payload.get("response").map(parse_codex_usage);
         let incomplete = response_is_incomplete(payload);
@@ -530,6 +612,16 @@ impl LiveStreamTranslator {
         } else {
             STOP_END_TURN
         };
+        self.emit_finish(stop_reason, usage, traffic, out);
+    }
+
+    fn emit_finish(
+        &mut self,
+        stop_reason: &str,
+        usage: Option<CodexUsage>,
+        traffic: Option<&TrafficCapture>,
+        out: &mut Vec<u8>,
+    ) {
         let mapped = map_codex_usage_to_anthropic(&usage, Some(self.web_search_requests));
         self.emit(
             traffic,
@@ -551,6 +643,29 @@ impl LiveStreamTranslator {
             &serde_json::json!({"type": "message_stop"}),
         );
         self.finished = true;
+    }
+
+    fn close_open_blocks(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
+        self.close_thinking(traffic, out);
+        let open: Vec<usize> = self.blocks_by_output_index.keys().copied().collect();
+        for output_index in open {
+            let Some(state) = self.blocks_by_output_index.remove(&output_index) else {
+                continue;
+            };
+            let index = match state {
+                LiveBlock::Text { index } => index,
+                LiveBlock::Tool { index, .. } => index,
+            };
+            self.emit(
+                traffic,
+                out,
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index,
+                }),
+            );
+        }
     }
 
     fn close_thinking(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
@@ -632,6 +747,69 @@ fn sanitize_tool_args(name: &str, args: &str) -> String {
     let mut sanitized = obj.clone();
     sanitized.remove("pages");
     serde_json::to_string(&sanitized).unwrap_or_else(|_| args.to_string())
+}
+
+fn repair_whitespace_stalled_read_args(name: &str, args: &str) -> Option<String> {
+    if name != "Read" {
+        return None;
+    }
+    let trimmed = args.trim_end();
+    let trailing_whitespace = args.len().saturating_sub(trimmed.len());
+    if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
+        return None;
+    }
+    parse_read_args_candidate(trimmed).or_else(|| {
+        let with_brace = format!("{trimmed}}}");
+        parse_read_args_candidate(&with_brace)
+    })
+}
+
+fn parse_read_args_candidate(args: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
+    if !is_valid_read_args(&parsed) {
+        return None;
+    }
+    Some(sanitize_tool_args(
+        "Read",
+        &serde_json::to_string(&parsed).ok()?,
+    ))
+}
+
+fn is_valid_read_args(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "file_path" | "offset" | "limit" | "pages") {
+            return false;
+        }
+    }
+    let Some(file_path) = obj.get("file_path").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if file_path.is_empty() {
+        return false;
+    }
+    if let Some(offset) = obj.get("offset").and_then(|v| v.as_i64())
+        && offset < 0
+    {
+        return false;
+    }
+    if let Some(limit) = obj.get("limit").and_then(|v| v.as_i64())
+        && limit <= 0
+    {
+        return false;
+    }
+    if obj.get("offset").is_some_and(|v| !v.is_i64()) {
+        return false;
+    }
+    if obj.get("limit").is_some_and(|v| !v.is_i64()) {
+        return false;
+    }
+    if obj.get("pages").is_some_and(|v| !v.is_string()) {
+        return false;
+    }
+    true
 }
 
 fn error_message(payload: &serde_json::Value) -> String {
@@ -756,5 +934,92 @@ mod tests {
         assert!(out.contains("input_json_delta"));
         assert!(out.contains("/tmp/a"));
         assert!(!out.contains("pages"));
+    }
+
+    #[test]
+    fn repairs_whitespace_stalled_read_args_as_tool_use_finish() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let mut out = Vec::new();
+        out.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {"type":"function_call","call_id":"call_1","name":"Read"}
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
+        out.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.function_call_arguments.delta",
+                        "output_index": 0,
+                        "delta": format!("{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}", " ".repeat(1024))
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#));
+        assert!(rendered.contains(r#""stop_reason":"tool_use""#));
+        assert!(rendered.contains("message_stop"));
+        assert!(translator.is_finished());
+    }
+
+    #[test]
+    fn finishes_after_closed_completed_tool_call() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let mut out = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"function_call","call_id":"call_1","name":"WebSearch"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{\"query\":\"claude-code-proxy github\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type":"function_call",
+                    "call_id":"call_1",
+                    "name":"WebSearch",
+                    "arguments":"{\"query\":\"claude-code-proxy github\"}"
+                }
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+        out.extend(translator.finish_after_closed_completed_tool_call(None));
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("content_block_start"));
+        assert!(rendered.contains("input_json_delta"));
+        assert!(rendered.contains(r#""stop_reason":"tool_use""#));
+        assert!(rendered.contains("message_stop"));
+        assert!(!rendered.contains("event: error"));
+    }
+
+    #[test]
+    fn rate_limit_event_returns_error() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        let err = translator
+            .accept(
+                &json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {"limit_reached": true}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err, "rate limit reached");
     }
 }

@@ -24,7 +24,7 @@ use super::continuation::ContinuationCandidate;
 
 pub const WEBSOCKET_PROTOCOL_HEADER: &str = "responses_websockets=2026-02-06";
 pub const WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
-pub const WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 60_000;
+pub const WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL: &str = "websocket_response_start_timeout";
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;

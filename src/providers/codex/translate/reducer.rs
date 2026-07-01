@@ -59,6 +59,9 @@ pub const TERM_COMPLETED: &str = "response.completed";
 pub const TERM_INCOMPLETE: &str = "response.incomplete";
 pub const TERM_DONE: &str = "response.done";
 
+const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
+const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
+
 #[derive(Debug, Clone)]
 pub enum ReducerEvent {
     ThinkingStart {
@@ -453,49 +456,69 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 Some(s) => s,
                 None => continue,
             };
+            let mut repaired_read: Option<(usize, String)> = None;
             match state {
                 BlockState::Tool {
                     args_accum,
                     had_delta,
                     buffer_until_done,
                     emitted_args,
-                    name: _,
+                    name,
+                    index,
                     ..
                 } => {
                     args_accum.push_str(delta);
                     *had_delta = true;
+                    if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
+                        return Err(UpstreamStreamError {
+                            kind: UpstreamErrorKind::Failed,
+                            message: format!("Buffered {name} tool arguments exceeded safe limits"),
+                            retry_after_seconds: None,
+                            diagnostics: None,
+                        });
+                    }
 
-                    // Handle buffered Read tool args
                     if *buffer_until_done {
-                        // Only emit progress, not delta
-                        if let Some(idx) =
-                            blocks_by_output_index
-                                .get(&output_index)
-                                .and_then(|s| match s {
-                                    BlockState::Tool { index, .. } => Some(*index),
-                                    _ => None,
-                                })
+                        if let Some(repaired) =
+                            repair_whitespace_stalled_read_args(name, args_accum)
                         {
-                            out.push(ReducerEvent::ToolProgress { index: idx });
+                            *args_accum = repaired.clone();
+                            *emitted_args = true;
+                            repaired_read = Some((*index, repaired));
+                        } else {
+                            out.push(ReducerEvent::ToolProgress { index: *index });
                         }
                     } else {
                         *emitted_args = true;
-                        if let Some(idx) =
-                            blocks_by_output_index
-                                .get(&output_index)
-                                .and_then(|s| match s {
-                                    BlockState::Tool { index, .. } => Some(*index),
-                                    _ => None,
-                                })
-                        {
-                            out.push(ReducerEvent::ToolDelta {
-                                index: idx,
-                                partial_json: delta.to_string(),
-                            });
-                        }
+                        out.push(ReducerEvent::ToolDelta {
+                            index: *index,
+                            partial_json: delta.to_string(),
+                        });
                     }
                 }
                 _ => continue,
+            }
+            if let Some((index, repaired)) = repaired_read {
+                if let Some(state) = blocks_by_output_index.remove(&output_index) {
+                    capture_output_item(output_index, &state, &mut output_items_by_index);
+                }
+                out.push(ReducerEvent::ToolDelta {
+                    index,
+                    partial_json: repaired,
+                });
+                out.push(ReducerEvent::ToolStop { index });
+                let output_items: Vec<ResponsesInputItem> =
+                    output_items_by_index.into_values().collect();
+                out.push(ReducerEvent::Finish {
+                    stop_reason: STOP_TOOL_USE,
+                    terminal_type: TERM_INCOMPLETE.to_string(),
+                    continuation_eligible: false,
+                    usage: None,
+                    web_search_requests,
+                    response_id: None,
+                    output_items,
+                });
+                return Ok(out);
             }
             continue;
         }
@@ -766,6 +789,69 @@ fn sanitize_tool_args(name: &str, args: &str) -> String {
     let mut sanitized = obj.clone();
     sanitized.remove("pages");
     serde_json::to_string(&sanitized).unwrap_or_else(|_| args.to_string())
+}
+
+fn repair_whitespace_stalled_read_args(name: &str, args: &str) -> Option<String> {
+    if name != "Read" {
+        return None;
+    }
+    let trimmed = args.trim_end();
+    let trailing_whitespace = args.len().saturating_sub(trimmed.len());
+    if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
+        return None;
+    }
+    parse_read_args_candidate(trimmed).or_else(|| {
+        let with_brace = format!("{trimmed}}}");
+        parse_read_args_candidate(&with_brace)
+    })
+}
+
+fn parse_read_args_candidate(args: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
+    if !is_valid_read_args(&parsed) {
+        return None;
+    }
+    Some(sanitize_tool_args(
+        "Read",
+        &serde_json::to_string(&parsed).ok()?,
+    ))
+}
+
+fn is_valid_read_args(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "file_path" | "offset" | "limit" | "pages") {
+            return false;
+        }
+    }
+    let Some(file_path) = obj.get("file_path").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if file_path.is_empty() {
+        return false;
+    }
+    if let Some(offset) = obj.get("offset").and_then(|v| v.as_i64())
+        && offset < 0
+    {
+        return false;
+    }
+    if let Some(limit) = obj.get("limit").and_then(|v| v.as_i64())
+        && limit <= 0
+    {
+        return false;
+    }
+    if obj.get("offset").is_some_and(|v| !v.is_i64()) {
+        return false;
+    }
+    if obj.get("limit").is_some_and(|v| !v.is_i64()) {
+        return false;
+    }
+    if obj.get("pages").is_some_and(|v| !v.is_string()) {
+        return false;
+    }
+    true
 }
 
 fn web_search_query(item: &serde_json::Value) -> String {
@@ -1039,6 +1125,47 @@ mod tests {
         let result = reduce_upstream_bytes(upstream.as_bytes());
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind, UpstreamErrorKind::RateLimit);
+    }
+
+    #[test]
+    fn reduce_repairs_whitespace_stalled_read_args() {
+        let upstream = format!(
+            "{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                })
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({
+                    "output_index":0,
+                    "delta": format!("{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}", " ".repeat(1024))
+                })
+            )
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert!(out.iter().any(|event| {
+            matches!(
+                event,
+                ReducerEvent::ToolDelta { partial_json, .. }
+                    if partial_json == "{\"file_path\":\"/tmp/a\"}"
+            )
+        }));
+        let last = out.last().unwrap();
+        if let ReducerEvent::Finish {
+            stop_reason,
+            continuation_eligible,
+            ..
+        } = last
+        {
+            assert_eq!(*stop_reason, "tool_use");
+            assert!(!continuation_eligible);
+        } else {
+            panic!("expected Finish");
+        }
     }
 
     #[test]

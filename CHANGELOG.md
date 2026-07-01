@@ -17,6 +17,11 @@
 - Codex WebSocket streaming responses report completed turns as `end_turn`
   when the gateway sends `incomplete_details: null`, preventing false output
   limit recovery loops in Claude Code.
+- Codex WebSocket live streaming matches the TypeScript fallback behavior for
+  retryable startup failures, completed tool-call disconnects, SSE error
+  framing, buffered `Read` argument repair, and longer quiet upstream turns.
+- Codex tool result translation preserves omitted-block markers for malformed
+  text and image result content, keeping unsupported tool output visible.
 
 ## v0.1.2 (2026-06-30)
 

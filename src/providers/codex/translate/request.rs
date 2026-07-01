@@ -599,28 +599,58 @@ fn tool_result_to_string(content: &Value) -> String {
             let mut parts = Vec::new();
             for b in arr {
                 match b.get("type").and_then(|v| v.as_str()) {
-                    Some("text") => {
-                        let text = b.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        parts.push(text.to_string());
-                    }
+                    Some("text") => match b.get("text").and_then(|v| v.as_str()) {
+                        Some(text) => parts.push(text.to_string()),
+                        None => parts.push(unsupported_tool_result_block_to_string(b)),
+                    },
                     Some("image") => {
-                        let source = b.get("source");
-                        let media_type = source
-                            .and_then(|s| s.get("media_type"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("image");
-                        parts.push(format!("[image omitted: {media_type}]"));
+                        if let Some(source) = b.get("source").and_then(|v| v.as_object()) {
+                            match source.get("type").and_then(|v| v.as_str()) {
+                                Some("url")
+                                    if source.get("url").and_then(|v| v.as_str()).is_some() =>
+                                {
+                                    parts.push("[image omitted: url]".to_string());
+                                }
+                                Some("base64")
+                                    if source
+                                        .get("media_type")
+                                        .and_then(|v| v.as_str())
+                                        .is_some()
+                                        && source
+                                            .get("data")
+                                            .and_then(|v| v.as_str())
+                                            .is_some() =>
+                                {
+                                    let media_type = source
+                                        .get("media_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("image");
+                                    parts.push(format!("[image omitted: {media_type}]"));
+                                }
+                                _ => parts.push(unsupported_tool_result_block_to_string(b)),
+                            }
+                        } else {
+                            parts.push(unsupported_tool_result_block_to_string(b));
+                        }
                     }
                     Some(other) => {
                         parts.push(format!("[unsupported content block omitted: {other}]"));
                     }
-                    None => {}
+                    None => parts.push(unsupported_tool_result_block_to_string(b)),
                 }
             }
             parts.join("\n")
         }
         _ => String::new(),
     }
+}
+
+fn unsupported_tool_result_block_to_string(block: &Value) -> String {
+    let kind = block
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    format!("[unsupported content block omitted: {kind}]")
 }
 
 #[cfg(test)]
@@ -806,6 +836,22 @@ mod tests {
         } else {
             panic!("expected FunctionCallOutput");
         }
+    }
+
+    #[test]
+    fn tool_result_stringifies_images_and_malformed_blocks() {
+        let rendered = tool_result_to_string(&json!([
+            {"type": "text", "text": "caption"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
+            {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}},
+            {"type": "text"},
+            {"type": "image"},
+            {}
+        ]));
+        assert_eq!(
+            rendered,
+            "caption\n[image omitted: image/png]\n[image omitted: url]\n[unsupported content block omitted: text]\n[unsupported content block omitted: image]\n[unsupported content block omitted: unknown]"
+        );
     }
 
     #[test]

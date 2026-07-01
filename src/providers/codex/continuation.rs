@@ -20,6 +20,7 @@ struct ContinuationState {
 static STATES: Mutex<Option<HashMap<String, ContinuationState>>> = Mutex::new(None);
 static TOTAL_TRANSCRIPT_BYTES: Mutex<u64> = Mutex::new(0);
 
+#[derive(Clone)]
 pub struct ContinuationCandidate {
     pub previous_response_id: Option<String>,
     pub input_delta: Option<Vec<ResponsesInputItem>>,
