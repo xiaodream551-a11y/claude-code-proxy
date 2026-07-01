@@ -826,6 +826,7 @@ fn is_continuation_retry_error(err: &CodexError) -> bool {
         err.detail.as_deref(),
         Some("previous_response_not_found")
             | Some(super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
+            | Some(super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL)
     )
 }
 

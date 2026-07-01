@@ -26,6 +26,7 @@ pub const WEBSOCKET_PROTOCOL_HEADER: &str = "responses_websockets=2026-02-06";
 pub const WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
 pub const WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL: &str = "websocket_response_start_timeout";
+pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal";
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_POOL_ENTRIES: usize = 10_000;
@@ -558,7 +559,7 @@ fn missing_terminal_error() -> CodexError {
     CodexError {
         status: 0,
         message: "WebSocket connection closed before terminal Codex response event".to_string(),
-        detail: None,
+        detail: Some(WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
         retry_after: None,
         origin: CodexErrorOrigin::WebSocket,
     }

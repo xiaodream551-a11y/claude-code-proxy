@@ -282,6 +282,7 @@ enum LiveStreamStart {
     Retry {
         message: String,
         retry_after: Option<String>,
+        full_context: bool,
     },
 }
 
@@ -295,14 +296,21 @@ async fn live_stream_response(
 ) -> Response {
     let model = model.to_string();
     let mut attempt = 0_u32;
+    let mut continuation = Some(continuation);
 
     loop {
         let upstream_events = match client
-            .stream_codex_websocket_events(&request_body, &ctx, Some(&continuation))
+            .stream_codex_websocket_events(&request_body, &ctx, continuation.as_ref())
             .await
         {
             Ok(events) => events,
             Err(err) if retryable_live_start_codex_error(&err) => {
+                if retry_with_full_context_for_live_error(&err)
+                    && drop_live_continuation_for_retry(&mut continuation, &ctx)
+                {
+                    attempt += 1;
+                    continue;
+                }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
                     clear_continuation(ctx.session_id.as_deref());
                     return map_codex_error_to_response(&err);
@@ -335,7 +343,12 @@ async fn live_stream_response(
             LiveStreamStart::Retry {
                 message,
                 retry_after,
+                full_context,
             } => {
+                if full_context && drop_live_continuation_for_retry(&mut continuation, &ctx) {
+                    attempt += 1;
+                    continue;
+                }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
                     clear_continuation(ctx.session_id.as_deref());
                     return json_error(StatusCode::BAD_GATEWAY, "api_error", message);
@@ -367,9 +380,11 @@ async fn live_stream_response_once(
             Ok(payload) => payload,
             Err(err) => {
                 if retryable_live_start_codex_error(&err) {
+                    let full_context = retry_with_full_context_for_live_error(&err);
                     return LiveStreamStart::Retry {
                         message: codex_error_message(&err).to_string(),
                         retry_after: err.retry_after,
+                        full_context,
                     };
                 }
                 clear_continuation(ctx.session_id.as_deref());
@@ -385,6 +400,7 @@ async fn live_stream_response_once(
                     return LiveStreamStart::Retry {
                         message,
                         retry_after: retry_after_from_live_payload(&payload),
+                        full_context: false,
                     };
                 }
                 clear_continuation(ctx.session_id.as_deref());
@@ -427,6 +443,7 @@ async fn live_stream_response_once(
     LiveStreamStart::Retry {
         message: "WebSocket connection closed before terminal Codex response event".to_string(),
         retry_after: None,
+        full_context: true,
     }
 }
 
@@ -598,6 +615,32 @@ fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
     matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
         || (err.status == 0 && retryable_live_message(codex_error_message(err)))
+}
+
+fn retry_with_full_context_for_live_error(err: &client::CodexError) -> bool {
+    matches!(
+        err.detail.as_deref(),
+        Some("previous_response_not_found")
+            | Some(websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
+            | Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL)
+    )
+}
+
+fn drop_live_continuation_for_retry(
+    continuation: &mut Option<ContinuationCandidate>,
+    ctx: &RequestContext,
+) -> bool {
+    if continuation
+        .as_ref()
+        .and_then(|candidate| candidate.previous_response_id.as_deref())
+        .is_none()
+    {
+        return false;
+    }
+
+    clear_continuation(ctx.session_id.as_deref());
+    *continuation = None;
+    true
 }
 
 fn retryable_live_start_payload(payload: &serde_json::Value, message: &str) -> bool {

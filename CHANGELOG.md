@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Codex WebSocket streams retry continued turns with full context when a pooled
+  upstream socket closes before any terminal response event.
+
 ## v0.1.3 (2026-07-01)
 
 - Codex WebSocket streams deliver live text and reasoning progress while reusing
