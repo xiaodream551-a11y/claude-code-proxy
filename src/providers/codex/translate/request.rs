@@ -9,6 +9,8 @@ use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, read_effort,
 };
 
+use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -566,6 +568,8 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                             } else {
                                 body
                             };
+                            let output =
+                                maybe_append_rewritten_read_offset_note(output, tool_use_id);
                             let output = maybe_append_read_offset_guidance(
                                 output,
                                 read_tool_uses_with_offset.contains(tool_use_id),
@@ -647,6 +651,32 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
 
 fn is_read_tool_use_with_offset(name: &str, input: &Value) -> bool {
     name == "Read" && input.get("offset").is_some()
+}
+
+fn maybe_append_rewritten_read_offset_note(output: String, tool_use_id: &str) -> String {
+    if output.contains("Proxy Read offset note:") {
+        return output;
+    }
+    let Some(rewrite) = read_offset_rewrite(tool_use_id) else {
+        return output;
+    };
+    format!("{output}\n\n{}", read_offset_rewrite_note(&rewrite))
+}
+
+fn read_offset_rewrite_note(rewrite: &ReadOffsetRewrite) -> String {
+    let file = rewrite
+        .file_path
+        .as_deref()
+        .map(|path| format!(" for {path}"))
+        .unwrap_or_default();
+    format!(
+        "Proxy Read offset note:\n\
+         - Requested Read offset {}{} exceeds the proxy rewrite threshold of 1000000.\n\
+         - This Read starts at the beginning of the file.\n\
+         - For continuation reads, use offset after a prior Read of the same file returned content and more lines are needed.\n\
+         - Compute offset as prior offset plus the number of lines returned by that prior Read.",
+        rewrite.offset, file
+    )
 }
 
 fn maybe_append_read_offset_guidance(
@@ -1096,6 +1126,42 @@ mod tests {
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
             assert_eq!(output, "[tool execution error]\nFile does not exist.");
+        } else {
+            panic!("expected FunctionCallOutput");
+        }
+    }
+
+    #[test]
+    fn translate_rewritten_read_result_adds_proxy_note() {
+        crate::providers::codex::translate::read_rewrite::sanitize_read_args(
+            "Read",
+            r#"{"file_path":"/tmp/a","offset":1300000,"limit":20}"#,
+            Some("tu_rewritten_read"),
+        );
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role":"assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "tu_rewritten_read",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/a", "limit": 20}
+                }]},
+                {"role":"user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu_rewritten_read",
+                    "content": [{"type":"text", "text":"1\tcontent"}]
+                }]}
+            ]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert_eq!(out.input.len(), 2);
+        if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
+            assert!(output.contains("1\tcontent"));
+            assert!(output.contains("Proxy Read offset note:"));
+            assert!(output.contains("1300000"));
+            assert!(output.contains("/tmp/a"));
         } else {
             panic!("expected FunctionCallOutput");
         }

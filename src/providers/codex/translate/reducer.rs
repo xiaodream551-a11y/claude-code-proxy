@@ -1,5 +1,6 @@
 use crate::anthropic::sse::parse_sse_events;
 
+use super::read_rewrite::sanitize_read_args;
 use super::request::ResponsesInputItem;
 
 #[derive(Debug, Clone)]
@@ -465,6 +466,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     emitted_args,
                     name,
                     index,
+                    call_id,
                     ..
                 } => {
                     args_accum.push_str(delta);
@@ -479,9 +481,11 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     }
 
                     if *buffer_until_done {
-                        if let Some(repaired) =
-                            repair_whitespace_stalled_read_args(name, args_accum)
-                        {
+                        if let Some(repaired) = repair_whitespace_stalled_read_args(
+                            name,
+                            args_accum,
+                            Some(call_id.as_str()),
+                        ) {
                             *args_accum = repaired.clone();
                             *emitted_args = true;
                             repaired_read = Some((*index, repaired));
@@ -581,6 +585,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 if let BlockState::Tool {
                     args_accum,
                     name,
+                    call_id,
                     buffer_until_done,
                     emitted_args,
                     had_delta,
@@ -603,7 +608,8 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     }
 
                     if !args_accum.is_empty() {
-                        let sanitized = sanitize_tool_args(name, args_accum);
+                        let sanitized =
+                            sanitize_read_args(name, args_accum, Some(call_id.as_str()));
                         *args_accum = sanitized;
                         if *buffer_until_done || !*emitted_args {
                             *emitted_args = true;
@@ -766,32 +772,11 @@ fn should_buffer_tool_args(name: &str) -> bool {
     name == "Read"
 }
 
-fn sanitize_tool_args(name: &str, args: &str) -> String {
-    if name != "Read" || args.is_empty() {
-        return args.to_string();
-    }
-    let parsed: serde_json::Value = match serde_json::from_str(args) {
-        Ok(v) => v,
-        Err(_) => return args.to_string(),
-    };
-    let obj = match parsed.as_object() {
-        Some(o) => o,
-        None => return args.to_string(),
-    };
-    // Remove empty "pages" field
-    let has_empty_pages = obj
-        .get("pages")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s.is_empty());
-    if !has_empty_pages {
-        return args.to_string();
-    }
-    let mut sanitized = obj.clone();
-    sanitized.remove("pages");
-    serde_json::to_string(&sanitized).unwrap_or_else(|_| args.to_string())
-}
-
-fn repair_whitespace_stalled_read_args(name: &str, args: &str) -> Option<String> {
+fn repair_whitespace_stalled_read_args(
+    name: &str,
+    args: &str,
+    call_id: Option<&str>,
+) -> Option<String> {
     if name != "Read" {
         return None;
     }
@@ -800,20 +785,21 @@ fn repair_whitespace_stalled_read_args(name: &str, args: &str) -> Option<String>
     if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
         return None;
     }
-    parse_read_args_candidate(trimmed).or_else(|| {
+    parse_read_args_candidate(trimmed, call_id).or_else(|| {
         let with_brace = format!("{trimmed}}}");
-        parse_read_args_candidate(&with_brace)
+        parse_read_args_candidate(&with_brace, call_id)
     })
 }
 
-fn parse_read_args_candidate(args: &str) -> Option<String> {
+fn parse_read_args_candidate(args: &str, call_id: Option<&str>) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
     if !is_valid_read_args(&parsed) {
         return None;
     }
-    Some(sanitize_tool_args(
+    Some(sanitize_read_args(
         "Read",
         &serde_json::to_string(&parsed).ok()?,
+        call_id,
     ))
 }
 
@@ -1371,7 +1357,7 @@ mod tests {
     #[test]
     fn sanitize_tool_args_removes_empty_pages() {
         let args = r#"{"file_path":"/tmp/a","pages":""}"#;
-        let sanitized = sanitize_tool_args("Read", args);
+        let sanitized = sanitize_read_args("Read", args, None);
         let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
         assert!(parsed.get("pages").is_none());
         assert_eq!(

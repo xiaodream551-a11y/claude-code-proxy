@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
 
+use super::read_rewrite::sanitize_read_args;
 use super::reducer::{
     CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
 };
@@ -16,6 +17,7 @@ enum LiveBlock {
     },
     Tool {
         index: usize,
+        call_id: String,
         name: String,
         args_accum: String,
         had_delta: bool,
@@ -271,6 +273,7 @@ impl LiveStreamTranslator {
                     output_index,
                     LiveBlock::Tool {
                         index,
+                        call_id: call_id.clone(),
                         name: name.clone(),
                         args_accum: String::new(),
                         had_delta: false,
@@ -419,6 +422,7 @@ impl LiveStreamTranslator {
         let mut repaired_read: Option<(usize, String)> = None;
         let Some(LiveBlock::Tool {
             index,
+            call_id,
             name,
             args_accum,
             had_delta,
@@ -437,7 +441,9 @@ impl LiveStreamTranslator {
                     "Buffered {name} tool arguments exceeded safe limits"
                 ));
             }
-            if let Some(repaired) = repair_whitespace_stalled_read_args(name, args_accum) {
+            if let Some(repaired) =
+                repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
+            {
                 *args_accum = repaired.clone();
                 *emitted_args = true;
                 repaired_read = Some((*index, repaired));
@@ -547,6 +553,7 @@ impl LiveStreamTranslator {
             LiveBlock::Tool {
                 index,
                 name,
+                call_id,
                 args_accum,
                 had_delta,
                 buffer_until_done,
@@ -563,7 +570,7 @@ impl LiveStreamTranslator {
                     *args_accum = final_args.to_string();
                 }
                 if !args_accum.is_empty() {
-                    *args_accum = sanitize_tool_args(name, args_accum);
+                    *args_accum = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
                     if *buffer_until_done || !*emitted_args {
                         *emitted_args = true;
                         self.emit(
@@ -725,31 +732,11 @@ fn response_is_incomplete(payload: &serde_json::Value) -> bool {
             .is_some()
 }
 
-fn sanitize_tool_args(name: &str, args: &str) -> String {
-    if name != "Read" || args.is_empty() {
-        return args.to_string();
-    }
-    let parsed: serde_json::Value = match serde_json::from_str(args) {
-        Ok(v) => v,
-        Err(_) => return args.to_string(),
-    };
-    let obj = match parsed.as_object() {
-        Some(o) => o,
-        None => return args.to_string(),
-    };
-    let has_empty_pages = obj
-        .get("pages")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s.is_empty());
-    if !has_empty_pages {
-        return args.to_string();
-    }
-    let mut sanitized = obj.clone();
-    sanitized.remove("pages");
-    serde_json::to_string(&sanitized).unwrap_or_else(|_| args.to_string())
-}
-
-fn repair_whitespace_stalled_read_args(name: &str, args: &str) -> Option<String> {
+fn repair_whitespace_stalled_read_args(
+    name: &str,
+    args: &str,
+    call_id: Option<&str>,
+) -> Option<String> {
     if name != "Read" {
         return None;
     }
@@ -758,20 +745,21 @@ fn repair_whitespace_stalled_read_args(name: &str, args: &str) -> Option<String>
     if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
         return None;
     }
-    parse_read_args_candidate(trimmed).or_else(|| {
+    parse_read_args_candidate(trimmed, call_id).or_else(|| {
         let with_brace = format!("{trimmed}}}");
-        parse_read_args_candidate(&with_brace)
+        parse_read_args_candidate(&with_brace, call_id)
     })
 }
 
-fn parse_read_args_candidate(args: &str) -> Option<String> {
+fn parse_read_args_candidate(args: &str, call_id: Option<&str>) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
     if !is_valid_read_args(&parsed) {
         return None;
     }
-    Some(sanitize_tool_args(
+    Some(sanitize_read_args(
         "Read",
         &serde_json::to_string(&parsed).ok()?,
+        call_id,
     ))
 }
 
