@@ -79,12 +79,14 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
     let image_parts = input_image_parts(&body.input);
 
     let input_type_counts = count_items_by(&body.input, |item| match item {
+        ResponsesInputItem::AdditionalTools { .. } => Some("additional_tools".to_string()),
         ResponsesInputItem::Message { .. } => Some("message".to_string()),
         ResponsesInputItem::FunctionCall { .. } => Some("function_call".to_string()),
         ResponsesInputItem::FunctionCallOutput { .. } => Some("function_call_output".to_string()),
     });
 
     let role_counts = count_items_by(&body.input, |item| match item {
+        ResponsesInputItem::AdditionalTools { role, .. } => Some(role.clone()),
         ResponsesInputItem::Message { role, .. } => Some(role.clone()),
         _ => None,
     });
@@ -96,6 +98,9 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
             .enumerate()
             .map(|(i, item)| {
                 let (r#type, role) = match item {
+                    ResponsesInputItem::AdditionalTools { role, .. } => {
+                        ("additional_tools".to_string(), Some(role.clone()))
+                    }
                     ResponsesInputItem::Message { role, .. } => {
                         ("message".to_string(), Some(role.clone()))
                     }
@@ -184,7 +189,12 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
                 .map(|i| serde_json::to_value(i).unwrap_or_default())
                 .as_ref(),
         ),
-        client_metadata_json_bytes: 0,
+        client_metadata_json_bytes: json_bytes(
+            body.client_metadata
+                .as_ref()
+                .map(|m| serde_json::to_value(m).unwrap_or_default())
+                .as_ref(),
+        ),
         input_item_count: body.input.len(),
         tool_count: body.tools.as_ref().map_or(0, |t| t.len()),
         input_image_part_count: image_parts.len(),
@@ -237,6 +247,7 @@ mod tests {
             stream: true,
             parallel_tool_calls: true,
             include: None,
+            client_metadata: None,
             service_tier: None,
             prompt_cache_key: None,
             text: super::super::translate::request::ResponsesText {

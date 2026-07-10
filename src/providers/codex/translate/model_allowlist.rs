@@ -104,6 +104,10 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
     }
 }
 
+pub fn uses_responses_lite(model: &str) -> bool {
+    matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
+}
+
 pub fn is_valid_model_for_codex(model: &str) -> bool {
     if ALLOWED_MODELS.contains(&model) {
         return true;

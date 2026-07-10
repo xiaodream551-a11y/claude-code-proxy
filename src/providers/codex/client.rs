@@ -82,6 +82,7 @@ impl std::fmt::Display for CodexTransportError {
 pub fn build_codex_headers(
     auth: &StoredAuth,
     ctx: &RequestContext,
+    use_responses_lite: bool,
 ) -> Result<http::HeaderMap, CodexError> {
     let mut headers = http::HeaderMap::new();
     headers.insert(
@@ -103,6 +104,12 @@ pub fn build_codex_headers(
         "openai-beta",
         header_value("openai-beta", "responses=experimental")?,
     );
+    if use_responses_lite {
+        headers.insert(
+            "x-openai-internal-codex-responses-lite",
+            header_value("x-openai-internal-codex-responses-lite", "true")?,
+        );
+    }
     if let Some(ref account_id) = auth.account_id {
         headers.insert(
             "ChatGPT-Account-Id",
@@ -290,10 +297,12 @@ impl CodexHttpClient {
                         retry_after: None,
                         origin: CodexErrorOrigin::Http,
                     })?;
-                    self.attempt_post_http(&auth, &body_json, ctx).await
+                    self.attempt_post_http(&auth, &body_json, ctx, body.client_metadata.is_some())
+                        .await
                 }
                 CodexTransport::WebSocket => {
-                    let ws_headers = build_codex_headers(&auth, ctx)?;
+                    let ws_headers =
+                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(body, continuation);
 
@@ -311,7 +320,8 @@ impl CodexHttpClient {
                     .await
                 }
                 CodexTransport::Auto => {
-                    let ws_headers = build_codex_headers(&auth, ctx)?;
+                    let ws_headers =
+                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(body, continuation);
 
@@ -344,7 +354,13 @@ impl CodexHttpClient {
                                     retry_after: None,
                                     origin: CodexErrorOrigin::Http,
                                 })?;
-                            self.attempt_post_http(&auth, &body_json, ctx).await
+                            self.attempt_post_http(
+                                &auth,
+                                &body_json,
+                                ctx,
+                                body.client_metadata.is_some(),
+                            )
+                            .await
                         }
                         Err(err) => Err(err),
                     }
@@ -418,7 +434,8 @@ impl CodexHttpClient {
                         super::websocket::invalidate_codex_websocket_pool_key(key);
                     }
 
-                    let retry_headers = build_codex_headers(&auth, ctx)?;
+                    let retry_headers =
+                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
                     let full_body_json = serde_json::to_string(body).map_err(|e| CodexError {
                         status: 500,
                         message: "Failed to serialize request".to_string(),
@@ -429,7 +446,14 @@ impl CodexHttpClient {
 
                     match transport {
                         CodexTransport::Http => {
-                            return self.attempt_post_http(&auth, &full_body_json, ctx).await;
+                            return self
+                                .attempt_post_http(
+                                    &auth,
+                                    &full_body_json,
+                                    ctx,
+                                    body.client_metadata.is_some(),
+                                )
+                                .await;
                         }
                         CodexTransport::WebSocket | CodexTransport::Auto => {
                             let ws_retry_headers =
@@ -493,7 +517,7 @@ impl CodexHttpClient {
             super::websocket::invalidate_codex_websocket_pool_key(key);
         }
 
-        let ws_headers = build_codex_headers(&auth, ctx)?;
+        let ws_headers = build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
         let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
         let ws_body = build_websocket_request(body, continuation);
 
@@ -575,9 +599,10 @@ impl CodexHttpClient {
         auth: &StoredAuth,
         body_json: &str,
         ctx: &RequestContext,
+        use_responses_lite: bool,
     ) -> Result<CodexResponse, CodexError> {
         let url = &self.base_url;
-        let headers = build_codex_headers(auth, ctx)?;
+        let headers = build_codex_headers(auth, ctx, use_responses_lite)?;
 
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_codex_http_request_capture(traffic, url, &headers, body_json);
@@ -885,12 +910,37 @@ mod tests {
             traffic: None,
             monitor: None,
         };
-        let headers = build_codex_headers(&auth, &ctx).unwrap();
+        let headers = build_codex_headers(&auth, &ctx, false).unwrap();
         assert_eq!(
             headers.get("openai-beta").unwrap(),
             "responses=experimental"
         );
         assert_eq!(headers.get("session_id").unwrap(), "s");
+    }
+
+    #[test]
+    fn codex_headers_include_responses_lite_when_requested() {
+        let auth = StoredAuth {
+            access: "tok".into(),
+            refresh: String::new(),
+            account_id: None,
+            expires: u64::MAX,
+        };
+        let ctx = RequestContext {
+            req_id: "r".into(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".into(),
+            traffic: None,
+            monitor: None,
+        };
+        let headers = build_codex_headers(&auth, &ctx, true).unwrap();
+        assert_eq!(
+            headers
+                .get("x-openai-internal-codex-responses-lite")
+                .unwrap(),
+            "true"
+        );
     }
 
     #[test]
@@ -909,7 +959,7 @@ mod tests {
             traffic: None,
             monitor: None,
         };
-        let headers = build_codex_headers(&auth, &ctx).unwrap();
+        let headers = build_codex_headers(&auth, &ctx, false).unwrap();
         assert!(headers.get("session_id").is_none());
         assert!(headers.get("x-client-request-id").is_none());
     }
@@ -930,7 +980,7 @@ mod tests {
             traffic: None,
             monitor: None,
         };
-        let err = build_codex_headers(&auth, &ctx).unwrap_err();
+        let err = build_codex_headers(&auth, &ctx, false).unwrap_err();
         assert_eq!(err.status, 500);
         assert!(err.message.contains("session_id"));
     }
@@ -957,6 +1007,7 @@ mod tests {
             stream: true,
             parallel_tool_calls: true,
             include: None,
+            client_metadata: None,
             service_tier: None,
             prompt_cache_key: None,
             text: super::super::translate::request::ResponsesText {
@@ -1053,7 +1104,7 @@ mod tests {
             traffic: None,
             monitor: None,
         };
-        let result = build_codex_headers(&auth, &ctx);
+        let result = build_codex_headers(&auth, &ctx, false);
         assert!(
             result.is_ok(),
             "empty access should still produce valid Bearer header"

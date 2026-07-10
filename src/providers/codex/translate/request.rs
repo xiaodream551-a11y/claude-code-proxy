@@ -70,6 +70,8 @@ pub struct ResponsesRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_metadata: Option<std::collections::HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
@@ -84,6 +86,8 @@ pub struct ResponsesReasoning {
     pub effort: Option<Effort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +115,13 @@ pub enum ResponsesTextFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ResponsesInputItem {
+    #[serde(rename = "additional_tools")]
+    AdditionalTools {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        role: String,
+        tools: Vec<Value>,
+    },
     #[serde(rename = "message")]
     Message {
         role: String,
@@ -185,6 +196,7 @@ pub struct TranslateOptions {
     pub session_id: Option<String>,
     pub service_tier: Option<ServiceTier>,
     pub model: String,
+    pub use_responses_lite: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +232,13 @@ fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Erro
         }));
     }
     Ok(effort)
+}
+
+fn cap_luna_effort(effort: Option<Effort>) -> Option<Effort> {
+    match effort {
+        Some(Effort::High | Effort::Xhigh) => Some(Effort::Medium),
+        other => other,
+    }
 }
 
 fn reasoning_summary_requested(summary: Option<&str>) -> bool {
@@ -280,6 +299,7 @@ pub fn translate_request(
     let input = build_input(req);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
+    let is_luna = opts.model == "gpt-5.6-luna";
 
     let mut text = ResponsesText {
         verbosity: Some("low".to_string()),
@@ -301,12 +321,46 @@ pub fn translate_request(
         text,
         tools: None,
         include: None,
+        client_metadata: None,
         service_tier: None,
         prompt_cache_key: None,
         reasoning: None,
     };
 
-    if let Some(tools) = tools
+    if opts.use_responses_lite {
+        out.client_metadata = Some(std::collections::HashMap::from([(
+            "ws_request_header_x_openai_internal_codex_responses_lite".to_string(),
+            "true".to_string(),
+        )]));
+        out.parallel_tool_calls = false;
+
+        let mut prefix = Vec::new();
+        if let Some(ref tools) = tools
+            && !tools.is_empty()
+        {
+            let tools = tools
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            prefix.push(ResponsesInputItem::AdditionalTools {
+                id: None,
+                role: "developer".to_string(),
+                tools,
+            });
+        }
+        if let Some(instructions) = out.instructions.take()
+            && !instructions.is_empty()
+        {
+            prefix.push(ResponsesInputItem::Message {
+                role: "developer".to_string(),
+                content: vec![ResponsesContentPart::InputText { text: instructions }],
+            });
+        }
+        if !prefix.is_empty() {
+            prefix.extend(out.input);
+            out.input = prefix;
+        }
+    } else if let Some(tools) = tools
         && !tools.is_empty()
     {
         out.tools = Some(tools);
@@ -323,7 +377,10 @@ pub fn translate_request(
 
     let effort = read_effort(req)?;
     let codex_effort = to_codex_effort(effort);
-    let resolved_effort = resolve_effort(codex_effort)?;
+    let mut resolved_effort = resolve_effort(codex_effort)?;
+    if is_luna {
+        resolved_effort = cap_luna_effort(resolved_effort);
+    }
     if let Some(ref eff) = resolved_effort {
         let summary = if reasoning_summary_requested(config::codex_reasoning_summary().as_deref()) {
             Some("auto".to_string())
@@ -333,6 +390,7 @@ pub fn translate_request(
         out.reasoning = Some(ResponsesReasoning {
             effort: Some(eff.clone()),
             summary,
+            context: opts.use_responses_lite.then_some("all_turns".to_string()),
         });
         out.include = Some(vec!["reasoning.encrypted_content".to_string()]);
     }
@@ -791,6 +849,7 @@ mod tests {
             session_id: None,
             service_tier: None,
             model: "gpt-5.5".to_string(),
+            use_responses_lite: false,
         }
     }
 
@@ -813,6 +872,7 @@ mod tests {
                 session_id: Some("s".into()),
                 service_tier: None,
                 model: "gpt-5.5".to_string(),
+                use_responses_lite: false,
             },
         )
         .unwrap();
@@ -1212,6 +1272,104 @@ mod tests {
             rendered,
             "caption\n[image omitted: image/png]\n[image omitted: url]\n[unsupported content block omitted: text]\n[unsupported content block omitted: image]\n[unsupported content block omitted: unknown]"
         );
+    }
+
+    #[test]
+    fn luna_caps_high_effort_to_medium() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-luna",
+            "messages": [{"role":"user", "content":"hello"}],
+            "output_config": {"effort": "high"}
+        }))
+        .unwrap();
+        let out = translate_request(
+            &req,
+            TranslateOptions {
+                model: "gpt-5.6-luna".to_string(),
+                use_responses_lite: true,
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            out.reasoning.unwrap().effort,
+            Some(Effort::Medium)
+        ));
+    }
+
+    #[test]
+    fn sol_preserves_high_effort() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"hello"}],
+            "output_config": {"effort": "high"}
+        }))
+        .unwrap();
+        let out = translate_request(
+            &req,
+            TranslateOptions {
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::High)));
+    }
+
+    #[test]
+    fn responses_lite_moves_instructions_and_tools_into_input() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-luna",
+            "messages": [{"role":"user", "content":"hello"}],
+            "system": "be helpful",
+            "tools": [{"name":"test","input_schema":{"type":"object"}}]
+        }))
+        .unwrap();
+        let out = translate_request(
+            &req,
+            TranslateOptions {
+                model: "gpt-5.6-luna".to_string(),
+                use_responses_lite: true,
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert!(out.instructions.is_none());
+        assert!(out.tools.is_none());
+        assert!(!out.parallel_tool_calls);
+        assert!(out.client_metadata.is_some());
+        assert_eq!(out.input.len(), 3);
+        assert!(matches!(
+            out.input[0],
+            ResponsesInputItem::AdditionalTools { .. }
+        ));
+        if let ResponsesInputItem::Message { role, content } = &out.input[1] {
+            assert_eq!(role, "developer");
+            assert!(matches!(content[0], ResponsesContentPart::InputText { .. }));
+        } else {
+            panic!("expected developer message");
+        }
+    }
+
+    #[test]
+    fn responses_lite_reasoning_uses_all_turns_context() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-luna",
+            "messages": [{"role":"user", "content":"hello"}],
+            "output_config": {"effort": "medium"}
+        }))
+        .unwrap();
+        let out = translate_request(
+            &req,
+            TranslateOptions {
+                model: "gpt-5.6-luna".to_string(),
+                use_responses_lite: true,
+                ..opts()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.reasoning.unwrap().context.as_deref(), Some("all_turns"));
     }
 
     #[test]

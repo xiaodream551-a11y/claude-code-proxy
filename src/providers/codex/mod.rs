@@ -33,7 +33,9 @@ use self::continuation::{
 use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
-use self::translate::model_allowlist::{assert_allowed_model, resolve_model_request};
+use self::translate::model_allowlist::{
+    assert_allowed_model, resolve_model_request, uses_responses_lite,
+};
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{TranslateOptions, translate_request};
 
@@ -104,6 +106,7 @@ impl Provider for CodexProvider {
                 session_id: ctx.session_id.clone(),
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
+                use_responses_lite: uses_responses_lite(&resolved.model),
             },
         ) {
             Ok(t) => t,
@@ -247,6 +250,7 @@ impl Provider for CodexProvider {
                 session_id: None,
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
+                use_responses_lite: uses_responses_lite(&resolved.model),
             },
         ) {
             Ok(t) => t,

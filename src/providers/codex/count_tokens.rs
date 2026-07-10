@@ -35,6 +35,10 @@ pub fn count_translated_tokens(translated: &ResponsesRequest) -> u64 {
 
 fn count_input_item_tokens(item: &ResponsesInputItem) -> u64 {
     match item {
+        ResponsesInputItem::AdditionalTools { tools, .. } => tools
+            .iter()
+            .map(|tool| approx_token_count(&serde_json::to_string(tool).unwrap_or_default()))
+            .sum(),
         ResponsesInputItem::Message { content, .. } => {
             let mut total = 0u64;
             for part in content {
