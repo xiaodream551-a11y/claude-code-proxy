@@ -616,7 +616,7 @@ fn render_recent(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
         Constraint::Length(12),
         Constraint::Length(9),
         Constraint::Length(9),
-        Constraint::Percentage(28),
+        Constraint::Fill(1),
     ];
     let model_width = table_column_width(area, &widths, 3);
     let rows = recent.iter().map(|request| {
@@ -1030,6 +1030,24 @@ mod tests {
     }
 
     #[test]
+    fn recent_rate_column_keeps_full_width() {
+        let widths = [
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(10),
+            Constraint::Min(16),
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Fill(1),
+        ];
+
+        assert_eq!(table_column_width(Rect::new(0, 0, 120, 10), &widths, 6), 12);
+    }
+
+    #[test]
     fn model_column_width_tracks_terminal_width() {
         let widths = [
             Constraint::Length(8),
@@ -1087,7 +1105,7 @@ mod tests {
         let monitor = MonitorHandle::new(10);
         monitor.request_started(
             "request-1",
-            Some("session-1".to_string()),
+            Some("sess-1".to_string()),
             Some(1),
             EndpointKind::Messages,
         );
@@ -1103,15 +1121,15 @@ mod tests {
             render_sessions(frame, frame.area(), &active_state.sessions, 0)
         });
         let sessions_text = buffer_text(&sessions);
-        assert!(sessions_text.contains("provider"));
-        assert!(sessions_text.contains("session-1"));
+        assert!(sessions_text.contains("Provider"));
+        assert!(sessions_text.contains("sess-1"));
         assert!(!sessions_text.contains("No sessions"));
 
         let active = draw(120, 8, |frame| {
             render_active(frame, frame.area(), &active_state.active, 0)
         });
         let active_text = buffer_text(&active);
-        assert!(active_text.contains("started"));
+        assert!(active_text.contains("Started"));
         assert!(active_text.contains("gpt-5.6-sol"));
         assert!(!active_text.contains("No active requests"));
 
@@ -1121,7 +1139,7 @@ mod tests {
             render_recent(frame, frame.area(), &completed_state.recent)
         });
         let recent_text = buffer_text(&recent);
-        assert!(recent_text.contains("finished"));
+        assert!(recent_text.contains("Finished"));
         assert!(recent_text.contains("200"));
         assert!(!recent_text.contains("No recent requests"));
 
@@ -1142,7 +1160,7 @@ mod tests {
             render_events(frame, frame.area(), &state.recent)
         });
         let events_text = buffer_text(&events);
-        assert!(events_text.contains("time"));
+        assert!(events_text.contains("Time"));
         assert!(events_text.contains("502"));
         assert!(events_text.contains("upstream unavailable"));
         assert!(!events_text.contains("No events"));
