@@ -710,11 +710,7 @@ fn session_summaries(
     }
 
     let mut out: Vec<_> = sessions.into_values().collect();
-    out.sort_by(|left, right| {
-        session_sort_key(right)
-            .cmp(&session_sort_key(left))
-            .then_with(|| left.label().cmp(&right.label()))
-    });
+    out.sort_by_key(SessionSummary::label);
     out
 }
 
@@ -724,15 +720,6 @@ fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
     } else {
         left
     }
-}
-
-fn session_sort_key(session: &SessionSummary) -> (u128, usize, usize) {
-    let last_seen = session
-        .last_seen
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    (last_seen, session.active_count, session.request_count)
 }
 
 pub fn throughput(
@@ -976,17 +963,17 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
-    fn active_session_order_is_stable_between_snapshots() {
+    fn session_order_is_stable_across_activity() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started(
             "r1",
-            Some("session-a".to_string()),
+            Some("session-b".to_string()),
             Some(1),
             EndpointKind::Messages,
         );
         monitor.request_started(
             "r2",
-            Some("session-b".to_string()),
+            Some("session-a".to_string()),
             Some(1),
             EndpointKind::Messages,
         );
@@ -997,7 +984,13 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             .iter()
             .map(SessionSummary::label)
             .collect();
-        std::thread::sleep(Duration::from_millis(2));
+        monitor.request_completed("r1", 200, None, None);
+        monitor.request_started(
+            "r3",
+            Some("session-b".to_string()),
+            Some(2),
+            EndpointKind::Messages,
+        );
         let second: Vec<_> = monitor
             .snapshot()
             .sessions
@@ -1005,6 +998,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             .map(SessionSummary::label)
             .collect();
 
-        assert_eq!(first, second);
+        assert_eq!(first, vec!["session-a", "session-b"]);
+        assert_eq!(second, first);
     }
 }
