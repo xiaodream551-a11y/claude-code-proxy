@@ -272,6 +272,37 @@ fn table_header_aligned(
     .style(Style::default().add_modifier(Modifier::BOLD))
 }
 
+fn render_empty_table_state(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    focused: bool,
+    message: &str,
+) {
+    frame.render_widget(panel(title, focused), area);
+    let content = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    let line = Rect {
+        y: content.y + content.height.saturating_sub(1) / 2,
+        height: 1,
+        ..content
+    };
+    frame.render_widget(
+        Paragraph::new(ellipsize(message, line.width.into()))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(DIM).bg(PANEL_BG)),
+        line,
+    );
+}
+
 fn muted_cell(value: impl Into<String>) -> Cell<'static> {
     Cell::from(Span::styled(value.into(), Style::default().fg(DIM)))
 }
@@ -413,6 +444,11 @@ fn render_sessions(
     sessions: &[SessionSummary],
     selected: usize,
 ) {
+    if sessions.is_empty() {
+        render_empty_table_state(frame, area, "Sessions", true, "No sessions");
+        return;
+    }
+
     let widths = [
         Constraint::Length(1),
         Constraint::Length(36),
@@ -475,6 +511,11 @@ fn render_active(
     active: &[ActiveRequest],
     tick: usize,
 ) {
+    if active.is_empty() {
+        render_empty_table_state(frame, area, "Active requests", false, "No active requests");
+        return;
+    }
+
     let widths = [
         Constraint::Length(8),
         Constraint::Length(10),
@@ -523,6 +564,11 @@ fn render_active(
 }
 
 fn render_recent(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[CompletedRequest]) {
+    if recent.is_empty() {
+        render_empty_table_state(frame, area, "Recent requests", false, "No recent requests");
+        return;
+    }
+
     let widths = [
         Constraint::Length(8),
         Constraint::Length(6),
@@ -575,6 +621,20 @@ fn render_recent(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
 }
 
 fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[CompletedRequest]) {
+    let events = recent
+        .iter()
+        .filter(|request| {
+            request.status == crate::monitor::RequestStatus::Failed
+                || request.http_status.is_some_and(|status| status >= 400)
+                || request.error.is_some()
+        })
+        .take(12)
+        .collect::<Vec<_>>();
+    if events.is_empty() {
+        render_empty_table_state(frame, area, "Events", false, "No events");
+        return;
+    }
+
     let widths = [
         Constraint::Length(8),
         Constraint::Length(6),
@@ -583,33 +643,25 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
         Constraint::Percentage(50),
     ];
     let model_width = table_column_width(area, &widths, 3);
-    let rows = recent
-        .iter()
-        .filter(|request| {
-            request.status == crate::monitor::RequestStatus::Failed
-                || request.http_status.is_some_and(|status| status >= 400)
-                || request.error.is_some()
-        })
-        .take(12)
-        .map(|request| {
-            let status = request
-                .http_status
-                .map(|status| status.to_string())
-                .unwrap_or_else(|| request.status.label().to_string());
-            let message = request
-                .error
-                .as_deref()
-                .filter(|error| !error.is_empty())
-                .unwrap_or("-");
-            Row::new(vec![
-                muted_cell(format_system_time(request.finished_at)),
-                Cell::from(Span::styled(status, http_status_style(request.http_status))),
-                provider_cell(request.provider.as_deref()),
-                model_cell(request.model.as_deref(), model_width),
-                detail_cell(message),
-            ])
-            .style(Style::default().bg(PANEL_BG))
-        });
+    let rows = events.iter().map(|request| {
+        let status = request
+            .http_status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| request.status.label().to_string());
+        let message = request
+            .error
+            .as_deref()
+            .filter(|error| !error.is_empty())
+            .unwrap_or("-");
+        Row::new(vec![
+            muted_cell(format_system_time(request.finished_at)),
+            Cell::from(Span::styled(status, http_status_style(request.http_status))),
+            provider_cell(request.provider.as_deref()),
+            model_cell(request.model.as_deref(), model_width),
+            detail_cell(message),
+        ])
+        .style(Style::default().bg(PANEL_BG))
+    });
     let table = Table::new(rows, widths)
         .header(table_header_aligned([
             ("time", Alignment::Left),
@@ -855,7 +907,58 @@ fn format_system_time(time: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{backend::TestBackend, buffer::Buffer};
+
     use super::*;
+    use crate::monitor::EndpointKind;
+
+    fn draw(width: u16, height: u16, render: impl FnOnce(&mut ratatui::Frame<'_>)) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(render).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn placeholder_position(buffer: &Buffer, placeholder: &str) -> Option<(u16, u16)> {
+        let symbols = placeholder
+            .chars()
+            .map(|character| character.to_string())
+            .collect::<Vec<_>>();
+        (0..buffer.area.height).find_map(|y| {
+            (0..buffer.area.width).find_map(|x| {
+                symbols
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, symbol)| {
+                        x + (offset as u16) < buffer.area.width
+                            && buffer[(x + offset as u16, y)].symbol() == symbol
+                    })
+                    .then_some((x, y))
+            })
+        })
+    }
+
+    fn assert_centered(buffer: &Buffer, placeholder: &str, expected_y: u16) {
+        let (x, y) = placeholder_position(buffer, placeholder).unwrap();
+        let left_space = x.saturating_sub(1);
+        let right_space = buffer
+            .area
+            .width
+            .saturating_sub(x + placeholder.chars().count() as u16 + 1);
+        assert_eq!(y, expected_y);
+        assert!(left_space.abs_diff(right_space) <= 1);
+    }
 
     #[test]
     fn model_column_width_tracks_terminal_width() {
@@ -881,6 +984,99 @@ mod tests {
         assert_eq!(ellipsize("claude-sonnet-4-6", 16), "claude-sonnet-4…");
         assert_eq!(ellipsize("gpt-5.6-sol", 16), "gpt-5.6-sol");
         assert_eq!(ellipsize("anything", 0), "");
+    }
+
+    #[test]
+    fn empty_tables_hide_columns_and_center_placeholders() {
+        let sessions = draw(40, 9, |frame| render_sessions(frame, frame.area(), &[], 0));
+        let sessions_text = buffer_text(&sessions);
+        assert_centered(&sessions, "No sessions", 4);
+        assert!(!sessions_text.contains("provider"));
+        assert!(sessions_text.contains("No sessions"));
+
+        let active = draw(27, 6, |frame| render_active(frame, frame.area(), &[], 0));
+        let active_text = buffer_text(&active);
+        assert_centered(&active, "No active requests", 2);
+        assert!(!active_text.contains("started"));
+        assert!(active_text.contains("No active requests"));
+
+        let recent = draw(40, 9, |frame| render_recent(frame, frame.area(), &[]));
+        let recent_text = buffer_text(&recent);
+        assert_centered(&recent, "No recent requests", 4);
+        assert!(!recent_text.contains("finished"));
+        assert!(recent_text.contains("No recent requests"));
+
+        let events = draw(40, 9, |frame| render_events(frame, frame.area(), &[]));
+        let events_text = buffer_text(&events);
+        assert_centered(&events, "No events", 4);
+        assert!(!events_text.contains("time"));
+        assert!(events_text.contains("No events"));
+    }
+
+    #[test]
+    fn populated_tables_render_rows_without_placeholders() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "request-1",
+            Some("session-1".to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected(
+            "request-1",
+            "codex",
+            "gpt-5.6-sol",
+            Some("high".to_string()),
+        );
+        let active_state = monitor.snapshot();
+
+        let sessions = draw(160, 8, |frame| {
+            render_sessions(frame, frame.area(), &active_state.sessions, 0)
+        });
+        let sessions_text = buffer_text(&sessions);
+        assert!(sessions_text.contains("provider"));
+        assert!(sessions_text.contains("session-1"));
+        assert!(!sessions_text.contains("No sessions"));
+
+        let active = draw(120, 8, |frame| {
+            render_active(frame, frame.area(), &active_state.active, 0)
+        });
+        let active_text = buffer_text(&active);
+        assert!(active_text.contains("started"));
+        assert!(active_text.contains("gpt-5.6-sol"));
+        assert!(!active_text.contains("No active requests"));
+
+        monitor.request_completed("request-1", 200, Some(100), Some(25));
+        let completed_state = monitor.snapshot();
+        let recent = draw(140, 8, |frame| {
+            render_recent(frame, frame.area(), &completed_state.recent)
+        });
+        let recent_text = buffer_text(&recent);
+        assert!(recent_text.contains("finished"));
+        assert!(recent_text.contains("200"));
+        assert!(!recent_text.contains("No recent requests"));
+
+        let events = draw(100, 8, |frame| {
+            render_events(frame, frame.area(), &completed_state.recent)
+        });
+        assert!(buffer_text(&events).contains("No events"));
+    }
+
+    #[test]
+    fn events_render_matching_request_rows_without_a_placeholder() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("request-1", None, None, EndpointKind::Messages);
+        monitor.request_failed("request-1", Some(502), "upstream unavailable");
+        let state = monitor.snapshot();
+
+        let events = draw(100, 8, |frame| {
+            render_events(frame, frame.area(), &state.recent)
+        });
+        let events_text = buffer_text(&events);
+        assert!(events_text.contains("time"));
+        assert!(events_text.contains("502"));
+        assert!(events_text.contains("upstream unavailable"));
+        assert!(!events_text.contains("No events"));
     }
 
     #[test]
