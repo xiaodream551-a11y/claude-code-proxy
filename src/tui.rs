@@ -686,12 +686,12 @@ fn render_active(
 
     let widths = [
         Constraint::Length(8),
-        Constraint::Length(10),
+        Constraint::Length(8),
         Constraint::Min(18),
-        Constraint::Length(7),
-        Constraint::Length(12),
-        Constraint::Length(13),
-        Constraint::Length(12),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(14),
+        Constraint::Length(10),
         Constraint::Length(9),
     ];
     let model_width = table_column_width(area, &widths, 2);
@@ -700,7 +700,7 @@ fn render_active(
             request.status.label(),
             "upstream" | "streaming" | "selected" | "started"
         ) {
-            format!("{}{}", spinner(tick), request.status.label())
+            format!("{} {}", spinner(tick), request.status.label())
         } else {
             request.status.label().to_string()
         };
@@ -1333,12 +1333,12 @@ mod tests {
     fn model_column_width_tracks_terminal_width() {
         let widths = [
             Constraint::Length(8),
-            Constraint::Length(10),
+            Constraint::Length(8),
             Constraint::Min(18),
-            Constraint::Length(7),
-            Constraint::Length(12),
-            Constraint::Length(13),
-            Constraint::Length(12),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(14),
+            Constraint::Length(10),
             Constraint::Length(9),
         ];
         let narrow = table_column_width(Rect::new(0, 0, 110, 10), &widths, 2);
@@ -1398,7 +1398,7 @@ mod tests {
         });
 
         let active_text = buffer_text(&active);
-        assert!(active_text.contains("⠋upstream"), "{active_text}");
+        assert!(active_text.contains("⠋ upstream"), "{active_text}");
     }
 
     #[test]
