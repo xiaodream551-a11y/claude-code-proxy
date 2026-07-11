@@ -5,7 +5,7 @@
 Plus/Pro** subscription, your **Kimi Code** (kimi.com) account, your **Grok**
 subscription, or **Cursor Agent**.
 
-<img src="meta/claude-code-screenshot.webp" alt="Claude Code running through claude-code-proxy" width="630" />
+<img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
 
 [Quick start](#quick-start) · [Providers](#providers) ·
 [How it works](#how-it-works) · [Configuration](#configuration) ·
