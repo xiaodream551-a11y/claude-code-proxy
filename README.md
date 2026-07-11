@@ -776,19 +776,6 @@ cargo clippy --all-targets -- -D warnings  # lint
 just check                                 # run the full project check
 ```
 
-### Smoke coverage
-
-See [docs/smoke-cutover.md](docs/smoke-cutover.md) for automated smoke tests,
-optional real-auth validation steps, known transport differences, and the
-current Rust support scope.
-
-**Install a compiled dev build globally:** compile the current working tree to a
-binary and place it on your `PATH` without linking:
-
-```sh
-cargo install --path . --locked
-```
-
 ## Related projects
 
 - [claude-history](https://github.com/raine/claude-history): search Claude Code
