@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.13 (2026-07-12)
+
+- Grok users can sign in on headless hosts with `grok auth device`.
+  ([#38](https://github.com/raine/claude-code-proxy/pull/38))
+- Grok tool calls accept Claude Code's prompt-cache markers, preventing errors
+  when switching to Grok during a tool-using session.
+  ([#37](https://github.com/raine/claude-code-proxy/pull/37))
+- Codex hosted web searches return their result links and citations to Claude
+  Code instead of appearing to produce zero results.
+  ([#10](https://github.com/raine/claude-code-proxy/issues/10))
+- Codex authentication refresh is coordinated across concurrent requests and
+  automatically recovers live WebSocket requests after credentials expire.
+- Codex requests recover more reliably from temporary upstream failures,
+  connection resets, overloads, and long-running responses.
+
 ## v0.1.12 (2026-07-12)
 
 - Codex hosted web searches work with GPT-5.6 models instead of failing with an
