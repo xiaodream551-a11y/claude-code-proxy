@@ -56,7 +56,9 @@ cleanup() {
   fi
   printf '\nDebug artifacts: %s\n' "$run_dir"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cd "$repo_root"
 cargo build --quiet --bin claude-code-proxy
@@ -80,8 +82,8 @@ for _attempt in {1..20}; do
       proxy_pid=""
       break
     fi
-    if curl --fail --silent --show-error \
-      "http://127.0.0.1:$proxy_port/healthz" >/dev/null; then
+    if curl --fail --silent \
+      "http://127.0.0.1:$proxy_port/healthz" >/dev/null 2>&1; then
       break 2
     fi
     sleep 0.1
