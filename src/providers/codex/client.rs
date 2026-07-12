@@ -802,16 +802,21 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 }
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
-    (err.detail.as_deref() == Some("websocket_pre_request")
-        && (err.status == 0 || should_retry_status(err.status)))
-        || (err.status == 0
-            && (err.message.contains("Timed out waiting")
-                || err.message.contains("Transport error")
-                || err.message.contains("connection reset")
-                || err.message.contains("connection closed")
-                || err.message.contains("timed out")
-                || err.message.contains("econnreset")
-                || err.message.contains("etimedout")))
+    if err.detail.as_deref() == Some("websocket_pre_request") {
+        return err.status == 0 || should_retry_status(err.status);
+    }
+    if err.status != 0 {
+        return false;
+    }
+
+    let message = err.message.to_ascii_lowercase();
+    message.contains("timed out waiting")
+        || message.contains("transport error")
+        || message.contains("connection reset")
+        || message.contains("connection closed")
+        || message.contains("timed out")
+        || message.contains("econnreset")
+        || message.contains("etimedout")
 }
 
 fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
@@ -938,6 +943,20 @@ mod tests {
         };
 
         assert!(!is_retryable_transport_error(&err));
+    }
+
+    #[test]
+    fn statusless_transport_error_matching_is_case_insensitive() {
+        let err = CodexError {
+            status: 0,
+            message: "WebSocket protocol error: Connection reset without closing handshake"
+                .to_string(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(is_retryable_transport_error(&err));
     }
 
     #[test]
