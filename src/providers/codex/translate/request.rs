@@ -184,6 +184,8 @@ pub struct ResponsesFunctionTool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: Value,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +533,7 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 name,
                 description,
                 parameters,
+                strict: false,
             }));
         }
     }
@@ -1188,6 +1191,11 @@ mod tests {
             panic!("expected function tool");
         };
         assert_eq!(tool.description.as_deref(), Some("Find matching records."));
+        assert!(!tool.strict);
+        assert_eq!(
+            serde_json::to_value(tool).unwrap()["strict"],
+            Value::Bool(false)
+        );
         assert_eq!(
             tool.parameters
                 .get("properties")
