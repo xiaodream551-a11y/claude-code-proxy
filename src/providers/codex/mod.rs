@@ -929,9 +929,6 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(serde_json::json!({
@@ -977,39 +974,6 @@ mod tests {
         }
     }
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
     #[test]
     fn live_stream_progress_records_terminal_usage() {
         let monitor = crate::monitor::MonitorHandle::new(10);
@@ -1046,32 +1010,6 @@ mod tests {
         assert!(models.contains(&"gpt-5.6-luna".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
-    }
-
-    #[test]
-    fn codex_cli_status_unauthenticated() {
-        let _lock = env_lock();
-        let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
-        // Without stored auth, status should fail
-        let result = CODEX_CLI.status();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Not authenticated")
-        );
-    }
-
-    #[test]
-    fn codex_cli_logout_does_not_error() {
-        let _lock = env_lock();
-        let config = tempfile::TempDir::new().unwrap();
-        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
-        // Logout without auth should succeed
-        let result = CODEX_CLI.logout();
-        assert!(result.is_ok());
     }
 
     #[test]

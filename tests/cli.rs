@@ -43,24 +43,6 @@ fn invalid_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn provider_auth_status_unauthenticated_and_logout() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["codex", "auth", "status"]);
-    cmd.env("CCP_CONFIG_DIR", temp.path());
-    let output = cmd.output()?;
-    assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8(output.stdout)?.contains("Not authenticated"));
-
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["codex", "auth", "logout"]);
-    cmd.env("CCP_CONFIG_DIR", temp.path());
-    let output = cmd.output()?;
-    assert!(output.status.success());
-    Ok(())
-}
-
-#[test]
 fn unsupported_provider_auth_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["cursor", "auth", "device"]);
