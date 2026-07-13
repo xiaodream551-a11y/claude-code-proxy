@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.16 (2026-07-13)
+
+- GPT-5.6 Luna requests work without a custom User-Agent instead of failing with
+  a model unavailable error.
+  ([#45](https://github.com/raine/claude-code-proxy/issues/45))
+- Canceled or replaced Codex prompts cannot interrupt later turns with stale
+  continuation state.
+- GPT-5.6 setup examples use a 272K compaction window to stay within the current
+  ChatGPT context limit.
+- Homebrew installations can run the proxy at login as a background service with
+  `brew services start claude-code-proxy`.
+  ([#44](https://github.com/raine/claude-code-proxy/pull/44))
+
 ## v0.1.15 (2026-07-12)
 
 - Codex function tools preserve optional parameters, preventing unintended tool
