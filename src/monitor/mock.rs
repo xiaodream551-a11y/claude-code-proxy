@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     time::{Duration, Instant, SystemTime},
 };
@@ -333,12 +333,101 @@ fn mock_state_for_tick(
     recent.push_back(no_status);
 
     add_simulated_requests(now, instant_now, tick, &mut active, &mut recent);
-    let sessions = session_summaries(&active, &recent);
+    let output_buckets = simulated_output_buckets(now, tick, &active, &recent);
+    let sessions = session_summaries(&active, &recent, &output_buckets);
     MonitorState {
         started_at,
         sessions,
         active,
         recent: recent.into_iter().collect(),
+    }
+}
+
+fn simulated_output_buckets(
+    now: SystemTime,
+    tick: u64,
+    active: &[ActiveRequest],
+    recent: &VecDeque<CompletedRequest>,
+) -> HashMap<Option<String>, Vec<(u64, u64)>> {
+    const HISTORIES: [(&str, [u64; 12]); 3] = [
+        (
+            "57c7c914-ada4-4f40-9672-985f950fbb66",
+            [0, 320, 780, 0, 1_600, 2_900, 850, 0, 440, 3_600, 2_200, 0],
+        ),
+        (
+            "terminal-refactor",
+            [180, 0, 420, 960, 0, 0, 1_300, 740, 2_100, 0, 350, 0],
+        ),
+        (
+            "cursor-session",
+            [0, 640, 1_200, 2_400, 3_800, 1_900, 0, 0, 820, 1_500, 0, 0],
+        ),
+    ];
+
+    let current_bucket = super::session_token_bucket(now);
+    let mut buckets = HashMap::<Option<String>, Vec<(u64, u64)>>::new();
+    for (session_id, history) in HISTORIES {
+        for (index, tokens) in history.iter().copied().enumerate() {
+            if tokens == 0 {
+                continue;
+            }
+            let offset = (history.len() - 1 - index) as u64;
+            record_output_bucket(
+                &mut buckets,
+                Some(session_id.to_string()),
+                current_bucket.saturating_sub(offset),
+                tokens,
+            );
+        }
+    }
+
+    for request in recent {
+        if let Some(tokens) = request.output_tokens.filter(|tokens| *tokens > 0) {
+            record_output_bucket(
+                &mut buckets,
+                request.session_id.clone(),
+                super::session_token_bucket(request.finished_at),
+                tokens,
+            );
+        }
+    }
+    for request in active {
+        if let Some(tokens) = request.output_tokens.filter(|tokens| *tokens > 0) {
+            record_output_bucket(
+                &mut buckets,
+                request.session_id.clone(),
+                current_bucket,
+                tokens,
+            );
+        }
+    }
+
+    record_output_bucket(
+        &mut buckets,
+        Some("57c7c914-ada4-4f40-9672-985f950fbb66".to_string()),
+        current_bucket,
+        120 + (tick % 40) * 80,
+    );
+    for samples in buckets.values_mut() {
+        samples.sort_by_key(|(bucket, _)| *bucket);
+    }
+    buckets
+}
+
+fn record_output_bucket(
+    buckets: &mut HashMap<Option<String>, Vec<(u64, u64)>>,
+    session_id: Option<String>,
+    bucket: u64,
+    tokens: u64,
+) {
+    let samples = buckets.entry(session_id).or_default();
+    if let Some((_, existing)) = samples
+        .iter_mut()
+        .find(|(existing_bucket, _)| *existing_bucket == bucket)
+    {
+        *existing = existing.saturating_add(tokens);
+    } else {
+        samples.push((bucket, tokens));
     }
 }
 
@@ -679,6 +768,10 @@ mod tests {
         assert!(second_request.output_tokens > first_request.output_tokens);
         assert_ne!(second_request.rate(), first_request.rate());
         assert!(second_session.output_tokens > first_session.output_tokens);
+        assert_ne!(
+            second_session.output_token_samples,
+            first_session.output_token_samples
+        );
         assert_eq!(second.started_at, first.started_at);
     }
 

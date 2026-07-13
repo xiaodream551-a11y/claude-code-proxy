@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, Stdout},
     time::{Duration, SystemTime},
 };
@@ -21,7 +22,8 @@ use tokio::sync::oneshot;
 
 use crate::{
     monitor::{
-        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState, SessionSummary,
+        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState,
+        SESSION_TOKEN_BUCKET_SECS, SessionSummary,
     },
     paths,
     registry::Registry,
@@ -41,6 +43,9 @@ const BLUE: Color = Color::Rgb(120, 170, 230);
 const DIM: Color = Color::Rgb(100, 104, 114);
 const RECENT_MODEL_WIDTH: u16 = 36;
 
+const SESSION_SPARKLINE_MIN_WIDTH: u16 = 170;
+const SESSION_SPARKLINE_MAX_TOKENS: u64 = 4_000;
+
 const SESSION_TABLE_HEADERS: [(&str, Alignment); 13] = [
     ("", Alignment::Left),
     ("ID", Alignment::Left),
@@ -54,6 +59,23 @@ const SESSION_TABLE_HEADERS: [(&str, Alignment); 13] = [
     ("In", Alignment::Right),
     ("Out", Alignment::Right),
     ("Rate", Alignment::Right),
+    ("Status", Alignment::Left),
+];
+
+const SESSION_WIDE_TABLE_HEADERS: [(&str, Alignment); 14] = [
+    ("", Alignment::Left),
+    ("ID", Alignment::Left),
+    ("Project", Alignment::Left),
+    ("Active", Alignment::Right),
+    ("Reqs", Alignment::Right),
+    ("Fail", Alignment::Right),
+    ("Provider", Alignment::Left),
+    ("Model", Alignment::Left),
+    ("Effort", Alignment::Left),
+    ("In", Alignment::Right),
+    ("Out", Alignment::Right),
+    ("Rate", Alignment::Right),
+    ("Tokens/10s · 4k", Alignment::Left),
     ("Status", Alignment::Left),
 ];
 
@@ -635,6 +657,62 @@ fn spinner(tick: usize) -> &'static str {
     FRAMES[tick % FRAMES.len()]
 }
 
+fn sparkline_bucket(timestamp: SystemTime) -> u64 {
+    timestamp
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+        / SESSION_TOKEN_BUCKET_SECS
+}
+
+fn token_sparkline(samples: &[(SystemTime, u64)], width: usize, now: SystemTime) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut buckets = HashMap::<u64, u64>::new();
+    for (timestamp, tokens) in samples {
+        let bucket = sparkline_bucket(*timestamp);
+        let total = buckets.entry(bucket).or_default();
+        *total = total.saturating_add(*tokens);
+    }
+
+    let current_bucket = sparkline_bucket(now);
+    let first_bucket = current_bucket.saturating_sub(width.saturating_sub(1) as u64);
+    (first_bucket..=current_bucket)
+        .map(|bucket| {
+            let value = buckets.get(&bucket).copied().unwrap_or(0);
+            if value == 0 {
+                return ' ';
+            }
+            let scaled = value.min(SESSION_SPARKLINE_MAX_TOKENS);
+            let level = ((u128::from(scaled) * LEVELS.len() as u128
+                + u128::from(SESSION_SPARKLINE_MAX_TOKENS)
+                - 1)
+                / u128::from(SESSION_SPARKLINE_MAX_TOKENS))
+            .saturating_sub(1) as usize;
+            LEVELS[level]
+        })
+        .collect()
+}
+
+fn token_sparkline_line(
+    samples: &[(SystemTime, u64)],
+    width: usize,
+    now: SystemTime,
+) -> Line<'static> {
+    let mut sparkline = token_sparkline(samples, width, now);
+    let current = sparkline
+        .pop()
+        .map_or_else(String::new, |value| value.to_string());
+    Line::from(vec![
+        Span::styled(sparkline, Style::default().fg(BLUE)),
+        Span::styled(current, Style::default().fg(DIM)),
+    ])
+}
+
 fn render_sessions(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -647,7 +725,8 @@ fn render_sessions(
         return;
     }
 
-    let widths = [
+    let show_sparkline = area.width >= SESSION_SPARKLINE_MIN_WIDTH;
+    let mut widths = vec![
         Constraint::Length(1),
         Constraint::Length(8),
         Constraint::Length(18),
@@ -660,16 +739,23 @@ fn render_sessions(
         Constraint::Length(9),
         Constraint::Length(9),
         Constraint::Length(12),
-        Constraint::Length(10),
     ];
+    if show_sparkline {
+        widths.push(Constraint::Fill(1));
+    }
+    widths.push(Constraint::Length(10));
     let model_width = table_column_width(area, &widths, 7);
+    let sparkline_width = show_sparkline
+        .then(|| table_column_width(area, &widths, 12))
+        .unwrap_or(0);
+    let now = SystemTime::now();
     let rows = sessions.iter().enumerate().map(|(index, session)| {
         let marker = if focused && index == selected {
             ">"
         } else {
             " "
         };
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(Span::styled(marker, Style::default().fg(TEAL))),
             text_cell(display_session_id(session.session_id.as_deref())),
             text_cell(session.project.as_deref().unwrap_or("-")),
@@ -682,16 +768,28 @@ fn render_sessions(
             number_cell(compact_tokens(session.input_tokens)),
             number_cell(compact_tokens(session.output_tokens)),
             rate_cell(session.rate().label()),
-            status_cell(&session.last_status),
-        ])
-        .style(if index == selected {
+        ];
+        if show_sparkline {
+            cells.push(Cell::from(token_sparkline_line(
+                &session.output_token_samples,
+                sparkline_width,
+                now,
+            )));
+        }
+        cells.push(status_cell(&session.last_status));
+        Row::new(cells).style(if index == selected {
             Style::default().bg(SELECTED_BG)
         } else {
             Style::default().bg(PANEL_BG)
         })
     });
+    let headers: &[(&str, Alignment)] = if show_sparkline {
+        &SESSION_WIDE_TABLE_HEADERS
+    } else {
+        &SESSION_TABLE_HEADERS
+    };
     let table = Table::new(rows, widths)
-        .header(table_header_aligned(SESSION_TABLE_HEADERS))
+        .header(table_header_aligned(headers.iter().copied()))
         .block(panel("Sessions", focused));
     frame.render_widget(table, area);
 }
@@ -1291,6 +1389,25 @@ mod tests {
             ]
         );
         assert_eq!(
+            table_header_labels(&SESSION_WIDE_TABLE_HEADERS),
+            [
+                "",
+                "ID",
+                "Project",
+                "Active",
+                "Reqs",
+                "Fail",
+                "Provider",
+                "Model",
+                "Effort",
+                "In",
+                "Out",
+                "Rate",
+                "Tokens/10s · 4k",
+                "Status",
+            ]
+        );
+        assert_eq!(
             table_header_labels(&ACTIVE_TABLE_HEADERS),
             [
                 "Started", "Provider", "Model", "Effort", "Endpoint", "Status", "Rate", "Elapsed",
@@ -1384,6 +1501,95 @@ mod tests {
         assert_eq!(ellipsize("claude-sonnet-4-6", 16), "claude-sonnet-4…");
         assert_eq!(ellipsize("gpt-5.6-sol", 16), "gpt-5.6-sol");
         assert_eq!(ellipsize("anything", 0), "");
+    }
+
+    #[test]
+    fn token_sparkline_uses_fixed_wall_clock_buckets() {
+        let samples = [
+            (SystemTime::UNIX_EPOCH + Duration::from_secs(78), 2_000),
+            (SystemTime::UNIX_EPOCH + Duration::from_secs(85), 3_000),
+            (SystemTime::UNIX_EPOCH + Duration::from_secs(100), 4_000),
+        ];
+        let bucket_start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let bucket_end = SystemTime::UNIX_EPOCH + Duration::from_secs(109);
+        let next_bucket = SystemTime::UNIX_EPOCH + Duration::from_secs(110);
+
+        assert_eq!(token_sparkline(&[], 4, bucket_start), "    ");
+        assert_eq!(token_sparkline(&samples, 4, bucket_start), "▄▆ █");
+        assert_eq!(token_sparkline(&samples, 4, bucket_end), "▄▆ █");
+        assert_eq!(token_sparkline(&samples, 4, next_bucket), "▆ █ ");
+        assert_eq!(token_sparkline(&samples, 0, bucket_start), "");
+    }
+
+    #[test]
+    fn token_sparkline_uses_fixed_shared_scale() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let current = (now, 2_000);
+        let offscreen_peak = (SystemTime::UNIX_EPOCH, 4_000);
+
+        assert_eq!(token_sparkline(&[current], 2, now), " ▄");
+        assert_eq!(token_sparkline(&[offscreen_peak, current], 2, now), " ▄");
+        assert_eq!(token_sparkline(&[(now, 10_000)], 1, now), "█");
+    }
+
+    #[test]
+    fn token_sparkline_dims_the_current_bucket() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let samples = [
+            (SystemTime::UNIX_EPOCH + Duration::from_secs(95), 2_000),
+            (now, 4_000),
+        ];
+
+        let line = token_sparkline_line(&samples, 2, now);
+
+        assert_eq!(line.spans[0].content, "▄");
+        assert_eq!(line.spans[0].style.fg, Some(BLUE));
+        assert_eq!(line.spans[1].content, "█");
+        assert_eq!(line.spans[1].style.fg, Some(DIM));
+    }
+
+    #[test]
+    fn session_sparkline_appears_only_when_space_allows_and_expands() {
+        let monitor = MonitorHandle::new(10);
+        for (index, tokens) in [1_000, 2_000, 4_000].into_iter().enumerate() {
+            let request_id = format!("request-{index}");
+            monitor.request_started(
+                &request_id,
+                Some("sess-1".to_string()),
+                Some(index as u64 + 1),
+                EndpointKind::Messages,
+            );
+            monitor.provider_selected(&request_id, "codex", "gpt-5.6-sol", None);
+            monitor.request_completed(&request_id, 200, Some(100), Some(tokens));
+        }
+        let state = monitor.snapshot();
+
+        let narrow = draw(SESSION_SPARKLINE_MIN_WIDTH - 1, 8, |frame| {
+            render_sessions(frame, frame.area(), &state.sessions, 0, true)
+        });
+        let wide = draw(SESSION_SPARKLINE_MIN_WIDTH, 8, |frame| {
+            render_sessions(frame, frame.area(), &state.sessions, 0, true)
+        });
+        let wider = draw(SESSION_SPARKLINE_MIN_WIDTH + 30, 8, |frame| {
+            render_sessions(frame, frame.area(), &state.sessions, 0, true)
+        });
+        let narrow_text = buffer_text(&narrow);
+        let wide_text = buffer_text(&wide);
+        let wider_text = buffer_text(&wider);
+        let spark_chars = |text: &str| {
+            text.chars()
+                .filter(|ch| matches!(ch, '▁' | '▂' | '▃' | '▄' | '▅' | '▆' | '▇' | '█'))
+                .count()
+        };
+
+        assert!(!narrow_text.contains("Tokens/10s"), "{narrow_text}");
+        assert_eq!(spark_chars(&narrow_text), 0, "{narrow_text}");
+        assert!(wide_text.contains("Tokens/10s"), "{wide_text}");
+        assert!(spark_chars(&wide_text) > 0, "{wide_text}");
+        assert!(
+            wider_text.find("█ completed") > wide_text.find("█ completed"),
+            "{wider_text}"
+        );
     }
 
     #[test]

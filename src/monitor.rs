@@ -10,6 +10,7 @@ mod mock;
 pub use mock::{MockMonitor, mock_state};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
+pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointKind {
@@ -235,6 +236,7 @@ pub struct SessionSummary {
     pub last_seen: SystemTime,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub output_token_samples: Vec<(SystemTime, u64)>,
     rate_output_tokens: u64,
     pub generation_duration: Duration,
     pub last_status: String,
@@ -262,6 +264,7 @@ struct MonitorStore {
     started_at: SystemTime,
     active: HashMap<String, ActiveRequest>,
     recent: VecDeque<CompletedRequest>,
+    session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     recent_limit: usize,
 }
 
@@ -283,6 +286,7 @@ impl MonitorHandle {
                 started_at: SystemTime::now(),
                 active: HashMap::new(),
                 recent: VecDeque::new(),
+                session_output_buckets: HashMap::new(),
                 recent_limit,
             })),
         }
@@ -528,6 +532,7 @@ impl MonitorStore {
                 input_tokens,
                 output_tokens,
             } => {
+                let mut history_update = None;
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.status = RequestStatus::Streaming;
                     if active.generation_started_instant.is_none() {
@@ -550,6 +555,7 @@ impl MonitorStore {
                     .iter_mut()
                     .find(|request| request.request_id == request_id)
                 {
+                    let previous_output_tokens = completed.output_tokens.unwrap_or(0);
                     if let Some(started) = completed.generation_started_instant {
                         completed.generation_finished_at = Some(SystemTime::now());
                         completed.generation_duration = Some(started.elapsed());
@@ -558,6 +564,22 @@ impl MonitorStore {
                     completed.stream_chunks = completed.stream_chunks.saturating_add(chunks);
                     completed.input_tokens = input_tokens.or(completed.input_tokens);
                     completed.output_tokens = output_tokens.or(completed.output_tokens);
+                    let added_tokens = completed
+                        .output_tokens
+                        .unwrap_or(0)
+                        .saturating_sub(previous_output_tokens);
+                    if added_tokens > 0 {
+                        history_update = Some((
+                            completed.session_id.clone(),
+                            completed
+                                .generation_finished_at
+                                .unwrap_or(completed.finished_at),
+                            added_tokens,
+                        ));
+                    }
+                }
+                if let Some((session_id, timestamp, tokens)) = history_update {
+                    self.record_session_output(session_id, timestamp, tokens);
                 }
             }
             MonitorEvent::UsageUpdated {
@@ -565,6 +587,7 @@ impl MonitorStore {
                 input_tokens,
                 output_tokens,
             } => {
+                let mut history_update = None;
                 if let Some(active) = self.active.get_mut(&request_id) {
                     if output_tokens.is_some()
                         && let Some(started) = active.generation_started_instant
@@ -579,6 +602,7 @@ impl MonitorStore {
                     .iter_mut()
                     .find(|request| request.request_id == request_id)
                 {
+                    let previous_output_tokens = completed.output_tokens.unwrap_or(0);
                     if output_tokens.is_some()
                         && let Some(started) = completed.generation_started_instant
                     {
@@ -587,6 +611,22 @@ impl MonitorStore {
                     }
                     completed.input_tokens = input_tokens.or(completed.input_tokens);
                     completed.output_tokens = output_tokens.or(completed.output_tokens);
+                    let added_tokens = completed
+                        .output_tokens
+                        .unwrap_or(0)
+                        .saturating_sub(previous_output_tokens);
+                    if added_tokens > 0 {
+                        history_update = Some((
+                            completed.session_id.clone(),
+                            completed
+                                .generation_finished_at
+                                .unwrap_or(completed.finished_at),
+                            added_tokens,
+                        ));
+                    }
+                }
+                if let Some((session_id, timestamp, tokens)) = history_update {
+                    self.record_session_output(session_id, timestamp, tokens);
                 }
             }
             MonitorEvent::RequestCompleted {
@@ -720,16 +760,39 @@ impl MonitorStore {
             error: error.or(active.error),
             traffic_capture_path: active.traffic_capture_path,
         };
+        if let Some(tokens) = completed.output_tokens.filter(|tokens| *tokens > 0) {
+            self.record_session_output(
+                completed.session_id.clone(),
+                completed
+                    .generation_finished_at
+                    .unwrap_or(completed.finished_at),
+                tokens,
+            );
+        }
         self.recent.push_front(completed);
         while self.recent.len() > self.recent_limit {
             self.recent.pop_back();
         }
     }
 
+    fn record_session_output(
+        &mut self,
+        session_id: Option<String>,
+        timestamp: SystemTime,
+        tokens: u64,
+    ) {
+        let bucket = session_token_bucket(timestamp);
+        let buckets = self.session_output_buckets.entry(session_id).or_default();
+        match buckets.binary_search_by_key(&bucket, |(bucket, _)| *bucket) {
+            Ok(index) => buckets[index].1 = buckets[index].1.saturating_add(tokens),
+            Err(index) => buckets.insert(index, (bucket, tokens)),
+        }
+    }
+
     fn snapshot(&self) -> MonitorState {
         let mut active: Vec<_> = self.active.values().cloned().collect();
         active.sort_by_key(|request| request.started_at);
-        let sessions = session_summaries(&active, &self.recent);
+        let sessions = session_summaries(&active, &self.recent, &self.session_output_buckets);
         MonitorState {
             started_at: self.started_at,
             sessions,
@@ -742,6 +805,7 @@ impl MonitorStore {
 fn session_summaries(
     active: &[ActiveRequest],
     recent: &VecDeque<CompletedRequest>,
+    session_output_buckets: &HashMap<Option<String>, Vec<(u64, u64)>>,
 ) -> Vec<SessionSummary> {
     let mut sessions: HashMap<Option<String>, SessionSummary> = HashMap::new();
     for request in recent.iter().rev() {
@@ -759,6 +823,7 @@ fn session_summaries(
                 last_seen: request.finished_at,
                 input_tokens: 0,
                 output_tokens: 0,
+                output_token_samples: Vec::new(),
                 rate_output_tokens: 0,
                 generation_duration: Duration::ZERO,
                 last_status: "-".to_string(),
@@ -808,6 +873,7 @@ fn session_summaries(
                 last_seen: request.started_at,
                 input_tokens: 0,
                 output_tokens: 0,
+                output_token_samples: Vec::new(),
                 rate_output_tokens: 0,
                 generation_duration: Duration::ZERO,
                 last_status: "-".to_string(),
@@ -840,9 +906,30 @@ fn session_summaries(
         entry.last_status = request.status.label().to_string();
     }
 
+    for (session_id, session) in &mut sessions {
+        if let Some(buckets) = session_output_buckets.get(session_id) {
+            session.output_token_samples = buckets
+                .iter()
+                .map(|(bucket, tokens)| (session_token_bucket_start(*bucket), *tokens))
+                .collect();
+        }
+    }
+
     let mut out: Vec<_> = sessions.into_values().collect();
     out.sort_by_key(SessionSummary::label);
     out
+}
+
+fn session_token_bucket(timestamp: SystemTime) -> u64 {
+    timestamp
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+        / SESSION_TOKEN_BUCKET_SECS
+}
+
+fn session_token_bucket_start(bucket: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(bucket.saturating_mul(SESSION_TOKEN_BUCKET_SECS))
 }
 
 fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
@@ -1001,6 +1088,14 @@ mod tests {
             state.recent[0].rate(),
             Throughput::TokensPerSecond(_)
         ));
+        assert_eq!(
+            state.sessions[0]
+                .output_token_samples
+                .iter()
+                .map(|(_, tokens)| *tokens)
+                .sum::<u64>(),
+            141
+        );
     }
 
     #[test]
@@ -1181,7 +1276,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             ),
         ]);
 
-        let sessions = session_summaries(&[], &recent);
+        let sessions = session_summaries(&[], &recent, &HashMap::new());
 
         assert_eq!(sessions[0].output_tokens, 150);
         assert_eq!(sessions[0].generation_duration, Duration::from_secs(5));
@@ -1194,7 +1289,10 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         let recent = VecDeque::from([request.clone()]);
 
         assert_eq!(request.rate(), Throughput::None);
-        assert_eq!(session_summaries(&[], &recent)[0].rate(), Throughput::None);
+        assert_eq!(
+            session_summaries(&[], &recent, &HashMap::new())[0].rate(),
+            Throughput::None
+        );
     }
 
     #[test]
@@ -1219,7 +1317,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         ]);
 
         assert_eq!(
-            session_summaries(&[], &recent)[0].rate(),
+            session_summaries(&[], &recent, &HashMap::new())[0].rate(),
             Throughput::TokensPerSecond(25.0)
         );
     }
@@ -1237,7 +1335,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             ),
         ]);
 
-        let session = &session_summaries(&[], &recent)[0];
+        let session = &session_summaries(&[], &recent, &HashMap::new())[0];
 
         assert_eq!(session.output_tokens, 1_000);
         assert_eq!(session.rate(), Throughput::TokensPerSecond(25.0));
@@ -1270,6 +1368,40 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(state.sessions[0].active_count, 1);
         assert_eq!(state.sessions[0].effort.as_deref(), Some("xhigh"));
         assert_eq!(state.sessions[0].output_tokens, 20);
+        assert_eq!(
+            state.sessions[0]
+                .output_token_samples
+                .iter()
+                .map(|(_, tokens)| *tokens)
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+    }
+
+    #[test]
+    fn session_output_history_survives_request_eviction() {
+        let monitor = MonitorHandle::new(1);
+        for (request_id, tokens) in [("oldest", 20), ("newest", 80)] {
+            monitor.request_started(
+                request_id,
+                Some("s1".to_string()),
+                None,
+                EndpointKind::Messages,
+            );
+            monitor.request_completed(request_id, 200, None, Some(tokens));
+        }
+
+        let state = monitor.snapshot();
+
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.sessions[0]
+                .output_token_samples
+                .iter()
+                .map(|(_, tokens)| *tokens)
+                .sum::<u64>(),
+            100
+        );
     }
 
     #[test]
