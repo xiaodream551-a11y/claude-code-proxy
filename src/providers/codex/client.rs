@@ -881,6 +881,7 @@ impl CodexHttpClient {
             .collect();
 
         let mut body_bytes = Vec::new();
+        let mut response_started = false;
         loop {
             let chunk = tokio::time::timeout(
                 Duration::from_millis(self.body_idle_timeout_ms),
@@ -908,6 +909,12 @@ impl CodexHttpClient {
             let Some(chunk) = chunk else {
                 break;
             };
+            if !response_started {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.generation_started(&ctx.req_id);
+                }
+                response_started = true;
+            }
             body_bytes.extend_from_slice(&chunk);
         }
 

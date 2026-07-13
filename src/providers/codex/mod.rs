@@ -395,6 +395,7 @@ async fn live_stream_response_once(
 ) -> LiveStreamStart {
     let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
     let mut upstream_sse_body = Vec::new();
+    let mut generation_started = false;
 
     while let Some(item) = upstream_events.recv().await {
         let payload = match item {
@@ -407,6 +408,12 @@ async fn live_stream_response_once(
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
+        if !generation_started && codex_generation_event(&payload) {
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.generation_started(&ctx.req_id);
+            }
+            generation_started = true;
+        }
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, &ctx)
         {
@@ -490,6 +497,13 @@ async fn live_stream_response_once(
             origin: client::CodexErrorOrigin::WebSocket,
         },
     }
+}
+
+fn codex_generation_event(payload: &serde_json::Value) -> bool {
+    !matches!(
+        payload.get("type").and_then(|value| value.as_str()),
+        Some("codex.rate_limits" | "keepalive") | None
+    )
 }
 
 fn translate_live_stream_payload(
@@ -968,6 +982,19 @@ mod tests {
             assert_eq!(model, resolved, "model must not change without web_search");
             assert_eq!(lite, lite_expected);
         }
+    }
+
+    #[test]
+    fn generation_timing_ignores_control_events() {
+        assert!(!codex_generation_event(&serde_json::json!({
+            "type": "codex.rate_limits"
+        })));
+        assert!(!codex_generation_event(&serde_json::json!({
+            "type": "keepalive"
+        })));
+        assert!(codex_generation_event(&serde_json::json!({
+            "type": "response.created"
+        })));
     }
 
     #[test]

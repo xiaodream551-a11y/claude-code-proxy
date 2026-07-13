@@ -452,8 +452,14 @@ sequenceDiagram
 Starts the HTTP proxy and blocks. Binds to `127.0.0.1` by default. Set
 `CCP_BIND_ADDRESS` or the `bindAddress` config key to choose another IP address.
 When stdout is a terminal, `serve` opens a monitor TUI showing sessions, active
-requests, recent requests, token throughput, and error events. Use `--no-monitor`
-to run with plain terminal output.
+requests, recent requests, output throughput, and error events. Token throughput
+uses the change in cumulative output usage over the matching observed generation
+interval. For Codex, timing begins with the first upstream response event or body
+chunk and ends with the terminal usage observation, so reasoning tokens and their
+generation time have the same scope. Requests without both usage and timing are
+excluded from the session rate. Session throughput combines the matched token and
+duration samples retained by the monitor. Use `--no-monitor` to run with plain
+terminal output.
 
 Logs are written to the platform state directory and rotated at 20 MiB. Set
 `CCP_LOG_STDERR=1` to mirror log lines to stderr while running without the

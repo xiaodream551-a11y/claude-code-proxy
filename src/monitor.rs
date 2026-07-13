@@ -66,6 +66,9 @@ pub enum MonitorEvent {
     UpstreamStarted {
         request_id: String,
     },
+    GenerationStarted {
+        request_id: String,
+    },
     TrafficCapturePath {
         request_id: String,
         path: PathBuf,
@@ -110,6 +113,11 @@ pub struct ActiveRequest {
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
     started_instant: Instant,
+    pub generation_started_at: Option<SystemTime>,
+    generation_started_instant: Option<Instant>,
+    generation_initial_output_tokens: u64,
+    pub generation_finished_at: Option<SystemTime>,
+    pub generation_duration: Option<Duration>,
     pub status: RequestStatus,
     pub streamed_bytes: u64,
     pub stream_chunks: u64,
@@ -126,10 +134,11 @@ impl ActiveRequest {
 
     pub fn rate(&self) -> Throughput {
         throughput(
-            self.output_tokens,
+            self.output_tokens
+                .and_then(|tokens| tokens.checked_sub(self.generation_initial_output_tokens)),
             self.streamed_bytes,
             self.stream_chunks,
-            self.elapsed(),
+            self.generation_duration.unwrap_or(Duration::ZERO),
         )
     }
 }
@@ -145,6 +154,11 @@ pub struct CompletedRequest {
     pub endpoint: EndpointKind,
     pub started_at: SystemTime,
     pub finished_at: SystemTime,
+    pub generation_started_at: Option<SystemTime>,
+    generation_started_instant: Option<Instant>,
+    generation_initial_output_tokens: u64,
+    pub generation_finished_at: Option<SystemTime>,
+    pub generation_duration: Option<Duration>,
     pub status: RequestStatus,
     pub http_status: Option<u16>,
     pub latency: Duration,
@@ -159,10 +173,11 @@ pub struct CompletedRequest {
 impl CompletedRequest {
     pub fn rate(&self) -> Throughput {
         throughput(
-            self.output_tokens,
+            self.output_tokens
+                .and_then(|tokens| tokens.checked_sub(self.generation_initial_output_tokens)),
             self.streamed_bytes,
             self.stream_chunks,
-            self.latency,
+            self.generation_duration.unwrap_or(Duration::ZERO),
         )
     }
 }
@@ -209,17 +224,18 @@ pub struct SessionSummary {
     pub last_seen: SystemTime,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub elapsed: Duration,
+    rate_output_tokens: u64,
+    pub generation_duration: Duration,
     pub last_status: String,
 }
 
 impl SessionSummary {
     pub fn rate(&self) -> Throughput {
         throughput(
-            Some(self.output_tokens).filter(|tokens| *tokens > 0),
+            Some(self.rate_output_tokens).filter(|tokens| *tokens > 0),
             0,
             0,
-            self.elapsed,
+            self.generation_duration,
         )
     }
 
@@ -322,6 +338,12 @@ impl MonitorHandle {
         });
     }
 
+    pub fn generation_started(&self, request_id: impl Into<String>) {
+        self.publish(MonitorEvent::GenerationStarted {
+            request_id: request_id.into(),
+        });
+    }
+
     pub fn traffic_capture_path(&self, request_id: impl Into<String>, path: PathBuf) {
         self.publish(MonitorEvent::TrafficCapturePath {
             request_id: request_id.into(),
@@ -416,6 +438,11 @@ impl MonitorStore {
                         endpoint,
                         started_at: SystemTime::now(),
                         started_instant: Instant::now(),
+                        generation_started_at: None,
+                        generation_started_instant: None,
+                        generation_initial_output_tokens: 0,
+                        generation_finished_at: None,
+                        generation_duration: None,
                         status: RequestStatus::Started,
                         streamed_bytes: 0,
                         stream_chunks: 0,
@@ -453,6 +480,15 @@ impl MonitorStore {
                     active.status = RequestStatus::Upstream;
                 }
             }
+            MonitorEvent::GenerationStarted { request_id } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.generation_started_at = Some(SystemTime::now());
+                    active.generation_started_instant = Some(Instant::now());
+                    active.generation_initial_output_tokens = active.output_tokens.unwrap_or(0);
+                    active.generation_finished_at = None;
+                    active.generation_duration = None;
+                }
+            }
             MonitorEvent::TrafficCapturePath { request_id, path } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.traffic_capture_path = Some(path);
@@ -467,6 +503,17 @@ impl MonitorStore {
             } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.status = RequestStatus::Streaming;
+                    if active.generation_started_instant.is_none() {
+                        active.generation_started_at = Some(SystemTime::now());
+                        active.generation_started_instant = Some(Instant::now());
+                        active.generation_initial_output_tokens =
+                            output_tokens.or(active.output_tokens).unwrap_or(0);
+                    } else {
+                        active.generation_finished_at = Some(SystemTime::now());
+                        active.generation_duration = active
+                            .generation_started_instant
+                            .map(|started| started.elapsed());
+                    }
                     active.streamed_bytes = active.streamed_bytes.saturating_add(bytes);
                     active.stream_chunks = active.stream_chunks.saturating_add(chunks);
                     active.input_tokens = input_tokens.or(active.input_tokens);
@@ -476,15 +523,14 @@ impl MonitorStore {
                     .iter_mut()
                     .find(|request| request.request_id == request_id)
                 {
+                    if let Some(started) = completed.generation_started_instant {
+                        completed.generation_finished_at = Some(SystemTime::now());
+                        completed.generation_duration = Some(started.elapsed());
+                    }
                     completed.streamed_bytes = completed.streamed_bytes.saturating_add(bytes);
                     completed.stream_chunks = completed.stream_chunks.saturating_add(chunks);
                     completed.input_tokens = input_tokens.or(completed.input_tokens);
                     completed.output_tokens = output_tokens.or(completed.output_tokens);
-                    completed.finished_at = SystemTime::now();
-                    completed.latency = completed
-                        .finished_at
-                        .duration_since(completed.started_at)
-                        .unwrap_or(completed.latency);
                 }
             }
             MonitorEvent::UsageUpdated {
@@ -493,6 +539,12 @@ impl MonitorStore {
                 output_tokens,
             } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
+                    if output_tokens.is_some()
+                        && let Some(started) = active.generation_started_instant
+                    {
+                        active.generation_finished_at = Some(SystemTime::now());
+                        active.generation_duration = Some(started.elapsed());
+                    }
                     active.input_tokens = input_tokens.or(active.input_tokens);
                     active.output_tokens = output_tokens.or(active.output_tokens);
                 } else if let Some(completed) = self
@@ -500,6 +552,12 @@ impl MonitorStore {
                     .iter_mut()
                     .find(|request| request.request_id == request_id)
                 {
+                    if output_tokens.is_some()
+                        && let Some(started) = completed.generation_started_instant
+                    {
+                        completed.generation_finished_at = Some(SystemTime::now());
+                        completed.generation_duration = Some(started.elapsed());
+                    }
                     completed.input_tokens = input_tokens.or(completed.input_tokens);
                     completed.output_tokens = output_tokens.or(completed.output_tokens);
                 }
@@ -576,7 +634,7 @@ impl MonitorStore {
         output_tokens: Option<u64>,
         error: Option<String>,
     ) {
-        let active = self
+        let mut active = self
             .active
             .remove(request_id)
             .unwrap_or_else(|| ActiveRequest {
@@ -589,6 +647,11 @@ impl MonitorStore {
                 endpoint: EndpointKind::Messages,
                 started_at: SystemTime::now(),
                 started_instant: Instant::now(),
+                generation_started_at: None,
+                generation_started_instant: None,
+                generation_initial_output_tokens: 0,
+                generation_finished_at: None,
+                generation_duration: None,
                 status: RequestStatus::Started,
                 streamed_bytes: 0,
                 stream_chunks: 0,
@@ -597,6 +660,12 @@ impl MonitorStore {
                 error: None,
                 traffic_capture_path: None,
             });
+        if output_tokens.is_some()
+            && let Some(started) = active.generation_started_instant
+        {
+            active.generation_finished_at = Some(SystemTime::now());
+            active.generation_duration = Some(started.elapsed());
+        }
         let completed = CompletedRequest {
             request_id: active.request_id,
             session_id: active.session_id,
@@ -607,6 +676,11 @@ impl MonitorStore {
             endpoint: active.endpoint,
             started_at: active.started_at,
             finished_at: SystemTime::now(),
+            generation_started_at: active.generation_started_at,
+            generation_started_instant: active.generation_started_instant,
+            generation_initial_output_tokens: active.generation_initial_output_tokens,
+            generation_finished_at: active.generation_finished_at,
+            generation_duration: active.generation_duration,
             status,
             http_status,
             latency: active.started_instant.elapsed(),
@@ -655,7 +729,8 @@ fn session_summaries(
                 last_seen: request.finished_at,
                 input_tokens: 0,
                 output_tokens: 0,
-                elapsed: Duration::ZERO,
+                rate_output_tokens: 0,
+                generation_duration: Duration::ZERO,
                 last_status: "-".to_string(),
             });
         entry.request_count += 1;
@@ -672,7 +747,18 @@ fn session_summaries(
         entry.output_tokens = entry
             .output_tokens
             .saturating_add(request.output_tokens.unwrap_or(0));
-        entry.elapsed = entry.elapsed.saturating_add(request.latency);
+        if let (Some(tokens), Some(duration)) = (
+            request
+                .output_tokens
+                .and_then(|tokens| tokens.checked_sub(request.generation_initial_output_tokens))
+                .filter(|tokens| *tokens > 0),
+            request
+                .generation_duration
+                .filter(|duration| !duration.is_zero()),
+        ) {
+            entry.rate_output_tokens = entry.rate_output_tokens.saturating_add(tokens);
+            entry.generation_duration = entry.generation_duration.saturating_add(duration);
+        }
         entry.last_status = request.status.label().to_string();
     }
 
@@ -690,7 +776,8 @@ fn session_summaries(
                 last_seen: request.started_at,
                 input_tokens: 0,
                 output_tokens: 0,
-                elapsed: Duration::ZERO,
+                rate_output_tokens: 0,
+                generation_duration: Duration::ZERO,
                 last_status: "-".to_string(),
             });
         entry.active_count += 1;
@@ -705,7 +792,18 @@ fn session_summaries(
         entry.output_tokens = entry
             .output_tokens
             .saturating_add(request.output_tokens.unwrap_or(0));
-        entry.elapsed = entry.elapsed.saturating_add(request.elapsed());
+        if let (Some(tokens), Some(duration)) = (
+            request
+                .output_tokens
+                .and_then(|tokens| tokens.checked_sub(request.generation_initial_output_tokens))
+                .filter(|tokens| *tokens > 0),
+            request
+                .generation_duration
+                .filter(|duration| !duration.is_zero()),
+        ) {
+            entry.rate_output_tokens = entry.rate_output_tokens.saturating_add(tokens);
+            entry.generation_duration = entry.generation_duration.saturating_add(duration);
+        }
         entry.last_status = request.status.label().to_string();
     }
 
@@ -820,25 +918,41 @@ mod tests {
     }
 
     #[test]
-    fn active_stream_progress_reports_token_rate() {
+    fn generation_baseline_pairs_total_usage_with_the_full_observed_interval() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", None, None, EndpointKind::Messages);
+        monitor.generation_started("r1");
+        monitor.stream_progress("r1", 50, 1, Some(1_225), Some(141));
+        monitor.request_completed("r1", 200, None, None);
+
+        let request = &monitor.snapshot().recent[0];
+
+        assert!(
+            request
+                .generation_duration
+                .is_some_and(|duration| !duration.is_zero())
+        );
+        assert!(matches!(request.rate(), Throughput::TokensPerSecond(_)));
+    }
+
+    #[test]
+    fn first_stream_progress_has_no_rate_without_an_interval() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
         monitor.stream_progress("r1", 50, 1, Some(1_225), Some(141));
 
         let state = monitor.snapshot();
         assert_eq!(state.active.len(), 1);
-        assert!(matches!(
-            state.active[0].rate(),
-            Throughput::TokensPerSecond(_)
-        ));
+        assert_eq!(state.active[0].rate(), Throughput::None);
     }
 
     #[test]
-    fn late_stream_usage_updates_completed_request() {
+    fn late_stream_progress_extends_stream_timing_without_extending_request_latency() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started("r1", None, None, EndpointKind::Messages);
         monitor.stream_progress("r1", 100, 1, Some(0), Some(0));
         monitor.request_completed("r1", 200, None, None);
+        let completed = monitor.snapshot().recent[0].clone();
         monitor.stream_progress("r1", 50, 1, Some(1_225), Some(141));
 
         let state = monitor.snapshot();
@@ -847,6 +961,9 @@ mod tests {
         assert_eq!(state.recent[0].stream_chunks, 2);
         assert_eq!(state.recent[0].input_tokens, Some(1_225));
         assert_eq!(state.recent[0].output_tokens, Some(141));
+        assert_eq!(state.recent[0].finished_at, completed.finished_at);
+        assert_eq!(state.recent[0].latency, completed.latency);
+        assert!(state.recent[0].generation_duration > completed.generation_duration);
         assert!(matches!(
             state.recent[0].rate(),
             Throughput::TokensPerSecond(_)
@@ -947,6 +1064,149 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 
 "#;
         assert_eq!(usage_from_anthropic_sse(sse), (Some(12), Some(48)));
+    }
+
+    fn completed_request(
+        request_id: &str,
+        session_id: &str,
+        output_tokens: u64,
+        latency: Duration,
+        generation_duration: Option<Duration>,
+    ) -> CompletedRequest {
+        CompletedRequest {
+            request_id: request_id.to_string(),
+            session_id: Some(session_id.to_string()),
+            session_seq: None,
+            provider: Some("codex".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: None,
+            endpoint: EndpointKind::Messages,
+            started_at: SystemTime::UNIX_EPOCH,
+            finished_at: SystemTime::UNIX_EPOCH + latency,
+            generation_started_at: generation_duration.map(|_| SystemTime::UNIX_EPOCH),
+            generation_started_instant: None,
+            generation_initial_output_tokens: 0,
+            generation_finished_at: generation_duration
+                .map(|duration| SystemTime::UNIX_EPOCH + duration),
+            generation_duration,
+            status: RequestStatus::Completed,
+            http_status: Some(200),
+            latency,
+            streamed_bytes: 0,
+            stream_chunks: 0,
+            input_tokens: None,
+            output_tokens: Some(output_tokens),
+            error: None,
+            traffic_capture_path: None,
+        }
+    }
+
+    #[test]
+    fn completed_request_rate_uses_stream_interval_instead_of_request_latency() {
+        let request = completed_request(
+            "r1",
+            "s1",
+            120,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(4)),
+        );
+
+        assert_eq!(request.rate(), Throughput::TokensPerSecond(30.0));
+    }
+
+    #[test]
+    fn request_rate_uses_token_delta_from_the_initial_observation() {
+        let mut request = completed_request(
+            "r1",
+            "s1",
+            120,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(4)),
+        );
+        request.generation_initial_output_tokens = 20;
+
+        assert_eq!(request.rate(), Throughput::TokensPerSecond(25.0));
+    }
+
+    #[test]
+    fn session_rate_combines_request_tokens_and_generation_intervals() {
+        let recent = VecDeque::from([
+            completed_request(
+                "r2",
+                "s1",
+                50,
+                Duration::from_secs(40),
+                Some(Duration::from_secs(1)),
+            ),
+            completed_request(
+                "r1",
+                "s1",
+                100,
+                Duration::from_secs(20),
+                Some(Duration::from_secs(4)),
+            ),
+        ]);
+
+        let sessions = session_summaries(&[], &recent);
+
+        assert_eq!(sessions[0].output_tokens, 150);
+        assert_eq!(sessions[0].generation_duration, Duration::from_secs(5));
+        assert_eq!(sessions[0].rate(), Throughput::TokensPerSecond(30.0));
+    }
+
+    #[test]
+    fn output_without_observed_stream_interval_has_no_output_rate() {
+        let request = completed_request("r1", "s1", 120, Duration::from_secs(30), None);
+        let recent = VecDeque::from([request.clone()]);
+
+        assert_eq!(request.rate(), Throughput::None);
+        assert_eq!(session_summaries(&[], &recent)[0].rate(), Throughput::None);
+    }
+
+    #[test]
+    fn session_rate_excludes_interval_without_output_usage() {
+        let mut tokenless = completed_request(
+            "tokenless",
+            "s1",
+            0,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(100)),
+        );
+        tokenless.output_tokens = None;
+        let recent = VecDeque::from([
+            tokenless,
+            completed_request(
+                "measured",
+                "s1",
+                100,
+                Duration::from_secs(20),
+                Some(Duration::from_secs(4)),
+            ),
+        ]);
+
+        assert_eq!(
+            session_summaries(&[], &recent)[0].rate(),
+            Throughput::TokensPerSecond(25.0)
+        );
+    }
+
+    #[test]
+    fn session_rate_excludes_output_without_a_matching_stream_interval() {
+        let recent = VecDeque::from([
+            completed_request("buffered", "s1", 900, Duration::from_secs(30), None),
+            completed_request(
+                "streamed",
+                "s1",
+                100,
+                Duration::from_secs(20),
+                Some(Duration::from_secs(4)),
+            ),
+        ]);
+
+        let session = &session_summaries(&[], &recent)[0];
+
+        assert_eq!(session.output_tokens, 1_000);
+        assert_eq!(session.rate(), Throughput::TokensPerSecond(25.0));
     }
 
     #[test]

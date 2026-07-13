@@ -287,10 +287,15 @@ where
                     return None;
                 }
             };
+            if self.bytes == 0
+                && let Some(monitor) = self.monitor.as_ref()
+            {
+                monitor.generation_started(&self.req_id);
+            }
             self.bytes = self.bytes.saturating_add(chunk.len() as u64);
             self.chunks = self.chunks.saturating_add(1);
             if let Some(monitor) = self.monitor.as_ref() {
-                monitor.stream_progress(&self.req_id, self.bytes, self.chunks, None, None);
+                monitor.stream_progress(&self.req_id, chunk.len() as u64, 1, None, None);
             }
             let events = match self.decoder.push(&chunk) {
                 Ok(events) => events,
