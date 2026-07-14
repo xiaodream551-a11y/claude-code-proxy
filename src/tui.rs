@@ -55,7 +55,7 @@ const SESSION_TABLE_HEADERS: [(&str, Alignment); 13] = [
     ("A", Alignment::Right),
     ("R", Alignment::Right),
     ("F", Alignment::Right),
-    ("Provider", Alignment::Left),
+    ("Prov", Alignment::Left),
     ("Model", Alignment::Left),
     ("Effort", Alignment::Left),
     ("In", Alignment::Right),
@@ -716,29 +716,105 @@ fn token_sparkline_line(
     ])
 }
 
-fn session_table_widths(show_sparkline: bool) -> Vec<Constraint> {
+fn session_value_width(header: &str, values: impl Iterator<Item = String>, maximum: u16) -> u16 {
+    values
+        .map(|value| value.chars().count())
+        .chain(std::iter::once(header.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(maximum)) as u16
+}
+
+fn session_table_widths(sessions: &[SessionSummary], show_sparkline: bool) -> Vec<Constraint> {
+    let project_width = session_value_width(
+        "Project",
+        sessions
+            .iter()
+            .map(|session| session.project.as_deref().unwrap_or("-").to_string()),
+        18,
+    );
+    let active_width = session_value_width(
+        "A",
+        sessions
+            .iter()
+            .map(|session| session.active_count.to_string()),
+        4,
+    );
+    let request_width = session_value_width(
+        "R",
+        sessions
+            .iter()
+            .map(|session| session.request_count.to_string()),
+        4,
+    );
+    let failure_width = session_value_width(
+        "F",
+        sessions
+            .iter()
+            .map(|session| session.failure_count.to_string()),
+        4,
+    );
+    let provider_width = session_value_width(
+        if show_sparkline { "Provider" } else { "Prov" },
+        sessions
+            .iter()
+            .map(|session| session.provider.as_deref().unwrap_or("-").to_string()),
+        10,
+    );
+    let effort_width = session_value_width(
+        "Effort",
+        sessions
+            .iter()
+            .map(|session| session.effort.as_deref().unwrap_or("-").to_string()),
+        7,
+    );
+    let input_width = session_value_width(
+        "In",
+        sessions
+            .iter()
+            .map(|session| compact_tokens(session.input_tokens)),
+        9,
+    );
+    let output_width = session_value_width(
+        "Out",
+        sessions
+            .iter()
+            .map(|session| compact_tokens(session.output_tokens)),
+        9,
+    );
+    let rate_width = session_value_width(
+        "Rate",
+        sessions.iter().map(|session| session.rate().label()),
+        12,
+    );
+    let status_width = session_value_width(
+        "Status",
+        sessions.iter().map(|session| session.last_status.clone()),
+        10,
+    );
+
     let mut widths = vec![
         Constraint::Length(1),
         Constraint::Length(8),
-        Constraint::Length(18),
-        Constraint::Length(4),
-        Constraint::Length(4),
-        Constraint::Length(4),
-        Constraint::Length(10),
+        Constraint::Length(project_width),
+        Constraint::Length(active_width),
+        Constraint::Length(request_width),
+        Constraint::Length(failure_width),
+        Constraint::Length(provider_width),
         if show_sparkline {
             Constraint::Length(SESSION_MODEL_WIDTH)
         } else {
             Constraint::Fill(1)
         },
-        Constraint::Length(7),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(12),
+        Constraint::Length(effort_width),
+        Constraint::Length(input_width),
+        Constraint::Length(output_width),
+        Constraint::Length(rate_width),
     ];
     if show_sparkline {
         widths.push(Constraint::Fill(1));
     }
-    widths.push(Constraint::Length(10));
+    widths.push(Constraint::Length(status_width));
     widths
 }
 
@@ -755,7 +831,7 @@ fn render_sessions(
     }
 
     let show_sparkline = area.width >= SESSION_SPARKLINE_MIN_WIDTH;
-    let widths = session_table_widths(show_sparkline);
+    let widths = session_table_widths(sessions, show_sparkline);
     let model_width = table_column_width(area, &widths, 7);
     let sparkline_width = show_sparkline
         .then(|| table_column_width(area, &widths, 12))
@@ -1398,8 +1474,8 @@ mod tests {
         assert_eq!(
             table_header_labels(&SESSION_TABLE_HEADERS),
             [
-                "", "ID", "Project", "A", "R", "F", "Provider", "Model", "Effort", "In", "Out",
-                "Rate", "Status",
+                "", "ID", "Project", "A", "R", "F", "Prov", "Model", "Effort", "In", "Out", "Rate",
+                "Status",
             ]
         );
         assert_eq!(
@@ -1493,16 +1569,21 @@ mod tests {
     }
 
     #[test]
-    fn session_columns_preserve_fixed_widths_before_allocating_flexible_space() {
-        let compact = session_table_widths(false);
-        let area = Rect::new(0, 0, 150, 10);
+    fn session_columns_fit_displayed_content_before_allocating_flexible_space() {
+        let state = mock_state();
+        let compact = session_table_widths(&state.sessions, false);
+        let area = Rect::new(0, 0, 120, 10);
 
         assert_eq!(table_column_width(area, &compact, 2), 18);
-        assert_eq!(table_column_width(area, &compact, 6), 10);
-        assert_eq!(table_column_width(area, &compact, 8), 7);
-        assert!(table_column_width(area, &compact, 7) >= 20);
+        assert_eq!(table_column_width(area, &compact, 3), 1);
+        assert_eq!(table_column_width(area, &compact, 4), 1);
+        assert_eq!(table_column_width(area, &compact, 5), 1);
+        assert_eq!(table_column_width(area, &compact, 6), 6);
+        assert!(table_column_width(area, &compact, 9) <= 6);
+        assert!(table_column_width(area, &compact, 10) <= 4);
+        assert!(table_column_width(area, &compact, 7) >= 10);
 
-        let wide = session_table_widths(true);
+        let wide = session_table_widths(&state.sessions, true);
         let wide_area = Rect::new(0, 0, 200, 10);
         assert_eq!(
             table_column_width(wide_area, &wide, 7),
@@ -1698,7 +1779,7 @@ mod tests {
             render_sessions(frame, frame.area(), &active_state.sessions, 0, true)
         });
         let sessions_text = buffer_text(&sessions);
-        assert!(sessions_text.contains("Provider"));
+        assert!(sessions_text.contains("Prov"));
         assert!(sessions_text.contains("Project"));
         assert!(sessions_text.contains("example-project"));
         assert!(sessions_text.contains("sess-1"));
