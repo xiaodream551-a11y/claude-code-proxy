@@ -41,6 +41,7 @@ const RED: Color = Color::Rgb(220, 120, 120);
 const YELLOW: Color = Color::Rgb(220, 200, 100);
 const BLUE: Color = Color::Rgb(120, 170, 230);
 const DIM: Color = Color::Rgb(100, 104, 114);
+const ACTIVE_MODEL_WIDTH: u16 = 40;
 const RECENT_MODEL_WIDTH: u16 = 36;
 
 const SESSION_SPARKLINE_MIN_WIDTH: u16 = 170;
@@ -79,10 +80,11 @@ const SESSION_WIDE_TABLE_HEADERS: [(&str, Alignment); 14] = [
     ("Status", Alignment::Left),
 ];
 
-const ACTIVE_TABLE_HEADERS: [(&str, Alignment); 8] = [
+const ACTIVE_TABLE_HEADERS: [(&str, Alignment); 9] = [
     ("Started", Alignment::Left),
     ("Provider", Alignment::Left),
     ("Model", Alignment::Left),
+    ("", Alignment::Left),
     ("Effort", Alignment::Left),
     ("Endpoint", Alignment::Left),
     ("Status", Alignment::Left),
@@ -808,7 +810,8 @@ fn render_active(
     let widths = [
         Constraint::Length(8),
         Constraint::Length(8),
-        Constraint::Min(18),
+        Constraint::Length(ACTIVE_MODEL_WIDTH),
+        Constraint::Fill(1),
         Constraint::Length(6),
         Constraint::Length(8),
         Constraint::Length(14),
@@ -829,6 +832,7 @@ fn render_active(
             muted_cell(format_system_time(request.started_at)),
             provider_cell(request.provider.as_deref()),
             model_cell(request.model.as_deref(), model_width),
+            muted_cell(""),
             text_cell(request.effort.as_deref().unwrap_or("-")),
             muted_cell(request.endpoint.label()),
             Cell::from(Span::styled(status, status_style(request.status.label()))),
@@ -1410,7 +1414,8 @@ mod tests {
         assert_eq!(
             table_header_labels(&ACTIVE_TABLE_HEADERS),
             [
-                "Started", "Provider", "Model", "Effort", "Endpoint", "Status", "Rate", "Elapsed",
+                "Started", "Provider", "Model", "", "Effort", "Endpoint", "Status", "Rate",
+                "Elapsed",
             ]
         );
         assert_eq!(
@@ -1431,7 +1436,7 @@ mod tests {
             table_header_labels(&EVENTS_TABLE_HEADERS),
             ["Time", "Status", "Provider", "Model", "Message"]
         );
-        assert_eq!(ACTIVE_TABLE_HEADERS[6], ("Rate", Alignment::Right));
+        assert_eq!(ACTIVE_TABLE_HEADERS[7], ("Rate", Alignment::Right));
         assert_eq!(RECENT_TABLE_HEADERS[6], ("Rate", Alignment::Right));
     }
 
@@ -1478,22 +1483,26 @@ mod tests {
     }
 
     #[test]
-    fn model_column_width_tracks_terminal_width() {
+    fn active_model_column_is_bounded_while_spacer_expands() {
         let widths = [
             Constraint::Length(8),
             Constraint::Length(8),
-            Constraint::Min(18),
+            Constraint::Length(ACTIVE_MODEL_WIDTH),
+            Constraint::Fill(1),
             Constraint::Length(6),
             Constraint::Length(8),
             Constraint::Length(14),
             Constraint::Length(10),
             Constraint::Length(9),
         ];
-        let narrow = table_column_width(Rect::new(0, 0, 110, 10), &widths, 2);
-        let wide = table_column_width(Rect::new(0, 0, 212, 10), &widths, 2);
+        let narrow_model = table_column_width(Rect::new(0, 0, 110, 10), &widths, 2);
+        let wide_model = table_column_width(Rect::new(0, 0, 212, 10), &widths, 2);
+        let narrow_spacer = table_column_width(Rect::new(0, 0, 110, 10), &widths, 3);
+        let wide_spacer = table_column_width(Rect::new(0, 0, 212, 10), &widths, 3);
 
-        assert!(wide > narrow);
-        assert!(wide >= "claude-haiku-4-5 → gpt-5.6-luna".chars().count());
+        assert!(narrow_model <= usize::from(ACTIVE_MODEL_WIDTH));
+        assert_eq!(wide_model, usize::from(ACTIVE_MODEL_WIDTH));
+        assert!(wide_spacer > narrow_spacer);
     }
 
     #[test]
