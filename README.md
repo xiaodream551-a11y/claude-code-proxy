@@ -658,8 +658,8 @@ The proxy speaks enough of the Anthropic API for Claude Code:
 
 - `POST /v1/messages`: the main turn endpoint (streaming and non-streaming)
 - `POST /v1/messages?beta=true`: same (Claude Code always sends `?beta=true`)
-- `POST /v1/messages/count_tokens`: local token count via `gpt-tokenizer`
-  (o200k_base); used by Claude Code's compaction logic
+- `POST /v1/messages/count_tokens`: local token count via `tiktoken-rs`
+  (`o200k_base`); used by Claude Code's compaction logic
 - `GET /healthz`: liveness check
 
 ## Configuration
@@ -723,7 +723,7 @@ Windows, and at
 | `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                                                                   |
 | `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
-| `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-iterra`) |
+| `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
 | `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`)                                                                               |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
@@ -1019,14 +1019,20 @@ supported shape.
 - **Rate limits:** shared across all clients of your upstream account. Codex's
   `codex.rate_limits.limit_reached` and Kimi's HTTP 429 are both surfaced as
   HTTP 429 with `retry-after`.
-- **Codex — image inputs in tool results:** Responses API `function_call_output`
-  only takes a string, so image blocks nested inside `tool_result` are replaced
-  with a `[image omitted: <media_type>]` placeholder. Top-level user-message
-  images pass through.
+- **Codex — image inputs in tool results:** valid URL and base64 image blocks are
+  forwarded as structured Responses `input_image` content. Malformed or unsupported
+  blocks are replaced with an explicit omission marker.
 - **Kimi — image inputs in tool results:** pass through as `image_url` parts
   (Kimi accepts them in `role:"tool"` content).
-- **Codex — reasoning blocks:** not forwarded to Claude Code (dropped), even if
-  the upstream model produced them.
+- **Codex — reasoning blocks:** visible reasoning summaries are forwarded as
+  Anthropic `thinking` blocks. Encrypted reasoning is carried in a namespaced
+  thinking signature and replayed on later turns; the proxy never decrypts it.
+- **Codex — Responses Lite parallel tools:** GPT-5.6 Lite models follow the native
+  Codex behavior and disable parallel tool emission. Existing parallel tool history
+  still replays correctly.
+- **Codex — HTTP transport:** `CCP_CODEX_TRANSPORT=http` buffers the complete
+  upstream response before translating it. Use the default WebSocket transport for
+  live token delivery and prompt cancellation.
 - **Kimi — reasoning blocks:** forwarded as Anthropic `thinking` content blocks
   and rendered by Claude Code. Disable by setting
   `thinking: {"type":"disabled"}` in your Anthropic request.

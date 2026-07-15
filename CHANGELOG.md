@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Preserve Claude tool-choice modes and single-tool constraints when translating
+  requests to Codex Responses.
+- Count Codex input with the `o200k_base` tokenizer, including accurate CJK text
+  accounting for Claude Code compaction.
+- Forward valid images nested in tool results as structured Responses content.
+- Preserve encrypted Codex reasoning by default and distinguish filtered
+  incomplete responses from output-token limits.
+
 ## v0.1.21 (2026-07-15)
 
 - The monitor shows session token activity trends at common terminal widths,

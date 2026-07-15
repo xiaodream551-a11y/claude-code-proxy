@@ -48,11 +48,17 @@ pub enum ServiceTier {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ResponsesToolChoice {
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesToolChoiceMode {
     Auto,
     None,
     Required,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesToolChoice {
+    Mode(ResponsesToolChoiceMode),
     Function {
         r#type: String,
         name: String,
@@ -151,13 +157,33 @@ pub enum ResponsesInputItem {
     FunctionCallOutput {
         #[serde(default)]
         call_id: String,
-        output: String,
+        output: ResponsesFunctionCallOutput,
     },
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
         summary: Vec<Value>,
         encrypted_content: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesFunctionCallOutput {
+    Text(String),
+    Content(Vec<ResponsesFunctionCallOutputContent>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesFunctionCallOutputContent {
+    InputText {
+        text: String,
+    },
+    InputImage {
+        image_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }
 
@@ -350,11 +376,11 @@ pub fn translate_request(
         input,
         store: false,
         stream: true,
-        parallel_tool_calls: true,
+        parallel_tool_calls: parallel_tool_calls_enabled(req),
         tool_choice,
         text,
         tools: None,
-        include: None,
+        include: Some(vec!["reasoning.encrypted_content".to_string()]),
         client_metadata: None,
         service_tier: None,
         prompt_cache_key: None,
@@ -411,7 +437,7 @@ pub fn translate_request(
                 .any(|tool| matches!(tool, ResponsesTool::WebSearch(_)))
         });
         if !has_web_search {
-            out.tool_choice = Some(ResponsesToolChoice::Auto);
+            out.tool_choice = Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto));
         }
     }
 
@@ -441,10 +467,6 @@ pub fn translate_request(
             context: opts.use_responses_lite.then_some("all_turns".to_string()),
         });
     }
-    if resolved_effort.is_some() {
-        out.include = Some(vec!["reasoning.encrypted_content".to_string()]);
-    }
-
     Ok(out)
 }
 
@@ -599,10 +621,10 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
         Some(Value::Object(m)) => m,
         Some(Value::String(s)) => {
             return Ok(Some(match s.as_str() {
-                "auto" => ResponsesToolChoice::Auto,
-                "none" => ResponsesToolChoice::None,
-                "any" | "required" => ResponsesToolChoice::Required,
-                _ => ResponsesToolChoice::Auto,
+                "auto" => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
+                "none" => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None),
+                "any" | "required" => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required),
+                _ => ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
             }));
         }
         _ => return Ok(None),
@@ -613,9 +635,15 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
         .and_then(|v| v.as_str())
         .unwrap_or("auto");
     match choice_type {
-        "auto" => Ok(Some(ResponsesToolChoice::Auto)),
-        "none" => Ok(Some(ResponsesToolChoice::None)),
-        "any" | "required" => Ok(Some(ResponsesToolChoice::Required)),
+        "auto" => Ok(Some(ResponsesToolChoice::Mode(
+            ResponsesToolChoiceMode::Auto,
+        ))),
+        "none" => Ok(Some(ResponsesToolChoice::Mode(
+            ResponsesToolChoiceMode::None,
+        ))),
+        "any" | "required" => Ok(Some(ResponsesToolChoice::Mode(
+            ResponsesToolChoiceMode::Required,
+        ))),
         "tool" => {
             let name = choice.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let tools = req.extra.get("tools").and_then(|v| v.as_array());
@@ -640,6 +668,15 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
         }
         _ => Ok(None),
     }
+}
+
+fn parallel_tool_calls_enabled(req: &MessagesRequest) -> bool {
+    !req.extra
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("disable_parallel_tool_use"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
@@ -673,16 +710,13 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                     content: std::mem::take(&mut parts),
                                 });
                             }
-                            let body = tool_result_to_string(content);
-                            let output = if is_error.unwrap_or(false) {
-                                format!("[tool execution error]\n{body}")
-                            } else {
-                                body
-                            };
-                            let output =
-                                maybe_append_rewritten_read_offset_note(output, tool_use_id);
-                            let output = maybe_append_read_offset_guidance(
+                            let mut output = tool_result_to_output(content);
+                            if is_error.unwrap_or(false) {
+                                prepend_tool_result_text(&mut output, "[tool execution error]");
+                            }
+                            let output = annotate_tool_result_output(
                                 output,
+                                tool_use_id,
                                 read_tool_uses_with_offset.contains(tool_use_id),
                                 is_error.unwrap_or(false),
                             );
@@ -844,56 +878,158 @@ fn read_offset_guidance() -> &'static str {
 // Tool result rendering
 // ---------------------------------------------------------------------------
 
-fn tool_result_to_string(content: &Value) -> String {
+fn tool_result_to_output(content: &Value) -> ResponsesFunctionCallOutput {
     match content {
-        Value::String(s) => s.clone(),
+        Value::String(s) => ResponsesFunctionCallOutput::Text(s.clone()),
         Value::Array(arr) => {
-            let mut parts = Vec::new();
+            let mut text_parts = Vec::new();
+            let mut content_parts = Vec::new();
+            let mut has_image = false;
             for b in arr {
                 match b.get("type").and_then(|v| v.as_str()) {
                     Some("text") => match b.get("text").and_then(|v| v.as_str()) {
-                        Some(text) => parts.push(text.to_string()),
-                        None => parts.push(unsupported_tool_result_block_to_string(b)),
+                        Some(text) => {
+                            text_parts.push(text.to_string());
+                            content_parts.push(ResponsesFunctionCallOutputContent::InputText {
+                                text: text.to_string(),
+                            });
+                        }
+                        None => push_unsupported_tool_result_block(
+                            b,
+                            &mut text_parts,
+                            &mut content_parts,
+                        ),
                     },
                     Some("image") => {
-                        if let Some(source) = b.get("source").and_then(|v| v.as_object()) {
-                            match source.get("type").and_then(|v| v.as_str()) {
-                                Some("url")
-                                    if source.get("url").and_then(|v| v.as_str()).is_some() =>
-                                {
-                                    parts.push("[image omitted: url]".to_string());
-                                }
-                                Some("base64")
-                                    if source
-                                        .get("media_type")
-                                        .and_then(|v| v.as_str())
-                                        .is_some()
-                                        && source
-                                            .get("data")
-                                            .and_then(|v| v.as_str())
-                                            .is_some() =>
-                                {
-                                    let media_type = source
-                                        .get("media_type")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("image");
-                                    parts.push(format!("[image omitted: {media_type}]"));
-                                }
-                                _ => parts.push(unsupported_tool_result_block_to_string(b)),
-                            }
+                        if let Some(image_url) = tool_result_image_url(b) {
+                            has_image = true;
+                            content_parts.push(ResponsesFunctionCallOutputContent::InputImage {
+                                image_url,
+                                detail: None,
+                            });
                         } else {
-                            parts.push(unsupported_tool_result_block_to_string(b));
+                            push_unsupported_tool_result_block(
+                                b,
+                                &mut text_parts,
+                                &mut content_parts,
+                            );
                         }
                     }
                     Some(other) => {
-                        parts.push(format!("[unsupported content block omitted: {other}]"));
+                        let text = format!("[unsupported content block omitted: {other}]");
+                        text_parts.push(text.clone());
+                        content_parts.push(ResponsesFunctionCallOutputContent::InputText { text });
                     }
-                    None => parts.push(unsupported_tool_result_block_to_string(b)),
+                    None => {
+                        push_unsupported_tool_result_block(b, &mut text_parts, &mut content_parts)
+                    }
                 }
             }
-            parts.join("\n")
+            if has_image {
+                ResponsesFunctionCallOutput::Content(content_parts)
+            } else {
+                ResponsesFunctionCallOutput::Text(text_parts.join("\n"))
+            }
         }
-        _ => String::new(),
+        _ => ResponsesFunctionCallOutput::Text(String::new()),
+    }
+}
+
+fn tool_result_image_url(block: &Value) -> Option<String> {
+    let source = block.get("source")?.as_object()?;
+    match source.get("type")?.as_str()? {
+        "url" => source
+            .get("url")?
+            .as_str()
+            .filter(|url| !url.is_empty())
+            .map(str::to_string),
+        "base64" => {
+            let media_type = source
+                .get("media_type")?
+                .as_str()
+                .filter(|value| !value.is_empty())?;
+            let data = source
+                .get("data")?
+                .as_str()
+                .filter(|value| !value.is_empty())?;
+            Some(format!("data:{media_type};base64,{data}"))
+        }
+        _ => None,
+    }
+}
+
+fn push_unsupported_tool_result_block(
+    block: &Value,
+    text_parts: &mut Vec<String>,
+    content_parts: &mut Vec<ResponsesFunctionCallOutputContent>,
+) {
+    let text = unsupported_tool_result_block_to_string(block);
+    text_parts.push(text.clone());
+    content_parts.push(ResponsesFunctionCallOutputContent::InputText { text });
+}
+
+fn prepend_tool_result_text(output: &mut ResponsesFunctionCallOutput, prefix: &str) {
+    match output {
+        ResponsesFunctionCallOutput::Text(text) => {
+            if text.is_empty() {
+                *text = prefix.to_string();
+            } else {
+                text.insert(0, '\n');
+                text.insert_str(0, prefix);
+            }
+        }
+        ResponsesFunctionCallOutput::Content(parts) => {
+            parts.insert(
+                0,
+                ResponsesFunctionCallOutputContent::InputText {
+                    text: prefix.to_string(),
+                },
+            );
+        }
+    }
+}
+
+fn annotate_tool_result_output(
+    mut output: ResponsesFunctionCallOutput,
+    tool_use_id: &str,
+    read_call_had_offset: bool,
+    is_error: bool,
+) -> ResponsesFunctionCallOutput {
+    let text = tool_result_text(&output);
+    let annotated = maybe_append_rewritten_read_offset_note(text.clone(), tool_use_id);
+    let annotated = maybe_append_read_offset_guidance(annotated, read_call_had_offset, is_error);
+    if annotated == text {
+        return output;
+    }
+
+    match &mut output {
+        ResponsesFunctionCallOutput::Text(value) => *value = annotated,
+        ResponsesFunctionCallOutput::Content(parts) => {
+            let annotation = annotated
+                .strip_prefix(&text)
+                .unwrap_or(&annotated)
+                .trim_start_matches('\n');
+            if !annotation.is_empty() {
+                parts.push(ResponsesFunctionCallOutputContent::InputText {
+                    text: annotation.to_string(),
+                });
+            }
+        }
+    }
+    output
+}
+
+fn tool_result_text(output: &ResponsesFunctionCallOutput) -> String {
+    match output {
+        ResponsesFunctionCallOutput::Text(text) => text.clone(),
+        ResponsesFunctionCallOutput::Content(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                ResponsesFunctionCallOutputContent::InputText { text } => Some(text.as_str()),
+                ResponsesFunctionCallOutputContent::InputImage { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -991,6 +1127,35 @@ mod tests {
             Some(&["spam.example".to_string()][..])
         );
         assert!(out.instructions.is_none());
+    }
+
+    #[test]
+    fn simple_tool_choices_serialize_as_responses_modes() {
+        for (anthropic, expected) in [("auto", "auto"), ("none", "none"), ("any", "required")] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.5",
+                "messages": [{"role":"user", "content":"use a tool"}],
+                "tools": [{"name":"test", "input_schema":{"type":"object"}}],
+                "tool_choice": {"type": anthropic}
+            }))
+            .unwrap();
+            let out = translate_request(&req, opts()).unwrap();
+            let value = serde_json::to_value(out).unwrap();
+            assert_eq!(value["tool_choice"], expected);
+        }
+    }
+
+    #[test]
+    fn disable_parallel_tool_use_is_forwarded_on_full_lane() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"use a tool"}],
+            "tools": [{"name":"test", "input_schema":{"type":"object"}}],
+            "tool_choice": {"type":"auto", "disable_parallel_tool_use":true}
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(!out.parallel_tool_calls);
     }
 
     #[test]
@@ -1098,7 +1263,10 @@ mod tests {
         )
         .unwrap();
         assert!(out.tools.is_none());
-        assert!(matches!(out.tool_choice, Some(ResponsesToolChoice::Auto)));
+        assert!(matches!(
+            out.tool_choice,
+            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto))
+        ));
     }
 
     #[test]
@@ -1227,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_omits_reasoning_when_not_enabled() {
+    fn translate_requests_encrypted_reasoning_without_forcing_effort() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
             "messages": [{"role":"user", "content":"hello"}]
@@ -1235,7 +1403,10 @@ mod tests {
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
         assert!(out.reasoning.is_none());
-        assert!(out.include.is_none());
+        assert_eq!(
+            out.include,
+            Some(vec!["reasoning.encrypted_content".to_string()])
+        );
     }
 
     #[test]
@@ -1414,10 +1585,11 @@ mod tests {
         let out = translate_request(&req, opts()).unwrap();
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
-            assert!(output.contains("[tool execution error]"));
-            assert!(output.contains("File has 331 lines"));
-            assert!(output.contains("Codex Read guidance:"));
-            assert!(output.contains("zero based continuation index"));
+            let text = tool_result_text(output);
+            assert!(text.contains("[tool execution error]"));
+            assert!(text.contains("File has 331 lines"));
+            assert!(text.contains("Codex Read guidance:"));
+            assert!(text.contains("zero based continuation index"));
         } else {
             panic!("expected FunctionCallOutput");
         }
@@ -1446,7 +1618,10 @@ mod tests {
         let out = translate_request(&req, opts()).unwrap();
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
-            assert_eq!(output, "[tool execution error]\nFile does not exist.");
+            assert_eq!(
+                tool_result_text(output),
+                "[tool execution error]\nFile does not exist."
+            );
         } else {
             panic!("expected FunctionCallOutput");
         }
@@ -1479,10 +1654,11 @@ mod tests {
         let out = translate_request(&req, opts()).unwrap();
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
-            assert!(output.contains("1\tcontent"));
-            assert!(output.contains("Proxy Read offset note:"));
-            assert!(output.contains("1300000"));
-            assert!(output.contains("/tmp/a"));
+            let text = tool_result_text(output);
+            assert!(text.contains("1\tcontent"));
+            assert!(text.contains("Proxy Read offset note:"));
+            assert!(text.contains("1300000"));
+            assert!(text.contains("/tmp/a"));
         } else {
             panic!("expected FunctionCallOutput");
         }
@@ -1511,7 +1687,7 @@ mod tests {
         assert_eq!(out.input.len(), 2);
         if let ResponsesInputItem::FunctionCallOutput { output, .. } = &out.input[1] {
             assert_eq!(
-                output,
+                tool_result_text(output),
                 "File has 331 lines, and the requested offset is shown in this fixture."
             );
         } else {
@@ -1520,8 +1696,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_stringifies_images_and_malformed_blocks() {
-        let rendered = tool_result_to_string(&json!([
+    fn tool_result_preserves_images_and_marks_malformed_blocks() {
+        let output = tool_result_to_output(&json!([
             {"type": "text", "text": "caption"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
             {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}},
@@ -1529,9 +1705,17 @@ mod tests {
             {"type": "image"},
             {}
         ]));
+        let rendered = serde_json::to_value(output).unwrap();
         assert_eq!(
             rendered,
-            "caption\n[image omitted: image/png]\n[image omitted: url]\n[unsupported content block omitted: text]\n[unsupported content block omitted: image]\n[unsupported content block omitted: unknown]"
+            json!([
+                {"type":"input_text", "text":"caption"},
+                {"type":"input_image", "image_url":"data:image/png;base64,abc"},
+                {"type":"input_image", "image_url":"https://example.invalid/a.png"},
+                {"type":"input_text", "text":"[unsupported content block omitted: text]"},
+                {"type":"input_text", "text":"[unsupported content block omitted: image]"},
+                {"type":"input_text", "text":"[unsupported content block omitted: unknown]"}
+            ])
         );
     }
 
@@ -1630,7 +1814,10 @@ mod tests {
         assert!(reasoning.effort.is_none());
         assert!(reasoning.summary.is_none());
         assert_eq!(reasoning.context.as_deref(), Some("all_turns"));
-        assert!(out.include.is_none());
+        assert_eq!(
+            out.include,
+            Some(vec!["reasoning.encrypted_content".to_string()])
+        );
     }
 
     #[test]

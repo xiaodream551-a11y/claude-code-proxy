@@ -6,7 +6,8 @@ use crate::traffic::TrafficCapture;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
-    CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
+    CodexUsage, STOP_END_TURN, STOP_TOOL_USE, map_codex_usage_to_anthropic,
+    stop_reason_for_incomplete_response,
 };
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
@@ -862,14 +863,18 @@ impl LiveStreamTranslator {
         self.emit_web_searches(traffic, out);
         self.ensure_message_start(traffic, out);
         let usage = payload.get("response").map(parse_codex_usage);
-        let incomplete = response_is_incomplete(payload);
-        let stop_reason = if incomplete {
-            STOP_MAX_TOKENS
-        } else if self.saw_tool_use {
-            STOP_TOOL_USE
-        } else {
-            STOP_END_TURN
-        };
+        let event_type = payload
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let stop_reason =
+            if let Some(reason) = stop_reason_for_incomplete_response(payload, event_type) {
+                reason
+            } else if self.saw_tool_use {
+                STOP_TOOL_USE
+            } else {
+                STOP_END_TURN
+            };
         self.emit_finish(stop_reason, usage, traffic, out);
     }
 
@@ -1060,21 +1065,6 @@ fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
     }
 }
 
-fn response_is_incomplete(payload: &serde_json::Value) -> bool {
-    payload.get("type").and_then(|v| v.as_str()) == Some("response.incomplete")
-        || payload
-            .get("response")
-            .and_then(|r| r.get("status"))
-            .and_then(|v| v.as_str())
-            == Some("incomplete")
-        || payload
-            .get("response")
-            .and_then(|r| r.get("incomplete_details"))
-            .and_then(|d| d.get("reason"))
-            .and_then(|v| v.as_str())
-            .is_some()
-}
-
 fn repair_whitespace_stalled_read_args(
     name: &str,
     args: &str,
@@ -1230,6 +1220,21 @@ mod tests {
             "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {}}
         })]);
         assert!(out.contains(r#""stop_reason":"end_turn""#));
+        assert!(!out.contains(r#""stop_reason":"max_tokens""#));
+    }
+
+    #[test]
+    fn content_filter_incomplete_is_refusal() {
+        let out = render(vec![json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"},
+                "usage": {}
+            }
+        })]);
+        assert!(out.contains(r#""stop_reason":"refusal""#));
         assert!(!out.contains(r#""stop_reason":"max_tokens""#));
     }
 
