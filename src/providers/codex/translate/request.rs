@@ -261,6 +261,39 @@ fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     }
 }
 
+fn content_contains_text(content: &Value, needle: &str) -> bool {
+    match content {
+        Value::String(text) => text.contains(needle),
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains(needle))
+        }),
+        _ => false,
+    }
+}
+
+fn is_claude_code_compaction_request(req: &MessagesRequest) -> bool {
+    let Some(content) = req
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| &message.content)
+    else {
+        return false;
+    };
+
+    [
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
+        "Your entire response must be plain text: an <analysis> block followed by a <summary> block.",
+        "Your task is to create a detailed summary",
+    ]
+    .iter()
+    .all(|marker| content_contains_text(content, marker))
+}
+
 fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Error> {
     resolve_effort_override(effort, config::codex_effort().as_deref())
 }
@@ -451,10 +484,13 @@ pub fn translate_request(
     }
 
     let effort = read_effort(req)?;
-    // Claude Code omits output_config.effort for Haiku, so keep Luna from
-    // inheriting an unbounded provider default when no explicit effort arrives.
-    let codex_effort =
-        to_codex_effort(effort).or_else(|| (out.model == "gpt-5.6-luna").then_some(Effort::Medium));
+    // Compaction is a structured summary pass, so max reasoning only adds
+    // latency. Claude Code also omits effort for Haiku; default Luna to medium.
+    let codex_effort = if is_claude_code_compaction_request(req) {
+        Some(Effort::Medium)
+    } else {
+        to_codex_effort(effort).or_else(|| (out.model == "gpt-5.6-luna").then_some(Effort::Medium))
+    };
     let resolved_effort = resolve_effort(codex_effort)?;
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
@@ -1440,6 +1476,28 @@ mod tests {
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
         assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Max)));
+    }
+
+    #[test]
+    fn claude_code_compaction_caps_effort_at_medium() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {"role":"user", "content":"Earlier task"},
+                {"role":"assistant", "content":"Earlier response"},
+                {"role":"user", "content":[{
+                    "type":"text",
+                    "text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."
+                }]}
+            ],
+            "output_config": {"effort": "max"}
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(matches!(
+            out.reasoning.unwrap().effort,
+            Some(Effort::Medium)
+        ));
     }
 
     #[test]

@@ -164,9 +164,11 @@ would 400 because no provider claims it, so set
 # Codex
 ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-5.6-sol[1m] \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
+ANTHROPIC_MODEL=gpt-5.6-sol \
+ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000 \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 \
+CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
@@ -213,9 +215,11 @@ the same Claude config, put the env in `~/.claude/settings.json`:
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:18765",
     "ANTHROPIC_AUTH_TOKEN": "unused",
-    "ANTHROPIC_MODEL": "gpt-5.6-sol[1m]",
-    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.6-luna[1m]",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": 272000,
+    "ANTHROPIC_MODEL": "gpt-5.6-sol",
+    "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.6-luna",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "372000",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
     "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": 1
   }
@@ -229,20 +233,26 @@ one of the process-start patterns in
 ### 5. Context window size
 
 Claude Code decides auto-compaction based on the model's context window. For
-unknown models, Claude Code uses its own fallback context size. The `[1m]` suffix
-is a local Claude Code hint that raises that compaction threshold. It is useful
-only when the upstream model can actually handle a window that large.
+custom gateway model ids, Claude Code 2.1.193 and later can use
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` as the raw model capacity and
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` as the capacity used for compaction. Set
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` to trigger compaction at a percentage of that
+capacity.
 
-Use the `[1m]` suffix for Codex and Kimi models so Claude Code uses a larger
-local compaction threshold, such as `gpt-5.6-sol[1m]`, `gpt-5.6-luna[1m]`, or
-`kimi-for-coding[1m]`. The proxy strips a trailing `[1m]` before sending the
-request upstream. The suffix affects Claude Code's local compaction decision and
-does not increase the upstream model's context window.
+The current ChatGPT/Codex catalog for GPT-5.6 exposes a 372K raw context window
+and derives its default compaction point at 90%, or 334,800 tokens. Match that
+behavior in Claude Code with:
 
-OpenAI's [GPT-5.6 subscription update](https://x.com/thsottiaux/status/2076495156757577895)
-sets the ChatGPT context limit to 272K tokens. Set
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` with `gpt-5.6-sol[1m]` so Claude Code
-compacts before the upstream limit.
+```sh
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000
+CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90
+```
+
+Use the concrete custom model ids (`gpt-5.6-sol`, `gpt-5.6-terra`, and
+`gpt-5.6-luna`) with these overrides. A `[1m]` suffix remains supported and is
+stripped by the proxy, but it makes Claude Code report a 1M window rather than
+the subscription's 372K capacity.
 
 If you'd rather disable auto-compact completely, set
 `DISABLE_AUTO_COMPACT=1` in your env or `~/.claude/settings.json`. Manual
@@ -280,6 +290,12 @@ into Anthropic `thinking` content blocks. Codex decides when a summary is useful
 so simple prompts can emit no thinking block. Set `codex.reasoningSummary` /
 `CCP_CODEX_REASONING_SUMMARY` to `off` or `none` to suppress summaries while
 keeping `reasoning.effort` and encrypted continuation content.
+
+Claude Code's automatic and manual compaction requests keep the selected Codex
+model but cap reasoning effort at `medium`. Compaction is a structured summary
+pass, and avoiding `max` reasoning substantially reduces the wait without
+changing the effort used by normal turns. An explicit global `codex.effort` /
+`CCP_CODEX_EFFORT` override still takes precedence.
 
 Claude Code's hosted `web_search_20250305` tool is translated to Codex's native
 Responses `web_search` tool with live external web access and non-empty native
@@ -847,7 +863,7 @@ Any of the `ANTHROPIC_BASE_URL=... claude` examples in
 settings. Shell aliases are enough for daily muscle memory:
 
 ```sh
-alias csol='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol[1m] ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
+alias csol='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000 CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
 alias cgrok='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=grok-4.5 ANTHROPIC_SMALL_FAST_MODEL=grok-4.5 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
 ```
 
@@ -871,15 +887,15 @@ real_claude="${REAL_CLAUDE:-$HOME/.local/bin/claude}"
 
 if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
   model_file="$HOME/.claude/claude-code-proxy-model"
-  main_model="gpt-5.6-sol[1m]"
-  small_model="gpt-5.6-luna[1m]"
+  main_model="gpt-5.6-sol"
+  small_model="gpt-5.6-luna"
 
   if [ -f "$model_file" ]; then
     main_model="$(tr -d '[:space:]' <"$model_file")"
     case "$main_model" in
       gpt-5.6-sol|gpt-5.6-sol\[1m\])
-        main_model="gpt-5.6-sol[1m]"
-        small_model="gpt-5.6-luna[1m]"
+        main_model="gpt-5.6-sol"
+        small_model="gpt-5.6-luna"
         ;;
       gpt-5.5|gpt-5.5\[1m\])
         main_model="gpt-5.5[1m]"
@@ -911,8 +927,10 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
   export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
 
   case "$main_model" in
-    gpt-5.6-sol\[1m\]|gpt-5.6-luna\[1m\]|gpt-5.6-terra\[1m\])
-      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-272000}"
+    gpt-5.6-sol|gpt-5.6-luna|gpt-5.6-terra)
+      export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-372000}"
+      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-372000}"
+      export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
       ;;
   esac
 fi
@@ -952,7 +970,7 @@ Optional sticky default proxy model:
 set -euo pipefail
 
 model_file="$HOME/.claude/claude-code-proxy-model"
-default_model="gpt-5.6-sol[1m]"
+default_model="gpt-5.6-sol"
 
 if [ "${1:-}" = "" ]; then
   if [ -f "$model_file" ]; then
@@ -974,7 +992,7 @@ Examples:
 ```sh
 claude-proxy-toggle                 # proxy on/off for new sessions
 claude-proxy-model grok-4.5         # sticky default while proxy is on
-claude-proxy-model gpt-5.6-sol[1m]
+claude-proxy-model gpt-5.6-sol
 ANTHROPIC_MODEL=kimi-for-coding[1m] claude   # one-shot override
 ```
 
@@ -1001,8 +1019,11 @@ enable gateway discovery when launching:
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
 ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-5.6-sol[1m] \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m] \
+ANTHROPIC_MODEL=gpt-5.6-sol \
+ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000 \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 \
+CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
