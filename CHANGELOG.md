@@ -9,6 +9,8 @@
 - Forward valid images nested in tool results as structured Responses content.
 - Preserve encrypted Codex reasoning by default and distinguish filtered
   incomplete responses from output-token limits.
+- Detect half-open Codex WebSockets with Ping/Pong probes, refresh stale pooled
+  connections, and retry transport stalls only before streaming output begins.
 
 ## v0.1.21 (2026-07-15)
 

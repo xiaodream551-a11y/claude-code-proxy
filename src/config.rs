@@ -63,6 +63,10 @@ struct CodexConfig {
     #[serde(rename = "model")]
     pub model: Option<String>,
     pub transport: Option<String>,
+    #[serde(rename = "websocketResponseStartTimeoutMs")]
+    pub websocket_response_start_timeout_ms: Option<u64>,
+    #[serde(rename = "websocketIdleTimeoutMs")]
+    pub websocket_idle_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -244,6 +248,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     {
         out.push("CCP_CODEX_REASONING_SUMMARY (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS") {
+        out.push("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS") {
+        out.push("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS (env)".to_string());
+    }
     if let Some(file_cfg) = file {
         if let Some(bind_address) = file_cfg.bind_address {
             out.push(format!("bindAddress: {bind_address}"));
@@ -262,11 +272,22 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 out.push(format!("log.stderr: {v}"));
             }
         }
-        if let Some(codex) = file_cfg.codex
-            && let Some(summary) = codex.reasoning_summary
-            && !summary.is_empty()
-        {
-            out.push("codex.reasoningSummary (config)".to_string());
+        if let Some(codex) = file_cfg.codex {
+            if codex
+                .reasoning_summary
+                .as_deref()
+                .is_some_and(|summary| !summary.is_empty())
+            {
+                out.push("codex.reasoningSummary (config)".to_string());
+            }
+            if let Some(timeout_ms) = codex.websocket_response_start_timeout_ms {
+                out.push(format!(
+                    "codex.websocketResponseStartTimeoutMs: {timeout_ms}"
+                ));
+            }
+            if let Some(timeout_ms) = codex.websocket_idle_timeout_ms {
+                out.push(format!("codex.websocketIdleTimeoutMs: {timeout_ms}"));
+            }
         }
     }
     out
@@ -480,6 +501,42 @@ pub fn codex_model() -> Option<String> {
     None
 }
 
+fn codex_positive_u64(
+    env_key: &str,
+    file_value: impl FnOnce(&CodexConfig) -> Option<u64>,
+    default: u64,
+) -> u64 {
+    if let Ok(raw) = std::env::var(env_key)
+        && let Ok(value) = raw.parse::<u64>()
+        && value > 0
+    {
+        return value;
+    }
+    if let Some(codex) = read_file_config(&paths::config_dir()).and_then(|file| file.codex)
+        && let Some(value) = file_value(&codex)
+        && value > 0
+    {
+        return value;
+    }
+    default
+}
+
+pub fn codex_websocket_response_start_timeout_ms(default: u64) -> u64 {
+    codex_positive_u64(
+        "CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS",
+        |codex| codex.websocket_response_start_timeout_ms,
+        default,
+    )
+}
+
+pub fn codex_websocket_idle_timeout_ms(default: u64) -> u64 {
+    codex_positive_u64(
+        "CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS",
+        |codex| codex.websocket_idle_timeout_ms,
+        default,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Codex transport config
 // ---------------------------------------------------------------------------
@@ -592,6 +649,8 @@ mod tests {
             std::env::remove_var("CCP_LOG_VERBOSE");
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
+            std::env::remove_var("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS");
+            std::env::remove_var("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS");
         }
     }
 
@@ -781,5 +840,43 @@ mod tests {
             let _summary_env = EnvGuard::set("CCP_CODEX_REASONING_SUMMARY", "");
             assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
         }
+    }
+
+    #[test]
+    fn codex_websocket_timeouts_read_config_and_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"websocketResponseStartTimeoutMs":45000,"websocketIdleTimeoutMs":180000}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(codex_websocket_response_start_timeout_ms(1), 45_000);
+        assert_eq!(codex_websocket_idle_timeout_ms(1), 180_000);
+
+        let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "12000");
+        let _idle_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS", "90000");
+        assert_eq!(codex_websocket_response_start_timeout_ms(1), 12_000);
+        assert_eq!(codex_websocket_idle_timeout_ms(1), 90_000);
+    }
+
+    #[test]
+    fn codex_websocket_timeouts_ignore_zero_and_invalid_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"websocketResponseStartTimeoutMs":0,"websocketIdleTimeoutMs":0}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "invalid");
+
+        assert_eq!(codex_websocket_response_start_timeout_ms(45_000), 45_000);
+        assert_eq!(codex_websocket_idle_timeout_ms(180_000), 180_000);
     }
 }

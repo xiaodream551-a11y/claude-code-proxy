@@ -688,6 +688,8 @@ Windows, and at
     "serviceTier": "fast",
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
     "transport": "websocket",
+    "websocketResponseStartTimeoutMs": 60000,
+    "websocketIdleTimeoutMs": 300000,
     "previousResponseId": false
   },
   "kimi": {
@@ -729,6 +731,8 @@ Windows, and at
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
 | `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                                                                   |
+| `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event before refreshing the WebSocket and retrying safely                                                                                |
+| `CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS` | `codex.websocketIdleTimeoutMs` | `300000` | Maximum gap between Codex response events; WebSocket control frames do not extend this business-event deadline                                                                    |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false`                                           | Enable WebSocket continuation with `previous_response_id` when the request is append-only                                                                                         |
 | `CCP_CODEX_ORIGINATOR`           | `codex.originator`         | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                                                                                    |
 | `CCP_CODEX_USER_AGENT`           | `codex.userAgent`          | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                                                                                    |
@@ -749,7 +753,14 @@ affecting other keys.
 Codex uses the WebSocket Responses transport by default. Set
 `CCP_CODEX_TRANSPORT=http` to use the older HTTP SSE transport for debugging or
 compatibility, or `CCP_CODEX_TRANSPORT=auto` to try WebSocket with HTTP fallback
-only when setup fails before a request is sent upstream.
+only when the WebSocket handshake fails before a request is sent upstream.
+Pooled WebSockets must answer a matching Ping/Pong probe before reuse. Active
+connections are also probed after 30 seconds without a frame, so a half-open
+socket left behind by a VPN or proxy-node switch is detected without waiting for
+the business idle timeout. Before any Anthropic output is emitted, statusless
+transport failures are retried up to two times on a refreshed connection. Once
+output has begun, the proxy reports the connection error instead of replaying a
+request that could duplicate tool execution.
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
 append-only turns. Continuation keeps in-memory state keyed by Claude Code
 session id, reuses a session WebSocket while it remains open, and sends

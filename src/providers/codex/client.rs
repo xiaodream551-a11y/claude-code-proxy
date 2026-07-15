@@ -327,6 +327,7 @@ impl CodexHttpClient {
         let mut active_continuation = continuation.cloned();
         let mut auth_refresh_attempted = false;
         let mut transport_failures = 0u32;
+        let websocket_timeouts = super::websocket::CodexWebSocketTimeouts::configured();
         loop {
             let pool_key = websocket_pool_key(ctx, active_continuation.as_ref());
             let result = match transport {
@@ -354,8 +355,7 @@ impl CodexHttpClient {
                         ctx,
                         ctx.traffic.as_deref(),
                         pool_key,
-                        super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
-                        super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+                        websocket_timeouts,
                         active_continuation.as_ref(),
                     )
                     .await
@@ -374,8 +374,7 @@ impl CodexHttpClient {
                         ctx,
                         ctx.traffic.as_deref(),
                         pool_key,
-                        super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
-                        super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+                        websocket_timeouts,
                         active_continuation.as_ref(),
                     )
                     .await;
@@ -682,6 +681,7 @@ impl CodexHttpClient {
             .and_then(|candidate| candidate.previous_response_id.as_deref())
             .is_some();
         let mut forwarded_any = false;
+        let websocket_timeouts = super::websocket::CodexWebSocketTimeouts::configured();
 
         'attempt: loop {
             let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
@@ -700,8 +700,7 @@ impl CodexHttpClient {
                 &ctx,
                 ctx.traffic.clone(),
                 pool_key.as_deref(),
-                super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
-                super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+                websocket_timeouts,
                 continuation.as_ref(),
             );
             let mut stream = tokio::select! {
@@ -1180,6 +1179,9 @@ fn is_retryable_transport_error(err: &CodexError) -> bool {
     if err.origin == CodexErrorOrigin::WebSocketHandshake {
         return err.status == 0 || should_retry_codex_status(err.status);
     }
+    if super::websocket::is_retryable_transport_detail(err.detail.as_deref()) {
+        return true;
+    }
     if err.detail.as_deref() == Some("websocket_pre_request") {
         return err.status == 0 || should_retry_codex_status(err.status);
     }
@@ -1265,12 +1267,12 @@ fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
 }
 
 fn is_continuation_retry_error(err: &CodexError) -> bool {
-    matches!(
-        err.detail.as_deref(),
-        Some("previous_response_not_found")
-            | Some(super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL)
-            | Some(super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL)
-    )
+    // store:false continuation state is tied to its WebSocket. Once that
+    // connection is lost or detached, the retry must send full context.
+    err.detail.as_deref() == Some("previous_response_not_found")
+        || super::websocket::is_retryable_transport_detail(err.detail.as_deref())
+        || (err.origin == CodexErrorOrigin::WebSocketHandshake
+            && (err.status == 0 || should_retry_codex_status(err.status)))
 }
 
 fn websocket_pool_key<'a>(
@@ -1680,6 +1682,28 @@ mod tests {
     }
 
     #[test]
+    fn structured_websocket_watchdog_errors_are_retryable() {
+        for detail in [
+            super::super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL,
+            super::super::websocket::WEBSOCKET_IDLE_TIMEOUT_DETAIL,
+            super::super::websocket::WEBSOCKET_HEARTBEAT_TIMEOUT_DETAIL,
+            super::super::websocket::WEBSOCKET_POOL_HEALTHCHECK_DETAIL,
+            super::super::websocket::WEBSOCKET_POOL_BUSY_DETAIL,
+            super::super::websocket::WEBSOCKET_CONNECTION_ERROR_DETAIL,
+            super::super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL,
+        ] {
+            let err = CodexError {
+                status: 0,
+                message: "localized or implementation-specific message".to_string(),
+                detail: Some(detail.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::WebSocket,
+            };
+            assert!(is_retryable_transport_error(&err), "detail={detail}");
+        }
+    }
+
+    #[test]
     fn codex_headers_include_session_and_beta() {
         let auth = StoredAuth {
             access: "tok".into(),
@@ -1952,6 +1976,13 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("expected rejected handshake"),
         };
+        let stale_pool = CodexError {
+            status: 0,
+            message: "stale pooled connection".to_string(),
+            detail: Some(super::super::websocket::WEBSOCKET_POOL_HEALTHCHECK_DETAIL.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
 
         assert!(should_refresh_after_unauthorized(
             &http_unauthorized,
@@ -1984,6 +2015,7 @@ mod tests {
             crate::config::CodexTransport::Auto
         ));
         assert!(should_fallback_to_http(rejected_handshake_err));
+        assert!(!should_fallback_to_http(&stale_pool));
     }
 
     #[test]
@@ -2035,14 +2067,33 @@ mod tests {
         let idle = CodexError {
             status: 0,
             message: "WebSocket idle timeout after 60000ms".to_string(),
-            detail: None,
+            detail: Some(super::super::websocket::WEBSOCKET_IDLE_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+        let pool_healthcheck = CodexError {
+            status: 0,
+            message: "WebSocket pooled connection health check failed".to_string(),
+            detail: Some(super::super::websocket::WEBSOCKET_POOL_HEALTHCHECK_DETAIL.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+        let pool_busy = CodexError {
+            status: 0,
+            message: "WebSocket pooled connection remained busy".to_string(),
+            detail: Some(super::super::websocket::WEBSOCKET_POOL_BUSY_DETAIL.to_string()),
             retry_after: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
         assert!(should_retry_without_continuation(&timeout, Some(&append)));
         assert!(should_retry_without_continuation(&missing, Some(&append)));
-        assert!(!should_retry_without_continuation(&idle, Some(&append)));
+        assert!(should_retry_without_continuation(&idle, Some(&append)));
+        assert!(should_retry_without_continuation(
+            &pool_healthcheck,
+            Some(&append)
+        ));
+        assert!(should_retry_without_continuation(&pool_busy, Some(&append)));
         assert!(!should_retry_without_continuation(&timeout, Some(&initial)));
         assert!(!should_retry_without_continuation(&timeout, None));
     }

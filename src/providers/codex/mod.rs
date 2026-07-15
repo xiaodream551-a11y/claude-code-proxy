@@ -41,6 +41,7 @@ use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{TranslateOptions, has_hosted_web_search, translate_request};
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
+const MAX_LIVE_TRANSPORT_RETRIES: u32 = 2;
 use self::translate::stream::translate_stream_bytes_with_traffic;
 
 // ---------------------------------------------------------------------------
@@ -333,7 +334,7 @@ async fn live_stream_response(
                     attempt += 1;
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                if attempt >= max_live_retries(&err) {
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_error_to_response(&err);
                 }
@@ -369,7 +370,7 @@ async fn live_stream_response(
                     attempt += 1;
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                if attempt >= max_live_retries(&error) {
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_error_to_response(&error);
                 }
@@ -678,8 +679,24 @@ fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
     if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
         return err.status == 0 || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529);
     }
+    if websocket::is_retryable_transport_detail(err.detail.as_deref()) {
+        return true;
+    }
     matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
         || (err.status == 0 && retryable_live_message(codex_error_message(err)))
+}
+
+fn max_live_retries(err: &client::CodexError) -> u32 {
+    if err.status == 0
+        && matches!(
+            err.origin,
+            client::CodexErrorOrigin::WebSocket | client::CodexErrorOrigin::WebSocketHandshake
+        )
+    {
+        MAX_LIVE_TRANSPORT_RETRIES
+    } else {
+        MAX_RETRYABLE_LIVE_STREAM_RETRIES
+    }
 }
 
 fn is_missing_previous_response_error(err: &client::CodexError) -> bool {
@@ -829,6 +846,9 @@ fn is_context_window_overflow(message: &str) -> bool {
 }
 
 fn codex_error_message(err: &client::CodexError) -> &str {
+    if websocket::is_retryable_transport_detail(err.detail.as_deref()) {
+        return err.message.as_str();
+    }
     err.detail.as_deref().unwrap_or({
         if err.status == 0 {
             err.message.as_str()
@@ -940,6 +960,46 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
 mod tests {
     use super::*;
 
+    fn live_test_context() -> RequestContext {
+        RequestContext {
+            req_id: "live-retry-test".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    fn live_test_request() -> translate::request::ResponsesRequest {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+        translate_request(
+            &body,
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap()
+    }
+
+    fn heartbeat_test_error() -> client::CodexError {
+        client::CodexError {
+            status: 0,
+            message: "WebSocket heartbeat timed out after 10000ms without a Pong".to_string(),
+            detail: Some(websocket::WEBSOCKET_HEARTBEAT_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        }
+    }
+
     fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(serde_json::json!({
             "model": "gpt-5.6-luna",
@@ -1023,6 +1083,58 @@ mod tests {
         assert_eq!(state.active[0].output_tokens, Some(48));
     }
 
+    #[tokio::test]
+    async fn live_transport_retry_stops_after_anthropic_output_begins() {
+        let request = live_test_request();
+        let ctx = live_test_context();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(Err(heartbeat_test_error())).await.unwrap();
+        drop(tx);
+        assert!(matches!(
+            live_stream_response_once(
+                rx,
+                "msg_before".to_string(),
+                "gpt-5.6-sol",
+                ctx.clone(),
+                None,
+                request.clone(),
+            )
+            .await,
+            LiveStreamStart::Retry { .. }
+        ));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "hello"
+        })))
+        .await
+        .unwrap();
+        tx.send(Err(heartbeat_test_error())).await.unwrap();
+        drop(tx);
+        let response = match live_stream_response_once(
+            rx,
+            "msg_after".to_string(),
+            "gpt-5.6-sol",
+            ctx,
+            None,
+            request,
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { .. } => panic!("must not replay after streaming output"),
+        };
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("hello"));
+        assert!(body.contains("heartbeat timed out"));
+    }
+
     #[test]
     fn supported_models_includes_fast_variants() {
         let provider = CodexProvider::new();
@@ -1093,6 +1205,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn websocket_watchdog_error_returns_descriptive_message() {
+        let err = client::CodexError {
+            status: 0,
+            message: "WebSocket heartbeat timed out after 10000ms without a Pong".to_string(),
+            detail: Some(websocket::WEBSOCKET_HEARTBEAT_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+
+        let response = map_codex_error_to_response(&err);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body.pointer("/error/message")
+                .and_then(|value| value.as_str()),
+            Some("WebSocket heartbeat timed out after 10000ms without a Pong")
+        );
+    }
+
     #[test]
     fn live_start_statusless_websocket_handshake_error_is_retryable() {
         let err = client::CodexError {
@@ -1104,6 +1238,34 @@ mod tests {
         };
 
         assert!(retryable_live_start_codex_error(&err));
+    }
+
+    #[test]
+    fn live_start_heartbeat_error_is_retryable_with_short_network_budget() {
+        let err = client::CodexError {
+            status: 0,
+            message: "WebSocket heartbeat timed out".to_string(),
+            detail: Some(websocket::WEBSOCKET_HEARTBEAT_TIMEOUT_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(retryable_live_start_codex_error(&err));
+        assert_eq!(max_live_retries(&err), MAX_LIVE_TRANSPORT_RETRIES);
+    }
+
+    #[test]
+    fn live_upstream_overload_keeps_service_retry_budget() {
+        let err = client::CodexError {
+            status: 529,
+            message: "Overloaded".to_string(),
+            detail: None,
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(retryable_live_start_codex_error(&err));
+        assert_eq!(max_live_retries(&err), MAX_RETRYABLE_LIVE_STREAM_RETRIES);
     }
 
     #[test]
