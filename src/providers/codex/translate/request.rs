@@ -451,7 +451,10 @@ pub fn translate_request(
     }
 
     let effort = read_effort(req)?;
-    let codex_effort = to_codex_effort(effort);
+    // Claude Code omits output_config.effort for Haiku, so keep Luna from
+    // inheriting an unbounded provider default when no explicit effort arrives.
+    let codex_effort =
+        to_codex_effort(effort).or_else(|| (out.model == "gpt-5.6-luna").then_some(Effort::Medium));
     let resolved_effort = resolve_effort(codex_effort)?;
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
@@ -1795,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_lite_without_effort_uses_all_turns_context() {
+    fn luna_without_effort_defaults_to_medium_and_uses_all_turns_context() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "claude-haiku-4-5",
             "messages": [{"role":"user", "content":"hello"}]
@@ -1811,8 +1814,7 @@ mod tests {
         )
         .unwrap();
         let reasoning = out.reasoning.unwrap();
-        assert!(reasoning.effort.is_none());
-        assert!(reasoning.summary.is_none());
+        assert!(matches!(reasoning.effort, Some(Effort::Medium)));
         assert_eq!(reasoning.context.as_deref(), Some("all_turns"));
         assert_eq!(
             out.include,

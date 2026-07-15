@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::StatusCode;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
@@ -38,7 +39,9 @@ use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request, uses_responses_lite,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
-use self::translate::request::{TranslateOptions, has_hosted_web_search, translate_request};
+use self::translate::request::{
+    ServiceTier, TranslateOptions, has_hosted_web_search, translate_request,
+};
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_LIVE_TRANSPORT_RETRIES: u32 = 2;
@@ -90,6 +93,7 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        let provider_started_at = Instant::now();
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
@@ -105,6 +109,7 @@ impl Provider for CodexProvider {
                 ),
             );
         }
+        let native_web_search = has_hosted_web_search(&body);
         let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
@@ -128,6 +133,7 @@ impl Provider for CodexProvider {
                 );
             }
         };
+        log_codex_request_configuration(&ctx, &translated, use_responses_lite, native_web_search);
 
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
@@ -152,6 +158,7 @@ impl Provider for CodexProvider {
                 ctx,
                 stream_request,
                 continuation,
+                provider_started_at,
             )
             .await;
         }
@@ -316,6 +323,7 @@ async fn live_stream_response(
     ctx: RequestContext,
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationCandidate,
+    provider_started_at: Instant,
 ) -> Response {
     let model = model.to_string();
     let turn_id = continuation.turn_id;
@@ -360,6 +368,7 @@ async fn live_stream_response(
             ctx.clone(),
             turn_id,
             request_body.clone(),
+            provider_started_at,
         )
         .await
         {
@@ -393,6 +402,7 @@ async fn live_stream_response_once(
     ctx: RequestContext,
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
+    provider_started_at: Instant,
 ) -> LiveStreamStart {
     let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
     let mut upstream_sse_body = Vec::new();
@@ -409,7 +419,9 @@ async fn live_stream_response_once(
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
+        log_native_web_search_phase(&ctx, &payload, provider_started_at);
         if !generation_started && codex_generation_event(&payload) {
+            log_codex_first_event(&ctx, &payload, provider_started_at);
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.generation_started(&ctx.req_id);
             }
@@ -476,6 +488,7 @@ async fn live_stream_response_once(
                 turn_id,
                 request_body,
                 upstream_sse_body,
+                provider_started_at,
             ));
         }
         if terminal {
@@ -505,6 +518,118 @@ fn codex_generation_event(payload: &serde_json::Value) -> bool {
         payload.get("type").and_then(|value| value.as_str()),
         Some("codex.rate_limits" | "keepalive") | None
     )
+}
+
+fn log_codex_request_configuration(
+    ctx: &RequestContext,
+    request: &translate::request::ResponsesRequest,
+    use_responses_lite: bool,
+    native_web_search: bool,
+) {
+    let service_tier = request.service_tier.as_ref().map(|tier| match tier {
+        ServiceTier::Priority => "priority",
+        ServiceTier::Flex => "flex",
+    });
+    let reasoning_effort = request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_ref())
+        .map(ToString::to_string);
+    crate::logging::create_logger("codex").info(
+        "request_configuration",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(ctx.req_id)),
+            ("model".to_string(), serde_json::json!(request.model)),
+            ("serviceTier".to_string(), serde_json::json!(service_tier)),
+            (
+                "reasoningEffort".to_string(),
+                serde_json::json!(reasoning_effort),
+            ),
+            (
+                "transport".to_string(),
+                serde_json::json!(config::codex_transport().as_str()),
+            ),
+            (
+                "responsesLite".to_string(),
+                serde_json::json!(use_responses_lite),
+            ),
+            (
+                "nativeWebSearch".to_string(),
+                serde_json::json!(native_web_search),
+            ),
+            (
+                "parallelToolCalls".to_string(),
+                serde_json::json!(request.parallel_tool_calls),
+            ),
+        ])),
+    );
+}
+
+fn native_web_search_phase(payload: &serde_json::Value) -> Option<&'static str> {
+    match payload.get("type").and_then(|value| value.as_str()) {
+        Some("response.web_search_call.in_progress") => Some("in_progress"),
+        Some("response.web_search_call.searching") => Some("searching"),
+        Some("response.web_search_call.completed") => Some("completed"),
+        Some("response.output_item.added")
+            if payload
+                .pointer("/item/type")
+                .and_then(|value| value.as_str())
+                == Some("web_search_call") =>
+        {
+            Some("added")
+        }
+        Some("response.output_item.done")
+            if payload
+                .pointer("/item/type")
+                .and_then(|value| value.as_str())
+                == Some("web_search_call") =>
+        {
+            Some("done")
+        }
+        _ => None,
+    }
+}
+
+fn log_native_web_search_phase(
+    ctx: &RequestContext,
+    payload: &serde_json::Value,
+    provider_started_at: Instant,
+) {
+    let Some(phase) = native_web_search_phase(payload) else {
+        return;
+    };
+    crate::logging::create_logger("codex").info(
+        "native_web_search_phase",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(ctx.req_id)),
+            ("phase".to_string(), serde_json::json!(phase)),
+            (
+                "elapsedMs".to_string(),
+                serde_json::json!(provider_started_at.elapsed().as_millis()),
+            ),
+        ])),
+    );
+}
+
+fn log_codex_first_event(
+    ctx: &RequestContext,
+    payload: &serde_json::Value,
+    provider_started_at: Instant,
+) {
+    crate::logging::create_logger("codex").info(
+        "upstream_first_event",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(ctx.req_id)),
+            (
+                "event".to_string(),
+                serde_json::json!(payload.get("type").and_then(|value| value.as_str())),
+            ),
+            (
+                "elapsedMs".to_string(),
+                serde_json::json!(provider_started_at.elapsed().as_millis()),
+            ),
+        ])),
+    );
 }
 
 fn translate_live_stream_payload(
@@ -548,6 +673,7 @@ fn remaining_live_stream_response(
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
+    provider_started_at: Instant,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
@@ -558,6 +684,7 @@ fn remaining_live_stream_response(
         while let Some(item) = upstream_events.recv().await {
             match item {
                 Ok(payload) => {
+                    log_native_web_search_phase(&ctx, &payload, provider_started_at);
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) =
                         match translate_live_stream_payload(&mut translator, &payload, &ctx) {
@@ -1058,6 +1185,41 @@ mod tests {
     }
 
     #[test]
+    fn classifies_native_web_search_phases() {
+        for (event, expected) in [
+            ("response.web_search_call.in_progress", "in_progress"),
+            ("response.web_search_call.searching", "searching"),
+            ("response.web_search_call.completed", "completed"),
+        ] {
+            assert_eq!(
+                native_web_search_phase(&serde_json::json!({"type": event})),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            native_web_search_phase(&serde_json::json!({
+                "type": "response.output_item.added",
+                "item": {"type": "web_search_call"}
+            })),
+            Some("added")
+        );
+        assert_eq!(
+            native_web_search_phase(&serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {"type": "web_search_call"}
+            })),
+            Some("done")
+        );
+        assert_eq!(
+            native_web_search_phase(&serde_json::json!({
+                "type": "response.output_item.added",
+                "item": {"type": "message"}
+            })),
+            None
+        );
+    }
+
+    #[test]
     fn live_stream_progress_records_terminal_usage() {
         let monitor = crate::monitor::MonitorHandle::new(10);
         monitor.request_started(
@@ -1099,6 +1261,7 @@ mod tests {
                 ctx.clone(),
                 None,
                 request.clone(),
+                Instant::now(),
             )
             .await,
             LiveStreamStart::Retry { .. }
@@ -1121,6 +1284,7 @@ mod tests {
             ctx,
             None,
             request,
+            Instant::now(),
         )
         .await
         {

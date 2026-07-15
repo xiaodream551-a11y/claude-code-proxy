@@ -269,8 +269,10 @@ model `gpt-5.6-sol` with `service_tier: "priority"`. An explicit
 
 Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
 the UI as `◐ medium · /effort`) is forwarded as Codex `reasoning.effort` (`low`
-/ `medium` / `high` / `xhigh` / `max`). An explicit `codex.effort` /
-`CCP_CODEX_EFFORT` override still takes precedence and can also force `none`.
+/ `medium` / `high` / `xhigh` / `max`). When Claude Code omits effort for a
+Haiku request, the mapped `gpt-5.6-luna` model defaults to `medium`. An explicit
+request effort or `codex.effort` / `CCP_CODEX_EFFORT` override still takes
+precedence, and the global override can also force `none`.
 
 Reasoning summaries: when a Codex request has reasoning effort, the proxy asks
 Codex for `reasoning.summary: "auto"` and translates returned summary deltas
