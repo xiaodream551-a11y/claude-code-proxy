@@ -795,6 +795,7 @@ fn session_columns(tier: LayoutTier, show_sparkline: bool) -> Vec<ColumnSpec<Ses
         (LayoutTier::Narrow, _) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
+            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, 10),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
             ColumnSpec::flex(C::Target, "Target", Alignment::Left, 1),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
@@ -944,7 +945,9 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
         LayoutTier::Narrow => vec![
             ColumnSpec::fixed(C::Started, "Started", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
-            ColumnSpec::flex(C::Target, "Target", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
+            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
             ColumnSpec::fixed(C::Elapsed, "Elapsed", Alignment::Right, DURATION_WIDTH),
         ],
@@ -1077,9 +1080,12 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
         LayoutTier::Narrow => vec![
             ColumnSpec::fixed(C::Finished, "Finished", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
-            ColumnSpec::flex(C::Target, "Target", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
+            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
         ],
         LayoutTier::Emergency => vec![
@@ -1176,7 +1182,6 @@ enum EventColumn {
     Session,
     Provider,
     Model,
-    Target,
     Message,
 }
 
@@ -1210,7 +1215,8 @@ fn event_columns(tier: LayoutTier) -> Vec<ColumnSpec<EventColumn>> {
         LayoutTier::Narrow => vec![
             ColumnSpec::fixed(C::Time, "Time", Alignment::Left, TIME_WIDTH),
             ColumnSpec::fixed(C::Code, "Code", Alignment::Right, CODE_WIDTH),
-            ColumnSpec::fixed(C::Target, "Target", Alignment::Left, MODEL_NARROW_WIDTH),
+            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_NARROW_WIDTH),
             ColumnSpec::flex(C::Message, "Message", Alignment::Left, 1),
         ],
         LayoutTier::Emergency => vec![
@@ -1260,9 +1266,6 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
                     }
                     EventColumn::Provider => provider_cell(request.provider.as_deref()),
                     EventColumn::Model => model_cell(request.model.as_deref(), width),
-                    EventColumn::Target => {
-                        target_cell(request.provider.as_deref(), request.model.as_deref(), width)
-                    }
                     EventColumn::Message => detail_cell(message),
                 }
             })
@@ -1837,9 +1840,10 @@ mod tests {
         assert!(!emergency.contains("Rate"), "{emergency}");
 
         let narrow = render_at(78);
-        assert!(narrow.contains("Target"), "{narrow}");
-        assert!(narrow.contains("Rate"), "{narrow}");
-        assert!(!narrow.contains("Provider"), "{narrow}");
+        assert!(narrow.contains("Provider"), "{narrow}");
+        assert!(narrow.contains("Model"), "{narrow}");
+        assert!(narrow.contains("Effort"), "{narrow}");
+        assert!(!narrow.contains("Project"), "{narrow}");
 
         let medium = render_at(90);
         assert!(medium.contains("Provider"), "{medium}");
@@ -1928,10 +1932,10 @@ mod tests {
     }
 
     #[test]
-    fn narrow_schemas_drop_optional_columns_instead_of_shrinking_metrics() {
+    fn narrow_schemas_use_available_space_for_context() {
         let sessions = session_columns(LayoutTier::Narrow, false);
         assert!(
-            !sessions
+            sessions
                 .iter()
                 .any(|column| column.key == SessionColumn::Project)
         );
@@ -1943,26 +1947,36 @@ mod tests {
 
         let active = active_columns(LayoutTier::Narrow);
         assert!(
-            !active
+            active
                 .iter()
-                .any(|column| column.key == ActiveColumn::Effort)
+                .any(|column| column.key == ActiveColumn::Provider)
         );
         assert!(
             active
                 .iter()
-                .any(|column| column.key == ActiveColumn::Target)
+                .any(|column| column.key == ActiveColumn::Model)
+        );
+        assert!(
+            active
+                .iter()
+                .any(|column| column.key == ActiveColumn::Effort)
         );
 
         let recent = recent_columns(LayoutTier::Narrow);
         assert!(
-            !recent
+            recent
                 .iter()
-                .any(|column| column.key == RecentColumn::Effort)
+                .any(|column| column.key == RecentColumn::Provider)
         );
         assert!(
             recent
                 .iter()
-                .any(|column| column.key == RecentColumn::Error)
+                .any(|column| column.key == RecentColumn::Input)
+        );
+        assert!(
+            recent
+                .iter()
+                .any(|column| column.key == RecentColumn::Output)
         );
 
         let events = event_columns(LayoutTier::Emergency);
