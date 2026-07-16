@@ -107,6 +107,10 @@ struct GrokConfig {
     pub first_byte_timeout_ms: Option<u64>,
     #[serde(rename = "bodyIdleTimeoutMs")]
     pub body_idle_timeout_ms: Option<u64>,
+    #[serde(rename = "totalTimeoutMs")]
+    pub total_timeout_ms: Option<u64>,
+    #[serde(rename = "streamHeartbeatMs")]
+    pub stream_heartbeat_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +270,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_GROK_BODY_IDLE_TIMEOUT_MS") {
         out.push("CCP_GROK_BODY_IDLE_TIMEOUT_MS (env)".to_string());
     }
+    if env.contains_key("CCP_GROK_TOTAL_TIMEOUT_MS") {
+        out.push("CCP_GROK_TOTAL_TIMEOUT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_GROK_STREAM_HEARTBEAT_MS") {
+        out.push("CCP_GROK_STREAM_HEARTBEAT_MS (env)".to_string());
+    }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .is_some_and(|raw| !raw.is_empty())
@@ -337,6 +347,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(timeout_ms) = grok.body_idle_timeout_ms {
                 out.push(format!("grok.bodyIdleTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(timeout_ms) = grok.total_timeout_ms {
+                out.push(format!("grok.totalTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(heartbeat_ms) = grok.stream_heartbeat_ms {
+                out.push(format!("grok.streamHeartbeatMs: {heartbeat_ms}"));
             }
         }
     }
@@ -417,6 +433,22 @@ pub fn grok_body_idle_timeout_ms(default: u64) -> u64 {
     grok_positive_u64(
         "CCP_GROK_BODY_IDLE_TIMEOUT_MS",
         |grok| grok.body_idle_timeout_ms,
+        default,
+    )
+}
+
+pub fn grok_total_timeout_ms(default: u64) -> u64 {
+    grok_positive_u64(
+        "CCP_GROK_TOTAL_TIMEOUT_MS",
+        |grok| grok.total_timeout_ms,
+        default,
+    )
+}
+
+pub fn grok_stream_heartbeat_ms(default: u64) -> u64 {
+    grok_positive_u64(
+        "CCP_GROK_STREAM_HEARTBEAT_MS",
+        |grok| grok.stream_heartbeat_ms,
         default,
     )
 }
@@ -783,6 +815,8 @@ mod tests {
             std::env::remove_var("CCP_GROK_HEADER_TIMEOUT_MS");
             std::env::remove_var("CCP_GROK_FIRST_BYTE_TIMEOUT_MS");
             std::env::remove_var("CCP_GROK_BODY_IDLE_TIMEOUT_MS");
+            std::env::remove_var("CCP_GROK_TOTAL_TIMEOUT_MS");
+            std::env::remove_var("CCP_GROK_STREAM_HEARTBEAT_MS");
         }
     }
 
@@ -1053,7 +1087,7 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"grok":{"connectTimeoutMs":11000,"headerTimeoutMs":22000,"firstByteTimeoutMs":33000,"bodyIdleTimeoutMs":44000}}"#,
+            r#"{"grok":{"connectTimeoutMs":11000,"headerTimeoutMs":22000,"firstByteTimeoutMs":33000,"bodyIdleTimeoutMs":44000,"totalTimeoutMs":55000,"streamHeartbeatMs":6000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -1062,15 +1096,21 @@ mod tests {
         assert_eq!(grok_header_timeout_ms(1), 22_000);
         assert_eq!(grok_first_byte_timeout_ms(1), 33_000);
         assert_eq!(grok_body_idle_timeout_ms(1), 44_000);
+        assert_eq!(grok_total_timeout_ms(1), 55_000);
+        assert_eq!(grok_stream_heartbeat_ms(1), 6_000);
 
         let _connect_env = EnvGuard::set("CCP_GROK_CONNECT_TIMEOUT_MS", "15000");
         let _header_env = EnvGuard::set("CCP_GROK_HEADER_TIMEOUT_MS", "25000");
         let _first_env = EnvGuard::set("CCP_GROK_FIRST_BYTE_TIMEOUT_MS", "35000");
         let _idle_env = EnvGuard::set("CCP_GROK_BODY_IDLE_TIMEOUT_MS", "45000");
+        let _total_env = EnvGuard::set("CCP_GROK_TOTAL_TIMEOUT_MS", "56000");
+        let _heartbeat_env = EnvGuard::set("CCP_GROK_STREAM_HEARTBEAT_MS", "7000");
         assert_eq!(grok_connect_timeout_ms(1), 15_000);
         assert_eq!(grok_header_timeout_ms(1), 25_000);
         assert_eq!(grok_first_byte_timeout_ms(1), 35_000);
         assert_eq!(grok_body_idle_timeout_ms(1), 45_000);
+        assert_eq!(grok_total_timeout_ms(1), 56_000);
+        assert_eq!(grok_stream_heartbeat_ms(1), 7_000);
     }
 
     #[test]
@@ -1080,16 +1120,19 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"grok":{"connectTimeoutMs":0,"headerTimeoutMs":0,"firstByteTimeoutMs":0,"bodyIdleTimeoutMs":0}}"#,
+            r#"{"grok":{"connectTimeoutMs":0,"headerTimeoutMs":0,"firstByteTimeoutMs":0,"bodyIdleTimeoutMs":0,"totalTimeoutMs":0,"streamHeartbeatMs":0}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         let _connect_env = EnvGuard::set("CCP_GROK_CONNECT_TIMEOUT_MS", "invalid");
+        let _total_env = EnvGuard::set("CCP_GROK_TOTAL_TIMEOUT_MS", "invalid");
 
         assert_eq!(grok_connect_timeout_ms(10_000), 10_000);
         assert_eq!(grok_header_timeout_ms(60_000), 60_000);
         assert_eq!(grok_first_byte_timeout_ms(60_000), 60_000);
         assert_eq!(grok_body_idle_timeout_ms(300_000), 300_000);
+        assert_eq!(grok_total_timeout_ms(540_000), 540_000);
+        assert_eq!(grok_stream_heartbeat_ms(15_000), 15_000);
     }
 
     #[test]
@@ -1099,7 +1142,7 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"grok":{"connectTimeoutMs":10000,"headerTimeoutMs":60000,"firstByteTimeoutMs":60000,"bodyIdleTimeoutMs":300000}}"#,
+            r#"{"grok":{"connectTimeoutMs":10000,"headerTimeoutMs":60000,"firstByteTimeoutMs":60000,"bodyIdleTimeoutMs":300000,"totalTimeoutMs":540000,"streamHeartbeatMs":15000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -1124,6 +1167,16 @@ mod tests {
             summary
                 .iter()
                 .any(|line| line.contains("grok.bodyIdleTimeoutMs"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("grok.totalTimeoutMs"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("grok.streamHeartbeatMs"))
         );
 
         let _connect_env = EnvGuard::set("CCP_GROK_CONNECT_TIMEOUT_MS", "12000");

@@ -195,8 +195,16 @@ pub fn translate_stream_bytes(
 }
 
 pub fn stream_error() -> Vec<u8> {
-    let data = serde_json::json!({"type":"error","error":{"type":"api_error","message":"Grok stream is invalid"}});
+    stream_error_with_message("Grok stream is invalid")
+}
+
+pub fn stream_error_with_message(message: &str) -> Vec<u8> {
+    let data = serde_json::json!({"type":"error","error":{"type":"api_error","message":message}});
     encode_sse_event(Some("error"), &data.to_string())
+}
+
+pub fn stream_ping() -> Vec<u8> {
+    encode_sse_event(Some("ping"), r#"{"type":"ping"}"#)
 }
 
 fn emit(out: &mut Vec<u8>, event: &str, data: serde_json::Value) {
@@ -206,11 +214,11 @@ fn emit(out: &mut Vec<u8>, event: &str, data: serde_json::Value) {
 fn render(out: &mut Vec<u8>, event: ReducerEvent) {
     match event {
         // The Grok CLI endpoint exposes a plaintext reasoning summary. It is not a signed
-        // Anthropic thinking block and often contains draft answers or model chatter. Preserve
-        // streaming liveness with an SSE comment without exposing the private scratch work.
+        // Anthropic thinking block and often contains draft answers or model chatter. The Grok
+        // coordinator emits protocol-level pings independently, so suppress these events here.
         ReducerEvent::ThinkingStart(_)
         | ReducerEvent::ThinkingDelta(_, _)
-        | ReducerEvent::ThinkingStop(_) => out.extend_from_slice(b": keep-alive\n\n"),
+        | ReducerEvent::ThinkingStop(_) => {}
         ReducerEvent::TextStop(i) | ReducerEvent::ToolStop(i) => emit(
             out,
             "content_block_stop",

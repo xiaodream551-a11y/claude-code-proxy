@@ -162,7 +162,13 @@ async fn dispatch_request(
     if let Some(monitor) = state.monitor.as_ref() {
         monitor.request_started(&req_id, session_id.clone(), None, endpoint);
     }
-    let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
+    let mut request_guard = RequestMonitorGuard::new(
+        state.monitor.clone(),
+        req_id.clone(),
+        log.clone(),
+        started_at,
+        count_tokens,
+    );
     let now = current_millis();
     let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(bytes) => bytes,
@@ -172,7 +178,7 @@ async fn dispatch_request(
                 "invalid_request_error",
                 format!("Invalid JSON: {err}"),
             );
-            log_request_completed(
+            log_response_started(
                 &log,
                 RequestLogContext {
                     req_id: &req_id,
@@ -195,14 +201,13 @@ async fn dispatch_request(
                 response,
             )
             .await;
-            monitor_failed(
-                state.monitor.as_ref(),
-                &req_id,
-                Some(response.status()),
+            request_guard.failed(
+                response.status(),
                 details
                     .as_ref()
                     .map(|details| details.message.as_str())
-                    .unwrap_or("Invalid JSON"),
+                    .unwrap_or("Invalid JSON")
+                    .to_string(),
             );
             return response;
         }
@@ -212,7 +217,7 @@ async fn dispatch_request(
         Ok(body) => body,
         Err(response) => {
             let status = response.status();
-            log_request_completed(
+            log_response_started(
                 &log,
                 RequestLogContext {
                     req_id: &req_id,
@@ -235,14 +240,13 @@ async fn dispatch_request(
                 *response,
             )
             .await;
-            monitor_failed(
-                state.monitor.as_ref(),
-                &req_id,
-                Some(status),
+            request_guard.failed(
+                status,
                 details
                     .as_ref()
                     .map(|details| details.message.as_str())
-                    .unwrap_or("Invalid JSON"),
+                    .unwrap_or("Invalid JSON")
+                    .to_string(),
             );
             return response;
         }
@@ -267,7 +271,7 @@ async fn dispatch_request(
                     state.registry.unknown_model_message()
                 ),
             );
-            log_request_completed(
+            log_response_started(
                 &log,
                 RequestLogContext {
                     req_id: &req_id,
@@ -290,20 +294,20 @@ async fn dispatch_request(
                 response,
             )
             .await;
-            monitor_failed(
-                state.monitor.as_ref(),
-                &req_id,
-                Some(response.status()),
+            request_guard.failed(
+                response.status(),
                 details
                     .as_ref()
                     .map(|details| details.message.as_str())
-                    .unwrap_or("Missing model"),
+                    .unwrap_or("Missing model")
+                    .to_string(),
             );
             return response;
         }
     };
 
     let normalized_model = normalize_incoming_model(model);
+    request_guard.set_route(None, Some(&normalized_model));
     body.model = Some(normalized_model.clone());
     let session_state = if let Some(session_id) = session_id.as_deref() {
         session::existing_session(Some(session_id), now)
@@ -336,7 +340,7 @@ async fn dispatch_request(
                     state.registry.unknown_model_message()
                 ),
             );
-            log_request_completed(
+            log_response_started(
                 &log,
                 RequestLogContext {
                     req_id: &req_id,
@@ -359,14 +363,13 @@ async fn dispatch_request(
                 response,
             )
             .await;
-            monitor_failed(
-                state.monitor.as_ref(),
-                &req_id,
-                Some(response.status()),
+            request_guard.failed(
+                response.status(),
                 details
                     .as_ref()
                     .map(|details| details.message.as_str())
-                    .unwrap_or("Unknown model"),
+                    .unwrap_or("Unknown model")
+                    .to_string(),
             );
             return response;
         }
@@ -376,6 +379,7 @@ async fn dispatch_request(
         .ok()
         .flatten()
         .map(str::to_string);
+    request_guard.set_route(Some(provider.name()), Some(&normalized_model));
     let current = session::record_session_request(
         session_id.as_deref(),
         session_state.as_ref(),
@@ -438,7 +442,7 @@ async fn dispatch_request(
     } else {
         provider.handle_messages(body, context).await
     };
-    log_request_completed(
+    log_response_started(
         &log,
         RequestLogContext {
             req_id: &req_id,
@@ -451,7 +455,18 @@ async fn dispatch_request(
     );
     let status = response.status();
     if status.is_success() {
-        return monitor_response_body(response, request_guard);
+        return monitor_response_body(
+            response,
+            request_guard,
+            ResponseLogContext {
+                log,
+                req_id,
+                provider: Some(provider.name().to_string()),
+                model: Some(normalized_model),
+                count_tokens,
+                started_at,
+            },
+        );
     }
 
     let (response, details) = record_failed_response(
@@ -466,42 +481,248 @@ async fn dispatch_request(
         response,
     )
     .await;
-    if let Some(details) = details.as_ref() {
-        monitor_failed(
-            state.monitor.as_ref(),
-            &req_id,
-            Some(status),
-            details.message.as_str(),
-        );
-    } else {
-        monitor_failed(
-            state.monitor.as_ref(),
-            &req_id,
-            Some(status),
-            format!("HTTP {}", status.as_u16()),
-        );
-    }
+    request_guard.failed(
+        status,
+        details
+            .as_ref()
+            .map(|details| details.message.clone())
+            .unwrap_or_else(|| format!("HTTP {}", status.as_u16())),
+    );
     response
 }
 
-fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Response {
+fn monitor_response_body(
+    response: Response,
+    guard: RequestMonitorGuard,
+    log_context: ResponseLogContext,
+) -> Response {
     let status = response.status();
+    let is_event_stream = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
     let (parts, body) = response.into_parts();
-    let stream =
-        futures_util::stream::unfold((body, guard), move |(mut body, mut guard)| async move {
+    let lifecycle = ResponseBodyLifecycle {
+        guard,
+        log_context,
+        status,
+        sse_detector: is_event_stream.then(SseErrorDetector::default),
+        terminal: false,
+    };
+    let stream = futures_util::stream::unfold(
+        (body, lifecycle),
+        move |(mut body, mut lifecycle)| async move {
+            if lifecycle.terminal {
+                return None;
+            }
             match body.frame().await {
-                Some(Ok(frame)) => Some((Ok(frame), (body, guard))),
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref()
+                        && let Some(error) = lifecycle.detect_sse_error(data)
+                    {
+                        lifecycle.failed(error, true);
+                    }
+                    Some((Ok(frame), (body, lifecycle)))
+                }
                 Some(Err(err)) => {
-                    guard.failed(status, err.to_string());
-                    Some((Err(err), (body, guard)))
+                    lifecycle.failed(err.to_string(), false);
+                    Some((Err(err), (body, lifecycle)))
                 }
                 None => {
-                    guard.completed(status);
+                    lifecycle.completed();
                     None
                 }
             }
-        });
+        },
+    );
     Response::from_parts(parts, Body::new(StreamBody::new(stream)))
+}
+
+struct ResponseLogContext {
+    log: Logger,
+    req_id: String,
+    provider: Option<String>,
+    model: Option<String>,
+    count_tokens: bool,
+    started_at: Instant,
+}
+
+struct ResponseBodyLifecycle {
+    guard: RequestMonitorGuard,
+    log_context: ResponseLogContext,
+    status: StatusCode,
+    sse_detector: Option<SseErrorDetector>,
+    terminal: bool,
+}
+
+impl ResponseBodyLifecycle {
+    fn detect_sse_error(&mut self, bytes: &[u8]) -> Option<String> {
+        self.sse_detector.as_mut()?.push(bytes)
+    }
+
+    fn completed(&mut self) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        self.guard.completed(self.status);
+        log_request_completed(&self.log_context, self.status);
+    }
+
+    fn failed(&mut self, error: String, in_band_sse: bool) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        self.guard.failed(self.status, error.clone());
+        log_stream_failed(&self.log_context, self.status, &error, in_band_sse);
+    }
+}
+
+impl Drop for ResponseBodyLifecycle {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.terminal = true;
+            self.guard.abandoned("Downstream response body was dropped");
+        }
+    }
+}
+
+const MAX_SSE_ERROR_EVENT_BYTES: usize = 256 * 1024;
+
+#[derive(Default)]
+struct SseErrorDetector {
+    line: Vec<u8>,
+    event: Option<String>,
+    data: Vec<String>,
+    event_bytes: usize,
+    discard_line: bool,
+    discard_event: bool,
+    skip_lf: bool,
+}
+
+impl SseErrorDetector {
+    fn push(&mut self, bytes: &[u8]) -> Option<String> {
+        for &byte in bytes {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            if matches!(byte, b'\r' | b'\n') {
+                if byte == b'\r' {
+                    self.skip_lf = true;
+                }
+                if self.discard_line {
+                    self.discard_line = false;
+                    continue;
+                }
+                if self.discard_event {
+                    if let Some(error) = self.finish_event() {
+                        return Some(error);
+                    }
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&self.line).into_owned();
+                self.line.clear();
+                if let Some(error) = self.process_line(&line) {
+                    return Some(error);
+                }
+                continue;
+            }
+
+            if self.discard_event {
+                self.discard_line = true;
+                continue;
+            }
+            self.event_bytes = self.event_bytes.saturating_add(1);
+            if self.event_bytes > MAX_SSE_ERROR_EVENT_BYTES {
+                self.line.clear();
+                self.data.clear();
+                self.event = None;
+                self.discard_line = true;
+                self.discard_event = true;
+                continue;
+            }
+            self.line.push(byte);
+        }
+        None
+    }
+
+    fn process_line(&mut self, line: &str) -> Option<String> {
+        if line.is_empty() {
+            return self.finish_event();
+        }
+        if self.discard_event || line.starts_with(':') {
+            return None;
+        }
+
+        let (field, value) = line
+            .split_once(':')
+            .map(|(field, value)| (field, value.strip_prefix(' ').unwrap_or(value)))
+            .unwrap_or((line, ""));
+        match field {
+            "event" => self.event = Some(value.to_string()),
+            "data" => {
+                self.event_bytes = self
+                    .event_bytes
+                    .saturating_add(std::mem::size_of::<String>());
+                if self.event_bytes > MAX_SSE_ERROR_EVENT_BYTES {
+                    self.discard_event = true;
+                    self.event = None;
+                    self.data.clear();
+                } else {
+                    self.data.push(value.to_string());
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn finish_event(&mut self) -> Option<String> {
+        let event = self.event.take();
+        let data = std::mem::take(&mut self.data).join("\n");
+        let discarded = std::mem::take(&mut self.discard_event);
+        self.event_bytes = 0;
+        if discarded {
+            return None;
+        }
+
+        let payload = serde_json::from_str::<Value>(&data).ok();
+        let is_error = event.as_deref() == Some("error")
+            || payload
+                .as_ref()
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                == Some("error");
+        if !is_error {
+            return None;
+        }
+
+        Some(
+            payload
+                .as_ref()
+                .and_then(|value| value.pointer("/error/message"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    payload
+                        .as_ref()
+                        .and_then(|value| value.get("message"))
+                        .and_then(Value::as_str)
+                })
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("Upstream stream returned an error event")
+                .to_string(),
+        )
+    }
 }
 
 struct RequestLogContext<'a> {
@@ -513,9 +734,9 @@ struct RequestLogContext<'a> {
     started_at: Instant,
 }
 
-fn log_request_completed(log: &Logger, ctx: RequestLogContext<'_>) {
+fn log_response_started(log: &Logger, ctx: RequestLogContext<'_>) {
     log.info(
-        "request_completed",
+        "response_started",
         Some(serde_json::Map::from_iter([
             ("reqId".to_string(), json!(ctx.req_id)),
             ("provider".to_string(), json!(ctx.provider)),
@@ -528,6 +749,42 @@ fn log_request_completed(log: &Logger, ctx: RequestLogContext<'_>) {
             ),
         ])),
     );
+}
+
+fn response_log_fields(
+    ctx: &ResponseLogContext,
+    status: StatusCode,
+    extra: Option<(&str, Value)>,
+) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::from_iter([
+        ("reqId".to_string(), json!(ctx.req_id)),
+        ("provider".to_string(), json!(ctx.provider)),
+        ("model".to_string(), json!(ctx.model)),
+        ("countTokens".to_string(), json!(ctx.count_tokens)),
+        ("status".to_string(), json!(status.as_u16())),
+        (
+            "ms".to_string(),
+            json!(ctx.started_at.elapsed().as_millis()),
+        ),
+    ]);
+    if let Some((key, value)) = extra {
+        fields.insert(key.to_string(), value);
+    }
+    fields
+}
+
+fn log_request_completed(ctx: &ResponseLogContext, status: StatusCode) {
+    ctx.log.info(
+        "request_completed",
+        Some(response_log_fields(ctx, status, None)),
+    );
+}
+
+fn log_stream_failed(ctx: &ResponseLogContext, status: StatusCode, error: &str, in_band_sse: bool) {
+    let mut fields = response_log_fields(ctx, status, Some(("message", json!(error))));
+    fields.insert("phase".to_string(), json!("response_body"));
+    fields.insert("inBandSse".to_string(), json!(in_band_sse));
+    ctx.log.info("request_failed", Some(fields));
 }
 
 struct FailedResponseLogContext<'a> {
@@ -699,42 +956,81 @@ fn redact_error_key(value: Value) -> Value {
 struct RequestMonitorGuard {
     monitor: Option<MonitorHandle>,
     req_id: String,
+    log: Logger,
+    started_at: Instant,
+    count_tokens: bool,
+    provider: Option<String>,
+    model: Option<String>,
+    terminal: bool,
 }
 
 impl RequestMonitorGuard {
-    fn new(monitor: Option<MonitorHandle>, req_id: String) -> Self {
-        Self { monitor, req_id }
+    fn new(
+        monitor: Option<MonitorHandle>,
+        req_id: String,
+        log: Logger,
+        started_at: Instant,
+        count_tokens: bool,
+    ) -> Self {
+        Self {
+            monitor,
+            req_id,
+            log,
+            started_at,
+            count_tokens,
+            provider: None,
+            model: None,
+            terminal: false,
+        }
+    }
+
+    fn set_route(&mut self, provider: Option<&str>, model: Option<&str>) {
+        self.provider = provider.map(str::to_string);
+        self.model = model.map(str::to_string);
     }
 
     fn completed(&mut self, status: StatusCode) {
+        self.terminal = true;
         if let Some(monitor) = self.monitor.take() {
             monitor.request_completed(&self.req_id, status.as_u16(), None, None);
         }
     }
 
     fn failed(&mut self, status: StatusCode, error: String) {
+        self.terminal = true;
         if let Some(monitor) = self.monitor.take() {
             monitor.request_failed(&self.req_id, Some(status.as_u16()), error);
         }
+    }
+
+    fn abandoned(&mut self, error: &str) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        if let Some(monitor) = self.monitor.take() {
+            monitor.request_abandoned(&self.req_id, error);
+        }
+        self.log.info(
+            "request_abandoned",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(&self.req_id)),
+                ("provider".to_string(), json!(&self.provider)),
+                ("model".to_string(), json!(&self.model)),
+                ("countTokens".to_string(), json!(self.count_tokens)),
+                (
+                    "ms".to_string(),
+                    json!(self.started_at.elapsed().as_millis()),
+                ),
+                ("message".to_string(), json!(error)),
+            ])),
+        );
     }
 }
 
 impl Drop for RequestMonitorGuard {
     fn drop(&mut self) {
-        if let Some(monitor) = self.monitor.as_ref() {
-            monitor.request_abandoned(&self.req_id, "Request future ended before completion");
-        }
-    }
-}
-
-fn monitor_failed(
-    monitor: Option<&MonitorHandle>,
-    req_id: &str,
-    status: Option<StatusCode>,
-    error: impl Into<String>,
-) {
-    if let Some(monitor) = monitor {
-        monitor.request_failed(req_id, status.map(|status| status.as_u16()), error);
+        self.abandoned("Request future ended before completion");
     }
 }
 
@@ -822,4 +1118,197 @@ fn set_mode(path: &Path, mode: u32) {
 #[allow(dead_code)]
 fn _unused(session_state: Option<&SessionState>) {
     let _ = session_state;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    fn response_log_context(req_id: &str) -> ResponseLogContext {
+        ResponseLogContext {
+            log: create_logger("server-test"),
+            req_id: req_id.to_string(),
+            provider: Some("test".to_string()),
+            model: Some("test-model".to_string()),
+            count_tokens: false,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn started_monitor(req_id: &str) -> MonitorHandle {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(req_id, None, None, EndpointKind::Messages);
+        monitor
+    }
+
+    fn request_guard(monitor: MonitorHandle, req_id: &str) -> RequestMonitorGuard {
+        RequestMonitorGuard::new(
+            Some(monitor),
+            req_id.to_string(),
+            create_logger("server-test"),
+            Instant::now(),
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn response_body_stays_active_until_successful_eof() {
+        let req_id = "stream-success";
+        let monitor = started_monitor(req_id);
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream::iter(vec![
+                Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                )),
+            ])))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            request_guard(monitor.clone(), req_id),
+            response_log_context(req_id),
+        );
+
+        let state = monitor.snapshot();
+        assert_eq!(state.active.len(), 1);
+        assert!(state.recent.is_empty());
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("event: ping"));
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent[0].status,
+            crate::monitor::RequestStatus::Completed
+        );
+        assert_eq!(state.recent[0].http_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn split_in_band_sse_error_is_a_failed_request() {
+        let req_id = "stream-error";
+        let monitor = started_monitor(req_id);
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"event: er")),
+            Ok(Bytes::from_static(
+                b"ror\r\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"deadline exceeded\"}}\r",
+            )),
+            Ok(Bytes::from_static(b"\n\r\n")),
+            Ok(Bytes::from_static(
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+        ];
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                http::header::CONTENT_TYPE,
+                "text/event-stream; charset=utf-8",
+            )
+            .body(Body::from_stream(stream::iter(chunks)))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            request_guard(monitor.clone(), req_id),
+            response_log_context(req_id),
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("deadline exceeded"));
+        assert!(!body.contains("message_stop"));
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent[0].status,
+            crate::monitor::RequestStatus::Failed
+        );
+        assert_eq!(state.recent[0].http_status, Some(200));
+        assert_eq!(state.recent[0].error.as_deref(), Some("deadline exceeded"));
+    }
+
+    #[tokio::test]
+    async fn non_sse_error_shaped_json_remains_a_successful_body() {
+        let req_id = "json-success";
+        let monitor = started_monitor(req_id);
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"message":"ordinary payload"}}"#,
+            ))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            request_guard(monitor.clone(), req_id),
+            response_log_context(req_id),
+        );
+
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let state = monitor.snapshot();
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent[0].status,
+            crate::monitor::RequestStatus::Completed
+        );
+    }
+
+    #[test]
+    fn cr_only_sse_error_is_detected() {
+        let mut detector = SseErrorDetector::default();
+        let error = detector
+            .push(
+                b"event: error\rdata: {\"type\":\"error\",\"error\":{\"message\":\"cr deadline\"}}\r\r",
+            )
+            .expect("CR-only SSE must dispatch an error event");
+
+        assert_eq!(error, "cr deadline");
+    }
+
+    #[test]
+    fn oversized_many_line_event_is_discarded_and_parser_recovers() {
+        let mut detector = SseErrorDetector::default();
+        for _ in 0..(MAX_SSE_ERROR_EVENT_BYTES / 5 + 10) {
+            assert!(detector.push(b"data:\n").is_none());
+        }
+        assert!(detector.discard_event);
+        assert!(detector.data.is_empty());
+        assert!(detector.push(b"\n").is_none());
+
+        let error = detector
+            .push(
+                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"recovered\"}}\n\n",
+            )
+            .expect("the parser should recover after the oversized event boundary");
+        assert_eq!(error, "recovered");
+    }
+
+    #[test]
+    fn dropping_pre_response_guard_records_abandonment_once() {
+        let req_id = "pre-response-drop";
+        let monitor = started_monitor(req_id);
+        drop(request_guard(monitor.clone(), req_id));
+
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent[0].status,
+            crate::monitor::RequestStatus::Failed
+        );
+        assert_eq!(
+            state.recent[0].error.as_deref(),
+            Some("Request future ended before completion")
+        );
+    }
 }

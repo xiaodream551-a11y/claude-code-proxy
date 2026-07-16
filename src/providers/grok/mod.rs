@@ -4,8 +4,10 @@ pub mod count_tokens;
 pub mod translate;
 
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::{
@@ -28,13 +30,16 @@ use crate::retry::{compute_backoff_delay, sleep};
 use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 
 use self::auth::token_store::file_store;
-use self::client::{GrokByteStream, GrokError, GrokRetryState};
+use self::client::{GrokByteStream, GrokError, GrokRequestDeadline, GrokRetryState};
 use self::translate::{
     accumulate::accumulate_response_with_traffic,
     model_allowlist::{assert_allowed_model, resolve_model_request},
     request::{GrokReasoning, GrokResponsesRequest, translate_request},
-    stream::{SseDecoder, StreamTranslator, stream_error},
+    stream::{SseDecoder, StreamTranslator, stream_error, stream_error_with_message, stream_ping},
 };
+
+const MIN_STREAM_HEARTBEAT: Duration = Duration::from_secs(1);
+const MAX_STREAM_HEARTBEAT: Duration = Duration::from_secs(60);
 
 pub struct GrokProvider {
     client: Arc<client::GrokClient>,
@@ -79,6 +84,7 @@ impl Provider for GrokProvider {
         &GROK_CLI
     }
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        let deadline = GrokRequestDeadline::configured();
         let requested = body.model.clone().unwrap_or_else(|| "grok-4.5".into());
         let resolved = resolve_model_request(&requested);
         if let Err(error) = assert_allowed_model(&resolved.model) {
@@ -125,7 +131,7 @@ impl Provider for GrokProvider {
             monitor.upstream_started(&ctx.req_id);
         }
 
-        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
         let upstream = match self
             .client
             .post_with_retry(&translated, ctx.traffic.clone(), retry.clone())
@@ -143,7 +149,7 @@ impl Provider for GrokProvider {
                 traffic: ctx.traffic.clone(),
                 retry,
             });
-            stream_body(
+            stream_body_with_policy(
                 upstream.into_stream(),
                 message_id,
                 requested,
@@ -151,6 +157,8 @@ impl Provider for GrokProvider {
                 ctx.req_id.clone(),
                 ctx.traffic.clone(),
                 reconnect,
+                deadline,
+                configured_stream_heartbeat(),
             )
         } else {
             match read_non_streaming_body(
@@ -159,6 +167,7 @@ impl Provider for GrokProvider {
                 upstream,
                 ctx.traffic.clone(),
                 retry,
+                deadline,
             )
             .await
             {
@@ -243,6 +252,7 @@ async fn read_non_streaming_body(
     mut response: client::GrokResponse,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
     retry: Arc<Mutex<GrokRetryState>>,
+    deadline: GrokRequestDeadline,
 ) -> Result<Vec<u8>, GrokError> {
     loop {
         match response.into_bytes().await {
@@ -265,7 +275,13 @@ async fn read_non_streaming_body(
                     state.note_transient_failure();
                     delay
                 };
-                sleep(delay.wait_ms).await;
+                client::run_before_deadline(
+                    deadline,
+                    retry.clone(),
+                    error.stage,
+                    sleep(delay.wait_ms),
+                )
+                .await?;
                 response = client
                     .post_with_retry(&request, traffic.clone(), retry.clone())
                     .await?;
@@ -282,6 +298,7 @@ struct GrokReconnectContext {
     retry: Arc<Mutex<GrokRetryState>>,
 }
 
+#[cfg(test)]
 fn stream_body<S>(
     upstream: S,
     message_id: String,
@@ -294,6 +311,45 @@ fn stream_body<S>(
 where
     S: Stream<Item = Result<Bytes, client::GrokError>> + Unpin + Send + 'static,
 {
+    stream_body_with_policy(
+        upstream,
+        message_id,
+        model,
+        monitor,
+        req_id,
+        traffic,
+        reconnect,
+        GrokRequestDeadline::after(Duration::from_millis(client::DEFAULT_TOTAL_TIMEOUT_MS)),
+        Duration::from_millis(client::DEFAULT_STREAM_HEARTBEAT_MS),
+    )
+}
+
+fn configured_stream_heartbeat() -> Duration {
+    Duration::from_millis(crate::config::grok_stream_heartbeat_ms(
+        client::DEFAULT_STREAM_HEARTBEAT_MS,
+    ))
+    .clamp(MIN_STREAM_HEARTBEAT, MAX_STREAM_HEARTBEAT)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_body_with_policy<S>(
+    upstream: S,
+    message_id: String,
+    model: String,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    traffic: Option<Arc<crate::traffic::TrafficCapture>>,
+    reconnect: Option<GrokReconnectContext>,
+    deadline: GrokRequestDeadline,
+    heartbeat_interval: Duration,
+) -> Response
+where
+    S: Stream<Item = Result<Bytes, client::GrokError>> + Unpin + Send + 'static,
+{
+    let next_heartbeat = tokio::time::Instant::now()
+        .checked_add(heartbeat_interval)
+        .unwrap_or_else(|| deadline.at())
+        .min(deadline.at());
     let state = GrokStreamState {
         upstream: Box::pin(upstream),
         decoder: SseDecoder::default(),
@@ -312,6 +368,10 @@ where
         stream_capture: traffic.as_ref().map(|traffic| traffic.stream_capture()),
         traffic,
         reconnect,
+        rebuild: None,
+        deadline,
+        heartbeat_interval,
+        next_heartbeat,
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         state
@@ -347,6 +407,10 @@ struct GrokStreamState {
     stream_capture: Option<StreamTrafficCapture>,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
     reconnect: Option<GrokReconnectContext>,
+    rebuild: Option<GrokPendingRebuild>,
+    deadline: GrokRequestDeadline,
+    heartbeat_interval: Duration,
+    next_heartbeat: tokio::time::Instant,
 }
 
 impl GrokStreamState {
@@ -359,35 +423,54 @@ impl GrokStreamState {
             return None;
         }
         loop {
+            if self.rebuild.is_some() {
+                let (fail_stage, fail_kind) = {
+                    let rebuild = self.rebuild.as_ref().expect("rebuild must exist");
+                    (rebuild.fail_stage, rebuild.fail_kind)
+                };
+                match self.next_rebuild_poll().await {
+                    GrokRebuildPoll::Rebuilt(upstream) => {
+                        self.reset_attempt(upstream);
+                        continue;
+                    }
+                    GrokRebuildPoll::Heartbeat => {
+                        let ping = stream_ping();
+                        self.capture_downstream(&ping);
+                        return Some(ping);
+                    }
+                    GrokRebuildPoll::Failed(error) => {
+                        return Some(self.fail_mapped(error, fail_stage, fail_kind));
+                    }
+                }
+            }
             let chunk = match self.next_upstream_chunk().await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => {
+                Ok(GrokStreamPoll::Chunk(chunk)) => chunk,
+                Ok(GrokStreamPoll::Heartbeat) => {
+                    let ping = stream_ping();
+                    self.capture_downstream(&ping);
+                    return Some(ping);
+                }
+                Ok(GrokStreamPoll::End) => {
                     if self.decoder.finish().is_err() || !self.reducer.finished() {
-                        match self
-                            .maybe_rebuild(
-                                client::GrokError::stream_transport(
-                                    client::GrokErrorStage::Stream,
-                                    "Grok stream closed before a terminal event",
-                                ),
-                                "decoder",
-                                "incomplete_stream",
-                            )
-                            .await
-                        {
-                            RebuildOutcome::Rebuilt => continue,
-                            RebuildOutcome::Failed(bytes) => return Some(bytes),
+                        match self.begin_rebuild(
+                            client::GrokError::stream_transport(
+                                client::GrokErrorStage::Stream,
+                                "Grok stream closed before a terminal event",
+                            ),
+                            "decoder",
+                            "incomplete_stream",
+                        ) {
+                            Ok(()) => continue,
+                            Err(bytes) => return Some(bytes),
                         }
                     }
                     self.terminal = true;
                     self.finish_capture(true);
                     return None;
                 }
-                Err(error) => match self
-                    .maybe_rebuild(error, "transport", "upstream_stream")
-                    .await
-                {
-                    RebuildOutcome::Rebuilt => continue,
-                    RebuildOutcome::Failed(bytes) => return Some(bytes),
+                Err(error) => match self.begin_rebuild(error, "transport", "upstream_stream") {
+                    Ok(()) => continue,
+                    Err(bytes) => return Some(bytes),
                 },
             };
 
@@ -458,76 +541,144 @@ impl GrokStreamState {
                     self.downstream_emitted = true;
                 }
                 self.capture_downstream(&out);
+                self.schedule_next_heartbeat();
                 return Some(out);
             }
         }
     }
 
-    async fn next_upstream_chunk(&mut self) -> Result<Option<Bytes>, GrokError> {
-        match self.upstream.next().await {
-            Some(Ok(chunk)) => Ok(Some(chunk)),
-            Some(Err(error)) => Err(error),
-            None => Ok(None),
+    async fn next_upstream_chunk(&mut self) -> Result<GrokStreamPoll, GrokError> {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(self.deadline.at()) => {
+                if let Some(reconnect) = self.reconnect.as_ref() {
+                    reconnect.retry.lock().await.mark_terminal();
+                }
+                Err(GrokError::deadline_exceeded(client::GrokErrorStage::Stream))
+            }
+            _ = tokio::time::sleep_until(self.next_heartbeat) => {
+                self.schedule_next_heartbeat();
+                Ok(GrokStreamPoll::Heartbeat)
+            },
+            item = self.upstream.next() => match item {
+                Some(Ok(chunk)) => Ok(GrokStreamPoll::Chunk(chunk)),
+                Some(Err(error)) => Err(error),
+                None => Ok(GrokStreamPoll::End),
+            },
         }
     }
 
-    async fn maybe_rebuild(
+    fn schedule_next_heartbeat(&mut self) {
+        self.next_heartbeat = tokio::time::Instant::now()
+            .checked_add(self.heartbeat_interval)
+            .unwrap_or_else(|| self.deadline.at())
+            .min(self.deadline.at());
+    }
+
+    fn begin_rebuild(
         &mut self,
         error: GrokError,
-        fail_stage: &str,
-        fail_kind: &str,
-    ) -> RebuildOutcome {
+        fail_stage: &'static str,
+        fail_kind: &'static str,
+    ) -> Result<(), Vec<u8>> {
         if self.downstream_emitted || !error.is_retryable() {
-            return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
+            return Err(self.fail_mapped(error, fail_stage, fail_kind));
         }
         let Some(reconnect) = self.reconnect.as_ref() else {
-            return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
+            return Err(self.fail_at(fail_stage, fail_kind));
         };
         let client = reconnect.client.clone();
         let request = reconnect.request.clone();
         let traffic = reconnect.traffic.clone();
         let retry = reconnect.retry.clone();
+        let deadline = self.deadline;
+        let attempt_bytes = self.attempt_bytes;
+        let future = Box::pin(async move {
+            let delay = {
+                let mut state = retry.lock().await;
+                if !state.can_retry_transient() {
+                    state.mark_terminal();
+                    return Err(error.into_terminal("retry exhausted"));
+                }
+                let delay =
+                    compute_backoff_delay(state.transient_failures(), error.retry_after.as_deref());
+                if delay.exceeds_budget {
+                    state.mark_terminal();
+                    return Err(error.into_terminal("retry delay exceeds budget"));
+                }
+                state.note_transient_failure();
+                if let Some(traffic) = traffic.as_ref() {
+                    traffic.write_json(
+                        "024-upstream-stream-rebuild",
+                        &serde_json::json!({
+                            "wait_ms": delay.wait_ms,
+                            "origin": client::origin_name(error.origin),
+                            "error_stage": client::stage_name(error.stage),
+                            "status": error.status.as_u16(),
+                            "message": error.message,
+                            "stage": fail_stage,
+                            "kind": fail_kind,
+                            "attempt_bytes": attempt_bytes,
+                        }),
+                    );
+                }
+                delay
+            };
+            client::run_before_deadline(deadline, retry.clone(), error.stage, sleep(delay.wait_ms))
+                .await?;
+            client
+                .post_with_retry(&request, traffic, retry)
+                .await
+                .map(client::GrokResponse::into_stream)
+        });
+        self.rebuild = Some(GrokPendingRebuild {
+            future,
+            fail_stage,
+            fail_kind,
+        });
+        Ok(())
+    }
 
-        let delay = {
-            let mut state = retry.lock().await;
-            if !state.can_retry_transient() {
-                state.mark_terminal();
-                drop(state);
-                return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
+    async fn next_rebuild_poll(&mut self) -> GrokRebuildPoll {
+        enum WaitResult {
+            Deadline,
+            Heartbeat,
+            Finished(Result<GrokByteStream, GrokError>),
+        }
+
+        let wait = {
+            let rebuild = self.rebuild.as_mut().expect("rebuild must exist");
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(self.deadline.at()) => WaitResult::Deadline,
+                _ = tokio::time::sleep_until(self.next_heartbeat) => WaitResult::Heartbeat,
+                result = &mut rebuild.future => WaitResult::Finished(result),
             }
-            let delay =
-                compute_backoff_delay(state.transient_failures(), error.retry_after.as_deref());
-            if delay.exceeds_budget {
-                state.mark_terminal();
-                drop(state);
-                return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
-            }
-            state.note_transient_failure();
-            if let Some(traffic) = traffic.as_ref() {
-                traffic.write_json(
-                    "024-upstream-stream-rebuild",
-                    &serde_json::json!({
-                        "wait_ms": delay.wait_ms,
-                        "origin": client::origin_name(error.origin),
-                        "error_stage": client::stage_name(error.stage),
-                        "status": error.status.as_u16(),
-                        "message": error.message,
-                        "stage": fail_stage,
-                        "kind": fail_kind,
-                        "attempt_bytes": self.attempt_bytes,
-                    }),
-                );
-            }
-            delay
         };
-        sleep(delay.wait_ms).await;
-
-        match client.post_with_retry(&request, traffic, retry).await {
-            Ok(response) => {
-                self.reset_attempt(response.into_stream());
-                RebuildOutcome::Rebuilt
+        match wait {
+            WaitResult::Deadline => {
+                // Drop the in-flight auth/header/body request before taking the retry lock. This
+                // makes downstream cancellation and the wall-clock deadline cancel the socket,
+                // rather than leaving a detached reconnect task behind.
+                self.rebuild.take();
+                if let Some(reconnect) = self.reconnect.as_ref() {
+                    reconnect.retry.lock().await.mark_terminal();
+                }
+                GrokRebuildPoll::Failed(GrokError::deadline_exceeded(
+                    client::GrokErrorStage::Stream,
+                ))
             }
-            Err(error) => RebuildOutcome::Failed(self.fail_mapped(error, fail_stage, fail_kind)),
+            WaitResult::Heartbeat => {
+                self.schedule_next_heartbeat();
+                GrokRebuildPoll::Heartbeat
+            }
+            WaitResult::Finished(result) => {
+                self.rebuild.take();
+                match result {
+                    Ok(upstream) => GrokRebuildPoll::Rebuilt(upstream),
+                    Err(error) => GrokRebuildPoll::Failed(error),
+                }
+            }
         }
     }
 
@@ -551,13 +702,19 @@ impl GrokStreamState {
 
     fn fail(&mut self, stage: &str, kind: &str, error: Option<&GrokError>) -> Vec<u8> {
         self.error_sent = true;
+        let stream_message = match error {
+            Some(error) if error.origin == client::GrokErrorOrigin::Deadline => {
+                error.message.as_str()
+            }
+            _ => "Grok stream is invalid",
+        };
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
             capture.downstream_event(
                 "error",
                 serde_json::json!({
                     "type":"error",
-                    "error":{"type":"api_error","message":"Grok stream is invalid"}
+                    "error":{"type":"api_error","message":stream_message}
                 }),
             );
         }
@@ -607,7 +764,11 @@ impl GrokStreamState {
             );
         }
         self.finish_capture(false);
-        stream_error()
+        if stream_message == "Grok stream is invalid" {
+            stream_error()
+        } else {
+            stream_error_with_message(stream_message)
+        }
     }
 
     fn capture_downstream(&mut self, bytes: &[u8]) {
@@ -639,9 +800,25 @@ impl GrokStreamState {
     }
 }
 
-enum RebuildOutcome {
-    Rebuilt,
-    Failed(Vec<u8>),
+type GrokRebuildFuture =
+    Pin<Box<dyn Future<Output = Result<GrokByteStream, GrokError>> + Send + 'static>>;
+
+struct GrokPendingRebuild {
+    future: GrokRebuildFuture,
+    fail_stage: &'static str,
+    fail_kind: &'static str,
+}
+
+enum GrokRebuildPoll {
+    Rebuilt(GrokByteStream),
+    Heartbeat,
+    Failed(GrokError),
+}
+
+enum GrokStreamPoll {
+    Chunk(Bytes),
+    Heartbeat,
+    End,
 }
 
 impl Drop for GrokStreamState {
@@ -787,6 +964,277 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn completely_silent_stream_emits_pings_then_explicit_total_timeout() {
+        let (tx, rx) = mpsc::channel(1);
+        let response = stream_body_with_policy(
+            ChannelStream(rx),
+            "msg_silent".into(),
+            "grok-4.5".into(),
+            None,
+            "req_silent".into(),
+            None,
+            None,
+            GrokRequestDeadline::after(Duration::from_millis(90)),
+            Duration::from_millis(20),
+        );
+
+        let body = tokio::time::timeout(Duration::from_millis(500), response.into_body().collect())
+            .await
+            .expect("the total deadline should end a silent stream")
+            .unwrap()
+            .to_bytes();
+        drop(tx);
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.matches("event: ping").count() >= 2, "{body}");
+        assert!(body.contains(r#"{"type":"ping"}"#), "{body}");
+        assert!(body.contains("total wall-clock timeout"), "{body}");
+        assert!(!body.contains("Grok stream is invalid"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn continuous_reasoning_cannot_starve_ping_or_extend_total_deadline() {
+        let (tx, rx) = mpsc::channel(8);
+        let producer = tokio::spawn(async move {
+            let chunk = Bytes::from_static(
+                b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"draft \\ud83d\\ude0a\"}\n\n",
+            );
+            loop {
+                if tx.send(Ok(chunk.clone())).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+        });
+        let response = stream_body_with_policy(
+            ChannelStream(rx),
+            "msg_reasoning".into(),
+            "grok-4.5".into(),
+            None,
+            "req_reasoning".into(),
+            None,
+            None,
+            GrokRequestDeadline::after(Duration::from_millis(90)),
+            Duration::from_millis(20),
+        );
+
+        let body = tokio::time::timeout(Duration::from_millis(500), response.into_body().collect())
+            .await
+            .expect("reasoning traffic must not extend the total deadline")
+            .unwrap()
+            .to_bytes();
+        producer.await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let pings = body.matches("event: ping").count();
+
+        assert!((2..=6).contains(&pings), "pings={pings}, body={body}");
+        assert!(!body.contains("draft"), "{body}");
+        assert!(!body.contains('😊'), "{body}");
+        assert!(body.contains("total wall-clock timeout"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn continuous_reasoning_emits_pings_before_one_final_answer() {
+        let (tx, rx) = mpsc::channel(8);
+        let producer = tokio::spawn(async move {
+            let reasoning = Bytes::from_static(
+                b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"draft\"}\n\n",
+            );
+            for _ in 0..24 {
+                tx.send(Ok(reasoning.clone())).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+            tx.send(Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"FINAL_ONCE\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+            )))
+            .await
+            .unwrap();
+        });
+        let response = stream_body_with_policy(
+            ChannelStream(rx),
+            "msg_reasoning_final".into(),
+            "grok-4.5".into(),
+            None,
+            "req_reasoning_final".into(),
+            None,
+            None,
+            GrokRequestDeadline::after(Duration::from_millis(500)),
+            Duration::from_millis(20),
+        );
+
+        let body = tokio::time::timeout(Duration::from_secs(1), response.into_body().collect())
+            .await
+            .expect("the final answer should complete before the total deadline")
+            .unwrap()
+            .to_bytes();
+        producer.await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.matches("event: ping").count() >= 2, "{body}");
+        assert_eq!(body.matches("FINAL_ONCE").count(), 1, "{body}");
+        assert!(!body.contains("draft"), "{body}");
+        assert!(!body.contains("total wall-clock timeout"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn dropping_downstream_body_immediately_drops_upstream_stream() {
+        let (tx, rx) = mpsc::channel(1);
+        let response = stream_body_with_policy(
+            ChannelStream(rx),
+            "msg_drop".into(),
+            "grok-4.5".into(),
+            None,
+            "req_drop".into(),
+            None,
+            None,
+            GrokRequestDeadline::after(Duration::from_secs(5)),
+            Duration::from_millis(20),
+        );
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .expect("heartbeat should make the body observable")
+            .expect("stream should yield a heartbeat")
+            .unwrap();
+        assert!(String::from_utf8_lossy(frame.data_ref().unwrap()).contains("event: ping"));
+
+        drop(body);
+
+        tokio::time::timeout(Duration::from_millis(100), tx.closed())
+            .await
+            .expect("dropping the downstream body must cancel the upstream poller");
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_rebuild_emits_multiple_pings_then_honors_total_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_complete_http_request(&mut stream).await;
+            let mut byte = [0_u8; 1];
+            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+                .await
+                .expect("the total deadline must cancel the stalled rebuild socket")
+                .unwrap()
+        });
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 5_000,
+                first_byte_ms: 5_000,
+                body_idle_ms: 5_000,
+            },
+        )
+        .await;
+        let deadline = GrokRequestDeadline::after(Duration::from_millis(180));
+        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+        let reconnect = Some(GrokReconnectContext {
+            client: Arc::new(client),
+            request: Arc::new(sample_request()),
+            traffic: None,
+            retry: retry.clone(),
+        });
+        let mut reset =
+            client::GrokError::stream_transport(GrokErrorStage::Stream, "synthetic stream reset");
+        reset.retry_after = Some("0".into());
+
+        let response = stream_body_with_policy(
+            futures_util::stream::iter(vec![Err(reset)]),
+            "msg_stalled_rebuild".into(),
+            "grok-4.5".into(),
+            None,
+            "req_stalled_rebuild".into(),
+            None,
+            reconnect,
+            deadline,
+            Duration::from_millis(25),
+        );
+        let body = tokio::time::timeout(Duration::from_secs(1), response.into_body().collect())
+            .await
+            .expect("the shared total deadline must terminate the rebuild")
+            .unwrap()
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.matches("event: ping").count() >= 3, "{body}");
+        assert!(body.contains("total wall-clock timeout"), "{body}");
+        assert!(retry.lock().await.is_terminal());
+        assert_eq!(server.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_downstream_during_stalled_rebuild_cancels_socket_immediately() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_complete_http_request(&mut stream).await;
+            let _ = request_seen_tx.send(());
+            let mut byte = [0_u8; 1];
+            tokio::time::timeout(Duration::from_millis(500), stream.read(&mut byte))
+                .await
+                .expect("dropping downstream must promptly cancel the rebuild socket")
+                .unwrap()
+        });
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 5_000,
+                first_byte_ms: 5_000,
+                body_idle_ms: 5_000,
+            },
+        )
+        .await;
+        let deadline = GrokRequestDeadline::after(Duration::from_secs(5));
+        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+        let reconnect = Some(GrokReconnectContext {
+            client: Arc::new(client),
+            request: Arc::new(sample_request()),
+            traffic: None,
+            retry,
+        });
+        let mut reset =
+            client::GrokError::stream_transport(GrokErrorStage::Stream, "synthetic stream reset");
+        reset.retry_after = Some("0".into());
+        let response = stream_body_with_policy(
+            futures_util::stream::iter(vec![Err(reset)]),
+            "msg_cancel_rebuild".into(),
+            "grok-4.5".into(),
+            None,
+            "req_cancel_rebuild".into(),
+            None,
+            reconnect,
+            deadline,
+            Duration::from_millis(20),
+        );
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .expect("rebuild wait must emit its first ping")
+            .expect("stream must remain open")
+            .unwrap();
+        assert!(String::from_utf8_lossy(first.data_ref().unwrap()).contains("event: ping"));
+        tokio::time::timeout(Duration::from_millis(200), request_seen_rx)
+            .await
+            .expect("the stalled rebuild request must start")
+            .expect("the rebuild server must observe the request");
+        let second = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .expect("rebuild wait must emit another ping")
+            .expect("stream must remain open")
+            .unwrap();
+        assert!(String::from_utf8_lossy(second.data_ref().unwrap()).contains("event: ping"));
+
+        drop(body);
+
+        assert_eq!(server.await.unwrap(), 0);
+    }
+
     fn sample_request() -> GrokResponsesRequest {
         GrokResponsesRequest {
             model: "grok-4.5".into(),
@@ -858,6 +1306,34 @@ mod tests {
         }
         buf.truncate(total);
         buf
+    }
+
+    async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = read_http_request(stream).await;
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("HTTP request must contain complete headers");
+        let content_length = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let complete_len = header_end.saturating_add(content_length);
+        if request.len() < complete_len {
+            let previous_len = request.len();
+            request.resize(complete_len, 0);
+            stream
+                .read_exact(&mut request[previous_len..])
+                .await
+                .expect("HTTP request body must arrive");
+        }
+        request
     }
 
     #[tokio::test]
@@ -1281,6 +1757,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
             drop(stream);
 
             // Second attempt succeeds.
@@ -1307,7 +1784,8 @@ mod tests {
         )
         .await;
         let client = Arc::new(client);
-        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let deadline = GrokRequestDeadline::after(Duration::from_secs(5));
+        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
         let response = client
             .post_with_retry(&sample_request(), None, retry.clone())
             .await
@@ -1318,25 +1796,35 @@ mod tests {
             traffic: None,
             retry,
         });
-        let body = stream_body(
-            response.into_stream(),
-            "msg_rebuild".into(),
-            "grok-4.5".into(),
-            None,
-            "req_rebuild".into(),
-            None,
-            reconnect,
+        let body = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream_body_with_policy(
+                response.into_stream(),
+                "msg_rebuild".into(),
+                "grok-4.5".into(),
+                None,
+                "req_rebuild".into(),
+                None,
+                reconnect,
+                deadline,
+                Duration::from_millis(10),
+            )
+            .into_body()
+            .collect(),
         )
-        .into_body()
-        .collect()
         .await
+        .expect("rebuild must remain bounded by the request deadline")
         .unwrap()
         .to_bytes();
-        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("rebuild should issue the second request")
+            .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("message_start"));
         assert!(body.contains("ok"));
+        assert!(body.contains("event: ping"));
         assert!(body.contains("message_stop"));
     }
 

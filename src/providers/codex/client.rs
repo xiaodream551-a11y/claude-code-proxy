@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::anthropic::sse::parse_sse_events;
@@ -216,8 +217,11 @@ pub struct CodexResponse {
 const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
+const LIVE_HTTP_ERROR_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_LIVE_HTTP_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub(super) const DEFAULT_CODEX_TOTAL_TIMEOUT_MS: u64 = 540_000;
 pub(super) const CODEX_TOTAL_TIMEOUT_DETAIL: &str = "codex_total_timeout";
+pub(super) const CODEX_LIVE_ATTEMPT_BUDGET_DETAIL: &str = "codex_live_attempt_budget_exhausted";
 const MAX_CODEX_TOTAL_TIMEOUT_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -261,6 +265,39 @@ impl CodexRequestDeadline {
 
     pub(super) fn timeout_ms(self) -> u64 {
         self.timeout_ms
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct CodexLiveAttemptBudget {
+    attempts: Arc<AtomicU32>,
+}
+
+impl CodexLiveAttemptBudget {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    fn reserve(&self, transport: crate::config::CodexTransport) -> Result<u32, CodexError> {
+        let attempt = self
+            .attempts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                (used < MAX_BUFFERED_TRANSPORT_ATTEMPTS).then_some(used + 1)
+            })
+            .map_err(|used| CodexError {
+                status: 503,
+                message: format!(
+                    "Codex live request exhausted its {used} physical upstream attempts"
+                ),
+                detail: Some(CODEX_LIVE_ATTEMPT_BUDGET_DETAIL.to_string()),
+                retry_after: None,
+                origin: match transport {
+                    crate::config::CodexTransport::Http => CodexErrorOrigin::Http,
+                    crate::config::CodexTransport::WebSocket
+                    | crate::config::CodexTransport::Auto => CodexErrorOrigin::WebSocket,
+                },
+            })?;
+        Ok(attempt + 1)
     }
 }
 
@@ -405,23 +442,6 @@ impl CodexHttpClient {
             ctx,
             continuation,
             crate::config::codex_transport(),
-            deadline,
-        )
-        .await
-    }
-
-    pub(super) async fn post_codex_http_before(
-        &self,
-        body: &ResponsesRequest,
-        ctx: &RequestContext,
-        continuation: Option<&super::continuation::ContinuationCandidate>,
-        deadline: CodexRequestDeadline,
-    ) -> Result<CodexResponse, CodexError> {
-        self.post_codex_with_transport_before(
-            body,
-            ctx,
-            continuation,
-            crate::config::CodexTransport::Http,
             deadline,
         )
         .await
@@ -856,11 +876,12 @@ impl CodexHttpClient {
         }
     }
 
-    pub async fn stream_codex_websocket_events(
+    pub(super) async fn stream_codex_websocket_events(
         self: &Arc<Self>,
         body: &ResponsesRequest,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
+        attempt_budget: CodexLiveAttemptBudget,
     ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
         let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
@@ -885,13 +906,22 @@ impl CodexHttpClient {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             client
-                .coordinate_live_websocket_events(body, ctx, continuation, auth, pool_key, tx)
+                .coordinate_live_websocket_events(
+                    body,
+                    ctx,
+                    continuation,
+                    auth,
+                    pool_key,
+                    attempt_budget,
+                    tx,
+                )
                 .await;
         });
 
         Ok(rx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn coordinate_live_websocket_events(
         &self,
         body: ResponsesRequest,
@@ -899,6 +929,7 @@ impl CodexHttpClient {
         mut continuation: Option<super::continuation::ContinuationCandidate>,
         mut auth: StoredAuth,
         pool_key: Option<String>,
+        attempt_budget: CodexLiveAttemptBudget,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
     ) {
         let turn_id = continuation
@@ -922,6 +953,10 @@ impl CodexHttpClient {
                 }
             };
             let ws_body = build_websocket_request(&body, continuation.as_ref());
+            if let Err(err) = attempt_budget.reserve(crate::config::CodexTransport::WebSocket) {
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
             let start = super::websocket::codex_websocket_event_stream(
                 &self.base_url,
                 &ws_headers,
@@ -1056,6 +1091,149 @@ impl CodexHttpClient {
         }
     }
 
+    pub(super) async fn stream_codex_http_events(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        deadline: CodexRequestDeadline,
+        attempt_budget: CodexLiveAttemptBudget,
+    ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|error| CodexError {
+                status: 401,
+                message: "Auth error".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Auth,
+            })?;
+        let body_json = serialize_request(body)?;
+        let mut auth_refresh_attempted = false;
+
+        loop {
+            let headers = build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
+            attempt_budget.reserve(crate::config::CodexTransport::Http)?;
+            if let Some(traffic) = ctx.traffic.as_deref() {
+                write_codex_http_request_capture(traffic, &self.base_url, &headers, &body_json);
+            }
+
+            let mut request = self.client.post(&self.base_url);
+            for (key, value) in headers.iter() {
+                request = request.header(key.as_str(), value.as_bytes());
+            }
+            let started_at = Instant::now();
+            let send = tokio::time::timeout(
+                Duration::from_millis(self.header_timeout_ms),
+                request.body(body_json.clone()).send(),
+            );
+            let response = tokio::select! {
+                _ = tokio::time::sleep_until(deadline.at()) => {
+                    return Err(codex_total_timeout_error(
+                        crate::config::CodexTransport::Http,
+                        deadline.timeout_ms(),
+                    ));
+                }
+                result = send => match result {
+                    Err(_) => {
+                        return Err(CodexError {
+                            status: 0,
+                            message: format!(
+                                "Timed out waiting {}ms for Codex response headers",
+                                self.header_timeout_ms
+                            ),
+                            detail: Some("http_response_headers".to_string()),
+                            retry_after: None,
+                            origin: CodexErrorOrigin::Http,
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        return Err(CodexError {
+                            status: 0,
+                            message: format!("Transport error waiting for Codex response headers: {error}"),
+                            detail: Some("http_response_headers".to_string()),
+                            retry_after: None,
+                            origin: CodexErrorOrigin::Http,
+                        });
+                    }
+                    Ok(Ok(response)) => response,
+                }
+            };
+
+            let status = response.status().as_u16();
+            let response_headers: Vec<(String, String)> = response
+                .headers()
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            let retry_after = response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+
+            if status == 401 && !auth_refresh_attempted {
+                auth_refresh_attempted = true;
+                auth = self
+                    .auth_manager
+                    .force_refresh(&auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
+            }
+            if !(200..300).contains(&status) {
+                let error_body = read_live_http_error_body(response, deadline).await?;
+                if let Some(traffic) = ctx.traffic.as_deref() {
+                    write_upstream_response_capture(
+                        traffic,
+                        status,
+                        started_at.elapsed(),
+                        &response_headers,
+                        &error_body,
+                    );
+                }
+                let message =
+                    codex_status_error_message(&error_body).unwrap_or_else(|| match status {
+                        401 => "Unauthorized".to_string(),
+                        403 => "Forbidden".to_string(),
+                        429 => "Rate limited".to_string(),
+                        _ => format!("Upstream Codex request failed with status {status}"),
+                    });
+                return Err(CodexError {
+                    status,
+                    detail: Some(message.clone()),
+                    message,
+                    retry_after,
+                    origin: CodexErrorOrigin::Http,
+                });
+            }
+
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let ctx = ctx.clone();
+            let body_idle_timeout = Duration::from_millis(self.body_idle_timeout_ms);
+            tokio::spawn(async move {
+                forward_live_http_response(
+                    response,
+                    status,
+                    response_headers,
+                    started_at,
+                    ctx,
+                    body_idle_timeout,
+                    deadline,
+                    tx,
+                )
+                .await;
+            });
+            return Ok(rx);
+        }
+    }
+
     async fn attempt_post_http(
         &self,
         auth: &StoredAuth,
@@ -1173,6 +1351,277 @@ impl CodexHttpClient {
             status,
             headers,
         })
+    }
+}
+
+#[derive(Default)]
+struct CodexLiveSseDecoder {
+    pending: Vec<u8>,
+}
+
+impl CodexLiveSseDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<serde_json::Value>, String> {
+        self.pending.extend_from_slice(bytes);
+        let mut payloads = Vec::new();
+        while let Some(end) = next_sse_record_end(&self.pending) {
+            let record: Vec<u8> = self.pending.drain(..end).collect();
+            decode_codex_sse_record(&record, &mut payloads)?;
+        }
+        if self.pending.len() > crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES {
+            return Err("Codex SSE event exceeded the incremental decode limit".to_string());
+        }
+        Ok(payloads)
+    }
+
+    fn finish(mut self) -> Result<Vec<serde_json::Value>, String> {
+        if self.pending.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Vec::new());
+        }
+        self.pending.extend_from_slice(b"\n\n");
+        let mut payloads = Vec::new();
+        while let Some(end) = next_sse_record_end(&self.pending) {
+            let record: Vec<u8> = self.pending.drain(..end).collect();
+            decode_codex_sse_record(&record, &mut payloads)?;
+        }
+        Ok(payloads)
+    }
+}
+
+fn next_sse_record_end(bytes: &[u8]) -> Option<usize> {
+    fn line_ending_len(bytes: &[u8], index: usize) -> Option<usize> {
+        match bytes.get(index) {
+            Some(b'\r') if bytes.get(index + 1) == Some(&b'\n') => Some(2),
+            Some(b'\r' | b'\n') => Some(1),
+            _ => None,
+        }
+    }
+
+    for index in 0..bytes.len() {
+        let Some(first) = line_ending_len(bytes, index) else {
+            continue;
+        };
+        let second_index = index + first;
+        if let Some(second) = line_ending_len(bytes, second_index) {
+            return Some(second_index + second);
+        }
+    }
+    None
+}
+
+fn decode_codex_sse_record(
+    record: &[u8],
+    payloads: &mut Vec<serde_json::Value>,
+) -> Result<(), String> {
+    for event in parse_sse_events(record) {
+        if event.data == "[DONE]" {
+            continue;
+        }
+        let payload = serde_json::from_str(&event.data)
+            .map_err(|error| format!("Malformed Codex SSE event: {error}"))?;
+        payloads.push(payload);
+    }
+    Ok(())
+}
+
+fn live_http_terminal_event(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload.get("type").and_then(|value| value.as_str()),
+        Some(
+            "response.completed"
+                | "response.incomplete"
+                | "response.done"
+                | "response.failed"
+                | "response.error"
+                | "error"
+        )
+    )
+}
+
+fn live_http_body_error(message: String) -> CodexError {
+    CodexError {
+        status: 0,
+        message,
+        detail: Some("http_response_body".to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::Http,
+    }
+}
+
+async fn send_live_http_item(
+    tx: &tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
+    item: Result<serde_json::Value, CodexError>,
+    deadline: CodexRequestDeadline,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = tx.closed() => false,
+        _ = tokio::time::sleep_until(deadline.at()) => false,
+        result = tx.send(item) => result.is_ok(),
+    }
+}
+
+async fn read_live_http_error_body(
+    mut response: reqwest::Response,
+    deadline: CodexRequestDeadline,
+) -> Result<Vec<u8>, CodexError> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline.at()) => {
+                return Err(codex_total_timeout_error(
+                    crate::config::CodexTransport::Http,
+                    deadline.timeout_ms(),
+                ));
+            }
+            result = tokio::time::timeout(LIVE_HTTP_ERROR_BODY_IDLE_TIMEOUT, response.chunk()) => {
+                match result {
+                    Ok(Ok(chunk)) => chunk,
+                    Ok(Err(_)) | Err(_) => return Ok(body),
+                }
+            }
+        };
+        let Some(chunk) = chunk else {
+            return Ok(body);
+        };
+        let remaining = MAX_LIVE_HTTP_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if chunk.len() >= remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            return Ok(body);
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_live_http_response(
+    mut response: reqwest::Response,
+    status: u16,
+    headers: Vec<(String, String)>,
+    started_at: Instant,
+    ctx: RequestContext,
+    body_idle_timeout: Duration,
+    deadline: CodexRequestDeadline,
+    tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
+) {
+    let mut decoder = CodexLiveSseDecoder::default();
+    // Translation is incremental. Retain raw bytes only when traffic capture
+    // is enabled, and cap them so a long reasoning stream cannot grow memory
+    // without bound.
+    let mut captured_body = ctx.traffic.is_some().then(Vec::new);
+    let mut capture_truncated = false;
+    let mut terminal = false;
+    let mut final_error = None;
+    let mut cancelled = false;
+
+    'body: loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = tx.closed() => {
+                cancelled = true;
+                break 'body;
+            }
+            _ = tokio::time::sleep_until(deadline.at()) => {
+                final_error = Some(codex_total_timeout_error(
+                    crate::config::CodexTransport::Http,
+                    deadline.timeout_ms(),
+                ));
+                break 'body;
+            }
+            result = tokio::time::timeout(body_idle_timeout, response.chunk()) => match result {
+                Err(_) => {
+                    final_error = Some(live_http_body_error(format!(
+                        "Timed out waiting {}ms for the next Codex response body chunk",
+                        body_idle_timeout.as_millis()
+                    )));
+                    break 'body;
+                }
+                Ok(Err(error)) => {
+                    final_error = Some(live_http_body_error(format!(
+                        "Transport error reading Codex response body: {error}"
+                    )));
+                    break 'body;
+                }
+                Ok(Ok(chunk)) => chunk,
+            }
+        };
+
+        let Some(chunk) = chunk else {
+            match decoder.finish() {
+                Ok(payloads) => {
+                    for payload in payloads {
+                        terminal |= live_http_terminal_event(&payload);
+                        if !send_live_http_item(&tx, Ok(payload), deadline).await {
+                            cancelled = true;
+                            break 'body;
+                        }
+                    }
+                }
+                Err(message) => final_error = Some(live_http_body_error(message)),
+            }
+            if !terminal && final_error.is_none() && !cancelled {
+                final_error = Some(live_http_body_error(
+                    "HTTP response body ended before terminal Codex response event".to_string(),
+                ));
+            }
+            break;
+        };
+
+        if let Some(body) = captured_body.as_mut() {
+            let remaining =
+                crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES.saturating_sub(body.len());
+            if chunk.len() > remaining {
+                body.extend_from_slice(&chunk[..remaining]);
+                capture_truncated = true;
+            } else {
+                body.extend_from_slice(&chunk);
+            }
+        }
+        let payloads = match decoder.push(&chunk) {
+            Ok(payloads) => payloads,
+            Err(message) => {
+                final_error = Some(live_http_body_error(message));
+                break;
+            }
+        };
+        for payload in payloads {
+            terminal |= live_http_terminal_event(&payload);
+            if !send_live_http_item(&tx, Ok(payload), deadline).await {
+                cancelled = true;
+                break 'body;
+            }
+        }
+        if terminal {
+            break;
+        }
+    }
+
+    if let Some(traffic) = ctx.traffic.as_deref() {
+        write_upstream_response_capture(
+            traffic,
+            status,
+            started_at.elapsed(),
+            &headers,
+            captured_body.as_deref().unwrap_or_default(),
+        );
+        if capture_truncated {
+            traffic.write_json(
+                "033-upstream-response-truncated",
+                &serde_json::json!({
+                    "limitBytes": crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES,
+                }),
+            );
+        }
+    }
+    if !cancelled && let Some(error) = final_error {
+        if error.detail.as_deref() == Some(CODEX_TOTAL_TIMEOUT_DETAIL) {
+            // The deadline has already elapsed, so the ordinary deadline-aware
+            // sender would suppress the terminal cause. Never block on a full
+            // queue; the downstream task enforces the same deadline itself.
+            let _ = tx.try_send(Err(error));
+        } else {
+            let _ = send_live_http_item(&tx, Err(error), deadline).await;
+        }
     }
 }
 
@@ -2101,6 +2550,286 @@ mod tests {
         assert!(deadline.at() > tokio::time::Instant::now());
     }
 
+    #[test]
+    fn live_attempt_budget_is_a_terminal_four_request_cap() {
+        let budget = CodexLiveAttemptBudget::new();
+        for expected in 1..=MAX_BUFFERED_TRANSPORT_ATTEMPTS {
+            assert_eq!(
+                budget.reserve(crate::config::CodexTransport::Http).unwrap(),
+                expected
+            );
+        }
+
+        let error = budget
+            .reserve(crate::config::CodexTransport::WebSocket)
+            .unwrap_err();
+        assert_eq!(error.status, 503);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(CODEX_LIVE_ATTEMPT_BUDGET_DETAIL)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_http_events_are_forwarded_incrementally_before_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(b"data: {\"type\":\"response.created\"}\n\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            stream
+                .write_all(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"HTTP_ONCE\",\"output_index\":0}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+                )
+                .await
+                .unwrap();
+        });
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut events = client
+            .stream_codex_http_events(
+                &buffered_test_request(),
+                &http_test_context(),
+                CodexRequestDeadline::from_timeout_ms(1_000),
+                CodexLiveAttemptBudget::new(),
+            )
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_millis(50), events.recv())
+            .await
+            .expect("the first HTTP SSE record should not wait for response EOF")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["type"], "response.created");
+        let mut types = vec!["response.created".to_string()];
+        while let Some(event) = events.recv().await {
+            types.push(event.unwrap()["type"].as_str().unwrap().to_string());
+        }
+        server.await.unwrap();
+        assert_eq!(
+            types,
+            [
+                "response.created",
+                "response.output_text.delta",
+                "response.completed"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_http_status_error_preserves_the_provider_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = br#"{"type":"error","error":{"message":"provider overloaded now"}}"#;
+            let headers = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let error = client
+            .stream_codex_http_events(
+                &buffered_test_request(),
+                &http_test_context(),
+                CodexRequestDeadline::from_timeout_ms(1_000),
+                CodexLiveAttemptBudget::new(),
+            )
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert_eq!(error.status, 503);
+        assert_eq!(error.detail.as_deref(), Some("provider overloaded now"));
+        assert_eq!(error.retry_after.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn live_http_total_deadline_preempts_stalled_headers_and_closes_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let mut byte = [0_u8; 1];
+            tokio::time::timeout(Duration::from_millis(500), stream.read(&mut byte))
+                .await
+                .expect("the live header deadline should close the HTTP socket")
+                .unwrap()
+        });
+        let client = Arc::new(CodexHttpClient::new_for_test(
+            reqwest::Client::new(),
+            format!("http://{addr}/responses"),
+            5_000,
+            5_000,
+            5_000,
+            0,
+        ));
+        client.auth_manager().set_test_auth(http_test_auth());
+
+        let error = client
+            .stream_codex_http_events(
+                &buffered_test_request(),
+                &http_test_context(),
+                CodexRequestDeadline::from_timeout_ms(80),
+                CodexLiveAttemptBudget::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, 504);
+        assert_eq!(error.detail.as_deref(), Some(CODEX_TOTAL_TIMEOUT_DETAIL));
+        assert_eq!(server.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_http_active_bytes_cannot_extend_the_total_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for _ in 0..40 {
+                if stream
+                    .write_all(b"data: {\"type\":\"keepalive\"}\n\n")
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        });
+        let client = Arc::new(CodexHttpClient::new_for_test(
+            reqwest::Client::new(),
+            format!("http://{addr}/responses"),
+            1_000,
+            1_000,
+            5_000,
+            0,
+        ));
+        client.auth_manager().set_test_auth(http_test_auth());
+        let mut events = client
+            .stream_codex_http_events(
+                &buffered_test_request(),
+                &http_test_context(),
+                CodexRequestDeadline::from_timeout_ms(100),
+                CodexLiveAttemptBudget::new(),
+            )
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match events.recv().await {
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => break error,
+                    None => panic!("live HTTP deadline closed without its terminal cause"),
+                }
+            }
+        })
+        .await
+        .expect("active bytes must not extend the total deadline");
+        assert_eq!(error.status, 504);
+        assert_eq!(error.detail.as_deref(), Some(CODEX_TOTAL_TIMEOUT_DETAIL));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_live_http_receiver_closes_the_upstream_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"type\":\"response.created\"}\n\n",
+                )
+                .await
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            tokio::time::timeout(Duration::from_millis(500), stream.read(&mut byte))
+                .await
+                .expect("dropping the receiver should close the HTTP response")
+                .unwrap()
+        });
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut events = client
+            .stream_codex_http_events(
+                &buffered_test_request(),
+                &http_test_context(),
+                CodexRequestDeadline::from_timeout_ms(1_000),
+                CodexLiveAttemptBudget::new(),
+            )
+            .await
+            .unwrap();
+        assert!(events.recv().await.unwrap().is_ok());
+        drop(events);
+
+        assert_eq!(server.await.unwrap(), 0);
+    }
+
+    #[test]
+    fn incremental_http_sse_decoder_accepts_split_crlf_records() {
+        let mut decoder = CodexLiveSseDecoder::default();
+        assert!(
+            decoder
+                .push(b"event: response.created\r\ndata: {\"type\":\"response.cre")
+                .unwrap()
+                .is_empty()
+        );
+        let events = decoder.push(b"ated\"}\r\n\r\n").unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "response.created");
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn incremental_http_sse_decoder_dispatches_cr_only_record_immediately() {
+        let mut decoder = CodexLiveSseDecoder::default();
+        let events = decoder
+            .push(b"event: response.created\rdata: {\"type\":\"response.created\"}\r\r")
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "response.created");
+        assert!(decoder.finish().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn total_timeout_preempts_stalled_http_headers_with_504() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2142,7 +2871,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn total_timeout_is_shared_by_auto_websocket_and_http_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (fallback_started_tx, fallback_started_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut websocket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let read = websocket.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            assert!(String::from_utf8_lossy(&request[..read]).contains("Upgrade: websocket"));
+            websocket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            drop(websocket);
+
+            let (mut http, _) = listener.accept().await.unwrap();
+            let read = http.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
+            let _ = fallback_started_tx.send(());
+            futures_util::future::pending::<()>().await;
+        });
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::new(),
+            format!("http://{addr}/responses"),
+            5_000,
+            5_000,
+            120,
+            0,
+        );
+        client.auth_manager().set_test_auth(http_test_auth());
+
+        let started_at = Instant::now();
+        let result = client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Auto,
+            )
+            .await;
+        tokio::time::timeout(Duration::from_millis(250), fallback_started_rx)
+            .await
+            .expect("Auto should reach HTTP fallback within the shared budget")
+            .expect("fallback observer should remain available");
+        server.abort();
+        let error = match result {
+            Ok(_) => panic!("the shared total budget must preempt stalled HTTP fallback"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, 504);
+        assert_eq!(error.detail.as_deref(), Some(CODEX_TOTAL_TIMEOUT_DETAIL));
+        assert!(started_at.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
     async fn pooled_websocket_total_timeout_invalidates_before_aborting_turn() {
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
         use tokio_tungstenite::tungstenite::Message;
 
@@ -2273,6 +3063,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_buffered_request_closes_http_and_aborts_continuation() {
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();

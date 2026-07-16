@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::StatusCode;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
@@ -45,6 +45,12 @@ use self::translate::request::{
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_LIVE_TRANSPORT_RETRIES: u32 = 2;
+const MAX_LIVE_UPSTREAM_SSE_BYTES: usize = crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES;
+const DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const DOWNSTREAM_PING: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+#[cfg(test)]
+pub(super) static CODEX_STATE_TEST_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
 use self::translate::stream::translate_stream_bytes_with_traffic;
 
 // ---------------------------------------------------------------------------
@@ -150,8 +156,7 @@ impl Provider for CodexProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
-        let transport = config::codex_transport();
-        if want_stream && !matches!(transport, config::CodexTransport::Http) {
+        if want_stream {
             let stream_request = translated.clone();
             return live_stream_response(
                 client,
@@ -330,30 +335,6 @@ fn buffered_stream_response(
     (headers, sse_bytes).into_response()
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn buffered_http_stream_fallback(
-    client: &Arc<CodexHttpClient>,
-    message_id: &str,
-    model: &str,
-    ctx: &RequestContext,
-    turn_id: Option<u64>,
-    request_body: &translate::request::ResponsesRequest,
-    continuation: Option<&ContinuationCandidate>,
-    deadline: client::CodexRequestDeadline,
-) -> Response {
-    let upstream = match client
-        .post_codex_http_before(request_body, ctx, continuation, deadline)
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            abort_continuation(ctx.session_id.as_deref(), turn_id);
-            return map_codex_error_to_response(&error);
-        }
-    };
-    buffered_stream_response(upstream, message_id, model, ctx, turn_id, request_body)
-}
-
 enum LiveStreamStart {
     Response(Response),
     Retry { error: client::CodexError },
@@ -414,37 +395,56 @@ async fn live_stream_response_inner(
     let mut continuation = Some(continuation);
     let circuit_key = ctx.session_id.as_deref();
     let transport = config::codex_transport();
+    let attempt_budget = client::CodexLiveAttemptBudget::new();
+    // Auto may fall back once, but it never switches back to WebSocket within
+    // the same logical request. This prevents retry multiplication.
+    let mut active_transport = transport;
+
+    if transport == config::CodexTransport::Auto
+        && circuit_key.is_some_and(websocket::codex_websocket_circuit_open)
+    {
+        client::log_websocket_circuit_fallback(&ctx);
+        drop_live_continuation_for_retry(&mut continuation);
+        active_transport = config::CodexTransport::Http;
+    }
 
     loop {
-        if transport == config::CodexTransport::Auto
-            && circuit_key.is_some_and(websocket::codex_websocket_circuit_open)
-        {
-            client::log_websocket_circuit_fallback(&ctx);
-            return buffered_http_stream_fallback(
-                &client,
-                &message_id,
-                &model,
-                &ctx,
-                turn_id,
-                &request_body,
-                continuation.as_ref(),
-                deadline,
-            )
-            .await;
-        }
-
-        let upstream_events = match client
-            .stream_codex_websocket_events(&request_body, &ctx, continuation.as_ref())
-            .await
-        {
+        let upstream = match active_transport {
+            config::CodexTransport::Http => {
+                client
+                    .stream_codex_http_events(&request_body, &ctx, deadline, attempt_budget.clone())
+                    .await
+            }
+            config::CodexTransport::WebSocket | config::CodexTransport::Auto => {
+                client
+                    .stream_codex_websocket_events(
+                        &request_body,
+                        &ctx,
+                        continuation.as_ref(),
+                        attempt_budget.clone(),
+                    )
+                    .await
+            }
+        };
+        let upstream_events = match upstream {
             Ok(events) => events,
             Err(err) if retryable_live_start_codex_error(&err) => {
+                if transport == config::CodexTransport::Auto
+                    && !matches!(active_transport, config::CodexTransport::Http)
+                    && client::should_fallback_to_http(&err)
+                {
+                    client::record_auto_websocket_failure(&ctx, &err);
+                    client::log_auto_http_fallback(&ctx, &err);
+                    drop_live_continuation_for_retry(&mut continuation);
+                    active_transport = config::CodexTransport::Http;
+                    continue;
+                }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if dropped && is_missing_previous_response_error(&err) {
                     attempt += 1;
                     continue;
                 }
-                if transport == config::CodexTransport::Auto
+                if active_transport == config::CodexTransport::Auto
                     && client::record_auto_websocket_failure(&ctx, &err)
                 {
                     continue;
@@ -461,7 +461,7 @@ async fn live_stream_response_inner(
                 }
                 client::log_live_transport_retry(
                     &ctx,
-                    transport,
+                    active_transport,
                     attempt + 1,
                     max_retries + 1,
                     delay.wait_ms,
@@ -486,11 +486,14 @@ async fn live_stream_response_inner(
             request_body.clone(),
             provider_started_at,
             deadline,
+            active_transport == config::CodexTransport::Http,
+            DOWNSTREAM_KEEPALIVE_INTERVAL,
         )
         .await
         {
             LiveStreamStart::Response(response) => {
                 if transport == config::CodexTransport::Auto
+                    && active_transport == config::CodexTransport::Auto
                     && let Some(key) = circuit_key
                 {
                     websocket::record_codex_websocket_success(key);
@@ -499,21 +502,14 @@ async fn live_stream_response_inner(
             }
             LiveStreamStart::Retry { error } => {
                 if transport == config::CodexTransport::Auto
+                    && !matches!(active_transport, config::CodexTransport::Http)
                     && client::should_fallback_to_http(&error)
                 {
                     client::record_auto_websocket_failure(&ctx, &error);
                     client::log_auto_http_fallback(&ctx, &error);
-                    return buffered_http_stream_fallback(
-                        &client,
-                        &message_id,
-                        &model,
-                        &ctx,
-                        turn_id,
-                        &request_body,
-                        continuation.as_ref(),
-                        deadline,
-                    )
-                    .await;
+                    drop_live_continuation_for_retry(&mut continuation);
+                    active_transport = config::CodexTransport::Http;
+                    continue;
                 }
                 if !retryable_live_start_codex_error(&error) {
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
@@ -524,7 +520,7 @@ async fn live_stream_response_inner(
                     attempt += 1;
                     continue;
                 }
-                if transport == config::CodexTransport::Auto
+                if active_transport == config::CodexTransport::Auto
                     && client::record_auto_websocket_failure(&ctx, &error)
                 {
                     continue;
@@ -541,7 +537,7 @@ async fn live_stream_response_inner(
                 }
                 client::log_live_transport_retry(
                     &ctx,
-                    transport,
+                    active_transport,
                     attempt + 1,
                     max_retries + 1,
                     delay.wait_ms,
@@ -564,12 +560,44 @@ async fn live_stream_response_once(
     request_body: translate::request::ResponsesRequest,
     provider_started_at: Instant,
     deadline: client::CodexRequestDeadline,
+    keepalive_from_start: bool,
+    keepalive_delay: Duration,
 ) -> LiveStreamStart {
     let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
     let mut upstream_sse_body = Vec::new();
     let mut generation_started = false;
+    let mut keepalive_at = keepalive_from_start
+        .then(|| tokio::time::Instant::now().checked_add(keepalive_delay))
+        .flatten();
 
-    while let Some(item) = upstream_events.recv().await {
+    loop {
+        let item = if let Some(at) = keepalive_at {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(at) => {
+                    // Preserve the original pre-output retry/fallback window for a grace period.
+                    // Once the model remains silent beyond it, establish downstream SSE so the
+                    // active request does not look hung to Claude or an intermediary.
+                    return LiveStreamStart::Response(remaining_live_stream_response(
+                        upstream_events,
+                        translator,
+                        DOWNSTREAM_PING.to_vec(),
+                        ctx,
+                        turn_id,
+                        request_body,
+                        upstream_sse_body,
+                        provider_started_at,
+                        deadline,
+                    ));
+                },
+                item = upstream_events.recv() => item,
+            }
+        } else {
+            upstream_events.recv().await
+        };
+        let Some(item) = item else {
+            break;
+        };
         let payload = match item {
             Ok(payload) => payload,
             Err(err) => {
@@ -589,6 +617,7 @@ async fn live_stream_response_once(
                 monitor.generation_started(&ctx.req_id);
             }
             generation_started = true;
+            keepalive_at = Some(tokio::time::Instant::now() + keepalive_delay);
         }
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, &ctx)
@@ -859,7 +888,7 @@ async fn send_live_chunk_before_deadline(
 }
 
 fn finish_live_stream_at_deadline(
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    terminal_permit: &mut Option<tokio::sync::mpsc::OwnedPermit<Result<Bytes, std::io::Error>>>,
     translator: &mut LiveStreamTranslator,
     ctx: &RequestContext,
     turn_id: Option<u64>,
@@ -871,14 +900,42 @@ fn finish_live_stream_at_deadline(
     let chunk = translator.error_chunk(&error.message, "api_error", ctx.traffic.as_deref());
     if !chunk.is_empty() {
         record_live_stream_progress(ctx, &chunk);
-        // The budget has expired. Never block on a slow/full downstream queue;
-        // enqueue the terminal SSE only when capacity is immediately available.
-        let _ = tx.try_send(Ok(Bytes::from(chunk)));
+        // One channel slot is reserved before ordinary streaming begins, so the
+        // terminal deadline event cannot be displaced by a slow/full downstream.
+        if let Some(permit) = terminal_permit.take() {
+            let _ = permit.send(Ok(Bytes::from(chunk)));
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn remaining_live_stream_response(
+    upstream_events: websocket::CodexWebSocketEventReceiver,
+    translator: LiveStreamTranslator,
+    first_chunk: Vec<u8>,
+    ctx: RequestContext,
+    turn_id: Option<u64>,
+    request_body: translate::request::ResponsesRequest,
+    upstream_sse_body: Vec<u8>,
+    provider_started_at: Instant,
+    deadline: client::CodexRequestDeadline,
+) -> Response {
+    remaining_live_stream_response_with_heartbeat(
+        upstream_events,
+        translator,
+        first_chunk,
+        ctx,
+        turn_id,
+        request_body,
+        upstream_sse_body,
+        provider_started_at,
+        deadline,
+        DOWNSTREAM_KEEPALIVE_INTERVAL,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remaining_live_stream_response_with_heartbeat(
     mut upstream_events: websocket::CodexWebSocketEventReceiver,
     mut translator: LiveStreamTranslator,
     first_chunk: Vec<u8>,
@@ -888,9 +945,17 @@ fn remaining_live_stream_response(
     mut upstream_sse_body: Vec<u8>,
     provider_started_at: Instant,
     deadline: client::CodexRequestDeadline,
+    heartbeat_interval: Duration,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
+        let mut terminal_permit = match tx.clone().try_reserve_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                return;
+            }
+        };
         macro_rules! send_chunk_or_stop {
             ($chunk:expr) => {
                 match send_live_chunk_before_deadline(&tx, $chunk, deadline).await {
@@ -901,7 +966,7 @@ fn remaining_live_stream_response(
                     }
                     LiveChunkSendOutcome::Deadline => {
                         finish_live_stream_at_deadline(
-                            &tx,
+                            &mut terminal_permit,
                             &mut translator,
                             &ctx,
                             turn_id,
@@ -914,9 +979,20 @@ fn remaining_live_stream_response(
         }
 
         send_chunk_or_stop!(first_chunk);
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + heartbeat_interval,
+            heartbeat_interval,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if tokio::time::Instant::now() >= deadline.at() {
-                finish_live_stream_at_deadline(&tx, &mut translator, &ctx, turn_id, deadline);
+                finish_live_stream_at_deadline(
+                    &mut terminal_permit,
+                    &mut translator,
+                    &ctx,
+                    turn_id,
+                    deadline,
+                );
                 return;
             }
             let item = tokio::select! {
@@ -927,13 +1003,19 @@ fn remaining_live_stream_response(
                 }
                 _ = tokio::time::sleep_until(deadline.at()) => {
                     finish_live_stream_at_deadline(
-                        &tx,
+                        &mut terminal_permit,
                         &mut translator,
                         &ctx,
                         turn_id,
                         deadline,
                     );
                     return;
+                }
+                _ = heartbeat.tick() => {
+                    // Anthropic ping events keep event-aware clients and intermediaries connected.
+                    // They bypass semantic translation, monitoring, and traffic capture.
+                    send_chunk_or_stop!(DOWNSTREAM_PING.to_vec());
+                    continue;
                 }
                 item = upstream_events.recv() => item,
             };
@@ -1025,6 +1107,14 @@ fn remaining_live_stream_response(
 
 fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
     let text = payload.to_string();
+    let encoded_len = text
+        .lines()
+        .map(|line| b"data: ".len() + line.len() + 1)
+        .sum::<usize>()
+        .saturating_add(1);
+    if buffer.len().saturating_add(encoded_len) > MAX_LIVE_UPSTREAM_SSE_BYTES {
+        return;
+    }
     for line in text.lines() {
         buffer.extend_from_slice(b"data: ");
         buffer.extend_from_slice(line.as_bytes());
@@ -1058,6 +1148,12 @@ fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
+    if matches!(
+        err.detail.as_deref(),
+        Some(client::CODEX_TOTAL_TIMEOUT_DETAIL | client::CODEX_LIVE_ATTEMPT_BUDGET_DETAIL)
+    ) {
+        return false;
+    }
     if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
         return err.status == 0 || matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529);
     }
@@ -1065,6 +1161,12 @@ fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
         return true;
     }
     matches!(err.status, 429 | 500 | 502 | 503 | 504 | 529)
+        || (err.origin == client::CodexErrorOrigin::Http
+            && err.status == 0
+            && matches!(
+                err.detail.as_deref(),
+                Some("http_response_headers" | "http_response_body")
+            ))
         || (err.status == 0 && retryable_live_message(codex_error_message(err)))
 }
 
@@ -1549,6 +1651,8 @@ mod tests {
                 request.clone(),
                 Instant::now(),
                 client::CodexRequestDeadline::from_timeout_ms(10_000),
+                false,
+                DOWNSTREAM_KEEPALIVE_INTERVAL,
             )
             .await,
             LiveStreamStart::Retry { .. }
@@ -1573,6 +1677,8 @@ mod tests {
             request,
             Instant::now(),
             client::CodexRequestDeadline::from_timeout_ms(10_000),
+            false,
+            DOWNSTREAM_KEEPALIVE_INTERVAL,
         )
         .await
         {
@@ -1585,6 +1691,244 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("hello"));
         assert!(body.contains("heartbeat timed out"));
+    }
+
+    #[tokio::test]
+    async fn response_created_starts_downstream_after_retry_grace_with_transport_only_ping() {
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(4);
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_silent", "status": "in_progress"}
+            })))
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            live_stream_response_once(
+                upstream_rx,
+                "msg_silent".to_string(),
+                "gpt-5.6-sol",
+                live_test_context(),
+                None,
+                live_test_request(),
+                Instant::now(),
+                client::CodexRequestDeadline::from_timeout_ms(10_000),
+                false,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("silent response should establish downstream SSE after its retry grace");
+        let response = match response {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { .. } => panic!("silent response should become a live stream"),
+        };
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_millis(250), body.frame())
+            .await
+            .expect("transport keepalive should be ready")
+            .expect("stream ended before transport keepalive")
+            .expect("transport keepalive frame failed")
+            .into_data()
+            .expect("transport keepalive was not data");
+        assert_eq!(first.as_ref(), DOWNSTREAM_PING);
+        let events = crate::anthropic::sse::parse_sse_events(&first);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.as_deref(), Some("ping"));
+        assert_eq!(events[0].data, r#"{"type":"ping"}"#);
+
+        drop(body);
+        tokio::time::timeout(Duration::from_millis(250), upstream_tx.closed())
+            .await
+            .expect("dropping a heartbeat-only body should cancel the upstream stream");
+    }
+
+    #[tokio::test]
+    async fn live_http_headers_start_ping_grace_before_the_first_body_event() {
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(1);
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            live_stream_response_once(
+                upstream_rx,
+                "msg_http_silent".to_string(),
+                "gpt-5.6-sol",
+                live_test_context(),
+                None,
+                live_test_request(),
+                Instant::now(),
+                client::CodexRequestDeadline::from_timeout_ms(10_000),
+                true,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("HTTP headers should start the downstream ping grace");
+        let response = match response {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { .. } => panic!("silent HTTP body should become a live stream"),
+        };
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_millis(100), body.frame())
+            .await
+            .expect("HTTP transport ping should be ready")
+            .expect("stream ended before HTTP transport ping")
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(first.as_ref(), DOWNSTREAM_PING);
+
+        drop(body);
+        tokio::time::timeout(Duration::from_millis(100), upstream_tx.closed())
+            .await
+            .expect("dropping the HTTP response should cancel its upstream body");
+    }
+
+    #[tokio::test]
+    async fn continuous_control_events_cannot_starve_the_ping_deadline() {
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(2);
+        let producer = tokio::spawn(async move {
+            upstream_tx
+                .send(Ok(serde_json::json!({"type":"response.created"})))
+                .await
+                .unwrap();
+            loop {
+                if upstream_tx
+                    .send(Ok(serde_json::json!({"type":"keepalive"})))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let response = tokio::time::timeout(
+            Duration::from_millis(150),
+            live_stream_response_once(
+                upstream_rx,
+                "msg_control_flood".to_string(),
+                "gpt-5.6-sol",
+                live_test_context(),
+                None,
+                live_test_request(),
+                Instant::now(),
+                client::CodexRequestDeadline::from_timeout_ms(10_000),
+                false,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("continuous control events must not starve the ping timer");
+        let response = match response {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { .. } => panic!("control events should keep the stream open"),
+        };
+        let mut body = response.into_body();
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first.as_ref(), DOWNSTREAM_PING);
+        drop(body);
+        producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_created_keeps_retryable_error_recovery_during_grace() {
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(4);
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_retry", "status": "in_progress"}
+            })))
+            .await
+            .unwrap();
+        upstream_tx.send(Err(heartbeat_test_error())).await.unwrap();
+        drop(upstream_tx);
+
+        assert!(matches!(
+            live_stream_response_once(
+                upstream_rx,
+                "msg_retry_grace".to_string(),
+                "gpt-5.6-sol",
+                live_test_context(),
+                None,
+                live_test_request(),
+                Instant::now(),
+                client::CodexRequestDeadline::from_timeout_ms(10_000),
+                false,
+                Duration::from_secs(1),
+            )
+            .await,
+            LiveStreamStart::Retry { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn silent_live_stream_emits_periodic_pings_without_duplication() {
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(4);
+        let (translator, first_chunk) = started_live_translator("msg_long");
+        let response = remaining_live_stream_response_with_heartbeat(
+            upstream_rx,
+            translator,
+            first_chunk,
+            live_test_context(),
+            None,
+            live_test_request(),
+            Vec::new(),
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(1_000),
+            Duration::from_millis(20),
+        );
+
+        let mut body = response.into_body();
+        let mut collected = Vec::new();
+        let mut pings = 0;
+        while pings < 2 {
+            let frame = tokio::time::timeout(Duration::from_millis(250), body.frame())
+                .await
+                .expect("periodic ping should arrive")
+                .expect("stream ended before two pings")
+                .expect("periodic ping frame failed")
+                .into_data()
+                .expect("periodic ping frame was not data");
+            pings += String::from_utf8_lossy(&frame)
+                .matches("event: ping\n")
+                .count();
+            collected.extend_from_slice(&frame);
+        }
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": " world"
+            })))
+            .await
+            .unwrap();
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_long",
+                    "status": "completed",
+                    "incomplete_details": null,
+                    "usage": {"input_tokens": 2, "output_tokens": 2}
+                }
+            })))
+            .await
+            .unwrap();
+        drop(upstream_tx);
+        let rest = tokio::time::timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .expect("long stream should finish before its deadline")
+        .unwrap();
+        collected.extend_from_slice(&rest);
+        let body = String::from_utf8(collected).unwrap();
+        assert!(body.matches("event: ping\n").count() >= 2, "{body}");
+        assert_eq!(body.matches("hello").count(), 1, "{body}");
+        assert_eq!(body.matches(" world").count(), 1, "{body}");
+        assert!(body.contains("message_stop"), "{body}");
     }
 
     #[test]
@@ -1601,7 +1945,7 @@ mod tests {
     async fn post_first_byte_deadline_emits_sse_error_and_closes_upstream() {
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(4);
         let (translator, first_chunk) = started_live_translator("msg_deadline");
-        let response = remaining_live_stream_response(
+        let response = remaining_live_stream_response_with_heartbeat(
             upstream_rx,
             translator,
             first_chunk,
@@ -1611,6 +1955,7 @@ mod tests {
             Vec::new(),
             Instant::now(),
             client::CodexRequestDeadline::from_timeout_ms(100),
+            Duration::from_millis(20),
         );
 
         let body = tokio::time::timeout(
@@ -1625,6 +1970,7 @@ mod tests {
         assert!(body.contains("event: error"));
         assert!(body.contains("api_error"));
         assert!(body.contains("total wall-clock budget of 100ms"));
+        assert!(body.contains("event: ping\ndata: {\"type\":\"ping\"}\n\n"));
         tokio::time::timeout(Duration::from_millis(250), upstream_tx.closed())
             .await
             .expect("deadline should drop the upstream event receiver");
@@ -1687,11 +2033,21 @@ mod tests {
             Instant::now(),
             client::CodexRequestDeadline::from_timeout_ms(100),
         );
-        let _unconsumed_body = response.into_body();
+        let body = response.into_body();
 
         tokio::time::timeout(Duration::from_secs(1), upstream_tx.closed())
             .await
             .expect("deadline must cancel upstream even when downstream is not consuming");
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .expect("reserved terminal slot should drain without blocking")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: error"), "{body}");
+        assert!(body.contains("total wall-clock budget of 100ms"), "{body}");
     }
 
     #[test]

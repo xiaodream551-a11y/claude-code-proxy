@@ -42,11 +42,15 @@ pub enum GrokAuthError {
     #[error("Grok credentials are invalid: {message}")]
     CredentialsInvalid { message: String },
     #[error("Grok authentication is temporarily unavailable: {message}")]
-    Temporary { message: String },
+    Temporary {
+        message: String,
+        safe_to_retry: bool,
+    },
     #[error("Grok authentication is rate limited: {message}")]
     RateLimited {
         message: String,
         retry_after: Option<String>,
+        safe_to_retry: bool,
     },
 }
 
@@ -60,6 +64,14 @@ impl GrokAuthError {
     fn temporary(message: impl Into<String>) -> Self {
         Self::Temporary {
             message: message.into(),
+            safe_to_retry: false,
+        }
+    }
+
+    fn retryable_temporary(message: impl Into<String>) -> Self {
+        Self::Temporary {
+            message: message.into(),
+            safe_to_retry: true,
         }
     }
 
@@ -67,6 +79,7 @@ impl GrokAuthError {
         Self::RateLimited {
             message: message.into(),
             retry_after,
+            safe_to_retry: true,
         }
     }
 
@@ -82,6 +95,15 @@ impl GrokAuthError {
         match self {
             Self::RateLimited { retry_after, .. } => retry_after.as_deref(),
             _ => None,
+        }
+    }
+
+    pub fn safe_to_retry(&self) -> bool {
+        match self {
+            Self::CredentialsInvalid { .. } => false,
+            Self::Temporary { safe_to_retry, .. } | Self::RateLimited { safe_to_retry, .. } => {
+                *safe_to_retry
+            }
         }
     }
 }
@@ -192,7 +214,9 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
             .send()
             .await
             .map_err(|error| {
-                GrokAuthError::temporary(format!("OIDC discovery request failed: {error}"))
+                GrokAuthError::retryable_temporary(format!(
+                    "OIDC discovery request failed: {error}"
+                ))
             })?;
         let discovery_status = discovery_response.status();
         if discovery_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -202,10 +226,17 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
             ));
         }
         if !discovery_status.is_success() {
-            return Err(GrokAuthError::temporary(format!(
+            let message = format!(
                 "OIDC discovery failed with status {}",
                 discovery_status.as_u16()
-            )));
+            );
+            return Err(
+                if matches!(discovery_status.as_u16(), 500 | 502 | 503 | 504) {
+                    GrokAuthError::retryable_temporary(message)
+                } else {
+                    GrokAuthError::temporary(message)
+                },
+            );
         }
         let discovery: Discovery = discovery_response.json().await.map_err(|error| {
             GrokAuthError::temporary(format!("OIDC discovery response is invalid: {error}"))
@@ -234,7 +265,12 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
             .send()
             .await
             .map_err(|error| {
-                GrokAuthError::temporary(format!("token refresh request failed: {error}"))
+                let message = format!("token refresh request failed: {error}");
+                if error.is_connect() {
+                    GrokAuthError::retryable_temporary(message)
+                } else {
+                    GrokAuthError::temporary(message)
+                }
             })?;
         let refresh_status = refresh_response.status();
         if refresh_status == reqwest::StatusCode::TOO_MANY_REQUESTS {

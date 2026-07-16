@@ -1529,9 +1529,6 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 mod tests {
     use super::*;
 
-    static POOL_TEST_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
-        once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
-
     fn test_timeouts(response_start_ms: u64, idle_ms: u64) -> CodexWebSocketTimeouts {
         CodexWebSocketTimeouts {
             connect_ms: 1_000,
@@ -1733,7 +1730,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_invalidation() {
-        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         clear_codex_websocket_pool_for_tests();
         let stream = create_dummy_stream_async().await;
         // Verify pool operations work through the public API
@@ -1756,7 +1753,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_pool_entry_is_not_reused() {
-        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         clear_codex_websocket_pool_for_tests();
         let entry = Arc::new(PoolEntry {
             ws: Arc::new(AsyncMutex::new(create_dummy_stream_async().await)),
@@ -1888,7 +1885,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_event_receiver_releases_pooled_connection() {
-        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         clear_codex_websocket_pool_for_tests();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2035,7 +2032,7 @@ mod tests {
 
     #[tokio::test]
     async fn binary_frame_invalidates_pool_key() {
-        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         clear_codex_websocket_pool_for_tests();
         let pooled_stream = create_dummy_stream_async().await;
         {
@@ -2079,7 +2076,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_start_timeout_ignores_rate_limits_and_pings() {
-        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         clear_codex_websocket_pool_for_tests();
         let pooled_stream = create_dummy_stream_async().await;
         {
@@ -2141,7 +2138,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_idle_timeout_ignores_pings_after_response_event() {
-        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         clear_codex_websocket_pool_for_tests();
         let pooled_stream = create_dummy_stream_async().await;
         {

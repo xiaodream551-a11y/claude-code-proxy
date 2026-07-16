@@ -220,6 +220,7 @@ the same Claude config, put the env in `~/.claude/settings.json`:
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "372000",
     "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90",
+    "CLAUDE_CODE_MAX_RETRIES": "2",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
     "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": 1
   }
@@ -364,7 +365,9 @@ Supported model ids are `grok-composer-2.5-fast`, `grok-4.5`, and the
 reasoning effort to `high`, regardless of the incoming effort. Model access can
 vary by account and region. The proxy translates Claude Code messages, function
 tools, tool results, thinking, token counts, and streaming events.
-Grok reasoning text appears in Claude Code as Anthropic `thinking` blocks.
+The CLI endpoint's plaintext reasoning summaries are suppressed because they are
+not signed Anthropic thinking blocks and can contain draft answers; periodic
+Anthropic `ping` events preserve downstream liveness while Grok reasons.
 Claude Code reasoning effort is forwarded as Responses `reasoning.effort` for
 Grok 4.5; `xhigh` and `max` are capped at Grok's supported `high` level.
 Claude Code's `WebSearch` uses Grok's hosted general web search. Requests to
@@ -727,7 +730,9 @@ Windows, and at
     "connectTimeoutMs": 10000,
     "headerTimeoutMs": 60000,
     "firstByteTimeoutMs": 60000,
-    "bodyIdleTimeoutMs": 300000
+    "bodyIdleTimeoutMs": 300000,
+    "totalTimeoutMs": 540000,
+    "streamHeartbeatMs": 15000
   },
   "cursor": {
     "baseUrl": "https://api2.cursor.sh",
@@ -759,7 +764,7 @@ Windows, and at
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it                     |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
-| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, buffered `http`, or live WebSocket with session-scoped circuit breaking in `auto`                                                                   |
+| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or WebSocket with session-scoped HTTP fallback in `auto`                                                      |
 | `CCP_CODEX_TOTAL_TIMEOUT_MS`     | `codex.totalTimeoutMs`     | `540000`                                          | Total wall-clock budget across WebSocket retries, Auto HTTP fallback, and the remaining live stream; caps stragglers while remaining configurable                                   |
 | `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event before refreshing the WebSocket and retrying safely                                                                                |
 | `CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS` | `codex.websocketIdleTimeoutMs` | `300000` | Maximum gap between Codex response events; WebSocket control frames do not extend this business-event deadline                                                                    |
@@ -772,7 +777,9 @@ Windows, and at
 | `CCP_GROK_CONNECT_TIMEOUT_MS`    | `grok.connectTimeoutMs`    | `10000`                                           | Maximum time to establish the Grok TCP/TLS connection                                                                                                                             |
 | `CCP_GROK_HEADER_TIMEOUT_MS`     | `grok.headerTimeoutMs`     | `60000`                                           | Maximum time to receive Grok response headers before a safe pre-output retry                                                                                                      |
 | `CCP_GROK_FIRST_BYTE_TIMEOUT_MS` | `grok.firstByteTimeoutMs`  | `60000`                                           | Maximum time to receive the first Grok response body byte before a safe pre-output retry                                                                                          |
-| `CCP_GROK_BODY_IDLE_TIMEOUT_MS`  | `grok.bodyIdleTimeoutMs`   | `300000`                                          | Maximum gap between Grok response body chunks; active long-running responses have no whole-request deadline                                                                       |
+| `CCP_GROK_BODY_IDLE_TIMEOUT_MS`  | `grok.bodyIdleTimeoutMs`   | `300000`                                          | Maximum gap between Grok response body chunks; this per-gap limit cannot extend the total request deadline                                                                         |
+| `CCP_GROK_TOTAL_TIMEOUT_MS`      | `grok.totalTimeoutMs`      | `540000`                                          | Total wall-clock budget across authentication, all physical attempts, backoff, stream rebuilds, and response-body streaming                                                        |
+| `CCP_GROK_STREAM_HEARTBEAT_MS`   | `grok.streamHeartbeatMs`   | `15000`                                           | Emit Anthropic `ping` events during downstream silence; configured values are clamped to 1 through 60 seconds and do not extend the total deadline                                 |
 | `CCP_CURSOR_BASE_URL`            | `cursor.baseUrl`           | `https://api2.cursor.sh`                          | Override Cursor's API base URL                                                                                                                                                    |
 | `CCP_CURSOR_CLIENT_VERSION`      | `cursor.clientVersion`     | `cli-2026.06.04-5fd875e`                          | Override Cursor client version headers                                                                                                                                            |
 | `CCP_CURSOR_AGENT_BUNDLE`        | `cursor.agentBundle`       | auto-detected                                     | Path to Cursor Agent's bundled `index.js` used only for protobuf schemas                                                                                                          |
@@ -787,7 +794,7 @@ affecting other keys.
 Codex uses the WebSocket Responses transport by default. Set
 `CCP_CODEX_TRANSPORT=http` to use the older HTTP SSE transport for debugging or
 compatibility. `CCP_CODEX_TRANSPORT=auto` keeps live WebSocket streaming while
-the connection is healthy and immediately falls back to buffered HTTP when a
+the connection is healthy and immediately falls back to incremental HTTP when a
 retryable WebSocket transport failure occurs before Anthropic output begins.
 This covers handshake rejection, response-start or idle timeouts, failed
 heartbeat and pool probes, busy pooled connections, connection loss, and a
@@ -804,6 +811,12 @@ failures before Anthropic output are retried up to two times on a refreshed
 connection. In `auto` mode those failures use the HTTP fallback instead. Once
 output has begun, the proxy reports the connection error instead of replaying a
 request that could duplicate tool execution.
+Both live transports emit a standard Anthropic `ping` after 15 seconds without
+visible output. HTTP SSE is decoded incrementally, so cancellation closes the
+upstream socket instead of waiting for a buffered response. WebSocket retries,
+authentication retries, and an Auto HTTP fallback share a hard ceiling of four
+physical upstream requests; after Auto falls back, that logical request remains
+on HTTP rather than probing WebSocket again.
 Unsignaled retries use jittered exponential backoff capped at 30 seconds. Numeric
 and HTTP-date `Retry-After` values are honored directly within that retry budget.
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
@@ -817,15 +830,36 @@ Continuation reduces repeated request upload size, but it does not increase the
 upstream model context window. Multi-process or load-balanced deployments need
 sticky sessions or shared state before enabling continuation.
 
-Grok uses separate connection, response-header, first-body-byte, and body-idle
-timeouts instead of a whole-request deadline, so an active long reasoning stream
-can run beyond two minutes. Connection/header failures, HTTP 429/500/502/503/504,
-and a stream that dies before emitting Anthropic output share one budget of up to
-three transient retries with jittered backoff and `Retry-After` support. If a
-Grok stream fails after any Anthropic text or tool event has been sent, the proxy
-returns a stream error without replaying the request. Grok has no
+Grok applies one 540-second wall-clock budget to authentication, connection and
+header waits, every physical attempt, retry backoff, stream rebuilds, and the
+remaining response body. This finishes before Claude Code's common 600-second
+client timeout and prevents active reasoning chunks from keeping a stuck request
+alive forever. During downstream silence the proxy emits an Anthropic `ping`
+every 15 seconds; pings do not reset the total deadline or close the safe
+pre-output rebuild window. Connection/header failures, HTTP 429/500/502/503/504,
+safe authentication failures, and a stream that dies before emitting Anthropic
+output share one budget of up to three transient retries with jittered backoff
+and `Retry-After` support. Authentication is replayed only for idempotent OIDC
+discovery, rate limits, or a token connection that failed before the refresh
+request was sent; an ambiguous token response is never replayed. The four-attempt
+wire cap applies to model `/responses` requests, while any authentication retry
+consumes a transient slot and therefore reduces the remaining model retries. If
+a Grok stream fails after any Anthropic text or tool event has been sent, the
+proxy returns a stream error without replaying the request. Grok has no
 `previous_response_id` continuation and never silently falls back to another
-provider.
+provider. The configurable total budget is capped at 24 hours; values at or above
+the caller's own timeout lose the useful guarantee that the proxy fails first.
+
+Claude Code retries API failures independently of the proxy. Its default retry
+count can multiply a slow terminal failure, so the example configuration sets
+`CLAUDE_CODE_MAX_RETRIES=2`; increase it only when you prefer availability over a
+bounded user-visible wait.
+
+Request lifecycle logs distinguish response headers from a finished stream:
+`response_started` records the status returned by the provider,
+`request_completed` is written only after response-body EOF, `request_failed`
+captures HTTP or in-band SSE errors, and `request_abandoned` records downstream
+cancellation before completion.
 
 ### Files
 
@@ -1103,10 +1137,9 @@ supported shape.
   still replays correctly. Set `codex.responsesLite` to `false` to use the full
   Responses shape and permit parallel tool calls; full-lane GPT-5.6 availability is
   account-dependent, so restore the default if the upstream reports model not found.
-- **Codex — HTTP transport:** `CCP_CODEX_TRANSPORT=http` buffers the complete
-  upstream response before translating it. Use the default WebSocket transport for
-  live token delivery and prompt cancellation. HTTP fallback periods in `auto`
-  mode have the same buffering limitation.
+- **Codex — HTTP transport:** live requests are translated incrementally and
+  support prompt cancellation. Non-streaming Anthropic requests still accumulate
+  the upstream SSE response before returning one JSON document.
 - **Kimi — reasoning blocks:** forwarded as Anthropic `thinking` content blocks
   and rendered by Claude Code. Disable by setting
   `thinking: {"type":"disabled"}` in your Anthropic request.

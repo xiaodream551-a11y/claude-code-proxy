@@ -436,6 +436,7 @@ mod tests {
 
     #[test]
     fn continuation_behaviors() {
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.blocking_lock();
         // All tests run in sequence to avoid global state interference
 
         // disabled_when_not_enabled
