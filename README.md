@@ -363,6 +363,8 @@ Supported model ids are `grok-composer-2.5-fast` and `grok-4.5`. Model access
 can vary by account and region. The proxy translates Claude Code messages,
 function tools, tool results, thinking, token counts, and streaming events.
 Grok reasoning text appears in Claude Code as Anthropic `thinking` blocks.
+Claude Code reasoning effort is forwarded as Responses `reasoning.effort` for
+Grok 4.5; `xhigh` and `max` are capped at Grok's supported `high` level.
 Claude Code's `WebSearch` uses Grok's hosted general web search. Requests to
 search X use Grok's hosted `x_search` tool, with citations and search usage
 reported in Claude Code.
@@ -750,7 +752,7 @@ Windows, and at
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it                     |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
-| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                                                                   |
+| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, buffered `http`, or live WebSocket with session-scoped circuit breaking in `auto`                                                                   |
 | `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event before refreshing the WebSocket and retrying safely                                                                                |
 | `CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS` | `codex.websocketIdleTimeoutMs` | `300000` | Maximum gap between Codex response events; WebSocket control frames do not extend this business-event deadline                                                                    |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false`                                           | Enable WebSocket continuation with `previous_response_id` when the request is append-only                                                                                         |
@@ -772,8 +774,14 @@ affecting other keys.
 
 Codex uses the WebSocket Responses transport by default. Set
 `CCP_CODEX_TRANSPORT=http` to use the older HTTP SSE transport for debugging or
-compatibility, or `CCP_CODEX_TRANSPORT=auto` to try WebSocket with HTTP fallback
-only when the WebSocket handshake fails before a request is sent upstream.
+compatibility. `CCP_CODEX_TRANSPORT=auto` keeps live WebSocket streaming while
+the connection is healthy and immediately falls back to buffered HTTP when a
+WebSocket handshake fails before the request is sent. Three consecutive
+retryable WebSocket transport failures for the same Claude Code session open a
+30-second circuit, temporarily routing that session through HTTP. After the
+cooldown, one WebSocket request probes recovery while concurrent requests keep
+using HTTP; a successful response or any non-transport result resets the failure
+count.
 Pooled WebSockets must answer a matching Ping/Pong probe before reuse. Active
 connections are also probed after 30 seconds without a frame, so a half-open
 socket left behind by a VPN or proxy-node switch is detected without waiting for
@@ -781,6 +789,8 @@ the business idle timeout. Before any Anthropic output is emitted, statusless
 transport failures are retried up to two times on a refreshed connection. Once
 output has begun, the proxy reports the connection error instead of replaying a
 request that could duplicate tool execution.
+Unsignaled retries use jittered exponential backoff capped at 30 seconds. Numeric
+and HTTP-date `Retry-After` values are honored directly within that retry budget.
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
 append-only turns. Continuation keeps in-memory state keyed by Claude Code
 session id, reuses a session WebSocket while it remains open, and sends
@@ -1070,7 +1080,8 @@ supported shape.
   account-dependent, so restore the default if the upstream reports model not found.
 - **Codex — HTTP transport:** `CCP_CODEX_TRANSPORT=http` buffers the complete
   upstream response before translating it. Use the default WebSocket transport for
-  live token delivery and prompt cancellation.
+  live token delivery and prompt cancellation. HTTP fallback periods in `auto`
+  mode have the same buffering limitation.
 - **Kimi — reasoning blocks:** forwarded as Anthropic `thinking` content blocks
   and rendered by Claude Code. Disable by setting
   `thinking: {"type":"disabled"}` in your Anthropic request.

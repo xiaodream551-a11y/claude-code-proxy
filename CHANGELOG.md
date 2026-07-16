@@ -13,6 +13,12 @@
   incomplete responses from output-token limits.
 - Detect half-open Codex WebSockets with Ping/Pong probes, refresh stale pooled
   connections, and retry transport stalls only before streaming output begins.
+- Keep Codex `auto` transport on live WebSockets while healthy, then temporarily
+  route a session through HTTP after repeated retryable transport failures.
+- Honor numeric and HTTP-date `Retry-After` values and add bounded jitter to
+  exponential retry delays.
+- Forward Claude Code reasoning effort to Grok 4.5 instead of relying on the
+  upstream model's default effort.
 
 ## v0.1.21 (2026-07-15)
 
