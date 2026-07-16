@@ -4,12 +4,14 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 
 static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub const REDACT_KEYS: [&str; 14] = [
     "authorization",
@@ -123,18 +125,26 @@ pub fn create_logger(service: &str) -> Logger {
 
 fn write_log_line(line: &str) -> io::Result<()> {
     let file = log_file();
+    write_log_line_to(&file, line)
+}
+
+fn write_log_line_to(file: &Path, line: &str) -> io::Result<()> {
+    let _guard = LOG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(dir) = file.parent() {
         create_dir(dir, 0o700)?;
     }
 
-    if fs::metadata(&file).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
-        rotate_file(&file)?;
+    if fs::metadata(file).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
+        rotate_file(file)?;
     }
 
-    let mut out = OpenOptions::new().create(true).append(true).open(&file)?;
-    out.write_all(line.as_bytes())?;
-    out.write_all(b"\n")?;
-    Ok(())
+    let mut out = OpenOptions::new().create(true).append(true).open(file)?;
+    let mut record = Vec::with_capacity(line.len() + 1);
+    record.extend_from_slice(line.as_bytes());
+    record.push(b'\n');
+    out.write_all(&record)
 }
 
 fn rotate_file(path: &Path) -> io::Result<()> {
@@ -228,7 +238,8 @@ pub fn redacted_keys() -> HashSet<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier, Mutex};
 
     static STDERR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -258,5 +269,49 @@ mod tests {
 
         drop(outer);
         assert!(should_mirror_to_stderr("warn"));
+    }
+
+    #[test]
+    fn concurrent_writes_preserve_complete_jsonl_records() {
+        const THREADS: usize = 12;
+        const RECORDS_PER_THREAD: usize = 80;
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("proxy.log");
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut writers = Vec::new();
+
+        for thread in 0..THREADS {
+            let file = file.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for sequence in 0..RECORDS_PER_THREAD {
+                    let record = serde_json::json!({
+                        "thread": thread,
+                        "sequence": sequence,
+                        "payload": "x".repeat(2_048),
+                    })
+                    .to_string();
+                    write_log_line_to(&file, &record).unwrap();
+                }
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let contents = fs::read_to_string(file).unwrap();
+        assert!(contents.ends_with('\n'));
+        let mut observed = HashSet::new();
+        for line in contents.lines() {
+            let record: Value = serde_json::from_str(line).unwrap();
+            observed.insert((
+                record["thread"].as_u64().unwrap(),
+                record["sequence"].as_u64().unwrap(),
+            ));
+        }
+        assert_eq!(observed.len(), THREADS * RECORDS_PER_THREAD);
+        assert_eq!(contents.lines().count(), THREADS * RECORDS_PER_THREAD);
     }
 }

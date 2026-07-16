@@ -3,7 +3,7 @@ use claude_code_proxy::anthropic::{
 };
 use claude_code_proxy::auth::{AuthStorage, InMemoryAuthStore};
 use claude_code_proxy::config::{AliasProvider, load_config};
-use claude_code_proxy::logging::{create_logger, redact_value};
+use claude_code_proxy::logging::{create_logger, log_file, redact_value};
 use claude_code_proxy::paths::{self, DirResolverEnv};
 use claude_code_proxy::retry::{RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay};
 use claude_code_proxy::traffic::{
@@ -14,6 +14,7 @@ use serde_json::Map;
 use serde_json::json;
 use std::collections::HashMap;
 use std::env;
+use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
 
 #[test]
@@ -265,8 +266,68 @@ fn alias_provider_has_expected_default() {
 }
 
 #[test]
-fn logger_factory_builds() {
+fn logger_factory_uses_test_process_log() {
+    let production_log = paths::state_dir().join("proxy.log");
+    let test_log = log_file();
+    assert_ne!(test_log, production_log);
+    assert!(test_log.to_string_lossy().contains(".test-logs"));
+
     let logger = create_logger("server");
-    let fields = Map::new();
+    let mut fields = Map::new();
+    let marker = format!("foundation-logger-test-{}", std::process::id());
+    fields.insert("marker".into(), json!(marker));
     logger.debug("ready", Some(fields));
+
+    let contents = std::fs::read_to_string(test_log).unwrap();
+    assert!(contents.contains(&marker));
+}
+
+#[test]
+fn logger_concurrent_writes_are_complete_jsonl_records() {
+    const THREADS: usize = 12;
+    const RECORDS_PER_THREAD: usize = 80;
+
+    let marker = format!("foundation-concurrent-{}", std::process::id());
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let mut writers = Vec::new();
+    for thread in 0..THREADS {
+        let marker = marker.clone();
+        let barrier = barrier.clone();
+        writers.push(std::thread::spawn(move || {
+            let logger = create_logger("concurrency-test");
+            barrier.wait();
+            for sequence in 0..RECORDS_PER_THREAD {
+                let mut fields = Map::new();
+                fields.insert("test_run".into(), json!(marker));
+                fields.insert("thread".into(), json!(thread));
+                fields.insert("sequence".into(), json!(sequence));
+                fields.insert("payload".into(), json!("x".repeat(2_048)));
+                logger.info("concurrent_record", Some(fields));
+            }
+        }));
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    let contents = std::fs::read_to_string(log_file()).unwrap();
+    let mut observed = std::collections::HashSet::new();
+    for line in contents.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        if record
+            .pointer("/fields/test_run")
+            .and_then(|value| value.as_str())
+            == Some(marker.as_str())
+        {
+            observed.insert((
+                record.pointer("/fields/thread").unwrap().as_u64().unwrap(),
+                record
+                    .pointer("/fields/sequence")
+                    .unwrap()
+                    .as_u64()
+                    .unwrap(),
+            ));
+        }
+    }
+    assert_eq!(observed.len(), THREADS * RECORDS_PER_THREAD);
 }

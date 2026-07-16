@@ -35,10 +35,21 @@ pub enum ReducerEvent {
     },
 }
 
+impl ReducerEvent {
+    pub fn is_semantic(&self) -> bool {
+        !matches!(
+            self,
+            Self::ThinkingStart(_) | Self::ThinkingDelta(_, _) | Self::ThinkingStop(_)
+        )
+    }
+}
+
 #[derive(Default)]
 pub struct Reducer {
     next_index: usize,
     active: Option<(String, usize)>,
+    active_text: String,
+    saw_text_output: bool,
     calls: HashMap<String, (usize, String)>,
     item_calls: HashMap<String, String>,
     tool_args: HashMap<String, String>,
@@ -238,7 +249,16 @@ impl Reducer {
                 self.completed_arguments.insert(id.into(), true);
                 Ok(output)
             }
-            "response.output_text.done" => self.close_kind("text"),
+            "response.output_text.done" => {
+                let mut out = value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| self.complete_text_snapshot(text))
+                    .transpose()?
+                    .unwrap_or_default();
+                out.extend(self.close_kind("text")?);
+                Ok(out)
+            }
             "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
                 self.close_kind("thinking")
             }
@@ -336,8 +356,17 @@ impl Reducer {
                 if !self.calls.is_empty() {
                     anyhow::bail!("function call is incomplete");
                 }
-                let mut out = self.close_active()?;
                 let response = value.get("response").unwrap_or(&value);
+                let fallback_text = if self.saw_text_output {
+                    Vec::new()
+                } else {
+                    response_output_text(response)
+                };
+                let mut out = self.close_active()?;
+                for text in fallback_text {
+                    out.extend(self.delta("text", &text)?);
+                    out.extend(self.close_kind("text")?);
+                }
                 let usage = response.get("usage").unwrap_or(&Value::Null);
                 let input = usage
                     .get("input_tokens")
@@ -375,8 +404,15 @@ impl Reducer {
         {
             out.extend(self.close_active()?);
             let index = self.next_index;
-            self.next_index += 1;
+            // Grok reasoning is progress, not an Anthropic content block. Reserving an index for
+            // it would leave a hole once the plaintext reasoning is hidden downstream.
+            if kind != "thinking" {
+                self.next_index += 1;
+            }
             self.active = Some((kind.into(), index));
+            if kind == "text" {
+                self.active_text.clear();
+            }
             out.push(if kind == "thinking" {
                 ReducerEvent::ThinkingStart(index)
             } else {
@@ -384,6 +420,10 @@ impl Reducer {
             });
         }
         let index = self.active.as_ref().unwrap().1;
+        if kind == "text" {
+            self.active_text.push_str(delta);
+            self.saw_text_output |= !delta.is_empty();
+        }
         out.push(if kind == "thinking" {
             ReducerEvent::ThinkingDelta(index, delta.into())
         } else {
@@ -394,9 +434,26 @@ impl Reducer {
     fn close_active(&mut self) -> anyhow::Result<Vec<ReducerEvent>> {
         Ok(match self.active.take() {
             Some((kind, index)) if kind == "thinking" => vec![ReducerEvent::ThinkingStop(index)],
-            Some((_, index)) => vec![ReducerEvent::TextStop(index)],
+            Some((_, index)) => {
+                self.active_text.clear();
+                vec![ReducerEvent::TextStop(index)]
+            }
             None => vec![],
         })
+    }
+    fn complete_text_snapshot(&mut self, snapshot: &str) -> anyhow::Result<Vec<ReducerEvent>> {
+        if snapshot.is_empty() {
+            return Ok(Vec::new());
+        }
+        let suffix = match self.active.as_ref() {
+            Some((kind, _)) if kind == "text" => snapshot.strip_prefix(&self.active_text),
+            None if !self.saw_text_output => Some(snapshot),
+            _ => None,
+        };
+        match suffix {
+            Some(suffix) if !suffix.is_empty() => self.delta("text", suffix),
+            _ => Ok(Vec::new()),
+        }
     }
     fn close_kind(&mut self, kind: &str) -> anyhow::Result<Vec<ReducerEvent>> {
         if self
@@ -412,6 +469,29 @@ impl Reducer {
     pub fn finished(&self) -> bool {
         self.completed
     }
+}
+
+fn response_output_text(response: &Value) -> Vec<String> {
+    let mut text = Vec::new();
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return text;
+    };
+    for item in output {
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in content {
+            if part.get("type").and_then(Value::as_str) == Some("output_text")
+                && let Some(value) = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            {
+                text.push(value.to_string());
+            }
+        }
+    }
+    text
 }
 
 pub fn reduce_upstream_bytes(bytes: &[u8]) -> anyhow::Result<Vec<ReducerEvent>> {
@@ -502,6 +582,31 @@ mod tests {
                 output_tokens: 2,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn grok_reducer_uses_done_snapshot_without_replaying_deltas() {
+        let input = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer \"}\n\ndata: {\"type\":\"response.output_text.done\",\"text\":\"answer 😊\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer 😊\"}]}]}}\n\n";
+        let events = reduce_upstream_bytes(input.as_bytes()).unwrap();
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                ReducerEvent::TextDelta(_, text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert_eq!(text, "answer 😊");
+    }
+
+    #[test]
+    fn grok_reducer_recovers_snapshot_only_response() {
+        let input = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"snapshot only 😊\"}]}],\"usage\":{}}}\n\n";
+        let events = reduce_upstream_bytes(input.as_bytes()).unwrap();
+
+        assert!(events.iter().any(
+            |event| matches!(event, ReducerEvent::TextDelta(0, text) if text == "snapshot only 😊")
         ));
     }
 }

@@ -50,8 +50,10 @@ impl SseDecoder {
 
     fn end_line(&mut self, events: &mut Vec<SseEvent>) -> anyhow::Result<()> {
         if self.frame.len() == self.line_start {
-            if !self.frame.is_empty() {
-                events.push(parse_frame(&self.frame)?);
+            if !self.frame.is_empty()
+                && let Some(event) = parse_frame(&self.frame)?
+            {
+                events.push(event);
             }
             self.frame.clear();
             self.line_start = 0;
@@ -63,7 +65,7 @@ impl SseDecoder {
     }
 }
 
-fn parse_frame(frame: &[u8]) -> anyhow::Result<SseEvent> {
+fn parse_frame(frame: &[u8]) -> anyhow::Result<Option<SseEvent>> {
     let frame = std::str::from_utf8(frame)
         .map_err(|_| anyhow::anyhow!("Grok SSE frame contains invalid UTF-8"))?;
     let mut event = None;
@@ -81,12 +83,12 @@ fn parse_frame(frame: &[u8]) -> anyhow::Result<SseEvent> {
         }
     }
     if data.is_empty() {
-        anyhow::bail!("Grok SSE frame lacks data")
+        return Ok(None);
     }
-    Ok(SseEvent {
+    Ok(Some(SseEvent {
         event,
         data: data.join("\n"),
-    })
+    }))
 }
 
 pub struct StreamTranslator {
@@ -149,8 +151,7 @@ impl StreamTranslator {
             if !self.started
                 && matches!(
                     event,
-                    ReducerEvent::ThinkingStart(_)
-                        | ReducerEvent::TextStart(_)
+                    ReducerEvent::TextStart(_)
                         | ReducerEvent::ToolStart(_, _, _)
                         | ReducerEvent::HostedSearch { .. }
                         | ReducerEvent::Finish { .. }
@@ -204,23 +205,17 @@ fn emit(out: &mut Vec<u8>, event: &str, data: serde_json::Value) {
 
 fn render(out: &mut Vec<u8>, event: ReducerEvent) {
     match event {
-        ReducerEvent::ThinkingStart(i) => emit(
+        // The Grok CLI endpoint exposes a plaintext reasoning summary. It is not a signed
+        // Anthropic thinking block and often contains draft answers or model chatter. Preserve
+        // streaming liveness with an SSE comment without exposing the private scratch work.
+        ReducerEvent::ThinkingStart(_)
+        | ReducerEvent::ThinkingDelta(_, _)
+        | ReducerEvent::ThinkingStop(_) => out.extend_from_slice(b": keep-alive\n\n"),
+        ReducerEvent::TextStop(i) | ReducerEvent::ToolStop(i) => emit(
             out,
-            "content_block_start",
-            serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            "content_block_stop",
+            serde_json::json!({"type":"content_block_stop","index":i}),
         ),
-        ReducerEvent::ThinkingDelta(i, t) => emit(
-            out,
-            "content_block_delta",
-            serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"thinking_delta","thinking":t}}),
-        ),
-        ReducerEvent::ThinkingStop(i) | ReducerEvent::TextStop(i) | ReducerEvent::ToolStop(i) => {
-            emit(
-                out,
-                "content_block_stop",
-                serde_json::json!({"type":"content_block_stop","index":i}),
-            )
-        }
         ReducerEvent::TextStart(i) => emit(
             out,
             "content_block_start",
@@ -331,6 +326,18 @@ mod tests {
     }
 
     #[test]
+    fn decoder_ignores_comment_only_keepalives() {
+        let mut decoder = SseDecoder::default();
+        let events = decoder
+            .push(b": keep-alive\n\nevent: message_start\ndata: {\"type\":\"message_start\"}\n\n")
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.as_deref(), Some("message_start"));
+        assert_eq!(events[0].data, "{\"type\":\"message_start\"}");
+    }
+
+    #[test]
     fn decoder_requires_terminated_valid_frames_and_bounds_them() {
         assert!(SseDecoder::default().push(b"data: \xff\n\n").is_err());
         let mut decoder = SseDecoder::default();
@@ -381,5 +388,40 @@ mod tests {
             .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n")
             .unwrap();
         assert!(String::from_utf8(output).unwrap().contains("first"));
+    }
+
+    #[test]
+    fn stream_hides_plaintext_reasoning_without_shifting_content_indexes() {
+        let input = b"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"draft answer \\ud83d\\ude0a\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"final answer\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let output =
+            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
+
+        assert!(!output.contains("draft answer"));
+        assert!(!output.contains('😊'));
+        assert_eq!(output.matches("final answer").count(), 1);
+        assert!(output.contains("\"index\":0"));
+        assert!(!output.contains("\"type\":\"thinking\""));
+    }
+
+    #[test]
+    fn stream_emits_output_delta_once_and_ignores_full_snapshots() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\"}}\n\ndata: {\"type\":\"response.content_part.added\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer \\ud83d\\ude0a\"}\n\ndata: {\"type\":\"response.output_text.done\",\"text\":\"answer \\ud83d\\ude0a\"}\n\ndata: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"output_text\",\"text\":\"answer \\ud83d\\ude0a\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer \\ud83d\\ude0a\"}]}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer \\ud83d\\ude0a\"}]}],\"usage\":{}}}\n\n";
+        let output =
+            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
+
+        assert_eq!(output.matches("answer 😊").count(), 1);
+    }
+
+    #[test]
+    fn live_stream_preserves_final_utf8_across_every_chunk_boundary() {
+        let input = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer 😊\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n".as_bytes();
+        for split in 0..=input.len() {
+            let mut translator = LiveStreamTranslator::new("msg_1".into(), "grok-4.5".into());
+            let mut output = translator.push(&input[..split]).unwrap();
+            output.extend(translator.push(&input[split..]).unwrap());
+            translator.finish().unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output.matches("answer 😊").count(), 1, "split={split}");
+        }
     }
 }

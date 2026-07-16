@@ -143,6 +143,7 @@ impl Provider for CodexProvider {
             previous_response_id_enabled,
         );
         let turn_id = continuation.turn_id;
+        let deadline = client::CodexRequestDeadline::configured_from(provider_started_at);
 
         // Post to upstream with continuation
         let client = self.client.clone();
@@ -160,12 +161,13 @@ impl Provider for CodexProvider {
                 stream_request,
                 continuation,
                 provider_started_at,
+                deadline,
             )
             .await;
         }
 
         let upstream = match client
-            .post_codex(&translated, &ctx, Some(&continuation))
+            .post_codex_before(&translated, &ctx, Some(&continuation), deadline)
             .await
         {
             Ok(r) => r,
@@ -328,6 +330,7 @@ fn buffered_stream_response(
     (headers, sse_bytes).into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn buffered_http_stream_fallback(
     client: &Arc<CodexHttpClient>,
     message_id: &str,
@@ -336,9 +339,10 @@ async fn buffered_http_stream_fallback(
     turn_id: Option<u64>,
     request_body: &translate::request::ResponsesRequest,
     continuation: Option<&ContinuationCandidate>,
+    deadline: client::CodexRequestDeadline,
 ) -> Response {
     let upstream = match client
-        .post_codex_http(request_body, ctx, continuation)
+        .post_codex_http_before(request_body, ctx, continuation, deadline)
         .await
     {
         Ok(response) => response,
@@ -355,6 +359,7 @@ enum LiveStreamStart {
     Retry { error: client::CodexError },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn live_stream_response(
     client: Arc<CodexHttpClient>,
     message_id: String,
@@ -363,6 +368,45 @@ async fn live_stream_response(
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationCandidate,
     provider_started_at: Instant,
+    deadline: client::CodexRequestDeadline,
+) -> Response {
+    let turn_id = continuation.turn_id;
+    match tokio::time::timeout_at(
+        deadline.at(),
+        live_stream_response_inner(
+            client,
+            message_id,
+            model,
+            ctx.clone(),
+            request_body,
+            continuation,
+            provider_started_at,
+            deadline,
+        ),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            abort_continuation(ctx.session_id.as_deref(), turn_id);
+            map_codex_error_to_response(&client::codex_total_timeout_error(
+                config::codex_transport(),
+                deadline.timeout_ms(),
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn live_stream_response_inner(
+    client: Arc<CodexHttpClient>,
+    message_id: String,
+    model: &str,
+    ctx: RequestContext,
+    request_body: translate::request::ResponsesRequest,
+    continuation: ContinuationCandidate,
+    provider_started_at: Instant,
+    deadline: client::CodexRequestDeadline,
 ) -> Response {
     let model = model.to_string();
     let turn_id = continuation.turn_id;
@@ -384,6 +428,7 @@ async fn live_stream_response(
                 turn_id,
                 &request_body,
                 continuation.as_ref(),
+                deadline,
             )
             .await;
         }
@@ -440,6 +485,7 @@ async fn live_stream_response(
             turn_id,
             request_body.clone(),
             provider_started_at,
+            deadline,
         )
         .await
         {
@@ -465,6 +511,7 @@ async fn live_stream_response(
                         turn_id,
                         &request_body,
                         continuation.as_ref(),
+                        deadline,
                     )
                     .await;
                 }
@@ -507,6 +554,7 @@ async fn live_stream_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn live_stream_response_once(
     mut upstream_events: websocket::CodexWebSocketEventReceiver,
     message_id: String,
@@ -515,6 +563,7 @@ async fn live_stream_response_once(
     turn_id: Option<u64>,
     request_body: translate::request::ResponsesRequest,
     provider_started_at: Instant,
+    deadline: client::CodexRequestDeadline,
 ) -> LiveStreamStart {
     let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
     let mut upstream_sse_body = Vec::new();
@@ -603,6 +652,7 @@ async fn live_stream_response_once(
                 request_body,
                 upstream_sse_body,
                 provider_started_at,
+                deadline,
             ));
         }
         if terminal {
@@ -779,6 +829,55 @@ fn empty_live_stream_response() -> Response {
     event_stream_response(futures_util::stream::empty::<Result<Bytes, std::io::Error>>())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveChunkSendOutcome {
+    Sent,
+    Closed,
+    Deadline,
+}
+
+async fn send_live_chunk_before_deadline(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    chunk: Vec<u8>,
+    deadline: client::CodexRequestDeadline,
+) -> LiveChunkSendOutcome {
+    if tokio::time::Instant::now() >= deadline.at() {
+        return LiveChunkSendOutcome::Deadline;
+    }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline.at()) => LiveChunkSendOutcome::Deadline,
+        _ = tx.closed() => LiveChunkSendOutcome::Closed,
+        result = tx.send(Ok(Bytes::from(chunk))) => {
+            if result.is_ok() {
+                LiveChunkSendOutcome::Sent
+            } else {
+                LiveChunkSendOutcome::Closed
+            }
+        }
+    }
+}
+
+fn finish_live_stream_at_deadline(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    translator: &mut LiveStreamTranslator,
+    ctx: &RequestContext,
+    turn_id: Option<u64>,
+    deadline: client::CodexRequestDeadline,
+) {
+    abort_continuation(ctx.session_id.as_deref(), turn_id);
+    let error =
+        client::codex_total_timeout_error(config::CodexTransport::WebSocket, deadline.timeout_ms());
+    let chunk = translator.error_chunk(&error.message, "api_error", ctx.traffic.as_deref());
+    if !chunk.is_empty() {
+        record_live_stream_progress(ctx, &chunk);
+        // The budget has expired. Never block on a slow/full downstream queue;
+        // enqueue the terminal SSE only when capacity is immediately available.
+        let _ = tx.try_send(Ok(Bytes::from(chunk)));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn remaining_live_stream_response(
     mut upstream_events: websocket::CodexWebSocketEventReceiver,
     mut translator: LiveStreamTranslator,
@@ -788,14 +887,59 @@ fn remaining_live_stream_response(
     request_body: translate::request::ResponsesRequest,
     mut upstream_sse_body: Vec<u8>,
     provider_started_at: Instant,
+    deadline: client::CodexRequestDeadline,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
-        if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
-            abort_continuation(ctx.session_id.as_deref(), turn_id);
-            return;
+        macro_rules! send_chunk_or_stop {
+            ($chunk:expr) => {
+                match send_live_chunk_before_deadline(&tx, $chunk, deadline).await {
+                    LiveChunkSendOutcome::Sent => {}
+                    LiveChunkSendOutcome::Closed => {
+                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        return;
+                    }
+                    LiveChunkSendOutcome::Deadline => {
+                        finish_live_stream_at_deadline(
+                            &tx,
+                            &mut translator,
+                            &ctx,
+                            turn_id,
+                            deadline,
+                        );
+                        return;
+                    }
+                }
+            };
         }
-        while let Some(item) = upstream_events.recv().await {
+
+        send_chunk_or_stop!(first_chunk);
+        loop {
+            if tokio::time::Instant::now() >= deadline.at() {
+                finish_live_stream_at_deadline(&tx, &mut translator, &ctx, turn_id, deadline);
+                return;
+            }
+            let item = tokio::select! {
+                biased;
+                _ = tx.closed() => {
+                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    return;
+                }
+                _ = tokio::time::sleep_until(deadline.at()) => {
+                    finish_live_stream_at_deadline(
+                        &tx,
+                        &mut translator,
+                        &ctx,
+                        turn_id,
+                        deadline,
+                    );
+                    return;
+                }
+                item = upstream_events.recv() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item {
                 Ok(payload) => {
                     log_native_web_search_phase(&ctx, &payload, provider_started_at);
@@ -812,17 +956,14 @@ fn remaining_live_stream_response(
                                 );
                                 if !chunk.is_empty() {
                                     record_live_stream_progress(&ctx, &chunk);
-                                    let _ = tx.send(Ok(Bytes::from(chunk))).await;
+                                    send_chunk_or_stop!(chunk);
                                 }
                                 return;
                             }
                         };
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
-                        if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                            abort_continuation(ctx.session_id.as_deref(), turn_id);
-                            return;
-                        }
+                        send_chunk_or_stop!(chunk);
                     }
                     if terminal {
                         update_continuation_from_upstream(
@@ -840,7 +981,7 @@ fn remaining_live_stream_response(
                         translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
-                        let _ = tx.send(Ok(Bytes::from(chunk))).await;
+                        send_chunk_or_stop!(chunk);
                         return;
                     }
                     let error_type = codex_stream_error_type(&err);
@@ -851,7 +992,7 @@ fn remaining_live_stream_response(
                     );
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
-                        let _ = tx.send(Ok(Bytes::from(chunk))).await;
+                        send_chunk_or_stop!(chunk);
                     }
                     return;
                 }
@@ -862,7 +1003,7 @@ fn remaining_live_stream_response(
         let chunk = translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
-            let _ = tx.send(Ok(Bytes::from(chunk))).await;
+            send_chunk_or_stop!(chunk);
             return;
         }
         let chunk = translator.error_chunk(
@@ -872,7 +1013,7 @@ fn remaining_live_stream_response(
         );
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
-            let _ = tx.send(Ok(Bytes::from(chunk))).await;
+            send_chunk_or_stop!(chunk);
         }
     });
 
@@ -1200,6 +1341,8 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use std::time::Duration;
 
     fn live_test_context() -> RequestContext {
         RequestContext {
@@ -1239,6 +1382,22 @@ mod tests {
             retry_after: None,
             origin: client::CodexErrorOrigin::WebSocket,
         }
+    }
+
+    fn started_live_translator(message_id: &str) -> (LiveStreamTranslator, Vec<u8>) {
+        let mut translator = LiveStreamTranslator::new(message_id, "gpt-5.6-sol");
+        let first_chunk = translator
+            .accept(
+                &serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "hello"
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(!first_chunk.is_empty());
+        (translator, first_chunk)
     }
 
     fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
@@ -1389,6 +1548,7 @@ mod tests {
                 None,
                 request.clone(),
                 Instant::now(),
+                client::CodexRequestDeadline::from_timeout_ms(10_000),
             )
             .await,
             LiveStreamStart::Retry { .. }
@@ -1412,6 +1572,7 @@ mod tests {
             None,
             request,
             Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(10_000),
         )
         .await
         {
@@ -1424,6 +1585,113 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("hello"));
         assert!(body.contains("heartbeat timed out"));
+    }
+
+    #[test]
+    fn total_timeout_maps_to_gateway_timeout_before_streaming_starts() {
+        let response = map_codex_error_to_response(&client::codex_total_timeout_error(
+            config::CodexTransport::WebSocket,
+            100,
+        ));
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn post_first_byte_deadline_emits_sse_error_and_closes_upstream() {
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(4);
+        let (translator, first_chunk) = started_live_translator("msg_deadline");
+        let response = remaining_live_stream_response(
+            upstream_rx,
+            translator,
+            first_chunk,
+            live_test_context(),
+            None,
+            live_test_request(),
+            Vec::new(),
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(100),
+        );
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("deadline should terminate the downstream stream")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("hello"));
+        assert!(body.contains("event: error"));
+        assert!(body.contains("api_error"));
+        assert!(body.contains("total wall-clock budget of 100ms"));
+        tokio::time::timeout(Duration::from_millis(250), upstream_tx.closed())
+            .await
+            .expect("deadline should drop the upstream event receiver");
+    }
+
+    #[tokio::test]
+    async fn dropping_live_response_body_immediately_closes_upstream_receiver() {
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(4);
+        let (translator, first_chunk) = started_live_translator("msg_cancel");
+        let response = remaining_live_stream_response(
+            upstream_rx,
+            translator,
+            first_chunk,
+            live_test_context(),
+            None,
+            live_test_request(),
+            Vec::new(),
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(10_000),
+        );
+        let mut body = response.into_body();
+
+        let first = tokio::time::timeout(Duration::from_millis(250), body.frame())
+            .await
+            .expect("first downstream frame should be ready")
+            .expect("stream ended before the first frame")
+            .expect("first downstream frame failed")
+            .into_data()
+            .expect("first downstream frame was not data");
+        assert!(String::from_utf8_lossy(&first).contains("hello"));
+        drop(body);
+
+        tokio::time::timeout(Duration::from_millis(250), upstream_tx.closed())
+            .await
+            .expect("dropping the downstream body should drop the upstream receiver");
+    }
+
+    #[tokio::test]
+    async fn deadline_does_not_block_on_a_full_downstream_queue() {
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(128);
+        for index in 0..96 {
+            upstream_tx
+                .send(Ok(serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": format!("-{index}")
+                })))
+                .await
+                .unwrap();
+        }
+        let (translator, first_chunk) = started_live_translator("msg_full_queue");
+        let response = remaining_live_stream_response(
+            upstream_rx,
+            translator,
+            first_chunk,
+            live_test_context(),
+            None,
+            live_test_request(),
+            Vec::new(),
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(100),
+        );
+        let _unconsumed_body = response.into_body();
+
+        tokio::time::timeout(Duration::from_secs(1), upstream_tx.closed())
+            .await
+            .expect("deadline must cancel upstream even when downstream is not consuming");
     }
 
     #[test]

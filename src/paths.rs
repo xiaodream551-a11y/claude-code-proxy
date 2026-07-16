@@ -93,7 +93,44 @@ pub fn kimi_device_id_file(deps: &DirResolverEnv) -> PathBuf {
 }
 
 pub fn log_file() -> PathBuf {
-    resolve_state_dir(&DirResolverEnv::default()).join("proxy.log")
+    resolve_log_file_for_process(
+        &DirResolverEnv::default(),
+        std::env::current_exe().ok().as_deref(),
+        std::process::id(),
+    )
+}
+
+fn resolve_log_file_for_process(
+    deps: &DirResolverEnv,
+    executable: Option<&Path>,
+    process_id: u32,
+) -> PathBuf {
+    if let Some(path) = executable.and_then(|path| cargo_test_log_file(path, process_id)) {
+        return path;
+    }
+    resolve_state_dir(deps).join("proxy.log")
+}
+
+fn cargo_test_log_file(executable: &Path, process_id: u32) -> Option<PathBuf> {
+    // Cargo test and nextest executables use
+    // `<target>/<profile>/deps/<target-name>-<metadata-hash>`. Keep their logs beside other
+    // build artifacts so unit and integration test processes cannot append to the user's log.
+    let deps_dir = executable.parent()?;
+    if deps_dir.file_name()?.to_str()? != "deps" {
+        return None;
+    }
+    let stem = executable.file_stem()?.to_str()?;
+    let (_, metadata_hash) = stem.rsplit_once('-')?;
+    if metadata_hash.len() < 8 || !metadata_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let profile_dir = deps_dir.parent()?;
+    Some(
+        profile_dir
+            .join(".test-logs")
+            .join(process_id.to_string())
+            .join("proxy.log"),
+    )
 }
 
 pub fn provider_auth_file(provider: &str) -> PathBuf {
@@ -141,4 +178,54 @@ pub fn resolve_state_dir_for_env(
         env: env.clone(),
         home: home.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cargo_test_binary_uses_process_isolated_log_file() {
+        let deps = DirResolverEnv {
+            platform: "linux".into(),
+            env: HashMap::from([("XDG_STATE_HOME".into(), "/real-state".into())]),
+            home: "/home/tester".into(),
+        };
+        let executable = Path::new("/repo/target/debug/deps/foundation-0123456789abcdef");
+
+        assert_eq!(
+            resolve_log_file_for_process(&deps, Some(executable), 4242),
+            PathBuf::from("/repo/target/debug/.test-logs/4242/proxy.log")
+        );
+    }
+
+    #[test]
+    fn normal_binary_keeps_production_log_file() {
+        let deps = DirResolverEnv {
+            platform: "linux".into(),
+            env: HashMap::from([("XDG_STATE_HOME".into(), "/real-state".into())]),
+            home: "/home/tester".into(),
+        };
+        let executable = Path::new("/repo/target/debug/claude-code-proxy");
+
+        assert_eq!(
+            resolve_log_file_for_process(&deps, Some(executable), 4242),
+            PathBuf::from("/real-state/claude-code-proxy/proxy.log")
+        );
+    }
+
+    #[test]
+    fn deps_binary_without_cargo_hash_keeps_production_log_file() {
+        let deps = DirResolverEnv {
+            platform: "darwin".into(),
+            env: HashMap::new(),
+            home: "/Users/tester".into(),
+        };
+        let executable = Path::new("/repo/target/debug/deps/manual-helper");
+
+        assert_eq!(
+            resolve_log_file_for_process(&deps, Some(executable), 4242),
+            PathBuf::from("/Users/tester/.local/state/claude-code-proxy/proxy.log")
+        );
+    }
 }

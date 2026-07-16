@@ -251,14 +251,16 @@ async fn read_non_streaming_body(
                 let delay = {
                     let mut state = retry.lock().await;
                     if !state.can_retry_transient() {
-                        return Err(error);
+                        state.mark_terminal();
+                        return Err(error.into_terminal("retry exhausted"));
                     }
                     let delay = compute_backoff_delay(
                         state.transient_failures(),
                         error.retry_after.as_deref(),
                     );
                     if delay.exceeds_budget {
-                        return Err(error);
+                        state.mark_terminal();
+                        return Err(error.into_terminal("retry delay exceeds budget"));
                     }
                     state.note_transient_failure();
                     delay
@@ -405,6 +407,7 @@ impl GrokStreamState {
                 Err(_) => return Some(self.fail_at("decoder", "malformed_sse")),
             };
             let mut out = Vec::new();
+            let mut semantic_output = false;
             for event in events {
                 let value: serde_json::Value = match serde_json::from_str(&event.data) {
                     Ok(value) => value,
@@ -430,6 +433,7 @@ impl GrokStreamState {
                     } => Some((*input_tokens, *output_tokens)),
                     _ => None,
                 });
+                semantic_output |= reduced.iter().any(|event| event.is_semantic());
                 match self.translator.render(reduced) {
                     Ok(bytes) => out.extend(bytes),
                     Err(_) => return Some(self.fail_at("render", "invalid_event")),
@@ -441,7 +445,7 @@ impl GrokStreamState {
                 }
                 if self.reducer.finished() {
                     self.terminal = true;
-                    if !out.is_empty() {
+                    if semantic_output {
                         self.downstream_emitted = true;
                     }
                     self.capture_downstream(&out);
@@ -450,7 +454,9 @@ impl GrokStreamState {
                 }
             }
             if !out.is_empty() {
-                self.downstream_emitted = true;
+                if semantic_output {
+                    self.downstream_emitted = true;
+                }
                 self.capture_downstream(&out);
                 return Some(out);
             }
@@ -485,12 +491,14 @@ impl GrokStreamState {
         let delay = {
             let mut state = retry.lock().await;
             if !state.can_retry_transient() {
+                state.mark_terminal();
                 drop(state);
                 return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
             }
             let delay =
                 compute_backoff_delay(state.transient_failures(), error.retry_after.as_deref());
             if delay.exceeds_budget {
+                state.mark_terminal();
                 drop(state);
                 return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
             }
@@ -699,6 +707,10 @@ fn map_error(error: client::GrokError) -> Response {
         StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN => {
             json_error(error.status, "permission_error", error.message)
         }
+        StatusCode::INTERNAL_SERVER_ERROR
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => json_error(error.status, "api_error", error.message),
         _ => json_error(StatusCode::BAD_GATEWAY, "api_error", error.message),
     }
 }
@@ -846,6 +858,30 @@ mod tests {
         }
         buf.truncate(total);
         buf
+    }
+
+    #[tokio::test]
+    async fn map_error_preserves_transient_gateway_statuses() {
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let response = map_error(client::GrokError {
+                status,
+                retry_after: None,
+                message: "temporary authentication failure".into(),
+                origin: client::GrokErrorOrigin::Auth,
+                stage: client::GrokErrorStage::Auth,
+                retryable: true,
+            });
+            assert_eq!(response.status(), status);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "api_error");
+            assert_eq!(body["error"]["message"], "temporary authentication failure");
+        }
     }
 
     #[tokio::test]
@@ -1148,6 +1184,67 @@ mod tests {
         captured
     }
 
+    fn capture_contents_matching(root: std::path::PathBuf, name_fragment: &str) -> String {
+        let mut captured = String::new();
+        let mut pending = vec![root];
+        while let Some(path) = pending.pop() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(name_fragment))
+                {
+                    captured.push_str(&std::fs::read_to_string(path).unwrap());
+                }
+            }
+        }
+        captured
+    }
+
+    #[tokio::test]
+    async fn stream_capture_keeps_reasoning_only_upstream() {
+        let temp = TempDir::new().unwrap();
+        let traffic = Arc::new(test_capture(temp.path().join("traffic")));
+        let (tx, rx) = mpsc::channel(1);
+        let upstream = "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"draft only 😊\"}\n\ndata: {\"type\":\"response.reasoning_text.done\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"final only 🚀\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        tx.send(Ok(Bytes::copy_from_slice(upstream.as_bytes())))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let body = stream_body(
+            ChannelStream(rx),
+            "msg_capture".into(),
+            "grok-4.5".into(),
+            None,
+            "req_capture".into(),
+            Some(traffic),
+            None,
+        )
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("draft only"));
+        assert!(!body.contains('😊'));
+        assert_eq!(body.matches("final only 🚀").count(), 1);
+
+        let root = temp.path().join("traffic");
+        let downstream = capture_contents_matching(root.clone(), "050-downstream-event");
+        assert!(!downstream.contains("draft only"));
+        assert!(!downstream.contains('😊'));
+        assert_eq!(downstream.matches("final only 🚀").count(), 1);
+
+        let upstream_capture = capture_contents_matching(root, "040-upstream-event");
+        assert!(upstream_capture.contains("draft only"));
+        assert!(upstream_capture.contains('😊'));
+    }
+
     #[test]
     fn non_streaming_capture_writes_response_and_redacts_secrets() {
         let temp = TempDir::new().unwrap();
@@ -1241,6 +1338,87 @@ mod tests {
         assert!(body.contains("message_start"));
         assert!(body.contains("ok"));
         assert!(body.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_reset_rebuilds_without_replaying_visible_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"draft \\ud83d\\ude0a\"}\n\ndata: {\"type\":\"response.reasoning_text.done\"}\n\n";
+            let header = format!("{:x}\r\n", chunk.len());
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(chunk).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"final once\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let client = Arc::new(client);
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let response = client
+            .post_with_retry(&sample_request(), None, retry.clone())
+            .await
+            .unwrap();
+        let reconnect = Some(GrokReconnectContext {
+            client,
+            request: Arc::new(sample_request()),
+            traffic: None,
+            retry,
+        });
+        let body = stream_body(
+            response.into_stream(),
+            "msg_reasoning_rebuild".into(),
+            "grok-4.5".into(),
+            None,
+            "req_reasoning_rebuild".into(),
+            None,
+            reconnect,
+        )
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+        server.await.unwrap();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("draft"));
+        assert!(!body.contains('😊'));
+        assert_eq!(body.matches("final once").count(), 1);
+        assert!(!body.contains("event: error"));
     }
 
     #[tokio::test]

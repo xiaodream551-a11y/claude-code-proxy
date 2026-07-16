@@ -236,6 +236,11 @@ pub fn clear_codex_websocket_pool_for_tests() {
     WS_CIRCUIT_BREAKER.lock().unwrap().entries.clear();
 }
 
+#[cfg(test)]
+pub(super) fn codex_websocket_pool_contains_for_tests(session_id: &str) -> bool {
+    WS_POOL.lock().unwrap().contains_key(session_id)
+}
+
 pub(super) fn codex_websocket_circuit_open(key: &str) -> bool {
     let timeouts = CodexWebSocketTimeouts::configured();
     let probe_lease = Duration::from_millis(
@@ -710,66 +715,78 @@ pub async fn codex_websocket_event_stream(
     let pool_key = pool_key.map(str::to_string);
     let ws = entry.ws.clone();
     let ctx = ctx.clone();
+    let cancel_tx = tx.clone();
+    let cancel_pool_key = pool_key.clone();
+    let cancel_entry = entry.clone();
     tokio::spawn(async move {
-        let lock_timeout_ms = if used_pooled {
-            timeouts.pool_probe_ms
-        } else {
-            timeouts.pong_ms
-        };
-        let lock =
-            tokio::time::timeout(Duration::from_millis(lock_timeout_ms), ws.lock_owned()).await;
-        let mut ws_guard = match lock {
-            Ok(guard) => guard,
-            Err(_) => {
-                // Do not let an abandoned reader block the next turn until the
-                // business idle timeout; its Arc remains valid while detached.
+        let work = async move {
+            let lock_timeout_ms = if used_pooled {
+                timeouts.pool_probe_ms
+            } else {
+                timeouts.pong_ms
+            };
+            let lock =
+                tokio::time::timeout(Duration::from_millis(lock_timeout_ms), ws.lock_owned()).await;
+            let mut ws_guard = match lock {
+                Ok(guard) => guard,
+                Err(_) => {
+                    // Do not let an abandoned reader block the next turn until the
+                    // business idle timeout; its Arc remains valid while detached.
+                    invalidate_pool_owner(pool_key.as_deref(), Some(&entry));
+                    let err = pool_busy_error(lock_timeout_ms);
+                    log_websocket_pool_refresh(&ctx, &err.message);
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
+            };
+            if used_pooled
+                && let Err(err) =
+                    probe_pooled_connection(&mut ws_guard, timeouts.pool_probe_ms).await
+            {
                 invalidate_pool_owner(pool_key.as_deref(), Some(&entry));
-                let err = pool_busy_error(lock_timeout_ms);
                 log_websocket_pool_refresh(&ctx, &err.message);
                 let _ = tx.send(Err(err)).await;
                 return;
             }
-        };
-        if used_pooled
-            && let Err(err) = probe_pooled_connection(&mut ws_guard, timeouts.pool_probe_ms).await
-        {
-            invalidate_pool_owner(pool_key.as_deref(), Some(&entry));
-            log_websocket_pool_refresh(&ctx, &err.message);
-            let _ = tx.send(Err(err)).await;
-            return;
-        }
-        if let Err(err) = send_ws_frame(
-            &mut ws_guard,
-            Message::Text(body_json),
-            timeouts.pong_ms,
-            "request",
-            WEBSOCKET_CONNECTION_ERROR_DETAIL,
-        )
-        .await
-        {
-            invalidate_pool_owner(pool_key.as_deref(), Some(&entry));
-            let _ = tx.send(Err(err)).await;
-            return;
-        }
-
-        let reusable = stream_ws_events(
-            &mut ws_guard,
-            timeouts,
-            pool_key.as_deref(),
-            Some(&entry),
-            traffic,
-            tx,
-        )
-        .await;
-
-        if let Some(key) = pool_key.as_deref() {
-            if reusable {
-                if !used_pooled {
-                    pool_insert_for_turn(key.to_string(), entry.clone(), turn_id);
-                }
-            } else {
-                invalidate_pool_entry(key, &entry);
+            if let Err(err) = send_ws_frame(
+                &mut ws_guard,
+                Message::Text(body_json),
+                timeouts.pong_ms,
+                "request",
+                WEBSOCKET_CONNECTION_ERROR_DETAIL,
+            )
+            .await
+            {
+                invalidate_pool_owner(pool_key.as_deref(), Some(&entry));
+                let _ = tx.send(Err(err)).await;
+                return;
             }
+
+            let reusable = stream_ws_events(
+                &mut ws_guard,
+                timeouts,
+                pool_key.as_deref(),
+                Some(&entry),
+                traffic,
+                tx,
+            )
+            .await;
+
+            if let Some(key) = pool_key.as_deref() {
+                if reusable {
+                    if !used_pooled {
+                        pool_insert_for_turn(key.to_string(), entry.clone(), turn_id);
+                    }
+                } else {
+                    invalidate_pool_entry(key, &entry);
+                }
+            }
+        };
+        tokio::select! {
+            _ = cancel_tx.closed() => {
+                invalidate_pool_owner(cancel_pool_key.as_deref(), Some(&cancel_entry));
+            }
+            _ = work => {}
         }
     });
     Ok(rx)

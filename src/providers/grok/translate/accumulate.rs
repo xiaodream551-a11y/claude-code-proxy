@@ -64,22 +64,9 @@ pub fn accumulate_response_with_traffic(
     };
     for event in reduced {
         match event {
-            ReducerEvent::ThinkingStart(index) => {
-                block_positions.insert(index, blocks.len());
-                blocks.push(serde_json::json!({"type":"thinking","thinking":"","signature":""}))
-            }
-            ReducerEvent::ThinkingDelta(index, text) => {
-                if let Some(block) = block_positions
-                    .get(&index)
-                    .and_then(|position| blocks.get_mut(*position))
-                {
-                    block["thinking"] = Value::String(format!(
-                        "{}{}",
-                        block["thinking"].as_str().unwrap_or(""),
-                        text
-                    ));
-                }
-            }
+            ReducerEvent::ThinkingStart(_)
+            | ReducerEvent::ThinkingDelta(_, _)
+            | ReducerEvent::ThinkingStop(_) => {}
             ReducerEvent::TextStart(index) => {
                 block_positions.insert(index, blocks.len());
                 blocks.push(serde_json::json!({"type":"text","text":""}))
@@ -208,5 +195,27 @@ mod tests {
 
         assert_eq!(response["content"][0]["input"]["value"], 1);
         assert_eq!(response["content"][1]["input"]["value"], 2);
+    }
+
+    #[test]
+    fn accumulate_response_omits_plaintext_reasoning() {
+        let input = b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"draft \\ud83d\\ude0a\"}\n\ndata: {\"type\":\"response.reasoning_text.done\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        let response = accumulate_response(input, "message", "grok-4.5").unwrap();
+
+        assert_eq!(
+            response["content"],
+            serde_json::json!([{"type":"text","text":"answer"}])
+        );
+    }
+
+    #[test]
+    fn accumulate_response_preserves_emoji_in_final_text() {
+        let input = "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"draft 😊\"}\n\ndata: {\"type\":\"response.reasoning_text.done\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer 😊\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        let response = accumulate_response(input.as_bytes(), "message", "grok-4.5").unwrap();
+
+        assert_eq!(
+            response["content"],
+            serde_json::json!([{"type":"text","text":"answer 😊"}])
+        );
     }
 }
