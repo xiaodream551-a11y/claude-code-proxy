@@ -3,9 +3,9 @@ use crate::{
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     project,
-    provider::RequestContext,
+    provider::{Provider, RequestContext},
     registry::{Registry, normalize_incoming_model},
-    session::{self, SessionState},
+    session,
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
 use axum::{
@@ -16,17 +16,88 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use bytes::Bytes;
 use http_body_util::{BodyExt, StreamBody};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
+
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_MAX_BUFFERED_REQUEST_BYTES: usize = 256 * 1024 * 1024;
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
+pub const DEFAULT_MAX_CONCURRENT_PER_PROVIDER: usize = 48;
+pub const DEFAULT_MAX_CONCURRENT_PER_SESSION: usize = 24;
+pub const DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS: u64 = 30_000;
+const MAX_ERROR_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+const ERROR_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const ERROR_RESPONSE_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ERROR_CAPTURE_FILES: usize = 128;
+
+#[derive(Debug, Clone)]
+pub struct ServerLimits {
+    pub max_request_body_bytes: usize,
+    pub max_buffered_request_bytes: usize,
+    pub max_concurrent_requests: usize,
+    pub max_concurrent_per_provider: usize,
+    pub max_concurrent_per_session: usize,
+    pub request_body_idle_timeout: Duration,
+    pub request_body_total_timeout: Duration,
+}
+
+impl ServerLimits {
+    pub fn configured() -> Self {
+        Self {
+            max_request_body_bytes: crate::config::max_request_body_bytes(
+                DEFAULT_MAX_REQUEST_BODY_BYTES,
+            ),
+            max_buffered_request_bytes: crate::config::max_buffered_request_bytes(
+                DEFAULT_MAX_BUFFERED_REQUEST_BYTES,
+            ),
+            max_concurrent_requests: crate::config::max_concurrent_requests(
+                DEFAULT_MAX_CONCURRENT_REQUESTS,
+            ),
+            max_concurrent_per_provider: crate::config::max_concurrent_per_provider(
+                DEFAULT_MAX_CONCURRENT_PER_PROVIDER,
+            ),
+            max_concurrent_per_session: crate::config::max_concurrent_per_session(
+                DEFAULT_MAX_CONCURRENT_PER_SESSION,
+            ),
+            request_body_idle_timeout: Duration::from_millis(
+                crate::config::request_body_idle_timeout_ms(DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS),
+            ),
+            request_body_total_timeout: Duration::from_millis(
+                crate::config::request_body_total_timeout_ms(DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS),
+            ),
+        }
+    }
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            max_buffered_request_bytes: DEFAULT_MAX_BUFFERED_REQUEST_BYTES,
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            max_concurrent_per_provider: DEFAULT_MAX_CONCURRENT_PER_PROVIDER,
+            max_concurrent_per_session: DEFAULT_MAX_CONCURRENT_PER_SESSION,
+            request_body_idle_timeout: Duration::from_millis(DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS),
+            request_body_total_timeout: Duration::from_millis(
+                DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS,
+            ),
+        }
+    }
+}
 
 pub struct ServerConfig {
     pub bind_address: String,
@@ -68,6 +139,7 @@ pub async fn serve_listener(
     monitor: Option<MonitorHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    initialize_process_identity();
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
     create_logger("server").info(
@@ -88,7 +160,13 @@ pub async fn serve_listener(
             ),
         ])),
     );
-    let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
+    let limits = ServerLimits::configured();
+    initialize_config_fingerprint(
+        &limits,
+        Some(&local_addr.ip().to_string()),
+        Some(local_addr.port()),
+    );
+    let app = app_with_limits(Arc::new(Registry::with_default_alias()), monitor, limits);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
@@ -100,23 +178,226 @@ pub fn app(registry: Arc<Registry>) -> Router {
 }
 
 pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
-    let state = Arc::new(AppState { registry, monitor });
+    app_with_limits(registry, monitor, ServerLimits::default())
+}
+
+pub fn app_with_limits(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    limits: ServerLimits,
+) -> Router {
+    initialize_process_identity();
+    initialize_config_fingerprint(&limits, None, None);
+    let state = Arc::new(AppState {
+        registry,
+        monitor,
+        admission: AdmissionState::new(&limits),
+        limits,
+    });
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/version", get(version))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .fallback(fallback_handler)
         .with_state(state)
 }
 
-#[derive(Clone)]
 struct AppState {
     registry: Arc<Registry>,
     monitor: Option<MonitorHandle>,
+    admission: AdmissionState,
+    limits: ServerLimits,
+}
+
+struct AdmissionState {
+    global: Arc<Semaphore>,
+    request_bytes: Arc<Semaphore>,
+    providers: Mutex<HashMap<String, Arc<Semaphore>>>,
+    sessions: Mutex<HashMap<String, Weak<Semaphore>>>,
+    per_provider: usize,
+    per_session: usize,
+}
+
+impl AdmissionState {
+    fn new(limits: &ServerLimits) -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(limits.max_concurrent_requests)),
+            request_bytes: Arc::new(Semaphore::new(limits.max_buffered_request_bytes)),
+            providers: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            per_provider: limits.max_concurrent_per_provider,
+            per_session: limits.max_concurrent_per_session,
+        }
+    }
+
+    fn provider(&self, provider: &str) -> Arc<Semaphore> {
+        let mut providers = self.providers.lock().expect("provider admission lock");
+        providers
+            .entry(provider.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.per_provider)))
+            .clone()
+    }
+
+    fn session(&self, session_id: &str) -> Arc<Semaphore> {
+        let mut sessions = self.sessions.lock().expect("session admission lock");
+        if let Some(semaphore) = sessions.get(session_id).and_then(Weak::upgrade) {
+            return semaphore;
+        }
+        if sessions.len() >= session::MAX_SESSIONS {
+            sessions.retain(|_, semaphore| semaphore.strong_count() > 0);
+        }
+        let semaphore = Arc::new(Semaphore::new(self.per_session));
+        sessions.insert(session_id.to_string(), Arc::downgrade(&semaphore));
+        semaphore
+    }
+
+    fn acquire(&self, semaphore: Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+        semaphore.try_acquire_owned().ok()
+    }
+}
+
+#[derive(Default)]
+struct RequestPermits {
+    global: Option<OwnedSemaphorePermit>,
+    provider: Option<OwnedSemaphorePermit>,
+    session: Option<OwnedSemaphorePermit>,
+    request_bytes: Option<OwnedSemaphorePermit>,
+}
+
+enum ProviderRouteSelection {
+    Admitted {
+        provider: Arc<dyn Provider>,
+        permit: OwnedSemaphorePermit,
+    },
+    Saturated(&'static str),
 }
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
+}
+
+async fn version() -> Json<serde_json::Value> {
+    Json(version_info())
+}
+
+struct ProcessIdentity {
+    started_at_ms: u64,
+    path: Option<String>,
+    sha256: Option<String>,
+}
+
+static PROCESS_IDENTITY: OnceLock<ProcessIdentity> = OnceLock::new();
+static CONFIG_FINGERPRINT: OnceLock<String> = OnceLock::new();
+static ERROR_CAPTURE_GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+// Cache the executable hash before serving. Re-reading current_exe for each
+// request can hash a newly overwritten Cellar path while an old PID is alive.
+pub fn initialize_process_identity() {
+    PROCESS_IDENTITY.get_or_init(|| {
+        let started_at_ms = current_millis();
+        let executable = std::env::current_exe().ok();
+        let sha256 = executable.as_deref().and_then(hash_file_sha256);
+        ProcessIdentity {
+            started_at_ms,
+            path: executable.map(|path| path.display().to_string()),
+            sha256,
+        }
+    });
+}
+
+fn hash_file_sha256(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Some(hex::encode(digest.finalize()))
+}
+
+fn initialize_config_fingerprint(
+    limits: &ServerLimits,
+    bind_address: Option<&str>,
+    port: Option<u16>,
+) {
+    CONFIG_FINGERPRINT.get_or_init(|| {
+        let config = crate::config::load_config();
+        effective_config_fingerprint(
+            limits,
+            bind_address.unwrap_or(config.bind_address.as_str()),
+            port.unwrap_or(config.port),
+            config.alias_provider.as_str(),
+        )
+    });
+}
+
+fn effective_config_fingerprint(
+    limits: &ServerLimits,
+    bind_address: &str,
+    port: u16,
+    alias_provider: &str,
+) -> String {
+    let values = [
+        format!("bindAddress={bind_address}"),
+        format!("port={port}"),
+        format!("aliasProvider={alias_provider}"),
+        format!("maxRequestBodyBytes={}", limits.max_request_body_bytes),
+        format!(
+            "maxBufferedRequestBytes={}",
+            limits.max_buffered_request_bytes
+        ),
+        format!("maxConcurrentRequests={}", limits.max_concurrent_requests),
+        format!(
+            "maxConcurrentPerProvider={}",
+            limits.max_concurrent_per_provider
+        ),
+        format!(
+            "maxConcurrentPerSession={}",
+            limits.max_concurrent_per_session
+        ),
+        format!(
+            "requestBodyIdleTimeoutMs={}",
+            limits.request_body_idle_timeout.as_millis()
+        ),
+        format!(
+            "requestBodyTotalTimeoutMs={}",
+            limits.request_body_total_timeout.as_millis()
+        ),
+    ];
+    hex::encode(Sha256::digest(values.join("\n").as_bytes()))
+}
+
+fn process_identity() -> &'static ProcessIdentity {
+    initialize_process_identity();
+    PROCESS_IDENTITY
+        .get()
+        .expect("process identity initialized")
+}
+
+pub fn version_info() -> Value {
+    let identity = process_identity();
+    initialize_config_fingerprint(&ServerLimits::configured(), None, None);
+    let config_fingerprint = CONFIG_FINGERPRINT
+        .get()
+        .expect("configuration fingerprint initialized");
+
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "gitSha": env!("CCPROXY_GIT_SHA"),
+        "gitDirty": env!("CCPROXY_GIT_DIRTY") == "true",
+        "buildTimestamp": env!("CCPROXY_BUILD_UNIX_EPOCH").parse::<u64>().ok(),
+        "pid": std::process::id(),
+        "startedAtMs": identity.started_at_ms,
+        "executable": identity.path.as_deref(),
+        "binarySha256": identity.sha256.as_deref(),
+        "configFingerprint": config_fingerprint,
+        "configFingerprintScope": "server-routing",
+    })
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
@@ -125,6 +406,71 @@ async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>
 
 async fn handler_count_tokens(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     dispatch_request(state, req, true).await
+}
+
+struct BufferedRequestBody {
+    bytes: Bytes,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+enum RequestBodyReadError {
+    TooLarge,
+    ByteBudgetSaturated,
+    TimedOut,
+    Read(String),
+}
+
+async fn read_bounded_request_body(
+    mut body: Body,
+    request_limit: usize,
+    byte_budget: Arc<Semaphore>,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+) -> Result<BufferedRequestBody, RequestBodyReadError> {
+    let total_deadline = tokio::time::Instant::now() + total_timeout;
+    let mut bytes = Vec::new();
+    let mut byte_permit: Option<OwnedSemaphorePermit> = None;
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(total_deadline) => {
+                return Err(RequestBodyReadError::TimedOut);
+            }
+            result = tokio::time::timeout(idle_timeout, body.frame()) => {
+                match result {
+                    Ok(frame) => frame,
+                    Err(_) => return Err(RequestBodyReadError::TimedOut),
+                }
+            }
+        };
+        let Some(frame) = frame else {
+            break;
+        };
+        let frame = frame.map_err(|error| RequestBodyReadError::Read(error.to_string()))?;
+        let Some(data) = frame.data_ref() else {
+            continue;
+        };
+        if bytes.len().saturating_add(data.len()) > request_limit {
+            return Err(RequestBodyReadError::TooLarge);
+        }
+        if !data.is_empty() {
+            let amount = u32::try_from(data.len()).map_err(|_| RequestBodyReadError::TooLarge)?;
+            let permit = byte_budget
+                .clone()
+                .try_acquire_many_owned(amount)
+                .map_err(|_| RequestBodyReadError::ByteBudgetSaturated)?;
+            if let Some(existing) = byte_permit.as_mut() {
+                existing.merge(permit);
+            } else {
+                byte_permit = Some(permit);
+            }
+            bytes.extend_from_slice(data);
+        }
+    }
+    Ok(BufferedRequestBody {
+        bytes: Bytes::from(bytes),
+        permit: byte_permit,
+    })
 }
 
 async fn dispatch_request(
@@ -169,49 +515,131 @@ async fn dispatch_request(
         started_at,
         count_tokens,
     );
-    let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
+    if headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > state.limits.max_request_body_bytes as u64)
+    {
+        return request_body_too_large(
+            &log,
+            &mut request_guard,
+            &req_id,
+            count_tokens,
+            started_at,
+            state.limits.max_request_body_bytes,
+        )
+        .await;
+    }
+
+    let mut permits = RequestPermits::default();
+    if let Some(session_id) = session_id.as_deref() {
+        permits.session = state.admission.acquire(state.admission.session(session_id));
+        if permits.session.is_none() {
+            return admission_rejection(
+                &log,
+                &mut request_guard,
+                &req_id,
+                None,
+                None,
+                count_tokens,
+                started_at,
+                "session request limit is saturated",
+            )
+            .await;
+        }
+    }
+    permits.global = state.admission.acquire(state.admission.global.clone());
+    if permits.global.is_none() {
+        return admission_rejection(
+            &log,
+            &mut request_guard,
+            &req_id,
+            None,
+            None,
+            count_tokens,
+            started_at,
+            "global request limit is saturated",
+        )
+        .await;
+    }
+
+    let body_bytes = match read_bounded_request_body(
+        req.into_body(),
+        state.limits.max_request_body_bytes,
+        state.admission.request_bytes.clone(),
+        state.limits.request_body_idle_timeout,
+        state.limits.request_body_total_timeout,
+    )
+    .await
+    {
+        Ok(buffered) => {
+            permits.request_bytes = buffered.permit;
+            buffered.bytes
+        }
+        Err(RequestBodyReadError::TooLarge) => {
+            return request_body_too_large(
+                &log,
+                &mut request_guard,
+                &req_id,
+                count_tokens,
+                started_at,
+                state.limits.max_request_body_bytes,
+            )
+            .await;
+        }
+        Err(RequestBodyReadError::ByteBudgetSaturated) => {
+            return admission_rejection(
+                &log,
+                &mut request_guard,
+                &req_id,
+                None,
+                None,
+                count_tokens,
+                started_at,
+                "global buffered request byte limit is saturated",
+            )
+            .await;
+        }
+        Err(RequestBodyReadError::TimedOut) => {
             let response = json_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::REQUEST_TIMEOUT,
                 "invalid_request_error",
-                format!("Invalid JSON: {err}"),
+                "Request body exceeded its read timeout",
             );
-            log_response_started(
+            return finalize_immediate_failure(
                 &log,
-                RequestLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: None,
-                    count_tokens,
-                    status: response.status(),
-                    started_at,
-                },
-            );
-            let (response, details) = record_failed_response(
-                &log,
-                FailedResponseLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: None,
-                    count_tokens,
-                    started_at,
-                },
+                &mut request_guard,
+                &req_id,
+                None,
+                None,
+                count_tokens,
+                started_at,
                 response,
             )
             .await;
-            request_guard.failed(
-                response.status(),
-                details
-                    .as_ref()
-                    .map(|details| details.message.as_str())
-                    .unwrap_or("Invalid JSON")
-                    .to_string(),
+        }
+        Err(RequestBodyReadError::Read(error)) => {
+            let response = json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Invalid request body: {error}"),
             );
-            return response;
+            return finalize_immediate_failure(
+                &log,
+                &mut request_guard,
+                &req_id,
+                None,
+                None,
+                count_tokens,
+                started_at,
+                response,
+            )
+            .await;
         }
     };
+
+    let now = current_millis();
 
     let mut body: crate::anthropic::schema::MessagesRequest = match parse_json_body(&body_bytes) {
         Ok(body) => body,
@@ -309,21 +737,30 @@ async fn dispatch_request(
     let normalized_model = normalize_incoming_model(model);
     request_guard.set_route(None, Some(&normalized_model));
     body.model = Some(normalized_model.clone());
-    let session_state = if let Some(session_id) = session_id.as_deref() {
-        session::existing_session(Some(session_id), now)
-    } else {
-        None
-    };
+    let (selection, current) =
+        session::route_session_request(session_id.as_deref(), &normalized_model, now, |affinity| {
+            state
+                .registry
+                .provider_for_model(&normalized_model, affinity)
+                .map(|provider| {
+                    let provider_name = provider.name();
+                    match state
+                        .admission
+                        .acquire(state.admission.provider(provider_name))
+                    {
+                        Some(permit) => session::SessionRoute::new(
+                            ProviderRouteSelection::Admitted { provider, permit },
+                            provider_name,
+                        ),
+                        None => session::SessionRoute::without_commit(
+                            ProviderRouteSelection::Saturated(provider_name),
+                        ),
+                    }
+                })
+        });
 
-    let provider = state.registry.provider_for_model(
-        &normalized_model,
-        session_state
-            .as_ref()
-            .and_then(|state| state.affinity_provider.as_ref()),
-    );
-
-    let provider = match provider {
-        Some(provider) => provider,
+    let selection = match selection {
+        Some(selection) => selection,
         None => {
             log.warn(
                 "unknown model",
@@ -374,19 +811,30 @@ async fn dispatch_request(
             return response;
         }
     };
-
+    let provider = match selection {
+        ProviderRouteSelection::Admitted { provider, permit } => {
+            permits.provider = Some(permit);
+            provider
+        }
+        ProviderRouteSelection::Saturated(provider_name) => {
+            return admission_rejection(
+                &log,
+                &mut request_guard,
+                &req_id,
+                Some(provider_name),
+                Some(&normalized_model),
+                count_tokens,
+                started_at,
+                "provider request limit is saturated",
+            )
+            .await;
+        }
+    };
     let effort = crate::providers::translate_shared::read_effort(&body)
         .ok()
         .flatten()
         .map(str::to_string);
     request_guard.set_route(Some(provider.name()), Some(&normalized_model));
-    let current = session::record_session_request(
-        session_id.as_deref(),
-        session_state.as_ref(),
-        provider.name(),
-        &normalized_model,
-        now,
-    );
     if let Some(monitor) = state.monitor.as_ref() {
         if let Some(current) = current.as_ref() {
             monitor.session_sequence_resolved(&req_id, current.seq);
@@ -466,6 +914,7 @@ async fn dispatch_request(
                 count_tokens,
                 started_at,
             },
+            permits,
         );
     }
 
@@ -488,6 +937,109 @@ async fn dispatch_request(
             .map(|details| details.message.clone())
             .unwrap_or_else(|| format!("HTTP {}", status.as_u16())),
     );
+    hold_response_permits(response, permits)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admission_rejection(
+    log: &Logger,
+    request_guard: &mut RequestMonitorGuard,
+    req_id: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    count_tokens: bool,
+    started_at: Instant,
+    reason: &str,
+) -> Response {
+    let mut response = json_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "overloaded_error",
+        format!("Proxy is busy: {reason}"),
+    );
+    response.headers_mut().insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from_static("1"),
+    );
+    finalize_immediate_failure(
+        log,
+        request_guard,
+        req_id,
+        provider,
+        model,
+        count_tokens,
+        started_at,
+        response,
+    )
+    .await
+}
+
+async fn request_body_too_large(
+    log: &Logger,
+    request_guard: &mut RequestMonitorGuard,
+    req_id: &str,
+    count_tokens: bool,
+    started_at: Instant,
+    limit: usize,
+) -> Response {
+    let response = json_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "invalid_request_error",
+        format!("Request body exceeds the {limit}-byte limit"),
+    );
+    finalize_immediate_failure(
+        log,
+        request_guard,
+        req_id,
+        None,
+        None,
+        count_tokens,
+        started_at,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_immediate_failure(
+    log: &Logger,
+    request_guard: &mut RequestMonitorGuard,
+    req_id: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    count_tokens: bool,
+    started_at: Instant,
+    response: Response,
+) -> Response {
+    let status = response.status();
+    log_response_started(
+        log,
+        RequestLogContext {
+            req_id,
+            provider,
+            model,
+            count_tokens,
+            status,
+            started_at,
+        },
+    );
+    let (response, details) = record_failed_response(
+        log,
+        FailedResponseLogContext {
+            req_id,
+            provider,
+            model,
+            count_tokens,
+            started_at,
+        },
+        response,
+    )
+    .await;
+    request_guard.failed(
+        status,
+        details
+            .map(|details| details.message)
+            .unwrap_or_else(|| format!("HTTP {}", status.as_u16())),
+    );
     response
 }
 
@@ -495,6 +1047,7 @@ fn monitor_response_body(
     response: Response,
     guard: RequestMonitorGuard,
     log_context: ResponseLogContext,
+    permits: RequestPermits,
 ) -> Response {
     let status = response.status();
     let is_event_stream = response
@@ -513,6 +1066,7 @@ fn monitor_response_body(
         log_context,
         status,
         sse_detector: is_event_stream.then(SseErrorDetector::default),
+        _permits: permits,
         terminal: false,
     };
     let stream = futures_util::stream::unfold(
@@ -544,6 +1098,14 @@ fn monitor_response_body(
     Response::from_parts(parts, Body::new(StreamBody::new(stream)))
 }
 
+fn hold_response_permits(response: Response, permits: RequestPermits) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = futures_util::stream::unfold((body, permits), |(mut body, permits)| async move {
+        body.frame().await.map(|frame| (frame, (body, permits)))
+    });
+    Response::from_parts(parts, Body::new(StreamBody::new(stream)))
+}
+
 struct ResponseLogContext {
     log: Logger,
     req_id: String,
@@ -558,6 +1120,7 @@ struct ResponseBodyLifecycle {
     log_context: ResponseLogContext,
     status: StatusCode,
     sse_detector: Option<SseErrorDetector>,
+    _permits: RequestPermits,
     terminal: bool,
 }
 
@@ -809,32 +1372,20 @@ async fn record_failed_response(
     }
 
     let status = response.status();
-    let (parts, body) = response.into_parts();
-    let bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
-            log.info(
-                "request_failed",
-                Some(serde_json::Map::from_iter([
-                    ("reqId".to_string(), json!(ctx.req_id)),
-                    ("provider".to_string(), json!(ctx.provider)),
-                    ("model".to_string(), json!(ctx.model)),
-                    ("countTokens".to_string(), json!(ctx.count_tokens)),
-                    ("status".to_string(), json!(status.as_u16())),
-                    (
-                        "ms".to_string(),
-                        json!(ctx.started_at.elapsed().as_millis()),
-                    ),
-                    ("bodyReadError".to_string(), json!(err.to_string())),
-                ])),
-            );
-            return (Response::from_parts(parts, Body::empty()), None);
+    let (mut parts, body) = response.into_parts();
+    let read = read_bounded_error_body(body).await;
+    let response_body = response_body_value(&read.bytes);
+    let message = error_message_from_response(&response_body).unwrap_or_else(|| {
+        if read.timed_out {
+            "Upstream error response body timed out".to_string()
+        } else if read.truncated {
+            "Upstream error response exceeded the proxy limit".to_string()
+        } else if let Some(error) = read.error.as_deref() {
+            format!("Failed to read upstream error response: {error}")
+        } else {
+            format!("HTTP {}", status.as_u16())
         }
-    };
-
-    let response_body = response_body_value(&bytes);
-    let message = error_message_from_response(&response_body)
-        .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+    });
     let document = json!({
         "reqId": ctx.req_id,
         "provider": ctx.provider,
@@ -844,8 +1395,15 @@ async fn record_failed_response(
         "elapsedMs": ctx.started_at.elapsed().as_millis(),
         "message": message,
         "response": response_body,
+        "bodyTruncated": read.truncated,
+        "bodyTimedOut": read.timed_out,
+        "bodyReadError": read.error.as_deref(),
     });
-    let error_file = write_error_capture(ctx.req_id, &redact_error_value(document));
+    let error_file = if should_capture_error_response(ctx.provider, status) {
+        write_error_capture(ctx.req_id, redact_error_value(document)).await
+    } else {
+        None
+    };
 
     let mut fields = serde_json::Map::from_iter([
         ("reqId".to_string(), json!(ctx.req_id)),
@@ -858,16 +1416,107 @@ async fn record_failed_response(
             json!(ctx.started_at.elapsed().as_millis()),
         ),
         ("message".to_string(), json!(message)),
+        ("bodyTruncated".to_string(), json!(read.truncated)),
+        ("bodyTimedOut".to_string(), json!(read.timed_out)),
     ]);
+    if let Some(error) = read.error.as_deref() {
+        fields.insert("bodyReadError".to_string(), json!(error));
+    }
     if let Some(path) = error_file.as_ref() {
         fields.insert("errorFile".to_string(), json!(path.display().to_string()));
     }
     log.info("request_failed", Some(fields));
 
+    let abnormal = read.truncated || read.timed_out || read.error.is_some();
+    let bytes = if abnormal {
+        parts.headers.remove(http::header::CONTENT_LENGTH);
+        parts.headers.remove(http::header::CONTENT_ENCODING);
+        parts.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        serde_json::to_vec(&json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message,
+            }
+        }))
+        .unwrap_or_else(|_| b"{\"type\":\"error\"}".to_vec())
+    } else {
+        read.bytes
+    };
+
     (
         Response::from_parts(parts, Body::from(bytes)),
         Some(FailedResponseDetails { message }),
     )
+}
+
+struct BoundedErrorBody {
+    bytes: Vec<u8>,
+    truncated: bool,
+    timed_out: bool,
+    error: Option<String>,
+}
+
+async fn read_bounded_error_body(mut body: Body) -> BoundedErrorBody {
+    read_bounded_error_body_with_timeouts(
+        &mut body,
+        ERROR_RESPONSE_BODY_IDLE_TIMEOUT,
+        ERROR_RESPONSE_BODY_TOTAL_TIMEOUT,
+    )
+    .await
+}
+
+async fn read_bounded_error_body_with_timeouts(
+    body: &mut Body,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+) -> BoundedErrorBody {
+    let total_deadline = tokio::time::Instant::now() + total_timeout;
+    let mut out = BoundedErrorBody {
+        bytes: Vec::new(),
+        truncated: false,
+        timed_out: false,
+        error: None,
+    };
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(total_deadline) => {
+                out.timed_out = true;
+                break;
+            }
+            result = tokio::time::timeout(idle_timeout, body.frame()) => match result {
+                Ok(frame) => frame,
+                Err(_) => {
+                    out.timed_out = true;
+                    break;
+                }
+            }
+        };
+        match frame {
+            None => break,
+            Some(Err(error)) => {
+                out.error = Some(error.to_string());
+                break;
+            }
+            Some(Ok(frame)) => {
+                let Some(data) = frame.data_ref() else {
+                    continue;
+                };
+                let remaining = MAX_ERROR_RESPONSE_BODY_BYTES.saturating_sub(out.bytes.len());
+                if data.len() > remaining {
+                    out.bytes.extend_from_slice(&data[..remaining]);
+                    out.truncated = true;
+                    break;
+                }
+                out.bytes.extend_from_slice(data);
+            }
+        }
+    }
+    out
 }
 
 fn response_body_value(bytes: &[u8]) -> Value {
@@ -893,10 +1542,30 @@ fn error_message_from_response(response_body: &Value) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
-fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
+fn should_capture_error_response(provider: Option<&str>, status: StatusCode) -> bool {
+    provider.is_some() && status.is_server_error()
+}
+
+async fn write_error_capture(req_id: &str, document: Value) -> Option<PathBuf> {
+    let gate = ERROR_CAPTURE_GATE
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone();
+    let permit = gate.try_acquire_owned().ok()?;
+    let req_id = req_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        write_error_capture_blocking(&req_id, &document)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn write_error_capture_blocking(req_id: &str, document: &Value) -> Option<PathBuf> {
     let dir = crate::paths::state_dir().join("errors");
     fs::create_dir_all(&dir).ok()?;
     set_mode(&dir, 0o700);
+    prune_error_captures(&dir);
     let path = dir.join(format!(
         "{}-{}.json",
         current_millis(),
@@ -908,6 +1577,31 @@ fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
     file.write_all(&payload).ok()?;
     file.write_all(b"\n").ok()?;
     Some(path)
+}
+
+fn prune_error_captures(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let remove = files
+        .len()
+        .saturating_add(1)
+        .saturating_sub(MAX_ERROR_CAPTURE_FILES);
+    for (_, path) in files.into_iter().take(remove) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn sanitize_path_part(raw: &str) -> String {
@@ -1115,11 +1809,6 @@ fn set_mode(path: &Path, mode: u32) {
     }
 }
 
-#[allow(dead_code)]
-fn _unused(session_state: Option<&SessionState>) {
-    let _ = session_state;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,6 +1859,7 @@ mod tests {
             response,
             request_guard(monitor.clone(), req_id),
             response_log_context(req_id),
+            RequestPermits::default(),
         );
 
         let state = monitor.snapshot();
@@ -1188,6 +1878,25 @@ mod tests {
             crate::monitor::RequestStatus::Completed
         );
         assert_eq!(state.recent[0].http_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn rejected_provider_response_holds_admission_permit_until_body_drop() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let response = hold_response_permits(
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("bounded error"))
+                .unwrap(),
+            RequestPermits {
+                global: Some(permit),
+                ..RequestPermits::default()
+            },
+        );
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+        drop(response);
+        assert!(semaphore.try_acquire_owned().is_ok());
     }
 
     #[tokio::test]
@@ -1216,6 +1925,7 @@ mod tests {
             response,
             request_guard(monitor.clone(), req_id),
             response_log_context(req_id),
+            RequestPermits::default(),
         );
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1250,6 +1960,7 @@ mod tests {
             response,
             request_guard(monitor.clone(), req_id),
             response_log_context(req_id),
+            RequestPermits::default(),
         );
 
         let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1291,6 +2002,118 @@ mod tests {
             )
             .expect("the parser should recover after the oversized event boundary");
         assert_eq!(error, "recovered");
+    }
+
+    #[test]
+    fn local_rejections_and_rate_limits_do_not_create_error_capture_files() {
+        assert!(!should_capture_error_response(
+            None,
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!should_capture_error_response(
+            Some("grok"),
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!should_capture_error_response(
+            Some("codex"),
+            StatusCode::PAYLOAD_TOO_LARGE
+        ));
+        assert!(should_capture_error_response(
+            Some("codex"),
+            StatusCode::BAD_GATEWAY
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_response_body_is_bounded_and_marks_truncation() {
+        let mut exact = Body::from(vec![b'x'; MAX_ERROR_RESPONSE_BODY_BYTES]);
+        let exact = read_bounded_error_body_with_timeouts(
+            &mut exact,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(exact.bytes.len(), MAX_ERROR_RESPONSE_BODY_BYTES);
+        assert!(!exact.truncated);
+        assert!(!exact.timed_out);
+
+        let mut oversized = Body::from(vec![b'x'; MAX_ERROR_RESPONSE_BODY_BYTES + 1]);
+        let oversized = read_bounded_error_body_with_timeouts(
+            &mut oversized,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(oversized.bytes.len(), MAX_ERROR_RESPONSE_BODY_BYTES);
+        assert!(oversized.truncated);
+    }
+
+    #[tokio::test]
+    async fn rejected_response_body_idle_timeout_does_not_wait_forever() {
+        let body_stream = stream::once(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(b"late"))
+        });
+        let mut body = Body::from_stream(body_stream);
+        let result = read_bounded_error_body_with_timeouts(
+            &mut body,
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(result.timed_out);
+        assert!(result.bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_response_body_total_timeout_stops_a_trickle() {
+        let body_stream = stream::unfold(0_u8, |value| async move {
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            Some((Ok::<_, std::io::Error>(Bytes::from(vec![value])), value + 1))
+        });
+        let mut body = Body::from_stream(body_stream);
+        let result = read_bounded_error_body_with_timeouts(
+            &mut body,
+            Duration::from_millis(10),
+            Duration::from_millis(15),
+        )
+        .await;
+        assert!(result.timed_out);
+        assert!(!result.bytes.is_empty());
+        assert!(result.bytes.len() < MAX_ERROR_RESPONSE_BODY_BYTES);
+    }
+
+    #[test]
+    fn effective_config_fingerprint_changes_with_limit_values() {
+        let first = ServerLimits::default();
+        let mut second = first.clone();
+        second.max_concurrent_requests += 1;
+
+        assert_ne!(
+            effective_config_fingerprint(&first, "127.0.0.1", 18765, "codex"),
+            effective_config_fingerprint(&second, "127.0.0.1", 18765, "codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_response_body_read_error_is_captured() {
+        let body_stream = stream::iter([Err::<Bytes, _>(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ))]);
+        let mut body = Body::from_stream(body_stream);
+        let result = read_bounded_error_body_with_timeouts(
+            &mut body,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("reset"))
+        );
     }
 
     #[test]

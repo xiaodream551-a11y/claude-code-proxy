@@ -3,14 +3,44 @@ use axum::http::{Method, Request, StatusCode};
 use claude_code_proxy::{
     monitor::{MonitorHandle, RequestStatus},
     registry::Registry,
-    server::{app, app_with_monitor, bind_proxy_listener},
+    server::{ServerLimits, app, app_with_limits, app_with_monitor, bind_proxy_listener},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::sync::Arc;
+use std::time::Duration;
 use tower::util::ServiceExt;
 
 fn body_string(json: &str) -> Body {
     Body::from(json.to_string())
+}
+
+fn test_limits() -> ServerLimits {
+    ServerLimits {
+        max_request_body_bytes: 1024,
+        max_buffered_request_bytes: 8 * 1024,
+        max_concurrent_requests: 8,
+        max_concurrent_per_provider: 8,
+        max_concurrent_per_session: 8,
+        request_body_idle_timeout: Duration::from_millis(100),
+        request_body_total_timeout: Duration::from_millis(500),
+    }
+}
+
+fn count_tokens_request(session_id: Option<&str>) -> Request<Body> {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages/count_tokens")
+        .header("content-type", "application/json");
+    if let Some(session_id) = session_id {
+        request = request.header("x-claude-code-session-id", session_id);
+    }
+    request
+        .body(body_string(
+            r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .unwrap()
 }
 
 #[tokio::test]
@@ -67,6 +97,47 @@ async fn healthz_returns_ok() {
 }
 
 #[tokio::test]
+async fn version_reports_build_and_runtime_identity() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(body["gitSha"].as_str().is_some_and(|sha| !sha.is_empty()));
+    assert_eq!(body["pid"], std::process::id());
+    assert!(
+        body["binarySha256"]
+            .as_str()
+            .is_some_and(|sha| sha.len() == 64)
+    );
+    let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = executable.read(&mut buffer).unwrap();
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    assert_eq!(body["binarySha256"], hex::encode(digest.finalize()));
+}
+
+#[tokio::test]
 async fn invalid_json_request_is_json_error() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
@@ -104,6 +175,188 @@ async fn empty_body_is_invalid_json() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn request_body_limit_rejects_content_length_and_streamed_overflow() {
+    let mut limits = test_limits();
+    limits.max_request_body_bytes = 64;
+    let app = app_with_limits(Arc::new(Registry::with_default_alias()), None, limits);
+
+    let declared = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-length", "65")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(declared.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let chunks = futures_util::stream::iter([
+        Ok::<_, std::convert::Infallible>(bytes::Bytes::from(vec![b' '; 40])),
+        Ok(bytes::Bytes::from(vec![b' '; 25])),
+    ]);
+    let streamed = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .body(Body::from_stream(chunks))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(streamed.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn request_body_limit_accepts_the_exact_boundary() {
+    let mut body = r#"{"model":"not-a-model","messages":[]}"#.to_string();
+    body.push_str(&" ".repeat(128 - body.len()));
+    let mut limits = test_limits();
+    limits.max_request_body_bytes = body.len();
+    let app = app_with_limits(Arc::new(Registry::with_default_alias()), None, limits);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn request_body_timeout_releases_admission_capacity() {
+    let mut limits = test_limits();
+    limits.max_concurrent_requests = 1;
+    limits.request_body_idle_timeout = Duration::from_millis(10);
+    limits.request_body_total_timeout = Duration::from_millis(50);
+    let app = app_with_limits(Arc::new(Registry::with_default_alias()), None, limits);
+    let stalled = futures_util::stream::once(async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"{}"))
+    });
+
+    let timed_out = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .body(Body::from_stream(stalled))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+
+    let recovered = app.oneshot(count_tokens_request(None)).await.unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn global_request_byte_budget_load_sheds_before_aggregate_growth() {
+    let mut limits = test_limits();
+    limits.max_buffered_request_bytes = 4;
+    let app = app_with_limits(Arc::new(Registry::with_default_alias()), None, limits);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .body(Body::from("12345"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], "1");
+}
+
+#[tokio::test]
+async fn global_admission_permit_is_held_until_response_body_drop() {
+    let mut limits = test_limits();
+    limits.max_concurrent_requests = 1;
+    let app = app_with_limits(Arc::new(Registry::with_default_alias()), None, limits);
+
+    let first = app
+        .clone()
+        .oneshot(count_tokens_request(None))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let saturated = app
+        .clone()
+        .oneshot(count_tokens_request(None))
+        .await
+        .unwrap();
+    assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(saturated.headers()["retry-after"], "1");
+
+    drop(first);
+    let recovered = app.oneshot(count_tokens_request(None)).await.unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn provider_and_session_admission_limits_are_independent() {
+    let mut provider_limits = test_limits();
+    provider_limits.max_concurrent_per_provider = 1;
+    let provider_app = app_with_limits(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        provider_limits,
+    );
+    let first = provider_app
+        .clone()
+        .oneshot(count_tokens_request(Some("provider-a")))
+        .await
+        .unwrap();
+    let saturated = provider_app
+        .clone()
+        .oneshot(count_tokens_request(Some("provider-b")))
+        .await
+        .unwrap();
+    assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(first);
+
+    let mut session_limits = test_limits();
+    session_limits.max_concurrent_per_session = 1;
+    let session_app = app_with_limits(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        session_limits,
+    );
+    let first = session_app
+        .clone()
+        .oneshot(count_tokens_request(Some("same-session")))
+        .await
+        .unwrap();
+    let saturated = session_app
+        .clone()
+        .oneshot(count_tokens_request(Some("same-session")))
+        .await
+        .unwrap();
+    assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
+    let other_session = session_app
+        .clone()
+        .oneshot(count_tokens_request(Some("other-session")))
+        .await
+        .unwrap();
+    assert_eq!(other_session.status(), StatusCode::OK);
+    drop(first);
+    drop(other_session);
 }
 
 #[tokio::test]

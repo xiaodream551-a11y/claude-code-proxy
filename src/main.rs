@@ -29,7 +29,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Version,
+    Version {
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
     Serve {
         #[arg(long)]
         port: Option<u16>,
@@ -82,11 +85,18 @@ fn main() -> Result<()> {
     });
 
     match commands {
-        Commands::Version => {
-            println!("claude-code-proxy {}", VERSION);
+        Commands::Version { json } => {
+            if json {
+                println!("{}", serde_json::to_string(&server::version_info())?);
+            } else {
+                println!("claude-code-proxy {}", VERSION);
+            }
             Ok(())
         }
         Commands::Serve { port, no_monitor } => {
+            // Cache the running inode before a deployment can atomically replace
+            // the Cellar path while this process is still serving.
+            server::initialize_process_identity();
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Registry::with_default_alias();

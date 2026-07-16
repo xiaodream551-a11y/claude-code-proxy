@@ -142,6 +142,17 @@ alongside the proxy's own `proxy.log`. Provider logins are still a one-time
 interactive step (e.g. `claude-code-proxy codex auth login`); the service
 serves 401s until a token is stored.
 
+When testing changes from a source checkout against that Homebrew service, use
+`just deploy-homebrew`. It builds the release binary, backs up the active Cellar
+binary, replaces it atomically, restarts the service, and verifies the new PID,
+embedded Git SHA, clean-build flag, executable path, and runtime binary SHA. It
+refuses a dirty worktree, recovers stale deployment locks, and verifies the old
+running image by SHA even when that version predates `/version`. Failures and
+termination signals restore and restart the backup. The default health URL uses
+`PORT` (or 18765); an explicit `CCP_DEPLOY_HEALTH_URL` must end in `/healthz`.
+`just install` targets Cargo's bin directory and does not replace the binary used
+by the Homebrew launch service.
+
 ### 4. Point Claude Code at it
 
 `ANTHROPIC_MODEL` selects the provider:
@@ -686,6 +697,8 @@ The proxy speaks enough of the Anthropic API for Claude Code:
 - `POST /v1/messages/count_tokens`: local token count via `tiktoken-rs`
   (`o200k_base`); used by Claude Code's compaction logic
 - `GET /healthz`: liveness check
+- `GET /version`: build SHA, binary SHA-256, PID, executable path, startup time,
+  and a non-secret configuration fingerprint
 
 ## Configuration
 
@@ -704,6 +717,15 @@ Windows, and at
   "bindAddress": "127.0.0.1",
   "port": 18765,
   "aliasProvider": "codex",
+  "server": {
+    "maxRequestBodyBytes": 33554432,
+    "maxBufferedRequestBytes": 268435456,
+    "maxConcurrentRequests": 64,
+    "maxConcurrentPerProvider": 48,
+    "maxConcurrentPerSession": 24,
+    "requestBodyIdleTimeoutMs": 5000,
+    "requestBodyTotalTimeoutMs": 30000
+  },
   "codex": {
     "originator": "claude-code-proxy",
     "userAgent": "claude-code-proxy/dev",
@@ -756,6 +778,13 @@ Windows, and at
 | `CCP_LOG_VERBOSE`                | `log.verbose`              | unset                                             | Preserve full string fields in `proxy.log`; any env value enables it                                                                                                              |
 | `CCP_TRAFFIC_LOG`                | —                          | unset                                             | Write full per-request traffic captures under `traffic/` for session debugging (`1`, `true`, or `yes`)                                                                            |
 | `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                                                                   |
+| `CCP_MAX_REQUEST_BODY_BYTES`     | `server.maxRequestBodyBytes` | `33554432`                                      | Hard cap for both Anthropic request endpoints; declared and streamed overflows return 413                                                                                         |
+| `CCP_MAX_BUFFERED_REQUEST_BYTES` | `server.maxBufferedRequestBytes` | `268435456`                                  | Process-wide byte budget for request bodies retained by active requests; saturation returns retryable 429                                                                         |
+| `CCP_MAX_CONCURRENT_REQUESTS`    | `server.maxConcurrentRequests` | `64`                                            | Global in-flight request limit; saturated requests are shed immediately instead of entering an unbounded wait queue                                                               |
+| `CCP_MAX_CONCURRENT_PER_PROVIDER` | `server.maxConcurrentPerProvider` | `48`                                         | Per-provider in-flight limit, preventing one upstream from consuming the entire process                                                                                           |
+| `CCP_MAX_CONCURRENT_PER_SESSION` | `server.maxConcurrentPerSession` | `24`                                            | Per-session in-flight limit; checked before the global limit so one child-agent wave cannot occupy every global slot                                                              |
+| `CCP_REQUEST_BODY_IDLE_TIMEOUT_MS` | `server.requestBodyIdleTimeoutMs` | `5000`                                       | Maximum pause while reading a local request body                                                                                                                                  |
+| `CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS` | `server.requestBodyTotalTimeoutMs` | `30000`                                    | Absolute request-body read budget; timeout returns 408 and releases all reservations                                                                                              |
 | `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
@@ -764,7 +793,7 @@ Windows, and at
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it                     |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
-| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or WebSocket with session-scoped HTTP fallback in `auto`                                                      |
+| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or request-local sticky HTTP fallback plus an origin-wide WebSocket breaker in `auto`                         |
 | `CCP_CODEX_TOTAL_TIMEOUT_MS`     | `codex.totalTimeoutMs`     | `540000`                                          | Total wall-clock budget across WebSocket retries, Auto HTTP fallback, and the remaining live stream; caps stragglers while remaining configurable                                   |
 | `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event before refreshing the WebSocket and retrying safely                                                                                |
 | `CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS` | `codex.websocketIdleTimeoutMs` | `300000` | Maximum gap between Codex response events; WebSocket control frames do not extend this business-event deadline                                                                    |
@@ -799,8 +828,8 @@ retryable WebSocket transport failure occurs before Anthropic output begins.
 This covers handshake rejection, response-start or idle timeouts, failed
 heartbeat and pool probes, busy pooled connections, connection loss, and a
 close without a terminal event. Three consecutive retryable WebSocket transport
-failures for the same Claude Code session open a 30-second circuit, temporarily
-routing that session through HTTP. After the cooldown, one WebSocket request
+failures for the same upstream origin open a 30-second circuit, temporarily
+routing all sessions for that endpoint through HTTP. After the cooldown, one WebSocket request
 probes recovery while concurrent requests keep using HTTP; a successful response
 or any non-transport result resets the failure count.
 Pooled WebSockets must answer a matching Ping/Pong probe before reuse. Active
@@ -816,7 +845,12 @@ visible output. HTTP SSE is decoded incrementally, so cancellation closes the
 upstream socket instead of waiting for a buffered response. WebSocket retries,
 authentication retries, and an Auto HTTP fallback share a hard ceiling of four
 physical upstream requests; after Auto falls back, that logical request remains
-on HTTP rather than probing WebSocket again.
+on HTTP rather than probing WebSocket again. Live WebSocket messages are capped
+at 1 MiB at the wire, intermediary event channels hold two items each, and the
+final downstream queue has a 2 MiB byte budget. Buffered HTTP success bodies are
+capped at 8 MiB, and live translator input has the same cumulative ceiling. A
+downstream that remains backpressured for 60 seconds is terminated and its
+upstream request is cancelled.
 Unsignaled retries use jittered exponential backoff capped at 30 seconds. Numeric
 and HTTP-date `Retry-After` values are honored directly within that retry budget.
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
@@ -841,19 +875,42 @@ safe authentication failures, and a stream that dies before emitting Anthropic
 output share one budget of up to three transient retries with jittered backoff
 and `Retry-After` support. Authentication is replayed only for idempotent OIDC
 discovery, rate limits, or a token connection that failed before the refresh
-request was sent; an ambiguous token response is never replayed. The four-attempt
-wire cap applies to model `/responses` requests, while any authentication retry
+request was sent. An ambiguous token response blocks later use of that same
+credential generation across requests and process restarts. Refresh dispatches
+use a cross-process file lock and a durable pre-dispatch marker. A successfully
+rotated token remains usable in memory if persistence fails; the old durable
+generation remains fail-closed until the new token is saved or credentials change,
+and another rotation is refused while persistence is degraded. Browser/device
+login and logout take the same mutation lock so they cannot be overwritten by an
+in-flight refresh.
+Grok `sequence_number` values are validated before reducer state changes:
+identical repeated events within a bounded history are ignored, while gaps,
+conflicts, backwards movement, or mixed numbered/legacy events terminate the
+stream. This protocol check never deduplicates answer text or emoji. The
+four-attempt wire cap applies to model `/responses` requests, while any authentication retry
 consumes a transient slot and therefore reduces the remaining model retries. If
 a Grok stream fails after any Anthropic text or tool event has been sent, the
 proxy returns a stream error without replaying the request. Grok has no
 `previous_response_id` continuation and never silently falls back to another
 provider. The configurable total budget is capped at 24 hours; values at or above
 the caller's own timeout lose the useful guarantee that the proxy fails first.
+Grok streaming also uses a two-item/2 MiB downstream queue; a consumer stalled
+for 60 seconds cancels the producer instead of pinning a connection until the
+full model deadline. Raw stream bytes across rebuilds are capped at 8 MiB, which
+also bounds reducer text and tool state.
 
 Claude Code retries API failures independently of the proxy. Its default retry
 count can multiply a slow terminal failure, so the example configuration sets
 `CLAUDE_CODE_MAX_RETRIES=2`; increase it only when you prefer availability over a
 bounded user-visible wait.
+
+The server aggregates at most 32 MiB per incoming request and 256 MiB across
+active requests. Request bodies have five-second idle and 30-second total read
+budgets. Rejected response bodies are capped at 64 KiB with five-second idle and
+10-second total budgets. Global, provider, and session bulkheads shed excess work
+with 429 instead of allowing a child-agent wave to exhaust the process. Successful
+streaming permits and bounded provider error responses remain held through response
+EOF or body drop, not merely until response headers arrive.
 
 Request lifecycle logs distinguish response headers from a finished stream:
 `response_started` records the status returned by the provider,
@@ -868,9 +925,10 @@ cancellation before completion.
   `%LOCALAPPDATA%\claude-code-proxy\proxy.log` on Windows (falling back to
   `%USERPROFILE%\AppData\Local`). Secrets (`authorization`, `access`,
   `refresh`, `id_token`, `ChatGPT-Account-Id`, …) are redacted before write.
-- `errors/` - failed proxy responses captured as JSON files under the state
-  directory. `request_failed` log lines include an `errorFile` path for copying
-  the complete redacted error payload into debugging notes or an AI prompt.
+- `errors/` - redacted provider 5xx responses captured as JSON files under the
+  state directory. A single background writer keeps at most 128 files; local
+  validation/load-shed failures and provider 4xx responses are log-only so an
+  error storm cannot turn this diagnostic path into disk exhaustion.
 - `traffic/` — per-request captures written when `CCP_TRAFFIC_LOG=1` is set.
   Captures live under the state directory, grouped by Claude Code session and
   request sequence. They include inbound Anthropic requests, translated upstream

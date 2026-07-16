@@ -18,6 +18,40 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
+fn version_json_is_machine_readable() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    let output = cmd.args(["version", "--json"]).output()?;
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    assert!(value["binarySha256"].as_str().is_some());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn version_json_ignores_unrelated_non_utf8_environment_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    let output = cmd
+        .args(["version", "--json"])
+        .env("CCP_NON_UTF8_TEST", OsString::from_vec(vec![0xff, 0xfe]))
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    Ok(())
+}
+
+#[test]
 fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.arg("models");

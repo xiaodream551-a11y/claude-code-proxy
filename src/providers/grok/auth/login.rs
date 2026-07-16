@@ -57,7 +57,7 @@ pub fn login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> anyhow::R
         .filter(|value| !value.is_empty())
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Grok login did not grant an offline session"))?;
-    store.save_auth(StoredAuth {
+    store.save_auth_exclusive(StoredAuth {
         access: tokens.access_token,
         refresh,
         expires_at_ms: now_ms().saturating_add(tokens.expires_in.saturating_mul(1000)),

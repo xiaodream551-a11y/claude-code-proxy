@@ -356,6 +356,8 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(err.into());
     }
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
     set_mode(std::path::Path::new(path), 0o600);
     Ok(())
 }

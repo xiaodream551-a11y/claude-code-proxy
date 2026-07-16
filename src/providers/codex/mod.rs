@@ -46,6 +46,10 @@ use self::translate::request::{
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_LIVE_TRANSPORT_RETRIES: u32 = 2;
 const MAX_LIVE_UPSTREAM_SSE_BYTES: usize = crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES;
+pub(super) const MAX_LIVE_EVENT_BYTES: usize = 1024 * 1024;
+pub(super) const LIVE_EVENT_CHANNEL_CAPACITY: usize = 2;
+const MAX_DOWNSTREAM_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+const DOWNSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const DOWNSTREAM_PING: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
 #[cfg(test)]
@@ -393,7 +397,7 @@ async fn live_stream_response_inner(
     let turn_id = continuation.turn_id;
     let mut attempt = 0_u32;
     let mut continuation = Some(continuation);
-    let circuit_key = ctx.session_id.as_deref();
+    let circuit_key = client.websocket_circuit_key().to_string();
     let transport = config::codex_transport();
     let attempt_budget = client::CodexLiveAttemptBudget::new();
     // Auto may fall back once, but it never switches back to WebSocket within
@@ -401,7 +405,7 @@ async fn live_stream_response_inner(
     let mut active_transport = transport;
 
     if transport == config::CodexTransport::Auto
-        && circuit_key.is_some_and(websocket::codex_websocket_circuit_open)
+        && websocket::codex_websocket_circuit_open(&circuit_key)
     {
         client::log_websocket_circuit_fallback(&ctx);
         drop_live_continuation_for_retry(&mut continuation);
@@ -433,7 +437,7 @@ async fn live_stream_response_inner(
                     && !matches!(active_transport, config::CodexTransport::Http)
                     && client::should_fallback_to_http(&err)
                 {
-                    client::record_auto_websocket_failure(&ctx, &err);
+                    client::record_auto_websocket_failure(&ctx, &circuit_key, &err);
                     client::log_auto_http_fallback(&ctx, &err);
                     drop_live_continuation_for_retry(&mut continuation);
                     active_transport = config::CodexTransport::Http;
@@ -445,7 +449,7 @@ async fn live_stream_response_inner(
                     continue;
                 }
                 if active_transport == config::CodexTransport::Auto
-                    && client::record_auto_websocket_failure(&ctx, &err)
+                    && client::record_auto_websocket_failure(&ctx, &circuit_key, &err)
                 {
                     continue;
                 }
@@ -494,9 +498,8 @@ async fn live_stream_response_inner(
             LiveStreamStart::Response(response) => {
                 if transport == config::CodexTransport::Auto
                     && active_transport == config::CodexTransport::Auto
-                    && let Some(key) = circuit_key
                 {
-                    websocket::record_codex_websocket_success(key);
+                    websocket::record_codex_websocket_success(&circuit_key);
                 }
                 return response;
             }
@@ -505,7 +508,7 @@ async fn live_stream_response_inner(
                     && !matches!(active_transport, config::CodexTransport::Http)
                     && client::should_fallback_to_http(&error)
                 {
-                    client::record_auto_websocket_failure(&ctx, &error);
+                    client::record_auto_websocket_failure(&ctx, &circuit_key, &error);
                     client::log_auto_http_fallback(&ctx, &error);
                     drop_live_continuation_for_retry(&mut continuation);
                     active_transport = config::CodexTransport::Http;
@@ -521,7 +524,7 @@ async fn live_stream_response_inner(
                     continue;
                 }
                 if active_transport == config::CodexTransport::Auto
-                    && client::record_auto_websocket_failure(&ctx, &error)
+                    && client::record_auto_websocket_failure(&ctx, &circuit_key, &error)
                 {
                     continue;
                 }
@@ -863,21 +866,49 @@ enum LiveChunkSendOutcome {
     Sent,
     Closed,
     Deadline,
+    Stalled,
+    TooLarge,
+}
+
+struct BudgetedLiveChunk {
+    bytes: Bytes,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 async fn send_live_chunk_before_deadline(
-    tx: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    tx: &tokio::sync::mpsc::Sender<Result<BudgetedLiveChunk, std::io::Error>>,
+    byte_budget: &Arc<tokio::sync::Semaphore>,
     chunk: Vec<u8>,
     deadline: client::CodexRequestDeadline,
 ) -> LiveChunkSendOutcome {
+    if chunk.len() > MAX_DOWNSTREAM_QUEUE_BYTES {
+        return LiveChunkSendOutcome::TooLarge;
+    }
     if tokio::time::Instant::now() >= deadline.at() {
         return LiveChunkSendOutcome::Deadline;
     }
+    let stall_deadline = tokio::time::Instant::now() + DOWNSTREAM_STALL_TIMEOUT;
+    let byte_permit = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline.at()) => return LiveChunkSendOutcome::Deadline,
+        _ = tokio::time::sleep_until(stall_deadline) => return LiveChunkSendOutcome::Stalled,
+        _ = tx.closed() => return LiveChunkSendOutcome::Closed,
+        permit = byte_budget.clone().acquire_many_owned(chunk.len() as u32) => {
+            match permit {
+                Ok(permit) => permit,
+                Err(_) => return LiveChunkSendOutcome::Closed,
+            }
+        }
+    };
     tokio::select! {
         biased;
         _ = tokio::time::sleep_until(deadline.at()) => LiveChunkSendOutcome::Deadline,
+        _ = tokio::time::sleep_until(stall_deadline) => LiveChunkSendOutcome::Stalled,
         _ = tx.closed() => LiveChunkSendOutcome::Closed,
-        result = tx.send(Ok(Bytes::from(chunk))) => {
+        result = tx.send(Ok(BudgetedLiveChunk {
+            bytes: Bytes::from(chunk),
+            _permit: Some(byte_permit),
+        })) => {
             if result.is_ok() {
                 LiveChunkSendOutcome::Sent
             } else {
@@ -887,8 +918,35 @@ async fn send_live_chunk_before_deadline(
     }
 }
 
+fn finish_live_stream_after_downstream_stall(
+    terminal_permit: &mut Option<
+        tokio::sync::mpsc::OwnedPermit<Result<BudgetedLiveChunk, std::io::Error>>,
+    >,
+    translator: &mut LiveStreamTranslator,
+    ctx: &RequestContext,
+    turn_id: Option<u64>,
+) {
+    abort_continuation(ctx.session_id.as_deref(), turn_id);
+    let chunk = translator.error_chunk(
+        "Claude Code did not consume the proxy response for 60 seconds",
+        "api_error",
+        ctx.traffic.as_deref(),
+    );
+    if !chunk.is_empty() {
+        record_live_stream_progress(ctx, &chunk);
+        if let Some(permit) = terminal_permit.take() {
+            let _ = permit.send(Ok(BudgetedLiveChunk {
+                bytes: Bytes::from(chunk),
+                _permit: None,
+            }));
+        }
+    }
+}
+
 fn finish_live_stream_at_deadline(
-    terminal_permit: &mut Option<tokio::sync::mpsc::OwnedPermit<Result<Bytes, std::io::Error>>>,
+    terminal_permit: &mut Option<
+        tokio::sync::mpsc::OwnedPermit<Result<BudgetedLiveChunk, std::io::Error>>,
+    >,
     translator: &mut LiveStreamTranslator,
     ctx: &RequestContext,
     turn_id: Option<u64>,
@@ -903,7 +961,10 @@ fn finish_live_stream_at_deadline(
         // One channel slot is reserved before ordinary streaming begins, so the
         // terminal deadline event cannot be displaced by a slow/full downstream.
         if let Some(permit) = terminal_permit.take() {
-            let _ = permit.send(Ok(Bytes::from(chunk)));
+            let _ = permit.send(Ok(BudgetedLiveChunk {
+                bytes: Bytes::from(chunk),
+                _permit: None,
+            }));
         }
     }
 }
@@ -947,7 +1008,10 @@ fn remaining_live_stream_response_with_heartbeat(
     deadline: client::CodexRequestDeadline,
     heartbeat_interval: Duration,
 ) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<BudgetedLiveChunk, std::io::Error>>(
+        LIVE_EVENT_CHANNEL_CAPACITY,
+    );
+    let byte_budget = Arc::new(tokio::sync::Semaphore::new(MAX_DOWNSTREAM_QUEUE_BYTES));
     tokio::spawn(async move {
         let mut terminal_permit = match tx.clone().try_reserve_owned() {
             Ok(permit) => Some(permit),
@@ -958,7 +1022,7 @@ fn remaining_live_stream_response_with_heartbeat(
         };
         macro_rules! send_chunk_or_stop {
             ($chunk:expr) => {
-                match send_live_chunk_before_deadline(&tx, $chunk, deadline).await {
+                match send_live_chunk_before_deadline(&tx, &byte_budget, $chunk, deadline).await {
                     LiveChunkSendOutcome::Sent => {}
                     LiveChunkSendOutcome::Closed => {
                         abort_continuation(ctx.session_id.as_deref(), turn_id);
@@ -972,6 +1036,30 @@ fn remaining_live_stream_response_with_heartbeat(
                             turn_id,
                             deadline,
                         );
+                        return;
+                    }
+                    LiveChunkSendOutcome::Stalled => {
+                        finish_live_stream_after_downstream_stall(
+                            &mut terminal_permit,
+                            &mut translator,
+                            &ctx,
+                            turn_id,
+                        );
+                        return;
+                    }
+                    LiveChunkSendOutcome::TooLarge => {
+                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        let chunk = translator.error_chunk(
+                            "Codex translated stream chunk exceeded the queue byte limit",
+                            "api_error",
+                            ctx.traffic.as_deref(),
+                        );
+                        if let Some(permit) = terminal_permit.take() {
+                            let _ = permit.send(Ok(BudgetedLiveChunk {
+                                bytes: Bytes::from(chunk),
+                                _permit: None,
+                            }));
+                        }
                         return;
                     }
                 }
@@ -1100,7 +1188,10 @@ fn remaining_live_stream_response_with_heartbeat(
     });
 
     let stream = futures_util::stream::unfold(rx, |mut rx| async {
-        rx.recv().await.map(|item| (item, rx))
+        rx.recv().await.map(|item| {
+            let item = item.map(|chunk| chunk.bytes);
+            (item, rx)
+        })
     });
     event_stream_response(stream)
 }
@@ -2048,6 +2139,52 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("event: error"), "{body}");
         assert!(body.contains("total wall-clock budget of 100ms"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn live_chunk_byte_budget_is_held_until_the_consumer_drops_the_chunk() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let byte_budget = Arc::new(tokio::sync::Semaphore::new(4));
+        let deadline = client::CodexRequestDeadline::from_timeout_ms(1_000);
+
+        assert_eq!(
+            send_live_chunk_before_deadline(&tx, &byte_budget, vec![1; 4], deadline).await,
+            LiveChunkSendOutcome::Sent
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                send_live_chunk_before_deadline(&tx, &byte_budget, vec![2], deadline),
+            )
+            .await
+            .is_err(),
+            "queued bytes must retain the byte permit"
+        );
+
+        drop(rx.recv().await.unwrap().unwrap());
+        assert_eq!(
+            send_live_chunk_before_deadline(&tx, &byte_budget, vec![2], deadline).await,
+            LiveChunkSendOutcome::Sent
+        );
+    }
+
+    #[tokio::test]
+    async fn live_chunk_larger_than_the_queue_budget_is_rejected_without_enqueueing() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let byte_budget = Arc::new(tokio::sync::Semaphore::new(MAX_DOWNSTREAM_QUEUE_BYTES));
+
+        assert_eq!(
+            send_live_chunk_before_deadline(
+                &tx,
+                &byte_budget,
+                vec![0; MAX_DOWNSTREAM_QUEUE_BYTES + 1],
+                client::CodexRequestDeadline::from_timeout_ms(1_000),
+            )
+            .await,
+            LiveChunkSendOutcome::TooLarge
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(byte_budget.available_permits(), MAX_DOWNSTREAM_QUEUE_BYTES);
     }
 
     #[test]

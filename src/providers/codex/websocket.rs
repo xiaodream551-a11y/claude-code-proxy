@@ -8,8 +8,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{self, Message, handshake::client::generate_key},
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{self, Message, handshake::client::generate_key, protocol::WebSocketConfig},
 };
 
 use crate::provider::RequestContext;
@@ -710,7 +710,7 @@ pub async fn codex_websocket_event_stream(
         write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, used_pooled);
     }
 
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = mpsc::channel(super::LIVE_EVENT_CHANNEL_CAPACITY);
     let turn_id = continuation.and_then(|candidate| candidate.turn_id);
     let pool_key = pool_key.map(str::to_string);
     let ws = entry.ws.clone();
@@ -1069,7 +1069,12 @@ async fn connect_with_timeout(
         origin: CodexErrorOrigin::WebSocket,
     })?;
 
-    let connect_fut = connect_async(request);
+    let websocket_config = WebSocketConfig {
+        max_message_size: Some(super::MAX_LIVE_EVENT_BYTES),
+        max_frame_size: Some(super::MAX_LIVE_EVENT_BYTES),
+        ..WebSocketConfig::default()
+    };
+    let connect_fut = connect_async_with_config(request, Some(websocket_config), false);
     tokio::time::timeout(Duration::from_millis(connect_timeout_ms), connect_fut)
         .await
         .map_err(|_| CodexError {
@@ -1309,6 +1314,17 @@ async fn collect_ws_events(
 
         match frame {
             Some(Message::Text(text)) => {
+                if text.len() > crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES {
+                    invalidate_pool_owner(pool_key, pool_entry);
+                    return Err(CodexError {
+                        status: 0,
+                        message: "Codex WebSocket event exceeded the buffered response limit"
+                            .to_string(),
+                        detail: Some("websocket_event_size_limit".to_string()),
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    });
+                }
                 // Parse JSON
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -1323,13 +1339,17 @@ async fn collect_ws_events(
                             );
                         }
                         // Write invalid JSON as-is
-                        sse_body.extend_from_slice(&encode_sse(&text));
+                        append_buffered_sse(&mut sse_body, &text).inspect_err(|_| {
+                            invalidate_pool_owner(pool_key, pool_entry);
+                        })?;
                         continue;
                     }
                 };
 
                 // Convert to SSE bytes
-                sse_body.extend_from_slice(&encode_sse(&text));
+                append_buffered_sse(&mut sse_body, &text).inspect_err(|_| {
+                    invalidate_pool_owner(pool_key, pool_entry);
+                })?;
                 if let Some(tc) = traffic {
                     tc.write_json_event("040-upstream-event", &parsed);
                 }
@@ -1379,6 +1399,21 @@ async fn collect_ws_events(
     Ok((sse_body, terminal_event))
 }
 
+fn append_buffered_sse(buffer: &mut Vec<u8>, text: &str) -> Result<(), CodexError> {
+    let encoded = encode_sse(text);
+    if buffer.len().saturating_add(encoded.len()) > crate::traffic::MAX_SSE_CAPTURE_BYTES {
+        return Err(CodexError {
+            status: 0,
+            message: "Codex buffered WebSocket response exceeded the size limit".to_string(),
+            detail: Some("websocket_response_size_limit".to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        });
+    }
+    buffer.extend_from_slice(&encoded);
+    Ok(())
+}
+
 async fn stream_ws_events(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     timeouts: CodexWebSocketTimeouts,
@@ -1388,7 +1423,7 @@ async fn stream_ws_events(
     tx: mpsc::Sender<Result<serde_json::Value, CodexError>>,
 ) -> bool {
     let started_at = Instant::now();
-    let mut sse_body: Vec<u8> = Vec::new();
+    let mut sse_body = traffic.as_ref().map(|_| Vec::new());
     let mut watchdog = WebSocketWatchdog::new(timeouts);
     let mut status = 200u16;
     let mut reusable = false;
@@ -1411,6 +1446,20 @@ async fn stream_ws_events(
 
         match frame {
             Some(Message::Text(text)) => {
+                if text.len() > super::MAX_LIVE_EVENT_BYTES {
+                    invalidate_pool_owner(pool_key, pool_entry);
+                    let _ = tx
+                        .send(Err(CodexError {
+                            status: 0,
+                            message: "Codex WebSocket event exceeded the live event size limit"
+                                .to_string(),
+                            detail: Some("websocket_event_size_limit".to_string()),
+                            retry_after: None,
+                            origin: CodexErrorOrigin::WebSocket,
+                        }))
+                        .await;
+                    break;
+                }
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(_) => {
@@ -1423,12 +1472,12 @@ async fn stream_ws_events(
                                 }),
                             );
                         }
-                        sse_body.extend_from_slice(&encode_sse(&text));
+                        append_live_capture_sse(&mut sse_body, &text);
                         continue;
                     }
                 };
 
-                sse_body.extend_from_slice(&encode_sse(&text));
+                append_live_capture_sse(&mut sse_body, &text);
                 if let Some(tc) = traffic.as_deref() {
                     tc.write_json_event("040-upstream-event", &parsed);
                 }
@@ -1490,10 +1539,20 @@ async fn stream_ws_events(
         }
     }
 
-    if let Some(tc) = traffic.as_deref() {
-        write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
+    if let (Some(tc), Some(sse_body)) = (traffic.as_deref(), sse_body.as_deref()) {
+        write_websocket_response_capture(tc, status, started_at.elapsed(), sse_body);
     }
     reusable
+}
+
+fn append_live_capture_sse(capture: &mut Option<Vec<u8>>, text: &str) {
+    let Some(capture) = capture.as_mut() else {
+        return;
+    };
+    let encoded = encode_sse(text);
+    if capture.len().saturating_add(encoded.len()) <= crate::traffic::MAX_SSE_CAPTURE_BYTES {
+        capture.extend_from_slice(&encoded);
+    }
 }
 
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
@@ -1546,25 +1605,25 @@ mod tests {
         let now = Instant::now();
         let probe_lease = Duration::from_secs(90);
 
-        assert!(!breaker.should_route_http("session", now, probe_lease));
-        assert!(!breaker.record_failure("session", now));
-        assert!(!breaker.record_failure("session", now));
-        assert!(breaker.record_failure("session", now));
+        assert!(!breaker.should_route_http("wss://example.test", now, probe_lease));
+        assert!(!breaker.record_failure("wss://example.test", now));
+        assert!(!breaker.record_failure("wss://example.test", now));
+        assert!(breaker.record_failure("wss://example.test", now));
         assert!(breaker.should_route_http(
-            "session",
+            "wss://example.test",
             now + Duration::from_millis(WEBSOCKET_CIRCUIT_COOLDOWN_MS - 1),
             probe_lease,
         ));
 
         let probe_at = now + Duration::from_millis(WEBSOCKET_CIRCUIT_COOLDOWN_MS);
-        assert!(!breaker.should_route_http("session", probe_at, probe_lease));
-        assert!(breaker.should_route_http("session", probe_at, probe_lease));
+        assert!(!breaker.should_route_http("wss://example.test", probe_at, probe_lease));
+        assert!(breaker.should_route_http("wss://example.test", probe_at, probe_lease));
 
         let next_probe_at = probe_at + probe_lease;
-        assert!(!breaker.should_route_http("session", next_probe_at, probe_lease));
-        assert!(breaker.record_failure("session", next_probe_at));
-        breaker.record_success("session");
-        assert!(!breaker.should_route_http("session", next_probe_at, probe_lease));
+        assert!(!breaker.should_route_http("wss://example.test", next_probe_at, probe_lease));
+        assert!(breaker.record_failure("wss://example.test", next_probe_at));
+        breaker.record_success("wss://example.test");
+        assert!(!breaker.should_route_http("wss://example.test", next_probe_at, probe_lease));
     }
 
     #[test]
@@ -1572,15 +1631,15 @@ mod tests {
         let mut breaker = WebSocketCircuitBreaker::default();
         let now = Instant::now();
         for _ in 0..WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD {
-            breaker.record_failure("session-a", now);
+            breaker.record_failure("wss://a.example", now);
         }
         let probe_lease = Duration::from_secs(90);
-        assert!(breaker.should_route_http("session-a", now, probe_lease));
-        assert!(!breaker.should_route_http("session-b", now, probe_lease));
+        assert!(breaker.should_route_http("wss://a.example", now, probe_lease));
+        assert!(!breaker.should_route_http("wss://b.example", now, probe_lease));
 
         for index in 0..=MAX_CIRCUIT_ENTRIES {
             breaker.record_failure(
-                &format!("session-{index}"),
+                &format!("wss://endpoint-{index}.example"),
                 now + Duration::from_nanos(index as u64),
             );
         }
@@ -1668,6 +1727,31 @@ mod tests {
         let headers = http::HeaderMap::new();
         let ws = codex_websocket_headers(&headers);
         assert!(ws.contains_key("sec-websocket-key"));
+    }
+
+    #[tokio::test]
+    async fn websocket_wire_config_rejects_a_message_over_one_mebibyte() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let oversized = "x".repeat(super::super::MAX_LIVE_EVENT_BYTES + 1);
+            let _ = websocket.send(Message::Text(oversized)).await;
+        });
+
+        let (mut websocket, _) =
+            connect_with_timeout(&format!("ws://{addr}/"), &HeaderMap::new(), 1_000)
+                .await
+                .unwrap();
+        let error = websocket.next().await.unwrap().unwrap_err();
+        drop(websocket);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("oversized WebSocket sender should stop after the client closes")
+            .unwrap();
+
+        assert!(matches!(error, tungstenite::Error::Capacity(_)));
     }
 
     #[test]

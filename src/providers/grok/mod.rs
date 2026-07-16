@@ -18,7 +18,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::anthropic::{
     error::json_error,
@@ -37,6 +37,11 @@ use self::translate::{
     request::{GrokReasoning, GrokResponsesRequest, translate_request},
     stream::{SseDecoder, StreamTranslator, stream_error, stream_error_with_message, stream_ping},
 };
+
+const GROK_DOWNSTREAM_CHANNEL_CAPACITY: usize = 3;
+const GROK_DOWNSTREAM_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+const GROK_DOWNSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const GROK_MAX_CUMULATIVE_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 
 const MIN_STREAM_HEARTBEAT: Duration = Duration::from_secs(1);
 const MAX_STREAM_HEARTBEAT: Duration = Duration::from_secs(60);
@@ -373,11 +378,12 @@ where
         heartbeat_interval,
         next_heartbeat,
     };
-    let stream = futures_util::stream::unfold(state, |mut state| async move {
-        state
-            .next_output()
+    let (tx, rx) = mpsc::channel(GROK_DOWNSTREAM_CHANNEL_CAPACITY);
+    tokio::spawn(run_grok_stream_producer(state, tx));
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
             .await
-            .map(|bytes| (Ok::<Bytes, Infallible>(Bytes::from(bytes)), state))
+            .map(|chunk: GrokBudgetedChunk| (Ok::<Bytes, Infallible>(chunk.bytes), rx))
     });
     (
         [
@@ -387,6 +393,111 @@ where
         Body::from_stream(stream),
     )
         .into_response()
+}
+
+struct GrokBudgetedChunk {
+    bytes: Bytes,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+enum GrokChunkSendOutcome {
+    Sent,
+    Closed,
+    Deadline,
+    Stalled,
+    TooLarge,
+}
+
+async fn send_grok_chunk(
+    tx: &mpsc::Sender<GrokBudgetedChunk>,
+    budget: &Arc<Semaphore>,
+    bytes: Vec<u8>,
+    deadline: tokio::time::Instant,
+) -> GrokChunkSendOutcome {
+    if bytes.len() > GROK_DOWNSTREAM_QUEUE_BYTES {
+        return GrokChunkSendOutcome::TooLarge;
+    }
+    let stall_deadline = tokio::time::Instant::now() + GROK_DOWNSTREAM_STALL_TIMEOUT;
+    let permit = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => return GrokChunkSendOutcome::Deadline,
+        _ = tokio::time::sleep_until(stall_deadline) => return GrokChunkSendOutcome::Stalled,
+        _ = tx.closed() => return GrokChunkSendOutcome::Closed,
+        permit = budget.clone().acquire_many_owned(bytes.len() as u32) => match permit {
+            Ok(permit) => permit,
+            Err(_) => return GrokChunkSendOutcome::Closed,
+        },
+    };
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => GrokChunkSendOutcome::Deadline,
+        _ = tokio::time::sleep_until(stall_deadline) => GrokChunkSendOutcome::Stalled,
+        _ = tx.closed() => GrokChunkSendOutcome::Closed,
+        result = tx.send(GrokBudgetedChunk {
+            bytes: Bytes::from(bytes),
+            _permit: Some(permit),
+        }) => if result.is_ok() {
+            GrokChunkSendOutcome::Sent
+        } else {
+            GrokChunkSendOutcome::Closed
+        },
+    }
+}
+
+async fn run_grok_stream_producer(mut state: GrokStreamState, tx: mpsc::Sender<GrokBudgetedChunk>) {
+    let mut terminal_permit = match tx.clone().try_reserve_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => return,
+    };
+    let budget = Arc::new(Semaphore::new(GROK_DOWNSTREAM_QUEUE_BYTES));
+    loop {
+        let output = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            output = state.next_output() => output,
+        };
+        let Some(bytes) = output else {
+            return;
+        };
+        match send_grok_chunk(&tx, &budget, bytes, state.deadline.at()).await {
+            GrokChunkSendOutcome::Sent => {}
+            GrokChunkSendOutcome::Closed => return,
+            GrokChunkSendOutcome::Deadline => {
+                if let Some(retry) = state.retry_state() {
+                    retry.lock().await.mark_terminal();
+                }
+                let error = GrokError::deadline_exceeded(client::GrokErrorStage::Stream);
+                let bytes = state.fail_mapped(error, "deadline", "total_timeout");
+                send_reserved_grok_terminal(&mut terminal_permit, bytes);
+                return;
+            }
+            GrokChunkSendOutcome::Stalled => {
+                if let Some(retry) = state.retry_state() {
+                    retry.lock().await.mark_terminal();
+                }
+                let bytes = state.fail_at("downstream", "consumer_stalled");
+                send_reserved_grok_terminal(&mut terminal_permit, bytes);
+                return;
+            }
+            GrokChunkSendOutcome::TooLarge => {
+                let bytes = state.fail_at("downstream", "event_size_limit");
+                send_reserved_grok_terminal(&mut terminal_permit, bytes);
+                return;
+            }
+        }
+    }
+}
+
+fn send_reserved_grok_terminal(
+    terminal_permit: &mut Option<mpsc::OwnedPermit<GrokBudgetedChunk>>,
+    bytes: Vec<u8>,
+) {
+    if let Some(permit) = terminal_permit.take() {
+        let _ = permit.send(GrokBudgetedChunk {
+            bytes: Bytes::from(bytes),
+            _permit: None,
+        });
+    }
 }
 
 struct GrokStreamState {
@@ -414,6 +525,12 @@ struct GrokStreamState {
 }
 
 impl GrokStreamState {
+    fn retry_state(&self) -> Option<Arc<Mutex<GrokRetryState>>> {
+        self.reconnect
+            .as_ref()
+            .map(|reconnect| reconnect.retry.clone())
+    }
+
     async fn next_output(&mut self) -> Option<Vec<u8>> {
         if self.terminal {
             return None;
@@ -474,6 +591,9 @@ impl GrokStreamState {
                 },
             };
 
+            if cumulative_stream_size_exceeded(self.bytes, chunk.len()) {
+                return Some(self.fail_at("transport", "response_size_limit"));
+            }
             if self.bytes == 0
                 && let Some(monitor) = self.monitor.as_ref()
             {
@@ -800,6 +920,10 @@ impl GrokStreamState {
     }
 }
 
+fn cumulative_stream_size_exceeded(current: u64, next: usize) -> bool {
+    current.saturating_add(next as u64) > GROK_MAX_CUMULATIVE_STREAM_BYTES
+}
+
 type GrokRebuildFuture =
     Pin<Box<dyn Future<Output = Result<GrokByteStream, GrokError>> + Send + 'static>>;
 
@@ -924,7 +1048,7 @@ impl CliHandlers for GrokCli {
     }
     fn logout(&self) -> anyhow::Result<()> {
         let store = file_store();
-        store.clear_auth()?;
+        store.clear_auth_exclusive()?;
         println!("Grok proxy credentials removed");
         Ok(())
     }
@@ -953,6 +1077,18 @@ mod tests {
 
     use super::client::{GrokErrorStage, GrokTimeouts};
     use super::*;
+
+    #[test]
+    fn cumulative_stream_byte_limit_accepts_boundary_and_rejects_next_byte() {
+        assert!(!cumulative_stream_size_exceeded(
+            GROK_MAX_CUMULATIVE_STREAM_BYTES - 1,
+            1
+        ));
+        assert!(cumulative_stream_size_exceeded(
+            GROK_MAX_CUMULATIVE_STREAM_BYTES,
+            1
+        ));
+    }
 
     struct ChannelStream(mpsc::Receiver<Result<Bytes, client::GrokError>>);
 
@@ -1484,6 +1620,27 @@ mod tests {
         .unwrap();
         let _ = body.frame().await.unwrap().unwrap();
         drop(body);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let ready = std::fs::read_dir(temp.path().join("traffic"))
+                    .ok()
+                    .is_some_and(|entries| {
+                        entries.filter_map(Result::ok).any(|entry| {
+                            entry
+                                .path()
+                                .to_string_lossy()
+                                .contains("061-grok-stream-summary")
+                        })
+                    });
+                if ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the body should finalize capture promptly");
 
         let entries: Vec<_> = std::fs::read_dir(temp.path().join("traffic"))
             .unwrap()

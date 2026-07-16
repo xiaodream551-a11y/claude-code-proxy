@@ -13,6 +13,30 @@ pub struct SessionState {
     pub last_seen: u64,
 }
 
+pub struct SessionRoute<T> {
+    pub value: T,
+    pub provider_name: &'static str,
+    commit: bool,
+}
+
+impl<T> SessionRoute<T> {
+    pub fn new(value: T, provider_name: &'static str) -> Self {
+        Self {
+            value,
+            provider_name,
+            commit: true,
+        }
+    }
+
+    pub fn without_commit(value: T) -> Self {
+        Self {
+            value,
+            provider_name: "",
+            commit: false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct SessionStore {
     map: HashMap<String, SessionState>,
@@ -22,54 +46,49 @@ struct SessionStore {
 static SESSIONS: LazyLock<Mutex<SessionStore>> =
     LazyLock::new(|| Mutex::new(SessionStore::default()));
 
-fn now_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    dur.as_millis() as u64
-}
-
-pub fn existing_session(session_id: Option<&str>, now: u64) -> Option<SessionState> {
-    let id = session_id?;
-    let mut store = SESSIONS.lock().expect("session lock");
-    let state = store.map.get(id).cloned()?;
-    if now.saturating_sub(state.last_seen) > SESSION_IDLE_TTL_MS {
-        store.map.remove(id);
-        store.order.retain(|item| item != id);
-        return None;
-    }
-    Some(state)
-}
-
-pub fn existing_session_now(session_id: Option<&str>) -> Option<SessionState> {
-    existing_session(session_id, now_millis())
-}
-
-pub fn record_session_request(
+pub fn route_session_request<T>(
     session_id: Option<&str>,
-    prior: Option<&SessionState>,
-    provider_name: &str,
     model: &str,
     now: u64,
-) -> Option<SessionState> {
-    let id = session_id?;
+    route: impl FnOnce(Option<&AliasProvider>) -> Option<SessionRoute<T>>,
+) -> (Option<T>, Option<SessionState>) {
+    let Some(id) = session_id else {
+        return (route(None).map(|route| route.value), None);
+    };
     let mut store = SESSIONS.lock().expect("session lock");
-    let mut next = prior.cloned().unwrap_or(SessionState {
+    let prior = store.map.get(id).cloned().and_then(|state| {
+        (now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS).then_some(state)
+    });
+    if prior.is_none() && store.map.remove(id).is_some() {
+        store.order.retain(|item| item != id);
+    }
+
+    let selected = route(
+        prior
+            .as_ref()
+            .and_then(|state| state.affinity_provider.as_ref()),
+    );
+    let Some(selected) = selected else {
+        return (None, prior);
+    };
+    if !selected.commit {
+        return (Some(selected.value), prior);
+    }
+    let mut next = prior.unwrap_or(SessionState {
         seq: 0,
         affinity_provider: None,
         last_seen: now,
     });
     next.seq += 1;
-    next.last_seen = now;
-    if is_alias_routable_provider(provider_name)
+    next.last_seen = next.last_seen.max(now);
+    if is_alias_routable_provider(selected.provider_name)
         && !crate::registry::is_anthropic_alias(normalize_incoming_model(model).as_str())
     {
-        next.affinity_provider = Some(match provider_name {
-            "codex" => AliasProvider::Codex,
-            "kimi" => AliasProvider::Kimi,
-            _ => next.affinity_provider.unwrap_or(AliasProvider::Codex),
-        });
+        next.affinity_provider = match selected.provider_name {
+            "codex" => Some(AliasProvider::Codex),
+            "kimi" => Some(AliasProvider::Kimi),
+            _ => next.affinity_provider,
+        };
     }
 
     if !store.map.contains_key(id) {
@@ -85,7 +104,7 @@ pub fn record_session_request(
         }
     }
 
-    Some(next)
+    (Some(selected.value), Some(next))
 }
 
 fn is_alias_routable_provider(name: &str) -> bool {
@@ -99,6 +118,117 @@ pub fn reset_sessions_for_test() {
     store.order.clear();
 }
 
-pub fn affinity_provider_from_session(session: &SessionState) -> Option<AliasProvider> {
-    session.affinity_provider
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+
+    static SESSION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn concurrent_requests_receive_unique_monotonic_sequences() {
+        let _guard = SESSION_TEST_LOCK.lock().expect("session test lock");
+        reset_sessions_for_test();
+        const REQUESTS: usize = 256;
+        let barrier = Arc::new(Barrier::new(REQUESTS));
+        let mut threads = Vec::new();
+        for _ in 0..REQUESTS {
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                let (_, state) =
+                    route_session_request(Some("shared-session"), "gpt-5.6-sol", 1, |_| {
+                        Some(SessionRoute::new((), "codex"))
+                    });
+                state.unwrap().seq
+            }));
+        }
+        let sequences: Vec<u64> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let unique: HashSet<u64> = sequences.iter().copied().collect();
+        assert_eq!(unique.len(), REQUESTS);
+        assert_eq!(unique.iter().copied().min(), Some(1));
+        assert_eq!(unique.iter().copied().max(), Some(REQUESTS as u64));
+    }
+
+    #[test]
+    fn routing_and_affinity_update_are_atomic() {
+        let _guard = SESSION_TEST_LOCK.lock().expect("session test lock");
+        reset_sessions_for_test();
+        let (_, first) = route_session_request(Some("affinity-session"), "kimi-k2.6", 1, |_| {
+            Some(SessionRoute::new((), "kimi"))
+        });
+        assert_eq!(first.unwrap().affinity_provider, Some(AliasProvider::Kimi));
+
+        let (seen, second) =
+            route_session_request(Some("affinity-session"), "sonnet", 2, |affinity| {
+                Some(SessionRoute::new(affinity.copied(), "kimi"))
+            });
+        assert_eq!(seen, Some(Some(AliasProvider::Kimi)));
+        assert_eq!(second.unwrap().seq, 2);
+    }
+
+    #[test]
+    fn expired_session_starts_a_new_sequence() {
+        let _guard = SESSION_TEST_LOCK.lock().expect("session test lock");
+        reset_sessions_for_test();
+        let (_, first) = route_session_request(Some("expired-session"), "gpt-5.6-sol", 1, |_| {
+            Some(SessionRoute::new((), "codex"))
+        });
+        assert_eq!(first.unwrap().seq, 1);
+
+        let (_, next) = route_session_request(
+            Some("expired-session"),
+            "gpt-5.6-sol",
+            SESSION_IDLE_TTL_MS + 2,
+            |_| Some(SessionRoute::new((), "codex")),
+        );
+        assert_eq!(next.unwrap().seq, 1);
+    }
+
+    #[test]
+    fn unroutable_request_does_not_advance_or_rewind_session_state() {
+        let _guard = SESSION_TEST_LOCK.lock().expect("session test lock");
+        reset_sessions_for_test();
+        let (_, first) = route_session_request(Some("stable-session"), "gpt-5.6-sol", 10, |_| {
+            Some(SessionRoute::new((), "codex"))
+        });
+        assert_eq!(first.as_ref().unwrap().seq, 1);
+
+        let (selected, unchanged) =
+            route_session_request::<()>(Some("stable-session"), "unknown-model", 5, |_| None);
+        assert!(selected.is_none());
+        assert_eq!(unchanged.as_ref().unwrap().seq, 1);
+        assert_eq!(unchanged.unwrap().last_seen, 10);
+
+        let (_, next) = route_session_request(Some("stable-session"), "gpt-5.6-sol", 4, |_| {
+            Some(SessionRoute::new((), "codex"))
+        });
+        assert_eq!(next.as_ref().unwrap().seq, 2);
+        assert_eq!(next.unwrap().last_seen, 10);
+    }
+
+    #[test]
+    fn rejected_route_does_not_advance_sequence_or_change_affinity() {
+        let _guard = SESSION_TEST_LOCK.lock().expect("session test lock");
+        reset_sessions_for_test();
+        let (_, first) = route_session_request(Some("gate-session"), "kimi-k2.6", 1, |_| {
+            Some(SessionRoute::new((), "kimi"))
+        });
+        let prior = first.unwrap();
+
+        let (rejected, unchanged) =
+            route_session_request(Some("gate-session"), "gpt-5.6-sol", 2, |_| {
+                Some(SessionRoute::without_commit("provider saturated"))
+            });
+        assert_eq!(rejected, Some("provider saturated"));
+        assert_eq!(unchanged.as_ref().map(|state| state.seq), Some(prior.seq));
+        assert_eq!(
+            unchanged.and_then(|state| state.affinity_provider),
+            prior.affinity_provider
+        );
+    }
 }

@@ -1,12 +1,15 @@
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use url::Url;
 
 use super::login::{CANONICAL_ISSUER, CLIENT_ID};
-use super::token_store::{GrokTokenStore, StoredAuth};
+use super::token_store::{AuthMutationLock, GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
 
 const REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -52,6 +55,10 @@ pub enum GrokAuthError {
         retry_after: Option<String>,
         safe_to_retry: bool,
     },
+    #[error(
+        "Grok authentication is temporarily unavailable: the previous token refresh outcome is unknown; re-authenticate before retrying"
+    )]
+    RefreshOutcomeUnknown,
 }
 
 impl GrokAuthError {
@@ -86,7 +93,7 @@ impl GrokAuthError {
     pub fn kind(&self) -> GrokAuthErrorKind {
         match self {
             Self::CredentialsInvalid { .. } => GrokAuthErrorKind::CredentialsInvalid,
-            Self::Temporary { .. } => GrokAuthErrorKind::Temporary,
+            Self::Temporary { .. } | Self::RefreshOutcomeUnknown => GrokAuthErrorKind::Temporary,
             Self::RateLimited { .. } => GrokAuthErrorKind::RateLimited,
         }
     }
@@ -100,7 +107,7 @@ impl GrokAuthError {
 
     pub fn safe_to_retry(&self) -> bool {
         match self {
-            Self::CredentialsInvalid { .. } => false,
+            Self::CredentialsInvalid { .. } | Self::RefreshOutcomeUnknown => false,
             Self::Temporary { safe_to_retry, .. } | Self::RateLimited { safe_to_retry, .. } => {
                 *safe_to_retry
             }
@@ -112,8 +119,36 @@ pub struct GrokAuthManager<S: AuthStorage<StoredAuth>> {
     store: GrokTokenStore<S>,
     client: reqwest::Client,
     refresh_lock: Arc<Mutex<()>>,
+    refresh_safety: Arc<Mutex<RefreshSafetyState>>,
     issuer: String,
     require_https: bool,
+}
+
+#[derive(Default)]
+struct RefreshSafetyState {
+    volatile_auth: Option<VolatileAuth>,
+    ambiguous_generation: Option<[u8; 32]>,
+}
+
+#[derive(Clone)]
+struct VolatileAuth {
+    auth: StoredAuth,
+    base_generation: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct RefreshPendingMarker {
+    auth_generation_sha256: String,
+}
+
+fn filesystem_auth_path(auth_path: &str) -> Option<&Path> {
+    let path = Path::new(auth_path);
+    path.is_absolute().then_some(path)
+}
+
+fn refresh_pending_path(auth_path: &str) -> Option<PathBuf> {
+    filesystem_auth_path(auth_path)
+        .map(|path| PathBuf::from(format!("{}.refresh-pending.json", path.display())))
 }
 
 impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
@@ -140,6 +175,7 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
             store,
             client,
             refresh_lock: Arc::new(Mutex::new(())),
+            refresh_safety: Arc::new(Mutex::new(RefreshSafetyState::default())),
             issuer,
             require_https,
         })
@@ -155,17 +191,24 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
     }
 
     pub async fn get_auth(&self) -> Result<StoredAuth, GrokAuthError> {
-        let auth = self
-            .store
-            .load_auth()
-            .map_err(|error| {
-                GrokAuthError::temporary(format!("failed to load stored credentials: {error}"))
-            })?
-            .ok_or_else(|| GrokAuthError::credentials_invalid("not authenticated"))?;
+        self.get_auth_with_status().await.map(|(auth, _)| auth)
+    }
+
+    pub async fn get_auth_with_status(&self) -> Result<(StoredAuth, bool), GrokAuthError> {
+        let auth = match self.load_current_auth().await {
+            Ok(auth) => auth,
+            Err(GrokAuthError::RefreshOutcomeUnknown) => {
+                // A pending marker may belong to another request currently holding
+                // the refresh lock. Join that single-flight before deciding that it
+                // is an orphan left by a crashed process.
+                return self.refresh(false, None).await.map(|auth| (auth, true));
+            }
+            Err(error) => return Err(error),
+        };
         if auth.expires_at_ms > now_ms().saturating_add(REFRESH_SKEW_MS) {
-            return Ok(auth);
+            return Ok((auth, false));
         }
-        self.refresh(false, None).await
+        self.refresh(false, None).await.map(|auth| (auth, true))
     }
 
     pub async fn force_refresh(&self, rejected_access: &str) -> Result<StoredAuth, GrokAuthError> {
@@ -178,17 +221,17 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         rejected_access: Option<&str>,
     ) -> Result<StoredAuth, GrokAuthError> {
         let _guard = self.refresh_lock.lock().await;
-        let auth = self
-            .store
-            .load_auth()
-            .map_err(|error| {
-                GrokAuthError::temporary(format!("failed to load stored credentials: {error}"))
-            })?
-            .ok_or_else(|| GrokAuthError::credentials_invalid("not authenticated"))?;
+        let _file_lock = self.acquire_refresh_file_lock().await?;
+        let auth = self.load_current_auth().await?;
         if (!force && auth.expires_at_ms > now_ms().saturating_add(REFRESH_SKEW_MS))
             || rejected_access.is_some_and(|access| auth.access != access)
         {
             return Ok(auth);
+        }
+        if self.has_unpersisted_rotation(&auth).await {
+            return Err(GrokAuthError::temporary(
+                "rotated credentials are usable in memory but are not durably persisted; refusing another refresh",
+            ));
         }
         if auth.issuer.trim_end_matches('/') != self.issuer || auth.client_id != CLIENT_ID {
             return Err(GrokAuthError::credentials_invalid(
@@ -254,6 +297,7 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
                 "OIDC token endpoint is outside the canonical issuer",
             ));
         }
+        self.mark_refresh_pending(&auth).await?;
         let refresh_response = self
             .client
             .post(endpoint)
@@ -263,23 +307,31 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
                 ("client_id", auth.client_id.as_str()),
             ])
             .send()
-            .await
-            .map_err(|error| {
-                let message = format!("token refresh request failed: {error}");
+            .await;
+        let refresh_response = match refresh_response {
+            Ok(response) => response,
+            Err(error) => {
                 if error.is_connect() {
+                    self.clear_refresh_pending(&auth).await?;
+                }
+                let message = format!("token refresh request failed: {error}");
+                return Err(if error.is_connect() {
                     GrokAuthError::retryable_temporary(message)
                 } else {
                     GrokAuthError::temporary(message)
-                }
-            })?;
+                });
+            }
+        };
         let refresh_status = refresh_response.status();
         if refresh_status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            self.clear_refresh_pending(&auth).await?;
             return Err(GrokAuthError::rate_limited(
                 "token refresh was rate limited",
                 retry_after(refresh_response.headers()),
             ));
         }
         if !refresh_status.is_success() {
+            self.clear_refresh_pending(&auth).await?;
             let oauth_error = if refresh_status == reqwest::StatusCode::BAD_REQUEST {
                 refresh_response
                     .json::<OAuthErrorResponse>()
@@ -303,28 +355,213 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
                 refresh_status.as_u16()
             )));
         }
-        let refreshed: RefreshResponse = refresh_response.json().await.map_err(|error| {
-            GrokAuthError::temporary(format!("token refresh response is invalid: {error}"))
-        })?;
+        let refreshed: RefreshResponse = match refresh_response.json().await {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                return Err(GrokAuthError::temporary(format!(
+                    "token refresh response is invalid: {error}"
+                )));
+            }
+        };
         if refreshed.access_token.is_empty() || refreshed.expires_in == 0 {
             return Err(GrokAuthError::temporary(
                 "token refresh response omitted required fields",
             ));
         }
+        let base_generation = auth_generation_fingerprint(&auth);
         let updated = StoredAuth {
             access: refreshed.access_token,
             refresh: refreshed
                 .refresh_token
                 .filter(|token| !token.is_empty())
-                .unwrap_or(auth.refresh),
+                .unwrap_or_else(|| auth.refresh.clone()),
             expires_at_ms: now_ms().saturating_add(refreshed.expires_in.saturating_mul(1000)),
-            issuer: auth.issuer,
-            client_id: auth.client_id,
+            issuer: auth.issuer.clone(),
+            client_id: auth.client_id.clone(),
         };
-        self.store.save_auth(updated.clone()).map_err(|error| {
-            GrokAuthError::temporary(format!("failed to save refreshed credentials: {error}"))
-        })?;
+        {
+            let mut safety = self.refresh_safety.lock().await;
+            safety.volatile_auth = Some(VolatileAuth {
+                auth: updated.clone(),
+                base_generation,
+            });
+        }
+        match self.store.save_auth(updated.clone()) {
+            Ok(()) => {
+                self.clear_refresh_pending(&auth).await?;
+                self.refresh_safety.lock().await.volatile_auth = None;
+            }
+            Err(error) => {
+                crate::logging::create_logger("grok").warn(
+                    "auth_persistence_degraded",
+                    Some(serde_json::Map::from_iter([
+                        ("message".to_string(), serde_json::json!(error.to_string())),
+                        (
+                            "authPath".to_string(),
+                            serde_json::json!(self.store.auth_path()),
+                        ),
+                    ])),
+                );
+            }
+        }
         Ok(updated)
+    }
+
+    async fn load_current_auth(&self) -> Result<StoredAuth, GrokAuthError> {
+        let stored = self.store.load_auth();
+        let volatile = self.refresh_safety.lock().await.volatile_auth.clone();
+        if let Some(volatile) = volatile {
+            match stored.as_ref() {
+                Ok(Some(disk_auth))
+                    if auth_generation_fingerprint(disk_auth) == volatile.base_generation =>
+                {
+                    if self.store.save_auth(volatile.auth.clone()).is_ok() {
+                        self.clear_refresh_pending(disk_auth).await?;
+                        self.refresh_safety.lock().await.volatile_auth = None;
+                    }
+                    return Ok(volatile.auth);
+                }
+                Err(_) => return Ok(volatile.auth),
+                _ => {
+                    // A logout or explicit re-auth changed the durable generation;
+                    // do not let an older volatile token shadow that user action.
+                    self.refresh_safety.lock().await.volatile_auth = None;
+                }
+            }
+        }
+
+        let auth = stored
+            .map_err(|error| {
+                GrokAuthError::temporary(format!("failed to load stored credentials: {error}"))
+            })?
+            .ok_or_else(|| GrokAuthError::credentials_invalid("not authenticated"))?;
+        let fingerprint = auth_generation_fingerprint(&auth);
+        let mut safety = self.refresh_safety.lock().await;
+        if safety.ambiguous_generation == Some(fingerprint) {
+            return Err(GrokAuthError::RefreshOutcomeUnknown);
+        }
+        if safety.ambiguous_generation.is_some() {
+            safety.ambiguous_generation = None;
+        }
+        drop(safety);
+
+        if let Some(pending) = read_refresh_pending(&self.store.auth_path())? {
+            if pending == fingerprint {
+                return Err(GrokAuthError::RefreshOutcomeUnknown);
+            }
+            clear_refresh_pending_file(&self.store.auth_path())?;
+        }
+        Ok(auth)
+    }
+
+    async fn acquire_refresh_file_lock(&self) -> Result<AuthMutationLock, GrokAuthError> {
+        loop {
+            match AuthMutationLock::try_acquire(&self.store.auth_path()) {
+                Ok(lock) => return Ok(lock),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => {
+                    return Err(GrokAuthError::temporary(format!(
+                        "failed to acquire the OAuth refresh lock: {error}"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn has_unpersisted_rotation(&self, auth: &StoredAuth) -> bool {
+        self.refresh_safety
+            .lock()
+            .await
+            .volatile_auth
+            .as_ref()
+            .is_some_and(|volatile| {
+                auth_generation_fingerprint(&volatile.auth) == auth_generation_fingerprint(auth)
+            })
+    }
+
+    async fn mark_refresh_pending(&self, auth: &StoredAuth) -> Result<(), GrokAuthError> {
+        let fingerprint = auth_generation_fingerprint(auth);
+        if let Some(path) = refresh_pending_path(&self.store.auth_path()) {
+            crate::auth::write_atomically(
+                path.to_string_lossy().as_ref(),
+                &RefreshPendingMarker {
+                    auth_generation_sha256: hex::encode(fingerprint),
+                },
+            )
+            .map_err(|error| {
+                GrokAuthError::temporary(format!(
+                    "failed to persist the OAuth refresh pending marker: {error}"
+                ))
+            })?;
+        }
+        self.refresh_safety.lock().await.ambiguous_generation = Some(fingerprint);
+        Ok(())
+    }
+
+    async fn clear_refresh_pending(&self, auth: &StoredAuth) -> Result<(), GrokAuthError> {
+        clear_refresh_pending_file(&self.store.auth_path())?;
+        let fingerprint = auth_generation_fingerprint(auth);
+        let mut safety = self.refresh_safety.lock().await;
+        if safety.ambiguous_generation == Some(fingerprint) {
+            safety.ambiguous_generation = None;
+        }
+        Ok(())
+    }
+}
+
+fn auth_generation_fingerprint(auth: &StoredAuth) -> [u8; 32] {
+    let encoded = serde_json::to_vec(auth).expect("StoredAuth is serializable");
+    Sha256::digest(encoded).into()
+}
+
+fn read_refresh_pending(auth_path: &str) -> Result<Option<[u8; 32]>, GrokAuthError> {
+    let Some(path) = refresh_pending_path(auth_path) else {
+        return Ok(None);
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(GrokAuthError::temporary(format!(
+                "failed to read the OAuth refresh pending marker: {error}"
+            )));
+        }
+    };
+    let marker: RefreshPendingMarker = serde_json::from_slice(&bytes).map_err(|error| {
+        GrokAuthError::temporary(format!("OAuth refresh pending marker is invalid: {error}"))
+    })?;
+    let decoded = hex::decode(marker.auth_generation_sha256).map_err(|error| {
+        GrokAuthError::temporary(format!("OAuth refresh pending marker is invalid: {error}"))
+    })?;
+    decoded.try_into().map(Some).map_err(|_| {
+        GrokAuthError::temporary("OAuth refresh pending marker has an invalid fingerprint")
+    })
+}
+
+fn clear_refresh_pending_file(auth_path: &str) -> Result<(), GrokAuthError> {
+    let Some(path) = refresh_pending_path(auth_path) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| {
+                        GrokAuthError::temporary(format!(
+                            "failed to durably clear the OAuth refresh pending marker: {error}"
+                        ))
+                    })?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(GrokAuthError::temporary(format!(
+            "failed to clear the OAuth refresh pending marker: {error}"
+        ))),
     }
 }
 
@@ -352,10 +589,12 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::InMemoryAuthStore;
+    use crate::auth::{AuthStorage, FileAuthStore, InMemoryAuthStore};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
+    use tempfile::TempDir;
 
     fn auth(access: &str) -> StoredAuth {
         StoredAuth {
@@ -441,6 +680,107 @@ mod tests {
         (issuer, server)
     }
 
+    fn spawn_successful_refresh_server(
+        drop_token_response: bool,
+    ) -> (String, thread::JoinHandle<()>) {
+        spawn_successful_refresh_server_with_delay(drop_token_response, Duration::ZERO)
+    }
+
+    fn spawn_successful_refresh_server_with_delay(
+        drop_token_response: bool,
+        token_delay: Duration,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server_issuer = issuer.clone();
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().unwrap();
+            read_request(&mut discovery);
+            let body = serde_json::json!({
+                "issuer": server_issuer.clone(),
+                "token_endpoint": format!("{server_issuer}/oauth/token")
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            discovery.write_all(response.as_bytes()).unwrap();
+
+            let (mut token, _) = listener.accept().unwrap();
+            read_request(&mut token);
+            thread::sleep(token_delay);
+            if drop_token_response {
+                return;
+            }
+            let body = serde_json::json!({
+                "access_token": "rotated-access",
+                "refresh_token": "rotated-refresh",
+                "expires_in": 3600
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            token.write_all(response.as_bytes()).unwrap();
+        });
+        (issuer, server)
+    }
+
+    #[derive(Clone)]
+    struct FailingSaveStore {
+        inner: InMemoryAuthStore<StoredAuth>,
+        fail: Arc<AtomicBool>,
+    }
+
+    struct FailingFileSaveStore {
+        inner: FileAuthStore<StoredAuth>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl AuthStorage<StoredAuth> for FailingFileSaveStore {
+        fn load(&self) -> anyhow::Result<Option<StoredAuth>> {
+            self.inner.load()
+        }
+
+        fn save(&self, value: StoredAuth) -> anyhow::Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("synthetic persistence failure");
+            }
+            self.inner.save(value)
+        }
+
+        fn clear(&self) -> anyhow::Result<()> {
+            self.inner.clear()
+        }
+
+        fn path(&self) -> String {
+            self.inner.path()
+        }
+    }
+
+    impl AuthStorage<StoredAuth> for FailingSaveStore {
+        fn load(&self) -> anyhow::Result<Option<StoredAuth>> {
+            self.inner.load()
+        }
+
+        fn save(&self, value: StoredAuth) -> anyhow::Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("synthetic persistence failure");
+            }
+            self.inner.save(value)
+        }
+
+        fn clear(&self) -> anyhow::Result<()> {
+            self.inner.clear()
+        }
+
+        fn path(&self) -> String {
+            "synthetic-failing-store".to_string()
+        }
+    }
+
     async fn refresh_error(
         token_status: u16,
         retry_after: Option<&str>,
@@ -490,6 +830,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_expired_auth_requests_join_one_refresh() {
+        let (issuer, server) =
+            spawn_successful_refresh_server_with_delay(false, Duration::from_millis(100));
+        let store = GrokTokenStore::new(InMemoryAuthStore::new());
+        store
+            .save_auth(StoredAuth {
+                access: "expired-access".into(),
+                refresh: "expired-refresh".into(),
+                expires_at_ms: 0,
+                issuer: issuer.clone(),
+                client_id: CLIENT_ID.into(),
+            })
+            .unwrap();
+        let manager = Arc::new(GrokAuthManager::new_for_test(store, issuer).unwrap());
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut requests = Vec::new();
+        for _ in 0..16 {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            requests.push(tokio::spawn(async move {
+                barrier.wait().await;
+                manager.get_auth().await
+            }));
+        }
+        for request in requests {
+            assert_eq!(request.await.unwrap().unwrap().access, "rotated-access");
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn rejected_refresh_is_classified_as_invalid_credentials() {
         let error = refresh_error(400, None, "invalid_grant").await;
 
@@ -519,5 +890,173 @@ mod tests {
 
         assert_eq!(error.kind(), GrokAuthErrorKind::Temporary);
         assert_eq!(error.retry_after(), None);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_token_response_is_not_replayed_by_a_later_request() {
+        let (issuer, server) = spawn_successful_refresh_server(true);
+        let store = GrokTokenStore::new(InMemoryAuthStore::new());
+        store
+            .save_auth(StoredAuth {
+                access: "expired-access".into(),
+                refresh: "possibly-rotated-refresh".into(),
+                expires_at_ms: 0,
+                issuer: issuer.clone(),
+                client_id: CLIENT_ID.into(),
+            })
+            .unwrap();
+        let manager = GrokAuthManager::new_for_test(store, issuer).unwrap();
+
+        let first = manager.get_auth().await.unwrap_err();
+        assert_eq!(first.kind(), GrokAuthErrorKind::Temporary);
+        server.join().unwrap();
+
+        let second = manager.get_auth().await.unwrap_err();
+        assert!(second.to_string().contains("outcome is unknown"));
+        assert!(!second.safe_to_retry());
+    }
+
+    #[tokio::test]
+    async fn rotated_credentials_remain_usable_when_persistence_fails() {
+        let (issuer, server) = spawn_successful_refresh_server(false);
+        let inner = InMemoryAuthStore::new();
+        inner
+            .save(StoredAuth {
+                access: "expired-access".into(),
+                refresh: "old-refresh".into(),
+                expires_at_ms: 0,
+                issuer: issuer.clone(),
+                client_id: CLIENT_ID.into(),
+            })
+            .unwrap();
+        let fail = Arc::new(AtomicBool::new(true));
+        let storage = FailingSaveStore {
+            inner: inner.clone(),
+            fail,
+        };
+        let manager = GrokAuthManager::new_for_test(GrokTokenStore::new(storage), issuer).unwrap();
+
+        let refreshed = manager.get_auth().await.unwrap();
+        assert_eq!(refreshed.access, "rotated-access");
+        assert_eq!(refreshed.refresh, "rotated-refresh");
+        server.join().unwrap();
+
+        let reused = manager.get_auth().await.unwrap();
+        assert_eq!(reused.access, "rotated-access");
+        assert_eq!(inner.load().unwrap().unwrap().refresh, "old-refresh");
+    }
+
+    #[tokio::test]
+    async fn persistence_degraded_state_blocks_a_second_rotation_and_stays_fail_closed() {
+        let (issuer, server) = spawn_successful_refresh_server(false);
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("grok/auth.json");
+        let auth_path_string = auth_path.to_string_lossy().into_owned();
+        let initial = StoredAuth {
+            access: "expired-access".into(),
+            refresh: "durable-refresh".into(),
+            expires_at_ms: 0,
+            issuer: issuer.clone(),
+            client_id: CLIENT_ID.into(),
+        };
+        let initial_store = FileAuthStore::new(auth_path_string.clone(), auth_path_string.clone());
+        initial_store.save(initial.clone()).unwrap();
+        let storage = FailingFileSaveStore {
+            inner: FileAuthStore::new(auth_path_string.clone(), auth_path_string.clone()),
+            fail: Arc::new(AtomicBool::new(true)),
+        };
+        let manager =
+            GrokAuthManager::new_for_test(GrokTokenStore::new(storage), issuer.clone()).unwrap();
+
+        assert_eq!(manager.get_auth().await.unwrap().access, "rotated-access");
+        server.join().unwrap();
+        let second = manager.force_refresh("rotated-access").await.unwrap_err();
+        assert!(second.to_string().contains("not durably persisted"));
+        assert!(!second.safe_to_retry());
+        assert_eq!(
+            read_refresh_pending(&auth_path_string).unwrap(),
+            Some(auth_generation_fingerprint(&initial))
+        );
+        drop(manager);
+
+        let restarted_store = GrokTokenStore::new(FileAuthStore::new(
+            auth_path_string.clone(),
+            auth_path_string.clone(),
+        ));
+        let restarted = GrokAuthManager::new_for_test(restarted_store, issuer).unwrap();
+        assert!(matches!(
+            restarted.get_auth().await,
+            Err(GrokAuthError::RefreshOutcomeUnknown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_refresh_future_leaves_a_durable_fail_closed_marker() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let server_issuer = issuer.clone();
+        let (token_seen_tx, token_seen_rx) = tokio::sync::oneshot::channel();
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().unwrap();
+            read_request(&mut discovery);
+            let body = serde_json::json!({
+                "issuer": server_issuer.clone(),
+                "token_endpoint": format!("{server_issuer}/oauth/token")
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            discovery.write_all(response.as_bytes()).unwrap();
+
+            let (mut token, _) = listener.accept().unwrap();
+            read_request(&mut token);
+            let _ = token_seen_tx.send(());
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("grok/auth.json");
+        let auth_path_string = auth_path.to_string_lossy().into_owned();
+        let initial = StoredAuth {
+            access: "expired-access".into(),
+            refresh: "possibly-rotated-refresh".into(),
+            expires_at_ms: 0,
+            issuer: issuer.clone(),
+            client_id: CLIENT_ID.into(),
+        };
+        let store = GrokTokenStore::new(FileAuthStore::new(
+            auth_path_string.clone(),
+            auth_path_string.clone(),
+        ));
+        store.save_auth(initial.clone()).unwrap();
+        let manager = GrokAuthManager::new_for_test(store, issuer.clone()).unwrap();
+        let refresh = tokio::spawn(async move { manager.get_auth().await });
+        token_seen_rx.await.unwrap();
+        refresh.abort();
+        let _ = refresh.await;
+        server.join().unwrap();
+
+        let restarted_store = GrokTokenStore::new(FileAuthStore::new(
+            auth_path_string.clone(),
+            auth_path_string.clone(),
+        ));
+        let restarted = GrokAuthManager::new_for_test(restarted_store, issuer).unwrap();
+        let blocked = restarted.get_auth().await.unwrap_err();
+        assert!(blocked.to_string().contains("outcome is unknown"));
+        assert!(refresh_pending_path(&auth_path_string).unwrap().exists());
+
+        restarted
+            .store()
+            .save_auth(StoredAuth {
+                access: "explicitly-reimported-access".into(),
+                expires_at_ms: now_ms().saturating_add(3_600_000),
+                ..initial
+            })
+            .unwrap();
+        let recovered = restarted.get_auth().await.unwrap();
+        assert_eq!(recovered.access, "explicitly-reimported-access");
+        assert!(!refresh_pending_path(&auth_path_string).unwrap().exists());
     }
 }

@@ -219,6 +219,8 @@ const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const LIVE_HTTP_ERROR_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LIVE_HTTP_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_BUFFERED_HTTP_SUCCESS_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BUFFERED_HTTP_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub(super) const DEFAULT_CODEX_TOTAL_TIMEOUT_MS: u64 = 540_000;
 pub(super) const CODEX_TOTAL_TIMEOUT_DETAIL: &str = "codex_total_timeout";
 pub(super) const CODEX_LIVE_ATTEMPT_BUDGET_DETAIL: &str = "codex_live_attempt_budget_exhausted";
@@ -350,6 +352,7 @@ pub struct CodexHttpClient {
     client: reqwest::Client,
     auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
     base_url: String,
+    websocket_circuit_key: String,
     header_timeout_ms: u64,
     body_idle_timeout_ms: u64,
     total_timeout_ms: u64,
@@ -366,13 +369,15 @@ impl Default for CodexHttpClient {
 impl CodexHttpClient {
     pub fn new() -> Self {
         let timeout_ms = 60_000;
+        let base_url = config::codex_base_url(CODEX_API_ENDPOINT);
         Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .build()
                 .expect("failed to create HTTP client"),
             auth_manager: CodexAuthManager::new(file_store()),
-            base_url: config::codex_base_url(CODEX_API_ENDPOINT),
+            websocket_circuit_key: websocket_circuit_key_for_url(&base_url),
+            base_url,
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             total_timeout_ms: config::codex_total_timeout_ms(DEFAULT_CODEX_TOTAL_TIMEOUT_MS),
@@ -385,10 +390,12 @@ impl CodexHttpClient {
         auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
         base_url: String,
     ) -> Self {
+        let websocket_circuit_key = websocket_circuit_key_for_url(&base_url);
         Self {
             client,
             auth_manager,
             base_url,
+            websocket_circuit_key,
             header_timeout_ms: 60_000,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             total_timeout_ms: config::codex_total_timeout_ms(DEFAULT_CODEX_TOTAL_TIMEOUT_MS),
@@ -405,10 +412,12 @@ impl CodexHttpClient {
         total_timeout_ms: u64,
         header_timeout_retries: u32,
     ) -> Self {
+        let websocket_circuit_key = websocket_circuit_key_for_url(&base_url);
         Self {
             client,
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
+            websocket_circuit_key,
             header_timeout_ms,
             body_idle_timeout_ms,
             total_timeout_ms,
@@ -418,6 +427,10 @@ impl CodexHttpClient {
 
     pub fn auth_manager(&self) -> &CodexAuthManager<DefaultCodexAuthStore> {
         &self.auth_manager
+    }
+
+    pub(super) fn websocket_circuit_key(&self) -> &str {
+        &self.websocket_circuit_key
     }
 
     pub async fn post_codex(
@@ -563,8 +576,8 @@ impl CodexHttpClient {
                     )
                 }
                 CodexTransport::Auto => {
-                    let circuit_key = ctx.session_id.as_deref();
-                    if circuit_key.is_some_and(super::websocket::codex_websocket_circuit_open) {
+                    let circuit_key = self.websocket_circuit_key();
+                    if super::websocket::codex_websocket_circuit_open(circuit_key) {
                         log_websocket_circuit_fallback(ctx);
                         active_transport = CodexTransport::Http;
                         let body_json = serialize_request(body)?;
@@ -601,13 +614,11 @@ impl CodexHttpClient {
 
                         match ws_result {
                             Ok(response) => {
-                                if let Some(key) = circuit_key {
-                                    super::websocket::record_codex_websocket_success(key);
-                                }
+                                super::websocket::record_codex_websocket_success(circuit_key);
                                 (Ok(response), CodexTransport::WebSocket)
                             }
                             Err(err) if should_fallback_to_http(&err) => {
-                                record_auto_websocket_failure(ctx, &err);
+                                record_auto_websocket_failure(ctx, circuit_key, &err);
                                 if physical_attempts >= MAX_BUFFERED_TRANSPORT_ATTEMPTS {
                                     (Err(err), CodexTransport::WebSocket)
                                 } else {
@@ -636,7 +647,7 @@ impl CodexHttpClient {
                                 }
                             }
                             Err(err) => {
-                                record_auto_websocket_failure(ctx, &err);
+                                record_auto_websocket_failure(ctx, circuit_key, &err);
                                 (Err(err), CodexTransport::WebSocket)
                             }
                         }
@@ -903,7 +914,7 @@ impl CodexHttpClient {
         let body = body.clone();
         let ctx = ctx.clone();
         let continuation = continuation.cloned();
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (tx, rx) = tokio::sync::mpsc::channel(super::LIVE_EVENT_CHANNEL_CAPACITY);
         tokio::spawn(async move {
             client
                 .coordinate_live_websocket_events(
@@ -1214,7 +1225,7 @@ impl CodexHttpClient {
                 });
             }
 
-            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let (tx, rx) = tokio::sync::mpsc::channel(super::LIVE_EVENT_CHANNEL_CAPACITY);
             let ctx = ctx.clone();
             let body_idle_timeout = Duration::from_millis(self.body_idle_timeout_ms);
             tokio::spawn(async move {
@@ -1292,6 +1303,23 @@ impl CodexHttpClient {
             })?;
 
         let status = resp.status().as_u16();
+        let body_limit = if (200..300).contains(&status) {
+            MAX_BUFFERED_HTTP_SUCCESS_BODY_BYTES
+        } else {
+            MAX_BUFFERED_HTTP_ERROR_BODY_BYTES
+        };
+        if resp
+            .content_length()
+            .is_some_and(|length| length > body_limit as u64)
+        {
+            return Err(CodexError {
+                status: 502,
+                message: "Codex HTTP response exceeded the buffered body limit".to_string(),
+                detail: Some("http_response_size_limit".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            });
+        }
         let headers: Vec<(String, String)> = resp
             .headers()
             .iter()
@@ -1333,6 +1361,15 @@ impl CodexHttpClient {
                 }
                 response_started = true;
             }
+            if body_bytes.len().saturating_add(chunk.len()) > body_limit {
+                return Err(CodexError {
+                    status: 502,
+                    message: "Codex HTTP response exceeded the buffered body limit".to_string(),
+                    detail: Some("http_response_size_limit".to_string()),
+                    retry_after: None,
+                    origin: CodexErrorOrigin::Http,
+                });
+            }
             body_bytes.extend_from_slice(&chunk);
         }
 
@@ -1364,10 +1401,13 @@ impl CodexLiveSseDecoder {
         self.pending.extend_from_slice(bytes);
         let mut payloads = Vec::new();
         while let Some(end) = next_sse_record_end(&self.pending) {
+            if end > super::MAX_LIVE_EVENT_BYTES {
+                return Err("Codex SSE event exceeded the incremental decode limit".to_string());
+            }
             let record: Vec<u8> = self.pending.drain(..end).collect();
             decode_codex_sse_record(&record, &mut payloads)?;
         }
-        if self.pending.len() > crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES {
+        if self.pending.len() > super::MAX_LIVE_EVENT_BYTES {
             return Err("Codex SSE event exceeded the incremental decode limit".to_string());
         }
         Ok(payloads)
@@ -1380,6 +1420,9 @@ impl CodexLiveSseDecoder {
         self.pending.extend_from_slice(b"\n\n");
         let mut payloads = Vec::new();
         while let Some(end) = next_sse_record_end(&self.pending) {
+            if end > super::MAX_LIVE_EVENT_BYTES {
+                return Err("Codex SSE event exceeded the incremental decode limit".to_string());
+            }
             let record: Vec<u8> = self.pending.drain(..end).collect();
             decode_codex_sse_record(&record, &mut payloads)?;
         }
@@ -1828,6 +1871,12 @@ fn serialize_request(body: &ResponsesRequest) -> Result<String, CodexError> {
     })
 }
 
+fn websocket_circuit_key_for_url(base_url: &str) -> String {
+    reqwest::Url::parse(base_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| base_url.trim_end_matches('/').to_string())
+}
+
 fn should_retry_codex_status(status: u16) -> bool {
     should_retry_status(status) || status == 529
 }
@@ -1929,18 +1978,19 @@ pub(super) fn log_websocket_circuit_fallback(ctx: &RequestContext) {
     );
 }
 
-pub(super) fn record_auto_websocket_failure(ctx: &RequestContext, err: &CodexError) -> bool {
-    let Some(key) = ctx.session_id.as_deref() else {
-        return false;
-    };
+pub(super) fn record_auto_websocket_failure(
+    ctx: &RequestContext,
+    circuit_key: &str,
+    err: &CodexError,
+) -> bool {
     if !should_fallback_to_http(err) {
         // A non-transport response proves the WebSocket path is reachable and
         // breaks a run of consecutive transport failures.
-        super::websocket::record_codex_websocket_success(key);
+        super::websocket::record_codex_websocket_success(circuit_key);
         return false;
     }
 
-    let opened = super::websocket::record_codex_websocket_failure(key);
+    let opened = super::websocket::record_codex_websocket_failure(circuit_key);
     if opened {
         create_logger("codex").warn(
             "websocket_circuit_opened",
@@ -2433,14 +2483,14 @@ mod tests {
             stream.write_all(body).await.unwrap();
         });
 
-        let mut ctx = http_test_context();
-        let circuit_key = "auto-circuit-http-test";
-        ctx.session_id = Some(circuit_key.to_string());
+        let ctx = http_test_context();
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let circuit_key = client.websocket_circuit_key().to_string();
         for _ in 0..super::super::websocket::WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD {
-            super::super::websocket::record_codex_websocket_failure(circuit_key);
+            super::super::websocket::record_codex_websocket_failure(&circuit_key);
         }
 
-        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+        let response = client
             .post_codex_with_transport(
                 &buffered_test_request(),
                 &ctx,
@@ -2450,7 +2500,7 @@ mod tests {
             .await
             .unwrap();
         server.await.unwrap();
-        super::super::websocket::record_codex_websocket_success(circuit_key);
+        super::super::websocket::record_codex_websocket_success(&circuit_key);
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"data: keep\n\n");
@@ -2828,6 +2878,102 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "response.created");
         assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn incremental_http_sse_decoder_rejects_complete_oversized_event() {
+        let mut decoder = CodexLiveSseDecoder::default();
+        let mut event = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"".to_vec();
+        event.resize(super::super::MAX_LIVE_EVENT_BYTES + 1, b'x');
+        event.extend_from_slice(b"\"}\n\n");
+
+        let error = decoder.push(&event).unwrap_err();
+
+        assert!(error.contains("incremental decode limit"));
+    }
+
+    #[tokio::test]
+    async fn buffered_http_rejects_declared_oversized_success_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                MAX_BUFFERED_HTTP_SUCCESS_BODY_BYTES + 1
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+
+        let error = match client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+        {
+            Ok(_) => panic!("declared oversized response must fail"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+
+        assert_eq!(error.detail.as_deref(), Some("http_response_size_limit"));
+        assert!(!is_retryable_transport_error(&error));
+    }
+
+    #[tokio::test]
+    async fn buffered_http_rejects_chunked_body_at_cumulative_limit_plus_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let data = vec![b'x'; 64 * 1024];
+            let mut remaining = MAX_BUFFERED_HTTP_SUCCESS_BODY_BYTES + 1;
+            while remaining > 0 {
+                let size = remaining.min(data.len());
+                let header = format!("{size:x}\r\n");
+                if stream.write_all(header.as_bytes()).await.is_err()
+                    || stream.write_all(&data[..size]).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    break;
+                }
+                remaining -= size;
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+        let client = http_test_client(format!("http://{addr}/responses"), 5_000);
+        client.auth_manager().set_test_auth(http_test_auth());
+
+        let error = match client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+        {
+            Ok(_) => panic!("chunked oversized response must fail"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+
+        assert_eq!(error.detail.as_deref(), Some("http_response_size_limit"));
+        assert!(!is_retryable_transport_error(&error));
     }
 
     #[tokio::test]
@@ -3463,6 +3609,18 @@ mod tests {
     }
 
     #[test]
+    fn websocket_breaker_key_is_normalized_to_the_upstream_origin() {
+        assert_eq!(
+            websocket_circuit_key_for_url("https://example.test/v1/responses?lane=fast"),
+            websocket_circuit_key_for_url("https://example.test/other/path")
+        );
+        assert_ne!(
+            websocket_circuit_key_for_url("https://example.test/responses"),
+            websocket_circuit_key_for_url("https://example.test:8443/responses")
+        );
+    }
+
+    #[test]
     fn websocket_pool_reset_clears_initial_stale_state() {
         let missing_state = super::super::continuation::ContinuationCandidate {
             turn_id: None,
@@ -3681,13 +3839,28 @@ mod tests {
             retry_after: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         };
-        let mut ctx = http_test_context();
+        let ctx = http_test_context();
         let circuit_key = "auto-circuit-reset-test";
-        ctx.session_id = Some(circuit_key.into());
-        assert!(!record_auto_websocket_failure(&ctx, &response_timeout));
-        assert!(!record_auto_websocket_failure(&ctx, &response_timeout));
-        assert!(!record_auto_websocket_failure(&ctx, &bad_request));
-        assert!(!record_auto_websocket_failure(&ctx, &response_timeout));
+        assert!(!record_auto_websocket_failure(
+            &ctx,
+            circuit_key,
+            &response_timeout
+        ));
+        assert!(!record_auto_websocket_failure(
+            &ctx,
+            circuit_key,
+            &response_timeout
+        ));
+        assert!(!record_auto_websocket_failure(
+            &ctx,
+            circuit_key,
+            &bad_request
+        ));
+        assert!(!record_auto_websocket_failure(
+            &ctx,
+            circuit_key,
+            &response_timeout
+        ));
         super::super::websocket::record_codex_websocket_success(circuit_key);
     }
 

@@ -430,17 +430,23 @@ impl GrokClient {
                     self.auth.force_refresh(rejected_access),
                 )
                 .await?
+                .map(|auth| (auth, true))
             } else {
                 run_before_deadline(
                     deadline,
                     retry.clone(),
                     GrokErrorStage::Auth,
-                    self.auth.get_auth(),
+                    self.auth.get_auth_with_status(),
                 )
                 .await?
             };
             let auth_failure = match result {
-                Ok(auth) => return Ok(auth),
+                Ok((auth, refreshed)) => {
+                    if refreshed {
+                        retry.lock().await.auth_refresh_succeeded = true;
+                    }
+                    return Ok(auth);
+                }
                 Err(error) => error,
             };
             let safe_to_retry = auth_failure.safe_to_retry();
@@ -1143,14 +1149,20 @@ fn responses_url(base_url: &str) -> anyhow::Result<String> {
 
 fn auth_error(error: GrokAuthError) -> GrokError {
     let kind = error.kind();
+    let safe_to_retry = error.safe_to_retry();
     let retry_after = error.retry_after().map(str::to_string);
     let message = error.to_string();
-    match kind {
+    let error = match kind {
         GrokAuthErrorKind::CredentialsInvalid => GrokError::auth(format!(
             "{message}. Re-authenticate with the Grok CLI and import the session again"
         )),
         GrokAuthErrorKind::Temporary => GrokError::auth_temporary(message),
         GrokAuthErrorKind::RateLimited => GrokError::auth_rate_limited(retry_after, message),
+    };
+    if safe_to_retry {
+        error
+    } else {
+        error.into_terminal("unsafe authentication outcome")
     }
 }
 
@@ -1581,9 +1593,79 @@ mod tests {
         );
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.origin, GrokErrorOrigin::Auth);
+        assert!(!error.is_retryable());
         let state = retry.lock().await;
         assert_eq!(state.transient_failures, 0);
         assert_eq!(state.wire_attempt, 0);
+        assert!(state.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn proactive_refresh_then_model_401_does_not_rotate_twice() {
+        let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth_addr = auth_listener.local_addr().unwrap();
+        let issuer = format!("http://{auth_addr}");
+        let server_issuer = issuer.clone();
+        let auth_server = tokio::spawn(async move {
+            let (mut discovery, _) = auth_listener.accept().await.unwrap();
+            let _ = read_http_request(&mut discovery).await;
+            let body = serde_json::json!({
+                "issuer": server_issuer.clone(),
+                "token_endpoint": format!("{server_issuer}/oauth/token")
+            })
+            .to_string();
+            write_http_response(&mut discovery, "200 OK", "", body.as_bytes()).await;
+
+            let (mut token, _) = auth_listener.accept().await.unwrap();
+            let _ = read_http_request(&mut token).await;
+            let body = br#"{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}"#;
+            write_http_response(&mut token, "200 OK", "", body).await;
+
+            tokio::time::timeout(Duration::from_millis(300), auth_listener.accept())
+                .await
+                .is_err()
+        });
+
+        let model_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model_addr = model_listener.local_addr().unwrap();
+        let model_server = tokio::spawn(async move {
+            let (mut model, _) = model_listener.accept().await.unwrap();
+            let request = read_http_request(&mut model).await;
+            assert!(String::from_utf8_lossy(&request).contains("Bearer rotated-access"));
+            write_http_response(&mut model, "401 Unauthorized", "", b"").await;
+            tokio::time::timeout(Duration::from_millis(300), model_listener.accept())
+                .await
+                .is_err()
+        });
+
+        let (client, _temp) = test_client_with_auth_issuer(
+            &format!("http://{model_addr}/v1"),
+            issuer,
+            0,
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let error = match client
+            .post_with_retry(&sample_body(), None, retry.clone())
+            .await
+        {
+            Ok(_) => panic!("a rejected refreshed token must be terminal"),
+            Err(error) => error,
+        };
+
+        assert!(auth_server.await.unwrap(), "OAuth refresh was repeated");
+        assert!(model_server.await.unwrap(), "model request was repeated");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(!error.is_retryable());
+        let state = retry.lock().await;
+        assert_eq!(state.wire_attempt, 1);
+        assert!(state.auth_refresh_succeeded);
         assert!(state.is_terminal());
     }
 

@@ -5,6 +5,17 @@ use std::path::{Path, PathBuf};
 
 use crate::paths;
 
+fn environment() -> HashMap<String, String> {
+    std::env::vars_os()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasProvider {
     Codex,
@@ -42,6 +53,25 @@ struct FileConfig {
     pub codex: Option<CodexConfig>,
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
+    pub server: Option<ServerResourceConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+struct ServerResourceConfig {
+    #[serde(rename = "maxRequestBodyBytes")]
+    pub max_request_body_bytes: Option<u64>,
+    #[serde(rename = "maxBufferedRequestBytes")]
+    pub max_buffered_request_bytes: Option<u64>,
+    #[serde(rename = "maxConcurrentRequests")]
+    pub max_concurrent_requests: Option<u64>,
+    #[serde(rename = "maxConcurrentPerProvider")]
+    pub max_concurrent_per_provider: Option<u64>,
+    #[serde(rename = "maxConcurrentPerSession")]
+    pub max_concurrent_per_session: Option<u64>,
+    #[serde(rename = "requestBodyIdleTimeoutMs")]
+    pub request_body_idle_timeout_ms: Option<u64>,
+    #[serde(rename = "requestBodyTotalTimeoutMs")]
+    pub request_body_total_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -136,7 +166,7 @@ fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
 pub fn load_config() -> LoadedConfig {
     let config_dir = paths::config_dir();
     let file = read_file_config(&config_dir);
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
 
     let mut out = LoadedConfig {
         bind_address: "127.0.0.1".to_string(),
@@ -220,7 +250,7 @@ pub fn log_stderr() -> bool {
 
 pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     let file = read_file_config(&cfg.config_dir);
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     let mut out = Vec::new();
     if env.contains_key("CCP_BIND_ADDRESS") {
         out.push("bindAddress (env)".to_string());
@@ -275,6 +305,27 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_GROK_STREAM_HEARTBEAT_MS") {
         out.push("CCP_GROK_STREAM_HEARTBEAT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_MAX_REQUEST_BODY_BYTES") {
+        out.push("CCP_MAX_REQUEST_BODY_BYTES (env)".to_string());
+    }
+    if env.contains_key("CCP_MAX_BUFFERED_REQUEST_BYTES") {
+        out.push("CCP_MAX_BUFFERED_REQUEST_BYTES (env)".to_string());
+    }
+    if env.contains_key("CCP_MAX_CONCURRENT_REQUESTS") {
+        out.push("CCP_MAX_CONCURRENT_REQUESTS (env)".to_string());
+    }
+    if env.contains_key("CCP_MAX_CONCURRENT_PER_PROVIDER") {
+        out.push("CCP_MAX_CONCURRENT_PER_PROVIDER (env)".to_string());
+    }
+    if env.contains_key("CCP_MAX_CONCURRENT_PER_SESSION") {
+        out.push("CCP_MAX_CONCURRENT_PER_SESSION (env)".to_string());
+    }
+    if env.contains_key("CCP_REQUEST_BODY_IDLE_TIMEOUT_MS") {
+        out.push("CCP_REQUEST_BODY_IDLE_TIMEOUT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS") {
+        out.push("CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS (env)".to_string());
     }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
@@ -355,12 +406,119 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 out.push(format!("grok.streamHeartbeatMs: {heartbeat_ms}"));
             }
         }
+        if let Some(server) = file_cfg.server {
+            if let Some(value) = server.max_request_body_bytes {
+                out.push(format!("server.maxRequestBodyBytes: {value}"));
+            }
+            if let Some(value) = server.max_buffered_request_bytes {
+                out.push(format!("server.maxBufferedRequestBytes: {value}"));
+            }
+            if let Some(value) = server.max_concurrent_requests {
+                out.push(format!("server.maxConcurrentRequests: {value}"));
+            }
+            if let Some(value) = server.max_concurrent_per_provider {
+                out.push(format!("server.maxConcurrentPerProvider: {value}"));
+            }
+            if let Some(value) = server.max_concurrent_per_session {
+                out.push(format!("server.maxConcurrentPerSession: {value}"));
+            }
+            if let Some(value) = server.request_body_idle_timeout_ms {
+                out.push(format!("server.requestBodyIdleTimeoutMs: {value}"));
+            }
+            if let Some(value) = server.request_body_total_timeout_ms {
+                out.push(format!("server.requestBodyTotalTimeoutMs: {value}"));
+            }
+        }
     }
     out
 }
 
+fn server_positive_u64(
+    env_key: &str,
+    file_value: impl FnOnce(&ServerResourceConfig) -> Option<u64>,
+    default: u64,
+    maximum: u64,
+) -> u64 {
+    if let Ok(raw) = std::env::var(env_key)
+        && let Ok(value) = raw.parse::<u64>()
+        && value > 0
+    {
+        return value.min(maximum);
+    }
+    if let Some(server) = read_file_config(&paths::config_dir()).and_then(|file| file.server)
+        && let Some(value) = file_value(&server)
+        && value > 0
+    {
+        return value.min(maximum);
+    }
+    default
+}
+
+pub fn max_request_body_bytes(default: usize) -> usize {
+    server_positive_u64(
+        "CCP_MAX_REQUEST_BODY_BYTES",
+        |server| server.max_request_body_bytes,
+        default as u64,
+        256 * 1024 * 1024,
+    ) as usize
+}
+
+pub fn max_buffered_request_bytes(default: usize) -> usize {
+    server_positive_u64(
+        "CCP_MAX_BUFFERED_REQUEST_BYTES",
+        |server| server.max_buffered_request_bytes,
+        default as u64,
+        1024 * 1024 * 1024,
+    ) as usize
+}
+
+pub fn max_concurrent_requests(default: usize) -> usize {
+    server_positive_u64(
+        "CCP_MAX_CONCURRENT_REQUESTS",
+        |server| server.max_concurrent_requests,
+        default as u64,
+        4096,
+    ) as usize
+}
+
+pub fn max_concurrent_per_provider(default: usize) -> usize {
+    server_positive_u64(
+        "CCP_MAX_CONCURRENT_PER_PROVIDER",
+        |server| server.max_concurrent_per_provider,
+        default as u64,
+        4096,
+    ) as usize
+}
+
+pub fn max_concurrent_per_session(default: usize) -> usize {
+    server_positive_u64(
+        "CCP_MAX_CONCURRENT_PER_SESSION",
+        |server| server.max_concurrent_per_session,
+        default as u64,
+        4096,
+    ) as usize
+}
+
+pub fn request_body_idle_timeout_ms(default: u64) -> u64 {
+    server_positive_u64(
+        "CCP_REQUEST_BODY_IDLE_TIMEOUT_MS",
+        |server| server.request_body_idle_timeout_ms,
+        default,
+        120_000,
+    )
+}
+
+pub fn request_body_total_timeout_ms(default: u64) -> u64 {
+    server_positive_u64(
+        "CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS",
+        |server| server.request_body_total_timeout_ms,
+        default,
+        300_000,
+    )
+}
+
 pub fn grok_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_GROK_BASE_URL") {
         return raw.clone();
     }
@@ -373,7 +531,7 @@ pub fn grok_base_url() -> String {
 }
 
 pub fn grok_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_GROK_CLIENT_VERSION") {
         return raw.clone();
     }
@@ -458,7 +616,7 @@ pub fn is_verbose() -> bool {
 }
 
 pub fn kimi_oauth_host() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_KIMI_OAUTH_HOST") {
         return raw.clone();
     }
@@ -473,7 +631,7 @@ pub fn kimi_oauth_host() -> String {
 }
 
 pub fn kimi_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_KIMI_BASE_URL") {
         return raw.clone();
     }
@@ -488,7 +646,7 @@ pub fn kimi_base_url() -> String {
 }
 
 pub fn kimi_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_KIMI_USER_AGENT") {
         return raw.clone();
     }
@@ -510,7 +668,7 @@ pub fn kimi_user_agent(default: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn codex_base_url(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_BASE_URL") {
         return raw.clone();
     }
@@ -528,7 +686,7 @@ pub fn codex_base_url(default: &str) -> String {
 }
 
 pub fn codex_originator(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_ORIGINATOR") {
         return raw.clone();
     }
@@ -543,7 +701,7 @@ pub fn codex_originator(default: &str) -> String {
 }
 
 pub fn codex_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_USER_AGENT") {
         return raw.clone();
     }
@@ -561,7 +719,7 @@ pub fn codex_user_agent(default: &str) -> String {
 }
 
 pub fn codex_previous_response_id() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -576,7 +734,7 @@ pub fn codex_previous_response_id() -> bool {
 }
 
 pub fn codex_service_tier() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
         return Some(raw.clone());
     }
@@ -606,7 +764,7 @@ pub fn codex_responses_lite() -> bool {
 }
 
 pub fn codex_effort() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_EFFORT") {
         return Some(raw.clone());
     }
@@ -620,7 +778,7 @@ pub fn codex_effort() -> Option<String> {
 }
 
 pub fn codex_reasoning_summary() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .filter(|raw| !raw.is_empty())
@@ -638,7 +796,7 @@ pub fn codex_reasoning_summary() -> Option<String> {
 }
 
 pub fn codex_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_MODEL") {
         return Some(raw.clone());
     }
@@ -726,7 +884,7 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
 }
 
 pub fn codex_transport() -> CodexTransport {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
         && let Some(transport) = parse_codex_transport(raw)
     {
@@ -747,7 +905,7 @@ pub fn codex_transport() -> CodexTransport {
 // ---------------------------------------------------------------------------
 
 pub fn cursor_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CURSOR_BASE_URL") {
         return raw.clone();
     }
@@ -762,7 +920,7 @@ pub fn cursor_base_url() -> String {
 }
 
 pub fn cursor_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CURSOR_CLIENT_VERSION") {
         return raw.clone();
     }
@@ -777,7 +935,7 @@ pub fn cursor_client_version() -> String {
 }
 
 pub fn cursor_agent_bundle() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CURSOR_AGENT_BUNDLE") {
         return Some(raw.clone());
     }
@@ -817,6 +975,13 @@ mod tests {
             std::env::remove_var("CCP_GROK_BODY_IDLE_TIMEOUT_MS");
             std::env::remove_var("CCP_GROK_TOTAL_TIMEOUT_MS");
             std::env::remove_var("CCP_GROK_STREAM_HEARTBEAT_MS");
+            std::env::remove_var("CCP_MAX_REQUEST_BODY_BYTES");
+            std::env::remove_var("CCP_MAX_BUFFERED_REQUEST_BYTES");
+            std::env::remove_var("CCP_MAX_CONCURRENT_REQUESTS");
+            std::env::remove_var("CCP_MAX_CONCURRENT_PER_PROVIDER");
+            std::env::remove_var("CCP_MAX_CONCURRENT_PER_SESSION");
+            std::env::remove_var("CCP_REQUEST_BODY_IDLE_TIMEOUT_MS");
+            std::env::remove_var("CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS");
         }
     }
 
@@ -1186,5 +1351,31 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("CCP_GROK_CONNECT_TIMEOUT_MS (env)"))
         );
+    }
+
+    #[test]
+    fn server_resource_limits_read_config_env_and_clamp() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"server":{"maxRequestBodyBytes":1048576,"maxBufferedRequestBytes":8388608,"maxConcurrentRequests":64,"maxConcurrentPerProvider":32,"maxConcurrentPerSession":8,"requestBodyIdleTimeoutMs":1500,"requestBodyTotalTimeoutMs":5000}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(max_request_body_bytes(1), 1_048_576);
+        assert_eq!(max_buffered_request_bytes(1), 8_388_608);
+        assert_eq!(max_concurrent_requests(1), 64);
+        assert_eq!(max_concurrent_per_provider(1), 32);
+        assert_eq!(max_concurrent_per_session(1), 8);
+        assert_eq!(request_body_idle_timeout_ms(1), 1_500);
+        assert_eq!(request_body_total_timeout_ms(1), 5_000);
+
+        let _global = EnvGuard::set("CCP_MAX_CONCURRENT_REQUESTS", "999999");
+        let _wait = EnvGuard::set("CCP_REQUEST_BODY_IDLE_TIMEOUT_MS", "999999");
+        assert_eq!(max_concurrent_requests(1), 4096);
+        assert_eq!(request_body_idle_timeout_ms(1), 120_000);
     }
 }

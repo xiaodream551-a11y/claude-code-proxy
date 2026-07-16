@@ -30,7 +30,16 @@ pub struct TrafficCaptureOptions {
 }
 
 pub fn traffic_capture_enabled() -> bool {
-    traffic_capture_enabled_for_env(&std::env::vars().collect())
+    traffic_capture_enabled_for_env(
+        &std::env::vars_os()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect(),
+    )
 }
 
 pub fn traffic_capture_enabled_for_env(env: &std::collections::HashMap<String, String>) -> bool {

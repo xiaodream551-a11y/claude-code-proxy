@@ -12,6 +12,7 @@ use super::reducer::{
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
 const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
+const MAX_LIVE_TRANSLATOR_INPUT_BYTES: usize = 8 * 1024 * 1024;
 
 enum LiveBlock {
     Text {
@@ -63,6 +64,7 @@ pub struct LiveStreamTranslator {
     web_searches: Vec<LiveWebSearch>,
     web_search_results: Vec<LiveWebSearchResult>,
     deferred_text: Vec<(usize, String)>,
+    upstream_input_bytes: usize,
     finished: bool,
 }
 
@@ -82,6 +84,7 @@ impl LiveStreamTranslator {
             web_searches: Vec::new(),
             web_search_results: Vec::new(),
             deferred_text: Vec::new(),
+            upstream_input_bytes: 0,
             finished: false,
         }
     }
@@ -94,6 +97,13 @@ impl LiveStreamTranslator {
         if self.finished {
             return Ok(Vec::new());
         }
+        let input_bytes = serde_json::to_vec(payload)
+            .map_err(|error| format!("Codex stream event could not be encoded: {error}"))?
+            .len();
+        if self.upstream_input_bytes.saturating_add(input_bytes) > MAX_LIVE_TRANSLATOR_INPUT_BYTES {
+            return Err("Codex live response exceeded the cumulative size limit".to_string());
+        }
+        self.upstream_input_bytes += input_bytes;
 
         let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let mut out = Vec::new();
@@ -1411,6 +1421,24 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, "rate limit reached");
+    }
+
+    #[test]
+    fn cumulative_live_input_is_bounded_across_many_valid_deltas() {
+        let mut translator = LiveStreamTranslator::new("msg_limit", "gpt-5.5");
+        let event = json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "x".repeat(512 * 1024),
+        });
+        let event_bytes = serde_json::to_vec(&event).unwrap().len();
+        let accepted = MAX_LIVE_TRANSLATOR_INPUT_BYTES / event_bytes;
+        for _ in 0..accepted {
+            translator.accept(&event, None).unwrap();
+        }
+        let error = translator.accept(&event, None).unwrap_err();
+        assert!(error.contains("cumulative size limit"));
+        assert!(translator.upstream_input_bytes <= MAX_LIVE_TRANSLATOR_INPUT_BYTES);
     }
 
     #[test]

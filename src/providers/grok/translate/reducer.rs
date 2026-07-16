@@ -1,11 +1,98 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::stream::SseDecoder;
 
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_INCOMPLETE_TOOL_CALLS: usize = 128;
+const MAX_SEQUENCE_HISTORY: usize = 1024;
+
+#[derive(Default)]
+enum SequenceState {
+    #[default]
+    Undecided,
+    Legacy,
+    Sequenced {
+        last: u64,
+        digests: HashMap<u64, [u8; 32]>,
+        order: VecDeque<u64>,
+    },
+}
+
+impl SequenceState {
+    fn accept(&mut self, value: &Value) -> anyhow::Result<bool> {
+        let sequence = value.get("sequence_number");
+        match (&mut *self, sequence) {
+            (Self::Undecided, None) => {
+                *self = Self::Legacy;
+                Ok(true)
+            }
+            (Self::Legacy, None) => Ok(true),
+            (Self::Legacy, Some(_)) => {
+                anyhow::bail!("Grok stream started sequence numbering after legacy events")
+            }
+            (Self::Sequenced { .. }, None) => {
+                anyhow::bail!("Grok sequenced stream event omitted sequence_number")
+            }
+            (Self::Undecided, Some(sequence)) => {
+                let sequence = parse_sequence(sequence)?;
+                let digest = event_digest(value)?;
+                *self = Self::Sequenced {
+                    last: sequence,
+                    digests: HashMap::from([(sequence, digest)]),
+                    order: VecDeque::from([sequence]),
+                };
+                Ok(true)
+            }
+            (
+                Self::Sequenced {
+                    last,
+                    digests,
+                    order,
+                },
+                Some(sequence),
+            ) => {
+                let sequence = parse_sequence(sequence)?;
+                let next_digest = event_digest(value)?;
+                if let Some(known_digest) = digests.get(&sequence) {
+                    if next_digest == *known_digest {
+                        return Ok(false);
+                    }
+                    anyhow::bail!("Grok stream repeated sequence_number with different payload")
+                }
+                if sequence < *last {
+                    anyhow::bail!("Grok stream sequence_number moved backwards")
+                }
+                if sequence != last.saturating_add(1) {
+                    anyhow::bail!("Grok stream sequence_number has a gap")
+                }
+                *last = sequence;
+                digests.insert(sequence, next_digest);
+                order.push_back(sequence);
+                while order.len() > MAX_SEQUENCE_HISTORY {
+                    if let Some(evicted) = order.pop_front() {
+                        digests.remove(&evicted);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+}
+
+fn parse_sequence(value: &Value) -> anyhow::Result<u64> {
+    value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Grok sequence_number is not an unsigned integer"))
+}
+
+fn event_digest(value: &Value) -> anyhow::Result<[u8; 32]> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| anyhow::anyhow!("failed to canonicalize Grok event: {error}"))?;
+    Ok(Sha256::digest(encoded).into())
+}
 
 #[derive(Debug, Clone)]
 pub enum ReducerEvent {
@@ -46,6 +133,7 @@ impl ReducerEvent {
 
 #[derive(Default)]
 pub struct Reducer {
+    sequence: SequenceState,
     next_index: usize,
     active: Option<(String, usize)>,
     active_text: String,
@@ -63,6 +151,9 @@ pub struct Reducer {
 
 impl Reducer {
     pub fn push(&mut self, value: Value) -> anyhow::Result<Vec<ReducerEvent>> {
+        if !self.sequence.accept(&value)? {
+            return Ok(vec![]);
+        }
         if self.completed {
             anyhow::bail!("event after terminal completion");
         }
@@ -513,6 +604,148 @@ pub fn reduce_upstream_bytes(bytes: &[u8]) -> anyhow::Result<Vec<ReducerEvent>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_validator_ignores_only_the_same_number_and_payload() {
+        let mut reducer = Reducer::default();
+        let first = serde_json::from_str(
+            r#"{"type":"response.output_text.delta","delta":"yes 😊","sequence_number":7}"#,
+        )
+        .unwrap();
+        let reordered = serde_json::from_str(
+            r#"{"sequence_number":7,"delta":"yes 😊","type":"response.output_text.delta"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(reducer.push(first).unwrap().len(), 2);
+        assert!(reducer.push(reordered).unwrap().is_empty());
+
+        let repeated_text_new_sequence = serde_json::json!({
+            "sequence_number": 8,
+            "type": "response.output_text.delta",
+            "delta": "yes 😊"
+        });
+        let events = reducer.push(repeated_text_new_sequence).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ReducerEvent::TextDelta(_, text)] if text == "yes 😊"
+        ));
+        let old_duplicate = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "yes 😊",
+            "sequence_number": 7
+        });
+        assert!(reducer.push(old_duplicate).unwrap().is_empty());
+
+        let same_text_again = serde_json::json!({
+            "sequence_number": 9,
+            "type": "response.output_text.delta",
+            "delta": "yes 😊"
+        });
+        assert!(matches!(
+            reducer.push(same_text_again).unwrap().as_slice(),
+            [ReducerEvent::TextDelta(_, text)] if text == "yes 😊"
+        ));
+    }
+
+    #[test]
+    fn sequence_validator_rejects_conflicts_backwards_and_mixed_streams() {
+        let mut conflict = Reducer::default();
+        conflict
+            .push(serde_json::json!({
+                "sequence_number": 1,
+                "type": "response.output_text.delta",
+                "delta": "a"
+            }))
+            .unwrap();
+        let error = conflict
+            .push(serde_json::json!({
+                "sequence_number": 1,
+                "type": "response.output_text.delta",
+                "delta": "b"
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("different payload"));
+
+        let mut backwards = Reducer::default();
+        backwards
+            .push(serde_json::json!({
+                "sequence_number": 5,
+                "type": "response.created"
+            }))
+            .unwrap();
+        assert!(
+            backwards
+                .push(serde_json::json!({
+                    "sequence_number": 4,
+                    "type": "response.in_progress"
+                }))
+                .unwrap_err()
+                .to_string()
+                .contains("backwards")
+        );
+
+        let mut mixed = Reducer::default();
+        mixed
+            .push(serde_json::json!({"type": "response.created"}))
+            .unwrap();
+        assert!(
+            mixed
+                .push(serde_json::json!({
+                    "sequence_number": 1,
+                    "type": "response.in_progress"
+                }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sequence_validator_deduplicates_tool_deltas_before_state_mutation() {
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "sequence_number": 0,
+                "type": "response.output_item.added",
+                "item": {"type":"function_call","call_id":"call_1","name":"lookup"}
+            }))
+            .unwrap();
+        let delta = serde_json::json!({
+            "sequence_number": 1,
+            "type": "response.function_call_arguments.delta",
+            "call_id": "call_1",
+            "delta": "{}"
+        });
+        assert_eq!(reducer.push(delta.clone()).unwrap().len(), 1);
+        assert!(reducer.push(delta).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sequence_validator_rejects_gaps_and_ignores_repeated_terminal_event() {
+        let mut gap = Reducer::default();
+        gap.push(serde_json::json!({
+            "sequence_number": 3,
+            "type": "response.created"
+        }))
+        .unwrap();
+        let error = gap
+            .push(serde_json::json!({
+                "sequence_number": 5,
+                "type": "response.output_text.delta",
+                "delta": "unsafe gap"
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("gap"));
+
+        let mut terminal = Reducer::default();
+        let completed = serde_json::json!({
+            "sequence_number": 12,
+            "type": "response.completed",
+            "response": {"usage":{"input_tokens":1,"output_tokens":1}}
+        });
+        assert!(!terminal.push(completed.clone()).unwrap().is_empty());
+        assert!(terminal.push(completed).unwrap().is_empty());
+    }
+
     #[test]
     fn grok_reducer_handles_text_tool_and_completion() {
         let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
