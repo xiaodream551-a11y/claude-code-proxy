@@ -148,7 +148,7 @@ serves 401s until a token is stored.
 
 - `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4-mini`, `gpt-5.2` → **codex**
 - `kimi-for-coding`, `kimi-k2.6`, `k2.6` → **kimi**
-- `grok-composer-2.5-fast`, `grok-4.5` → **grok**
+- `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.5-high` → **grok**
 - `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5`, `composer-2.5-fast`, `cursor:<model-id>`, `cursor-plan:<model-id>`, `cursor-ask:<model-id>` → **cursor**
 
 An unknown model returns a 400 listing the supported ids. There is no
@@ -359,9 +359,11 @@ Auth:
 
 Upstream: `https://cli-chat-proxy.grok.com/v1/responses` (Responses API).
 
-Supported model ids are `grok-composer-2.5-fast` and `grok-4.5`. Model access
-can vary by account and region. The proxy translates Claude Code messages,
-function tools, tool results, thinking, token counts, and streaming events.
+Supported model ids are `grok-composer-2.5-fast`, `grok-4.5`, and the
+`grok-4.5-high` profile. The profile sends `grok-4.5` upstream and forces its
+reasoning effort to `high`, regardless of the incoming effort. Model access can
+vary by account and region. The proxy translates Claude Code messages, function
+tools, tool results, thinking, token counts, and streaming events.
 Grok reasoning text appears in Claude Code as Anthropic `thinking` blocks.
 Claude Code reasoning effort is forwarded as Responses `reasoning.effort` for
 Grok 4.5; `xhigh` and `max` are capped at Grok's supported `high` level.

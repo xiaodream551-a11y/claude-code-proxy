@@ -28,8 +28,8 @@ use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 use self::auth::token_store::file_store;
 use self::translate::{
     accumulate::accumulate_response_with_traffic,
-    model_allowlist::{assert_allowed_model, resolve_model},
-    request::translate_request,
+    model_allowlist::{assert_allowed_model, resolve_model_request},
+    request::{GrokReasoning, translate_request},
     stream::{SseDecoder, StreamTranslator, stream_error},
 };
 
@@ -77,15 +77,15 @@ impl Provider for GrokProvider {
     }
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let requested = body.model.clone().unwrap_or_else(|| "grok-4.5".into());
-        let resolved = resolve_model(&requested);
-        if let Err(error) = assert_allowed_model(&resolved) {
+        let resolved = resolve_model_request(&requested);
+        if let Err(error) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 error.to_string(),
             );
         }
-        let translated = match translate_request(&body, resolved.clone()) {
+        let mut translated = match translate_request(&body, resolved.model.clone()) {
             Ok(value) => value,
             Err(error) => {
                 return json_error(
@@ -95,11 +95,16 @@ impl Provider for GrokProvider {
                 );
             }
         };
+        if let Some(effort) = resolved.reasoning_effort {
+            translated.reasoning = Some(GrokReasoning {
+                effort: effort.into(),
+            });
+        }
         crate::logging::create_logger("grok").info(
             "request_configuration",
             Some(serde_json::Map::from_iter([
                 ("reqId".into(), serde_json::json!(ctx.req_id)),
-                ("model".into(), serde_json::json!(resolved)),
+                ("model".into(), serde_json::json!(resolved.model)),
                 (
                     "reasoningEffort".into(),
                     serde_json::json!(
@@ -113,7 +118,7 @@ impl Provider for GrokProvider {
             ])),
         );
         if let Some(monitor) = &ctx.monitor {
-            monitor.model_resolved(&ctx.req_id, &resolved);
+            monitor.model_resolved(&ctx.req_id, &resolved.model);
             monitor.upstream_started(&ctx.req_id);
         }
         let upstream = match self.client.post(&translated, ctx.traffic.clone()).await {
@@ -173,15 +178,15 @@ impl Provider for GrokProvider {
     }
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let requested = body.model.clone().unwrap_or_else(|| "grok-4.5".into());
-        let resolved = resolve_model(&requested);
-        if let Err(error) = assert_allowed_model(&resolved) {
+        let resolved = resolve_model_request(&requested);
+        if let Err(error) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 error.to_string(),
             );
         }
-        let translated = match translate_request(&body, resolved) {
+        let translated = match translate_request(&body, resolved.model) {
             Ok(value) => value,
             Err(error) => {
                 return json_error(

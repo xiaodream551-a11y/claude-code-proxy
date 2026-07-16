@@ -49,7 +49,7 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "k2.6"];
-pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
+pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5", "grok-4.5-high"];
 
 pub struct Registry {
     alias_provider: AliasProvider,
@@ -347,6 +347,13 @@ mod tests {
             assert!(p.is_some(), "{model} should route to a provider");
             assert_eq!(p.expect("provider").name(), "codex");
         }
+    }
+
+    #[test]
+    fn grok_effort_alias_routes_to_grok() {
+        let registry = Registry::new(AliasProvider::Codex);
+        let provider = registry.provider_for_model("grok-4.5-high", None);
+        assert_eq!(provider.expect("provider").name(), "grok");
     }
 
     #[test]
