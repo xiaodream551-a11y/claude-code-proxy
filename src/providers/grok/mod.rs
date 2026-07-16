@@ -16,6 +16,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
+use tokio::sync::Mutex;
 
 use crate::anthropic::{
     error::json_error,
@@ -23,13 +24,15 @@ use crate::anthropic::{
 };
 use crate::monitor::MonitorHandle;
 use crate::provider::{CliHandlers, Provider, RequestContext};
+use crate::retry::{compute_backoff_delay, sleep};
 use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 
 use self::auth::token_store::file_store;
+use self::client::{GrokByteStream, GrokError, GrokRetryState};
 use self::translate::{
     accumulate::accumulate_response_with_traffic,
     model_allowlist::{assert_allowed_model, resolve_model_request},
-    request::{GrokReasoning, translate_request},
+    request::{GrokReasoning, GrokResponsesRequest, translate_request},
     stream::{SseDecoder, StreamTranslator, stream_error},
 };
 
@@ -121,57 +124,81 @@ impl Provider for GrokProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
             monitor.upstream_started(&ctx.req_id);
         }
-        let upstream = match self.client.post(&translated, ctx.traffic.clone()).await {
+
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let upstream = match self
+            .client
+            .post_with_retry(&translated, ctx.traffic.clone(), retry.clone())
+            .await
+        {
             Ok(response) => response,
             Err(error) => return map_error(error),
         };
+
         if body.stream {
-            stream_response(
-                upstream,
-                format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+            let reconnect = Some(GrokReconnectContext {
+                client: self.client.clone(),
+                request: Arc::new(translated),
+                traffic: ctx.traffic.clone(),
+                retry,
+            });
+            stream_body(
+                upstream.into_stream(),
+                message_id,
                 requested,
                 ctx.monitor.clone(),
                 ctx.req_id.clone(),
                 ctx.traffic.clone(),
+                reconnect,
             )
         } else {
-            let upstream_bytes = match upstream.into_bytes().await {
-                Ok(bytes) => bytes,
+            match read_non_streaming_body(
+                self.client.clone(),
+                translated,
+                upstream,
+                ctx.traffic.clone(),
+                retry,
+            )
+            .await
+            {
+                Ok(upstream_bytes) => {
+                    match accumulate_response_with_traffic(
+                        &upstream_bytes,
+                        &format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                        &requested,
+                        ctx.traffic.as_deref(),
+                    ) {
+                        Ok(value) => {
+                            if let Some(traffic) = ctx.traffic.as_ref() {
+                                traffic.write_json("051-downstream-response", &value);
+                            }
+                            if let Some(monitor) = ctx.monitor.as_ref() {
+                                monitor.usage_updated(
+                                    &ctx.req_id,
+                                    value
+                                        .pointer("/usage/input_tokens")
+                                        .and_then(|v| v.as_u64()),
+                                    value
+                                        .pointer("/usage/output_tokens")
+                                        .and_then(|v| v.as_u64()),
+                                );
+                            }
+                            (StatusCode::OK, Json(value)).into_response()
+                        }
+                        Err(_) => {
+                            write_error(ctx.traffic.as_deref(), "accumulate", "invalid_response");
+                            json_error(
+                                StatusCode::BAD_GATEWAY,
+                                "api_error",
+                                "Grok response is invalid",
+                            )
+                        }
+                    }
+                }
                 Err(error) => {
                     write_error(ctx.traffic.as_deref(), "body_read", "transport");
-                    return map_error(error);
-                }
-            };
-            match accumulate_response_with_traffic(
-                &upstream_bytes,
-                &format!("msg_{}", uuid::Uuid::new_v4().simple()),
-                &requested,
-                ctx.traffic.as_deref(),
-            ) {
-                Ok(value) => {
-                    if let Some(traffic) = ctx.traffic.as_ref() {
-                        traffic.write_json("051-downstream-response", &value);
-                    }
-                    if let Some(monitor) = ctx.monitor.as_ref() {
-                        monitor.usage_updated(
-                            &ctx.req_id,
-                            value
-                                .pointer("/usage/input_tokens")
-                                .and_then(|v| v.as_u64()),
-                            value
-                                .pointer("/usage/output_tokens")
-                                .and_then(|v| v.as_u64()),
-                        );
-                    }
-                    (StatusCode::OK, Json(value)).into_response()
-                }
-                Err(_) => {
-                    write_error(ctx.traffic.as_deref(), "accumulate", "invalid_response");
-                    json_error(
-                        StatusCode::BAD_GATEWAY,
-                        "api_error",
-                        "Grok response is invalid",
-                    )
+                    map_error(error)
                 }
             }
         }
@@ -210,22 +237,47 @@ impl Provider for GrokProvider {
     }
 }
 
-fn stream_response(
-    response: client::GrokResponse,
-    message_id: String,
-    model: String,
-    monitor: Option<MonitorHandle>,
-    req_id: String,
+async fn read_non_streaming_body(
+    client: Arc<client::GrokClient>,
+    request: GrokResponsesRequest,
+    mut response: client::GrokResponse,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
-) -> Response {
-    stream_body(
-        response.into_stream(),
-        message_id,
-        model,
-        monitor,
-        req_id,
-        traffic,
-    )
+    retry: Arc<Mutex<GrokRetryState>>,
+) -> Result<Vec<u8>, GrokError> {
+    loop {
+        match response.into_bytes().await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if error.is_retryable() => {
+                let delay = {
+                    let mut state = retry.lock().await;
+                    if !state.can_retry_transient() {
+                        return Err(error);
+                    }
+                    let delay = compute_backoff_delay(
+                        state.transient_failures(),
+                        error.retry_after.as_deref(),
+                    );
+                    if delay.exceeds_budget {
+                        return Err(error);
+                    }
+                    state.note_transient_failure();
+                    delay
+                };
+                sleep(delay.wait_ms).await;
+                response = client
+                    .post_with_retry(&request, traffic.clone(), retry.clone())
+                    .await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct GrokReconnectContext {
+    client: Arc<client::GrokClient>,
+    request: Arc<GrokResponsesRequest>,
+    traffic: Option<Arc<crate::traffic::TrafficCapture>>,
+    retry: Arc<Mutex<GrokRetryState>>,
 }
 
 fn stream_body<S>(
@@ -235,23 +287,29 @@ fn stream_body<S>(
     monitor: Option<MonitorHandle>,
     req_id: String,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
+    reconnect: Option<GrokReconnectContext>,
 ) -> Response
 where
     S: Stream<Item = Result<Bytes, client::GrokError>> + Unpin + Send + 'static,
 {
     let state = GrokStreamState {
-        upstream,
+        upstream: Box::pin(upstream),
         decoder: SseDecoder::default(),
         reducer: translate::reducer::Reducer::default(),
-        translator: StreamTranslator::new(message_id, model),
+        translator: StreamTranslator::new(message_id.clone(), model.clone()),
+        message_id,
+        model,
         terminal: false,
         error_sent: false,
+        downstream_emitted: false,
+        attempt_bytes: 0,
         monitor,
         req_id,
         bytes: 0,
         chunks: 0,
         stream_capture: traffic.as_ref().map(|traffic| traffic.stream_capture()),
         traffic,
+        reconnect,
     };
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         state
@@ -269,25 +327,27 @@ where
         .into_response()
 }
 
-struct GrokStreamState<S> {
-    upstream: S,
+struct GrokStreamState {
+    upstream: GrokByteStream,
     decoder: SseDecoder,
     reducer: translate::reducer::Reducer,
     translator: StreamTranslator,
+    message_id: String,
+    model: String,
     terminal: bool,
     error_sent: bool,
+    downstream_emitted: bool,
+    attempt_bytes: u64,
     monitor: Option<MonitorHandle>,
     req_id: String,
     bytes: u64,
     chunks: u64,
     stream_capture: Option<StreamTrafficCapture>,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
+    reconnect: Option<GrokReconnectContext>,
 }
 
-impl<S> GrokStreamState<S>
-where
-    S: Stream<Item = Result<Bytes, client::GrokError>> + Unpin,
-{
+impl GrokStreamState {
     async fn next_output(&mut self) -> Option<Vec<u8>> {
         if self.terminal {
             return None;
@@ -297,24 +357,45 @@ where
             return None;
         }
         loop {
-            let chunk = match self.upstream.next().await {
-                Some(Ok(chunk)) => chunk,
-                Some(Err(_)) => return Some(self.fail_at("transport", "upstream_stream")),
-                None => {
+            let chunk = match self.next_upstream_chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => {
                     if self.decoder.finish().is_err() || !self.reducer.finished() {
-                        return Some(self.fail_at("decoder", "incomplete_stream"));
+                        match self
+                            .maybe_rebuild(
+                                client::GrokError::stream_transport(
+                                    client::GrokErrorStage::Stream,
+                                    "Grok stream closed before a terminal event",
+                                ),
+                                "decoder",
+                                "incomplete_stream",
+                            )
+                            .await
+                        {
+                            RebuildOutcome::Rebuilt => continue,
+                            RebuildOutcome::Failed(bytes) => return Some(bytes),
+                        }
                     }
                     self.terminal = true;
                     self.finish_capture(true);
                     return None;
                 }
+                Err(error) => match self
+                    .maybe_rebuild(error, "transport", "upstream_stream")
+                    .await
+                {
+                    RebuildOutcome::Rebuilt => continue,
+                    RebuildOutcome::Failed(bytes) => return Some(bytes),
+                },
             };
+
             if self.bytes == 0
                 && let Some(monitor) = self.monitor.as_ref()
             {
                 monitor.generation_started(&self.req_id);
             }
             self.bytes = self.bytes.saturating_add(chunk.len() as u64);
+            self.attempt_bytes = self.attempt_bytes.saturating_add(chunk.len() as u64);
             self.chunks = self.chunks.saturating_add(1);
             if let Some(monitor) = self.monitor.as_ref() {
                 monitor.stream_progress(&self.req_id, chunk.len() as u64, 1, None, None);
@@ -360,26 +441,162 @@ where
                 }
                 if self.reducer.finished() {
                     self.terminal = true;
+                    if !out.is_empty() {
+                        self.downstream_emitted = true;
+                    }
                     self.capture_downstream(&out);
                     self.finish_capture(true);
                     return if out.is_empty() { None } else { Some(out) };
                 }
             }
             if !out.is_empty() {
+                self.downstream_emitted = true;
                 self.capture_downstream(&out);
                 return Some(out);
             }
         }
     }
 
+    async fn next_upstream_chunk(&mut self) -> Result<Option<Bytes>, GrokError> {
+        match self.upstream.next().await {
+            Some(Ok(chunk)) => Ok(Some(chunk)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    async fn maybe_rebuild(
+        &mut self,
+        error: GrokError,
+        fail_stage: &str,
+        fail_kind: &str,
+    ) -> RebuildOutcome {
+        if self.downstream_emitted || !error.is_retryable() {
+            return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
+        }
+        let Some(reconnect) = self.reconnect.as_ref() else {
+            return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
+        };
+        let client = reconnect.client.clone();
+        let request = reconnect.request.clone();
+        let traffic = reconnect.traffic.clone();
+        let retry = reconnect.retry.clone();
+
+        let delay = {
+            let mut state = retry.lock().await;
+            if !state.can_retry_transient() {
+                drop(state);
+                return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
+            }
+            let delay =
+                compute_backoff_delay(state.transient_failures(), error.retry_after.as_deref());
+            if delay.exceeds_budget {
+                drop(state);
+                return RebuildOutcome::Failed(self.fail_at(fail_stage, fail_kind));
+            }
+            state.note_transient_failure();
+            if let Some(traffic) = traffic.as_ref() {
+                traffic.write_json(
+                    "024-upstream-stream-rebuild",
+                    &serde_json::json!({
+                        "wait_ms": delay.wait_ms,
+                        "origin": client::origin_name(error.origin),
+                        "error_stage": client::stage_name(error.stage),
+                        "status": error.status.as_u16(),
+                        "message": error.message,
+                        "stage": fail_stage,
+                        "kind": fail_kind,
+                        "attempt_bytes": self.attempt_bytes,
+                    }),
+                );
+            }
+            delay
+        };
+        sleep(delay.wait_ms).await;
+
+        match client.post_with_retry(&request, traffic, retry).await {
+            Ok(response) => {
+                self.reset_attempt(response.into_stream());
+                RebuildOutcome::Rebuilt
+            }
+            Err(error) => RebuildOutcome::Failed(self.fail_mapped(error, fail_stage, fail_kind)),
+        }
+    }
+
+    fn reset_attempt(&mut self, upstream: GrokByteStream) {
+        self.upstream = upstream;
+        self.decoder = SseDecoder::default();
+        self.reducer = translate::reducer::Reducer::default();
+        self.translator = StreamTranslator::new(self.message_id.clone(), self.model.clone());
+        self.attempt_bytes = 0;
+        self.error_sent = false;
+        self.terminal = false;
+    }
+
+    fn fail_mapped(&mut self, error: GrokError, stage: &str, kind: &str) -> Vec<u8> {
+        self.fail(stage, kind, Some(&error))
+    }
+
     fn fail_at(&mut self, stage: &str, kind: &str) -> Vec<u8> {
+        self.fail(stage, kind, None)
+    }
+
+    fn fail(&mut self, stage: &str, kind: &str, error: Option<&GrokError>) -> Vec<u8> {
         self.error_sent = true;
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
-            capture.downstream_event("error", serde_json::json!({"type":"error","error":{"type":"api_error","message":"Grok stream is invalid"}}));
+            capture.downstream_event(
+                "error",
+                serde_json::json!({
+                    "type":"error",
+                    "error":{"type":"api_error","message":"Grok stream is invalid"}
+                }),
+            );
         }
         if let Some(traffic) = self.traffic.as_ref() {
-            traffic.write_json("060-grok-stream-error", &serde_json::json!({"stage":stage,"kind":kind,"bytes":self.bytes,"chunks":self.chunks}));
+            let mut fields = serde_json::Map::from_iter([
+                ("stage".into(), serde_json::json!(stage)),
+                ("kind".into(), serde_json::json!(kind)),
+                ("bytes".into(), serde_json::json!(self.bytes)),
+                ("chunks".into(), serde_json::json!(self.chunks)),
+                (
+                    "downstream_emitted".into(),
+                    serde_json::json!(self.downstream_emitted),
+                ),
+            ]);
+            if let Some(error) = error {
+                fields.insert("status".into(), serde_json::json!(error.status.as_u16()));
+                fields.insert(
+                    "origin".into(),
+                    serde_json::json!(client::origin_name(error.origin)),
+                );
+                fields.insert(
+                    "error_stage".into(),
+                    serde_json::json!(client::stage_name(error.stage)),
+                );
+                fields.insert("message".into(), serde_json::json!(error.message));
+            }
+            traffic.write_json("060-grok-stream-error", &serde_json::Value::Object(fields));
+        }
+        if let Some(error) = error {
+            crate::logging::create_logger("grok").info(
+                "stream_error",
+                Some(serde_json::Map::from_iter([
+                    ("stage".into(), serde_json::json!(stage)),
+                    ("kind".into(), serde_json::json!(kind)),
+                    ("status".into(), serde_json::json!(error.status.as_u16())),
+                    (
+                        "origin".into(),
+                        serde_json::json!(client::origin_name(error.origin)),
+                    ),
+                    (
+                        "errorStage".into(),
+                        serde_json::json!(client::stage_name(error.stage)),
+                    ),
+                    ("message".into(), serde_json::json!(error.message)),
+                    ("reqId".into(), serde_json::json!(self.req_id)),
+                ])),
+            );
         }
         self.finish_capture(false);
         stream_error()
@@ -414,7 +631,12 @@ where
     }
 }
 
-impl<S> Drop for GrokStreamState<S> {
+enum RebuildOutcome {
+    Rebuilt,
+    Failed(Vec<u8>),
+}
+
+impl Drop for GrokStreamState {
     fn drop(&mut self) {
         if self.terminal || self.stream_capture.is_none() {
             return;
@@ -528,15 +750,19 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::monitor::{EndpointKind, MonitorHandle};
     use crate::traffic::test_capture;
     use http_body_util::BodyExt;
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
+    use super::client::{GrokErrorStage, GrokTimeouts};
     use super::*;
 
     struct ChannelStream(mpsc::Receiver<Result<Bytes, client::GrokError>>);
@@ -547,6 +773,79 @@ mod tests {
         fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             self.0.poll_recv(cx)
         }
+    }
+
+    fn sample_request() -> GrokResponsesRequest {
+        GrokResponsesRequest {
+            model: "grok-4.5".into(),
+            instructions: None,
+            input: vec![],
+            tools: None,
+            tool_choice: None,
+            store: false,
+            stream: true,
+            max_output_tokens: None,
+            reasoning: None,
+        }
+    }
+
+    async fn test_client(base_url: &str, timeouts: GrokTimeouts) -> (client::GrokClient, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let primary = temp
+            .path()
+            .join("grok")
+            .join("auth.json")
+            .to_string_lossy()
+            .into_owned();
+        let legacy = temp
+            .path()
+            .join("legacy-grok")
+            .join("auth.json")
+            .to_string_lossy()
+            .into_owned();
+        let store = auth::token_store::GrokTokenStore::new(crate::auth::FileAuthStore::new(
+            primary, legacy,
+        ));
+        store
+            .save_auth(auth::token_store::StoredAuth {
+                access: "test-access".into(),
+                refresh: "test-refresh".into(),
+                expires_at_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 3_600_000,
+                issuer: auth::login::CANONICAL_ISSUER.into(),
+                client_id: auth::login::CLIENT_ID.into(),
+            })
+            .unwrap();
+        let auth_manager = auth::manager::GrokAuthManager::new(store).unwrap();
+        let client = client::GrokClient::new_for_test(
+            base_url.to_string(),
+            "test-version".into(),
+            timeouts,
+            auth_manager,
+        )
+        .unwrap();
+        (client, temp)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut buf = vec![0_u8; 32 * 1024];
+        let mut total = 0usize;
+        loop {
+            let n = stream.read(&mut buf[total..]).await.unwrap();
+            assert!(n > 0);
+            total += n;
+            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if total == buf.len() {
+                buf.resize(buf.len() * 2, 0);
+            }
+        }
+        buf.truncate(total);
+        buf
     }
 
     #[tokio::test]
@@ -570,6 +869,7 @@ mod tests {
             "grok-4.5".into(),
             Some(monitor.clone()),
             "req_1".into(),
+            None,
             None,
         );
         let _ = response.into_body().collect().await.unwrap();
@@ -602,6 +902,7 @@ mod tests {
             "grok-4.5".into(),
             None,
             "req_1".into(),
+            None,
             None,
         );
         let mut body = response.into_body();
@@ -660,6 +961,7 @@ mod tests {
             None,
             "req_1".into(),
             Some(traffic),
+            None,
         );
         let mut body = response.into_body();
 
@@ -709,6 +1011,7 @@ mod tests {
             None,
             "req_1".into(),
             Some(traffic),
+            None,
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("tool_use"));
@@ -747,6 +1050,7 @@ mod tests {
             None,
             "req_1".into(),
             Some(traffic),
+            None,
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("tool_use"));
@@ -774,6 +1078,7 @@ mod tests {
                 None,
                 "req_1".into(),
                 Some(traffic),
+                None,
             );
             let body = response.into_body().collect().await.unwrap().to_bytes();
             assert!(String::from_utf8_lossy(&body).contains("event: error"));
@@ -805,14 +1110,23 @@ mod tests {
     fn transport_failure_capture_contains_no_credentials() {
         let temp = TempDir::new().unwrap();
         let traffic = test_capture(temp.path().join("traffic"));
-        client::capture_failure(Some(&traffic), "transport", "transport", 1);
+        client::capture_terminal_failure(
+            Some(&traffic),
+            "transport",
+            "transport",
+            1,
+            Some(502),
+            Some("Grok upstream request failed"),
+        );
         let captured = capture_contents(temp.path().join("traffic"));
         assert!(captured.contains("transport"));
+        assert!(captured.contains("060-grok-stream-error") || captured.contains("\"kind\""));
         for secret in [
             "Bearer token",
             "refresh-secret",
             "oauth-code",
             "person@example.com",
+            "test-access",
         ] {
             assert!(!captured.contains(secret));
         }
@@ -851,5 +1165,264 @@ mod tests {
         }
         assert!(captured.contains("[redacted len=6]"));
         assert!(!captured.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn pre_emit_stream_reset_rebuilds_with_shared_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let server = tokio::spawn(async move {
+            // First attempt: 200 headers then reset before body.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            drop(stream);
+
+            // Second attempt succeeds.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let client = Arc::new(client);
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let response = client
+            .post_with_retry(&sample_request(), None, retry.clone())
+            .await
+            .unwrap();
+        let reconnect = Some(GrokReconnectContext {
+            client: client.clone(),
+            request: Arc::new(sample_request()),
+            traffic: None,
+            retry,
+        });
+        let body = stream_body(
+            response.into_stream(),
+            "msg_rebuild".into(),
+            "grok-4.5".into(),
+            None,
+            "req_rebuild".into(),
+            None,
+            reconnect,
+        )
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+        server.await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("message_start"));
+        assert!(body.contains("ok"));
+        assert!(body.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn post_emit_stream_reset_does_not_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            // First body chunk is a complete Anthropic-producing event.
+            let chunk = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n";
+            let header = format!("{:x}\r\n", chunk.len());
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(chunk).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            // Then reset.
+            drop(stream);
+            // If a second request arrives, count it (should not happen).
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(150), listener.accept()).await
+            {
+                let _ = read_http_request(&mut stream).await;
+                hits_server.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let temp = TempDir::new().unwrap();
+        let traffic = Arc::new(test_capture(temp.path().join("traffic")));
+        let (client, _auth) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let client = Arc::new(client);
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let response = client
+            .post_with_retry(&sample_request(), Some(traffic.clone()), retry.clone())
+            .await
+            .unwrap();
+        let reconnect = Some(GrokReconnectContext {
+            client,
+            request: Arc::new(sample_request()),
+            traffic: Some(traffic.clone()),
+            retry,
+        });
+        let body = stream_body(
+            response.into_stream(),
+            "msg_post".into(),
+            "grok-4.5".into(),
+            None,
+            "req_post".into(),
+            Some(traffic),
+            reconnect,
+        )
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+        let _ = server.await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("first"));
+        assert!(body.contains("event: error"));
+        let captured = capture_contents(temp.path().join("traffic"));
+        assert!(captured.contains("stream_error") || captured.contains("downstream_emitted"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_socket_close_without_terminal_is_not_success() {
+        let (tx, rx) = mpsc::channel(1);
+        let response = stream_body(
+            ChannelStream(rx),
+            "msg_1".into(),
+            "grok-4.5".into(),
+            None,
+            "req_1".into(),
+            None,
+            None,
+        );
+        let mut body = response.into_body();
+        // No terminal event; just close.
+        drop(tx);
+        let frame = tokio::time::timeout(Duration::from_millis(250), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&frame).contains("event: error"));
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_not_retried_even_with_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            let body = b"data: {bad json}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            {
+                let _ = read_http_request(&mut stream).await;
+                hits_server.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let client = Arc::new(client);
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let response = client
+            .post_with_retry(&sample_request(), None, retry.clone())
+            .await
+            .unwrap();
+        let reconnect = Some(GrokReconnectContext {
+            client,
+            request: Arc::new(sample_request()),
+            traffic: None,
+            retry,
+        });
+        let body = stream_body(
+            response.into_stream(),
+            "msg_bad".into(),
+            "grok-4.5".into(),
+            None,
+            "req_bad".into(),
+            None,
+            reconnect,
+        )
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+        let _ = server.await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(String::from_utf8_lossy(&body).contains("event: error"));
+    }
+
+    #[test]
+    fn stream_error_classifier_marks_transport_retryable() {
+        let err = client::GrokError::stream_transport(GrokErrorStage::Stream, "reset");
+        assert!(err.is_retryable());
+        assert_eq!(err.origin, client::GrokErrorOrigin::StreamTransport);
+        let bad = client::GrokError::http(StatusCode::BAD_REQUEST, None, "nope");
+        assert!(!bad.is_retryable());
+        let limit = client::GrokError::response_limit(GrokErrorStage::Body, "too large");
+        assert!(!limit.is_retryable());
+        assert_eq!(limit.origin, client::GrokErrorOrigin::ResponseLimit);
     }
 }

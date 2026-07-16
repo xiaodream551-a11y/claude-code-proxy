@@ -722,7 +722,11 @@ Windows, and at
   },
   "grok": {
     "baseUrl": "https://cli-chat-proxy.grok.com/v1",
-    "clientVersion": "0.2.93"
+    "clientVersion": "0.2.93",
+    "connectTimeoutMs": 10000,
+    "headerTimeoutMs": 60000,
+    "firstByteTimeoutMs": 60000,
+    "bodyIdleTimeoutMs": 300000
   },
   "cursor": {
     "baseUrl": "https://api2.cursor.sh",
@@ -763,6 +767,10 @@ Windows, and at
 | `CCP_KIMI_USER_AGENT`            | `kimi.userAgent`           | `KimiCLI/1.37.0`                                  | Override the `User-Agent` header sent to Kimi                                                                                                                                     |
 | `CCP_GROK_BASE_URL`              | `grok.baseUrl`             | `https://cli-chat-proxy.grok.com/v1`              | Override the Grok Responses API base URL                                                                                                                                          |
 | `CCP_GROK_CLIENT_VERSION`        | `grok.clientVersion`       | `0.2.93`                                          | Override the Grok client version header                                                                                                                                           |
+| `CCP_GROK_CONNECT_TIMEOUT_MS`    | `grok.connectTimeoutMs`    | `10000`                                           | Maximum time to establish the Grok TCP/TLS connection                                                                                                                             |
+| `CCP_GROK_HEADER_TIMEOUT_MS`     | `grok.headerTimeoutMs`     | `60000`                                           | Maximum time to receive Grok response headers before a safe pre-output retry                                                                                                      |
+| `CCP_GROK_FIRST_BYTE_TIMEOUT_MS` | `grok.firstByteTimeoutMs`  | `60000`                                           | Maximum time to receive the first Grok response body byte before a safe pre-output retry                                                                                          |
+| `CCP_GROK_BODY_IDLE_TIMEOUT_MS`  | `grok.bodyIdleTimeoutMs`   | `300000`                                          | Maximum gap between Grok response body chunks; active long-running responses have no whole-request deadline                                                                       |
 | `CCP_CURSOR_BASE_URL`            | `cursor.baseUrl`           | `https://api2.cursor.sh`                          | Override Cursor's API base URL                                                                                                                                                    |
 | `CCP_CURSOR_CLIENT_VERSION`      | `cursor.clientVersion`     | `cli-2026.06.04-5fd875e`                          | Override Cursor client version headers                                                                                                                                            |
 | `CCP_CURSOR_AGENT_BUNDLE`        | `cursor.agentBundle`       | auto-detected                                     | Path to Cursor Agent's bundled `index.js` used only for protobuf schemas                                                                                                          |
@@ -778,17 +786,20 @@ Codex uses the WebSocket Responses transport by default. Set
 `CCP_CODEX_TRANSPORT=http` to use the older HTTP SSE transport for debugging or
 compatibility. `CCP_CODEX_TRANSPORT=auto` keeps live WebSocket streaming while
 the connection is healthy and immediately falls back to buffered HTTP when a
-WebSocket handshake fails before the request is sent. Three consecutive
-retryable WebSocket transport failures for the same Claude Code session open a
-30-second circuit, temporarily routing that session through HTTP. After the
-cooldown, one WebSocket request probes recovery while concurrent requests keep
-using HTTP; a successful response or any non-transport result resets the failure
-count.
+retryable WebSocket transport failure occurs before Anthropic output begins.
+This covers handshake rejection, response-start or idle timeouts, failed
+heartbeat and pool probes, busy pooled connections, connection loss, and a
+close without a terminal event. Three consecutive retryable WebSocket transport
+failures for the same Claude Code session open a 30-second circuit, temporarily
+routing that session through HTTP. After the cooldown, one WebSocket request
+probes recovery while concurrent requests keep using HTTP; a successful response
+or any non-transport result resets the failure count.
 Pooled WebSockets must answer a matching Ping/Pong probe before reuse. Active
 connections are also probed after 30 seconds without a frame, so a half-open
 socket left behind by a VPN or proxy-node switch is detected without waiting for
-the business idle timeout. Before any Anthropic output is emitted, statusless
-transport failures are retried up to two times on a refreshed connection. Once
+the business idle timeout. In strict `websocket` mode, statusless transport
+failures before Anthropic output are retried up to two times on a refreshed
+connection. In `auto` mode those failures use the HTTP fallback instead. Once
 output has begun, the proxy reports the connection error instead of replaying a
 request that could duplicate tool execution.
 Unsignaled retries use jittered exponential backoff capped at 30 seconds. Numeric
@@ -803,6 +814,16 @@ proxy clears unsafe continuation state and sends the full request instead.
 Continuation reduces repeated request upload size, but it does not increase the
 upstream model context window. Multi-process or load-balanced deployments need
 sticky sessions or shared state before enabling continuation.
+
+Grok uses separate connection, response-header, first-body-byte, and body-idle
+timeouts instead of a whole-request deadline, so an active long reasoning stream
+can run beyond two minutes. Connection/header failures, HTTP 429/500/502/503/504,
+and a stream that dies before emitting Anthropic output share one budget of up to
+three transient retries with jittered backoff and `Retry-After` support. If a
+Grok stream fails after any Anthropic text or tool event has been sent, the proxy
+returns a stream error without replaying the request. Grok has no
+`previous_response_id` continuation and never silently falls back to another
+provider.
 
 ### Files
 

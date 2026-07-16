@@ -456,6 +456,7 @@ async fn live_stream_response(
                     && client::should_fallback_to_http(&error)
                 {
                     client::record_auto_websocket_failure(&ctx, &error);
+                    client::log_auto_http_fallback(&ctx, &error);
                     return buffered_http_stream_fallback(
                         &client,
                         &message_id,

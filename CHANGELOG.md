@@ -15,6 +15,11 @@
   connections, and retry transport stalls only before streaming output begins.
 - Keep Codex `auto` transport on live WebSockets while healthy, then temporarily
   route a session through HTTP after repeated retryable transport failures.
+- Fall back to buffered HTTP immediately when Codex `auto` encounters a
+  retryable WebSocket transport fault before Anthropic output begins.
+- Recover Grok requests from transient connection, timeout, rate-limit, and 5xx
+  failures before downstream output while preserving the no-replay boundary
+  after text or tool events have been emitted.
 - Honor numeric and HTTP-date `Retry-After` values and add bounded jitter to
   exponential retry delays.
 - Forward Claude Code reasoning effort to Grok 4.5 instead of relying on the

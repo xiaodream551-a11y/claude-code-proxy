@@ -404,7 +404,15 @@ impl CodexHttpClient {
                             }
                             Err(err) if should_fallback_to_http(&err) => {
                                 record_auto_websocket_failure(ctx, &err);
-                                // Fall back to HTTP only if WebSocket failed before sending
+                                log_auto_http_fallback(ctx, &err);
+                                if let Some(key) = pool_key {
+                                    super::websocket::invalidate_codex_websocket_pool_turn(
+                                        key, turn_id,
+                                    );
+                                }
+                                active_continuation =
+                                    full_context_continuation(active_continuation.as_ref());
+                                // Immediate buffered HTTP for retryable pre-output WS transport faults.
                                 let body_json = serialize_request(body)?;
                                 self.attempt_post_http(
                                     &auth,
@@ -423,7 +431,7 @@ impl CodexHttpClient {
                 }
             };
 
-            if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
+            if should_refresh_after_unauthorized(&result, auth_refresh_attempted) {
                 auth_refresh_attempted = true;
                 match self.auth_manager.force_refresh(&auth.access).await {
                     Ok(new_auth) => {
@@ -1249,7 +1257,7 @@ pub(super) fn record_auto_websocket_failure(ctx: &RequestContext, err: &CodexErr
     let Some(key) = ctx.session_id.as_deref() else {
         return false;
     };
-    if !should_count_auto_websocket_failure(err) {
+    if !should_fallback_to_http(err) {
         // A non-transport response proves the WebSocket path is reachable and
         // breaks a run of consecutive transport failures.
         super::websocket::record_codex_websocket_success(key);
@@ -1274,14 +1282,6 @@ pub(super) fn record_auto_websocket_failure(ctx: &RequestContext, err: &CodexErr
         );
     }
     opened
-}
-
-fn should_count_auto_websocket_failure(err: &CodexError) -> bool {
-    matches!(
-        err.origin,
-        CodexErrorOrigin::WebSocket | CodexErrorOrigin::WebSocketHandshake
-    ) && err.detail.as_deref() != Some("previous_response_not_found")
-        && is_retryable_transport_error(err)
 }
 
 pub(super) fn is_retryable_transport_error(err: &CodexError) -> bool {
@@ -1323,23 +1323,44 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
 fn should_refresh_after_unauthorized(
     result: &Result<CodexResponse, CodexError>,
     auth_refresh_attempted: bool,
-    transport: crate::config::CodexTransport,
 ) -> bool {
     if auth_refresh_attempted {
         return false;
     }
     match result {
         Ok(response) => response.status == 401,
-        Err(err) => {
-            err.status == 401
-                && (err.origin != CodexErrorOrigin::WebSocketHandshake
-                    || transport == crate::config::CodexTransport::WebSocket)
-        }
+        Err(err) => err.status == 401,
     }
 }
 
+/// Immediate Auto-mode fallback from WebSocket to buffered HTTP.
+///
+/// Only pre-output, retryable WebSocket transport failures qualify. Business
+/// 4xx, continuation misses, and service 429/5xx event errors stay on the
+/// original error path and must not be treated as transport fallback.
 pub(super) fn should_fallback_to_http(err: &CodexError) -> bool {
-    err.origin == CodexErrorOrigin::WebSocketHandshake
+    matches!(
+        err.origin,
+        CodexErrorOrigin::WebSocket | CodexErrorOrigin::WebSocketHandshake
+    ) && err.detail.as_deref() != Some("previous_response_not_found")
+        && is_retryable_transport_error(err)
+}
+
+pub(super) fn log_auto_http_fallback(ctx: &RequestContext, err: &CodexError) {
+    let mut fields = serde_json::Map::from_iter([
+        ("reqId".into(), serde_json::json!(ctx.req_id)),
+        ("action".into(), serde_json::json!("fallback_http")),
+        (
+            "origin".into(),
+            serde_json::json!(codex_error_origin_name(err.origin)),
+        ),
+        ("status".into(), serde_json::json!(err.status)),
+        ("reason".into(), serde_json::json!(err.message)),
+    ]);
+    if let Some(detail) = err.detail.as_deref() {
+        fields.insert("detail".into(), serde_json::json!(detail));
+    }
+    create_logger("codex").warn("auto_transport_fallback", Some(fields));
 }
 
 fn should_retry_without_continuation(
@@ -1518,7 +1539,7 @@ mod tests {
             assert!(String::from_utf8_lossy(&request[..read]).contains("Upgrade: websocket"));
             websocket
                 .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 13\r\nconnection: close\r\n\r\npolicy denied",
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
                 )
                 .await
                 .unwrap();
@@ -1550,6 +1571,133 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"data: keep\n\n");
+    }
+
+    #[tokio::test]
+    async fn auto_falls_back_to_http_after_websocket_closes_before_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = futures_util::StreamExt::next(&mut websocket).await;
+            drop(websocket);
+
+            let (mut http, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let read = http.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
+            let body = b"data: keep\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            http.write_all(response.as_bytes()).await.unwrap();
+            http.write_all(body).await.unwrap();
+        });
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"data: keep\n\n");
+    }
+
+    #[tokio::test]
+    async fn auto_http_fallback_invalidates_websocket_continuation_before_retry() {
+        use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = futures_util::StreamExt::next(&mut websocket)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            assert!(first.contains("\"previous_response_id\":\"resp_prev\""));
+            assert!(first.contains("delta only"));
+            drop(websocket);
+
+            let (mut http, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(http.read(&mut request).await.unwrap() > 0);
+            http.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 5\r\nretry-after: 0\r\nconnection: close\r\n\r\nretry",
+            )
+            .await
+            .unwrap();
+            drop(http);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let retried = futures_util::StreamExt::next(&mut websocket)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            assert!(!retried.contains("previous_response_id"));
+            assert!(retried.contains("full context"));
+            assert!(!retried.contains("delta only"));
+            futures_util::SinkExt::send(
+                &mut websocket,
+                Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp_retry","usage":{}}}"#
+                        .into(),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let full_input = ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "full context".into(),
+            }],
+        };
+        let delta_input = ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "delta only".into(),
+            }],
+        };
+        let mut request = buffered_test_request();
+        request.input = vec![full_input];
+        let continuation = super::super::continuation::ContinuationCandidate {
+            turn_id: Some(7),
+            previous_response_id: Some("resp_prev".into()),
+            input_delta: Some(vec![delta_input]),
+            input_delta_count: 1,
+            disabled_reason: None,
+        };
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.status, 200);
     }
 
     #[tokio::test]
@@ -2096,7 +2244,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_retry_distinguishes_auto_and_strict_websocket_handshakes() {
+    fn unauthorized_retry_refreshes_every_transport_once() {
         let http_unauthorized = Ok(CodexResponse {
             body: Vec::new(),
             status: 401,
@@ -2135,42 +2283,33 @@ mod tests {
             origin: CodexErrorOrigin::WebSocket,
         };
 
-        assert!(should_refresh_after_unauthorized(
-            &http_unauthorized,
-            false,
-            crate::config::CodexTransport::Auto
-        ));
+        assert!(should_refresh_after_unauthorized(&http_unauthorized, false));
         assert!(should_refresh_after_unauthorized(
             &websocket_unauthorized,
-            false,
-            crate::config::CodexTransport::Auto
+            false
         ));
-        assert!(!should_refresh_after_unauthorized(
-            &forbidden,
-            false,
-            crate::config::CodexTransport::Auto
-        ));
-        assert!(!should_refresh_after_unauthorized(
-            &rejected_handshake,
-            false,
-            crate::config::CodexTransport::Auto
-        ));
+        assert!(!should_refresh_after_unauthorized(&forbidden, false));
         assert!(should_refresh_after_unauthorized(
             &rejected_handshake,
-            false,
-            crate::config::CodexTransport::WebSocket
+            false
         ));
-        assert!(!should_refresh_after_unauthorized(
-            &http_unauthorized,
-            true,
-            crate::config::CodexTransport::Auto
-        ));
-        assert!(should_fallback_to_http(rejected_handshake_err));
-        assert!(!should_fallback_to_http(&stale_pool));
+        assert!(!should_refresh_after_unauthorized(&http_unauthorized, true));
+        // Permanent 4xx handshake rejections are not transport fallback candidates.
+        assert!(!should_fallback_to_http(rejected_handshake_err));
+        // Structured pre-output WebSocket transport failures fall back in auto mode.
+        assert!(should_fallback_to_http(&stale_pool));
     }
 
     #[test]
-    fn auto_circuit_counts_only_retryable_websocket_transport_failures() {
+    fn should_fallback_to_http_only_for_retryable_websocket_transport_errors() {
+        let statusless_ws = CodexError {
+            status: 0,
+            message: "WebSocket protocol error: Connection reset without closing handshake"
+                .to_string(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
         let retryable_handshake = CodexError {
             status: 503,
             message: "Service unavailable".into(),
@@ -2178,6 +2317,69 @@ mod tests {
             retry_after: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         };
+        let statusless_handshake = CodexError {
+            status: 0,
+            message: "WebSocket connect timeout after 15000ms".into(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        };
+        let http_reset = CodexError {
+            status: 0,
+            message: "Connection reset".into(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        };
+        let business_400 = CodexError {
+            status: 400,
+            message: "Bad request".into(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        };
+        let business_401 = CodexError {
+            status: 401,
+            message: "Unauthorized".into(),
+            detail: Some("policy denied".into()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        };
+        let service_429 = CodexError {
+            status: 429,
+            message: "Rate limited".into(),
+            detail: Some("rate limit".into()),
+            retry_after: Some("1".into()),
+            origin: CodexErrorOrigin::WebSocket,
+        };
+        let service_503 = CodexError {
+            status: 503,
+            message: "Overloaded".into(),
+            detail: Some("service unavailable".into()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+        let missing_continuation = CodexError {
+            status: 404,
+            message: "Previous response not found".into(),
+            detail: Some("previous_response_not_found".into()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(should_fallback_to_http(&statusless_ws));
+        assert!(should_fallback_to_http(&retryable_handshake));
+        assert!(should_fallback_to_http(&statusless_handshake));
+        assert!(!should_fallback_to_http(&http_reset));
+        assert!(!should_fallback_to_http(&business_400));
+        assert!(!should_fallback_to_http(&business_401));
+        assert!(!should_fallback_to_http(&service_429));
+        assert!(!should_fallback_to_http(&service_503));
+        assert!(!should_fallback_to_http(&missing_continuation));
+    }
+
+    #[test]
+    fn auto_circuit_counts_only_retryable_websocket_transport_failures() {
         let response_timeout = CodexError {
             status: 0,
             message: "Response start timeout".into(),
@@ -2192,27 +2394,6 @@ mod tests {
             retry_after: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         };
-        let http_reset = CodexError {
-            status: 0,
-            message: "Connection reset".into(),
-            detail: None,
-            retry_after: None,
-            origin: CodexErrorOrigin::Http,
-        };
-        let missing_continuation = CodexError {
-            status: 404,
-            message: "Previous response not found".into(),
-            detail: Some("previous_response_not_found".into()),
-            retry_after: None,
-            origin: CodexErrorOrigin::WebSocket,
-        };
-
-        assert!(should_count_auto_websocket_failure(&retryable_handshake));
-        assert!(should_count_auto_websocket_failure(&response_timeout));
-        assert!(!should_count_auto_websocket_failure(&bad_request));
-        assert!(!should_count_auto_websocket_failure(&http_reset));
-        assert!(!should_count_auto_websocket_failure(&missing_continuation));
-
         let mut ctx = http_test_context();
         let circuit_key = "auto-circuit-reset-test";
         ctx.session_id = Some(circuit_key.into());

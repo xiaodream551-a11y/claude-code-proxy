@@ -97,6 +97,14 @@ struct GrokConfig {
     pub base_url: Option<String>,
     #[serde(rename = "clientVersion")]
     pub client_version: Option<String>,
+    #[serde(rename = "connectTimeoutMs")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(rename = "headerTimeoutMs")]
+    pub header_timeout_ms: Option<u64>,
+    #[serde(rename = "firstByteTimeoutMs")]
+    pub first_byte_timeout_ms: Option<u64>,
+    #[serde(rename = "bodyIdleTimeoutMs")]
+    pub body_idle_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -244,6 +252,18 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_GROK_CLIENT_VERSION") {
         out.push("grok.clientVersion (env)".to_string());
     }
+    if env.contains_key("CCP_GROK_CONNECT_TIMEOUT_MS") {
+        out.push("CCP_GROK_CONNECT_TIMEOUT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_GROK_HEADER_TIMEOUT_MS") {
+        out.push("CCP_GROK_HEADER_TIMEOUT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_GROK_FIRST_BYTE_TIMEOUT_MS") {
+        out.push("CCP_GROK_FIRST_BYTE_TIMEOUT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_GROK_BODY_IDLE_TIMEOUT_MS") {
+        out.push("CCP_GROK_BODY_IDLE_TIMEOUT_MS (env)".to_string());
+    }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .is_some_and(|raw| !raw.is_empty())
@@ -297,6 +317,20 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 out.push(format!("codex.websocketIdleTimeoutMs: {timeout_ms}"));
             }
         }
+        if let Some(grok) = file_cfg.grok {
+            if let Some(timeout_ms) = grok.connect_timeout_ms {
+                out.push(format!("grok.connectTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(timeout_ms) = grok.header_timeout_ms {
+                out.push(format!("grok.headerTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(timeout_ms) = grok.first_byte_timeout_ms {
+                out.push(format!("grok.firstByteTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(timeout_ms) = grok.body_idle_timeout_ms {
+                out.push(format!("grok.bodyIdleTimeoutMs: {timeout_ms}"));
+            }
+        }
     }
     out
 }
@@ -325,6 +359,58 @@ pub fn grok_client_version() -> String {
         return version;
     }
     "0.2.93".to_string()
+}
+
+fn grok_positive_u64(
+    env_key: &str,
+    file_value: impl FnOnce(&GrokConfig) -> Option<u64>,
+    default: u64,
+) -> u64 {
+    if let Ok(raw) = std::env::var(env_key)
+        && let Ok(value) = raw.parse::<u64>()
+        && value > 0
+    {
+        return value;
+    }
+    if let Some(grok) = read_file_config(&paths::config_dir()).and_then(|file| file.grok)
+        && let Some(value) = file_value(&grok)
+        && value > 0
+    {
+        return value;
+    }
+    default
+}
+
+pub fn grok_connect_timeout_ms(default: u64) -> u64 {
+    grok_positive_u64(
+        "CCP_GROK_CONNECT_TIMEOUT_MS",
+        |grok| grok.connect_timeout_ms,
+        default,
+    )
+}
+
+pub fn grok_header_timeout_ms(default: u64) -> u64 {
+    grok_positive_u64(
+        "CCP_GROK_HEADER_TIMEOUT_MS",
+        |grok| grok.header_timeout_ms,
+        default,
+    )
+}
+
+pub fn grok_first_byte_timeout_ms(default: u64) -> u64 {
+    grok_positive_u64(
+        "CCP_GROK_FIRST_BYTE_TIMEOUT_MS",
+        |grok| grok.first_byte_timeout_ms,
+        default,
+    )
+}
+
+pub fn grok_body_idle_timeout_ms(default: u64) -> u64 {
+    grok_positive_u64(
+        "CCP_GROK_BODY_IDLE_TIMEOUT_MS",
+        |grok| grok.body_idle_timeout_ms,
+        default,
+    )
 }
 
 pub fn is_verbose() -> bool {
@@ -676,6 +762,10 @@ mod tests {
             std::env::remove_var("CCP_CODEX_RESPONSES_LITE");
             std::env::remove_var("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS");
             std::env::remove_var("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS");
+            std::env::remove_var("CCP_GROK_CONNECT_TIMEOUT_MS");
+            std::env::remove_var("CCP_GROK_HEADER_TIMEOUT_MS");
+            std::env::remove_var("CCP_GROK_FIRST_BYTE_TIMEOUT_MS");
+            std::env::remove_var("CCP_GROK_BODY_IDLE_TIMEOUT_MS");
         }
     }
 
@@ -736,6 +826,8 @@ mod tests {
     fn codex_transport_defaults_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         let result = codex_transport();
         assert_eq!(result, CodexTransport::WebSocket);
     }
@@ -744,6 +836,8 @@ mod tests {
     fn codex_transport_reads_env() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "auto");
         }
@@ -754,6 +848,8 @@ mod tests {
     fn codex_transport_env_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "websocket");
         }
@@ -764,6 +860,8 @@ mod tests {
     fn codex_transport_invalid_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
         }
@@ -774,6 +872,8 @@ mod tests {
     fn codex_transport_empty_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }
@@ -922,5 +1022,94 @@ mod tests {
 
         assert_eq!(codex_websocket_response_start_timeout_ms(45_000), 45_000);
         assert_eq!(codex_websocket_idle_timeout_ms(180_000), 180_000);
+    }
+
+    #[test]
+    fn grok_timeouts_read_config_and_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"grok":{"connectTimeoutMs":11000,"headerTimeoutMs":22000,"firstByteTimeoutMs":33000,"bodyIdleTimeoutMs":44000}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(grok_connect_timeout_ms(1), 11_000);
+        assert_eq!(grok_header_timeout_ms(1), 22_000);
+        assert_eq!(grok_first_byte_timeout_ms(1), 33_000);
+        assert_eq!(grok_body_idle_timeout_ms(1), 44_000);
+
+        let _connect_env = EnvGuard::set("CCP_GROK_CONNECT_TIMEOUT_MS", "15000");
+        let _header_env = EnvGuard::set("CCP_GROK_HEADER_TIMEOUT_MS", "25000");
+        let _first_env = EnvGuard::set("CCP_GROK_FIRST_BYTE_TIMEOUT_MS", "35000");
+        let _idle_env = EnvGuard::set("CCP_GROK_BODY_IDLE_TIMEOUT_MS", "45000");
+        assert_eq!(grok_connect_timeout_ms(1), 15_000);
+        assert_eq!(grok_header_timeout_ms(1), 25_000);
+        assert_eq!(grok_first_byte_timeout_ms(1), 35_000);
+        assert_eq!(grok_body_idle_timeout_ms(1), 45_000);
+    }
+
+    #[test]
+    fn grok_timeouts_ignore_zero_and_invalid_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"grok":{"connectTimeoutMs":0,"headerTimeoutMs":0,"firstByteTimeoutMs":0,"bodyIdleTimeoutMs":0}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _connect_env = EnvGuard::set("CCP_GROK_CONNECT_TIMEOUT_MS", "invalid");
+
+        assert_eq!(grok_connect_timeout_ms(10_000), 10_000);
+        assert_eq!(grok_header_timeout_ms(60_000), 60_000);
+        assert_eq!(grok_first_byte_timeout_ms(60_000), 60_000);
+        assert_eq!(grok_body_idle_timeout_ms(300_000), 300_000);
+    }
+
+    #[test]
+    fn grok_timeouts_appear_in_override_summary() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"grok":{"connectTimeoutMs":10000,"headerTimeoutMs":60000,"firstByteTimeoutMs":60000,"bodyIdleTimeoutMs":300000}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let loaded = load_config();
+        let summary = config_override_summary_lines(&loaded);
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("grok.connectTimeoutMs"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("grok.headerTimeoutMs"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("grok.firstByteTimeoutMs"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("grok.bodyIdleTimeoutMs"))
+        );
+
+        let _connect_env = EnvGuard::set("CCP_GROK_CONNECT_TIMEOUT_MS", "12000");
+        let summary = config_override_summary_lines(&loaded);
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("CCP_GROK_CONNECT_TIMEOUT_MS (env)"))
+        );
     }
 }
