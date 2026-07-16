@@ -95,6 +95,23 @@ impl Provider for GrokProvider {
                 );
             }
         };
+        crate::logging::create_logger("grok").info(
+            "request_configuration",
+            Some(serde_json::Map::from_iter([
+                ("reqId".into(), serde_json::json!(ctx.req_id)),
+                ("model".into(), serde_json::json!(resolved)),
+                (
+                    "reasoningEffort".into(),
+                    serde_json::json!(
+                        translated
+                            .reasoning
+                            .as_ref()
+                            .map(|reasoning| reasoning.effort.as_str())
+                    ),
+                ),
+                ("transport".into(), serde_json::json!("http")),
+            ])),
+        );
         if let Some(monitor) = &ctx.monitor {
             monitor.model_resolved(&ctx.req_id, &resolved);
             monitor.upstream_started(&ctx.req_id);
