@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Allow GPT-5.6 requests to opt out of Responses Lite so accounts that support
+  the full request shape can use parallel tool calls.
 - Preserve Claude tool-choice modes and single-tool constraints when translating
   requests to Codex Responses.
 - Count Codex input with the `o200k_base` tokenizer, including accurate CJK text

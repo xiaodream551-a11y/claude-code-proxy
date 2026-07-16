@@ -295,16 +295,23 @@ impl Provider for CodexProvider {
     }
 }
 
-/// Picks the upstream model and lane for a request. Hosted web_search must
-/// run on the full Responses API (the lite lane rejects hosted tools), and
-/// lite-only models like gpt-5.6-luna don't exist there, so such requests
-/// are upgraded to a full-lane model. Returns whether to use the lite lane.
+/// Picks the upstream model and lane for a request. Hosted web_search always
+/// uses the full Responses API and upgrades Luna for account compatibility.
+/// Other GPT-5.6 requests use Lite by default but may opt into the full shape.
 fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> bool {
+    apply_model_lane_for_request_with_lite(model, body, config::codex_responses_lite())
+}
+
+fn apply_model_lane_for_request_with_lite(
+    model: &mut String,
+    body: &MessagesRequest,
+    responses_lite: bool,
+) -> bool {
     if has_hosted_web_search(body) {
         *model = full_lane_web_search_model(model).to_string();
         return false;
     }
-    uses_responses_lite(model)
+    responses_lite && uses_responses_lite(model)
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -1148,7 +1155,7 @@ mod tests {
             ("gpt-5.4", "gpt-5.4"),
         ] {
             let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
+            let lite = apply_model_lane_for_request_with_lite(&mut model, &body, true);
             assert!(!lite, "{resolved} with web_search must use the full lane");
             assert_eq!(model, expected);
         }
@@ -1165,10 +1172,23 @@ mod tests {
             ("gpt-5.4", false),
         ] {
             let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
+            let lite = apply_model_lane_for_request_with_lite(&mut model, &body, true);
             assert_eq!(model, resolved, "model must not change without web_search");
             assert_eq!(lite, lite_expected);
         }
+    }
+
+    #[test]
+    fn responses_lite_can_be_disabled_without_changing_the_model() {
+        let body = request_with_tools(serde_json::json!([
+            {"name":"Bash", "input_schema":{}}
+        ]));
+        let mut model = "gpt-5.6-luna".to_string();
+
+        let lite = apply_model_lane_for_request_with_lite(&mut model, &body, false);
+
+        assert!(!lite);
+        assert_eq!(model, "gpt-5.6-luna");
     }
 
     #[test]

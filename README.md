@@ -704,6 +704,7 @@ Windows, and at
     "effort": "medium",
     "reasoningSummary": "auto",
     "serviceTier": "fast",
+    "responsesLite": true,
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
     "transport": "websocket",
     "websocketResponseStartTimeoutMs": 60000,
@@ -747,6 +748,7 @@ Windows, and at
 | `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`)                                                                               |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
+| `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it                     |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
 | `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: `websocket`, `http`, or `auto`                                                                                                                                   |
 | `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event before refreshing the WebSocket and retrying safely                                                                                |
@@ -1063,7 +1065,9 @@ supported shape.
   thinking signature and replayed on later turns; the proxy never decrypts it.
 - **Codex — Responses Lite parallel tools:** GPT-5.6 Lite models follow the native
   Codex behavior and disable parallel tool emission. Existing parallel tool history
-  still replays correctly.
+  still replays correctly. Set `codex.responsesLite` to `false` to use the full
+  Responses shape and permit parallel tool calls; full-lane GPT-5.6 availability is
+  account-dependent, so restore the default if the upstream reports model not found.
 - **Codex — HTTP transport:** `CCP_CODEX_TRANSPORT=http` buffers the complete
   upstream response before translating it. Use the default WebSocket transport for
   live token delivery and prompt cancellation.

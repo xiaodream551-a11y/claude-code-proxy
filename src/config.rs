@@ -56,6 +56,8 @@ struct CodexConfig {
     pub previous_response_id: Option<bool>,
     #[serde(rename = "serviceTier")]
     pub service_tier: Option<String>,
+    #[serde(rename = "responsesLite")]
+    pub responses_lite: Option<bool>,
     #[serde(rename = "reasoningSummary")]
     pub reasoning_summary: Option<String>,
     #[serde(rename = "effort")]
@@ -248,6 +250,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     {
         out.push("CCP_CODEX_REASONING_SUMMARY (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_RESPONSES_LITE") {
+        out.push("CCP_CODEX_RESPONSES_LITE (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS") {
         out.push("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS (env)".to_string());
     }
@@ -273,6 +278,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
         }
         if let Some(codex) = file_cfg.codex {
+            if let Some(responses_lite) = codex.responses_lite {
+                out.push(format!("codex.responsesLite: {responses_lite}"));
+            }
             if codex
                 .reasoning_summary
                 .as_deref()
@@ -453,6 +461,22 @@ pub fn codex_service_tier() -> Option<String> {
         return codex.service_tier;
     }
     None
+}
+
+pub fn codex_responses_lite() -> bool {
+    if let Ok(raw) = std::env::var("CCP_CODEX_RESPONSES_LITE") {
+        match raw.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    if let Some(codex) = read_file_config(&paths::config_dir()).and_then(|file| file.codex)
+        && let Some(value) = codex.responses_lite
+    {
+        return value;
+    }
+    true
 }
 
 pub fn codex_effort() -> Option<String> {
@@ -649,6 +673,7 @@ mod tests {
             std::env::remove_var("CCP_LOG_VERBOSE");
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
+            std::env::remove_var("CCP_CODEX_RESPONSES_LITE");
             std::env::remove_var("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS");
             std::env::remove_var("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS");
         }
@@ -819,6 +844,25 @@ mod tests {
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
         assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn codex_responses_lite_defaults_true_and_reads_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(codex_responses_lite());
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"responsesLite":false}}"#,
+        )
+        .unwrap();
+        assert!(!codex_responses_lite());
+
+        let _lite_env = EnvGuard::set("CCP_CODEX_RESPONSES_LITE", "true");
+        assert!(codex_responses_lite());
     }
 
     #[test]
