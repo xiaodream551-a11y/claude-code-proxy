@@ -149,7 +149,8 @@ impl Provider for CodexProvider {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
-        if want_stream && matches!(config::codex_transport(), config::CodexTransport::WebSocket) {
+        let transport = config::codex_transport();
+        if want_stream && !matches!(transport, config::CodexTransport::Http) {
             let stream_request = translated.clone();
             return live_stream_response(
                 client,
@@ -175,43 +176,7 @@ impl Provider for CodexProvider {
         };
 
         if want_stream {
-            let sse_bytes = match translate_stream_bytes_with_traffic(
-                &upstream.body,
-                &message_id,
-                model,
-                ctx.traffic.as_deref(),
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
-                    return map_codex_failure_to_response(&format!(
-                        "Stream translation error: {e}"
-                    ));
-                }
-            };
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                monitor.stream_progress(
-                    &ctx.req_id,
-                    sse_bytes.len() as u64,
-                    count_sse_events(&sse_bytes),
-                    input_tokens,
-                    output_tokens,
-                );
-            }
-            update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
-                turn_id,
-                &translated,
-                &upstream.body,
-            );
-
-            let headers = [
-                (http::header::CONTENT_TYPE, "text/event-stream"),
-                (http::header::CACHE_CONTROL, "no-cache"),
-                (http::header::CONNECTION, "keep-alive"),
-            ];
-            (headers, sse_bytes).into_response()
+            buffered_stream_response(upstream, &message_id, model, &ctx, turn_id, &translated)
         } else {
             match accumulate_response_with_traffic(
                 &upstream.body,
@@ -318,6 +283,73 @@ fn count_sse_events(bytes: &[u8]) -> u64 {
     String::from_utf8_lossy(bytes).matches("event:").count() as u64
 }
 
+fn buffered_stream_response(
+    upstream: client::CodexResponse,
+    message_id: &str,
+    model: &str,
+    ctx: &RequestContext,
+    turn_id: Option<u64>,
+    request_body: &translate::request::ResponsesRequest,
+) -> Response {
+    let sse_bytes = match translate_stream_bytes_with_traffic(
+        &upstream.body,
+        message_id,
+        model,
+        ctx.traffic.as_deref(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            abort_continuation(ctx.session_id.as_deref(), turn_id);
+            return map_codex_failure_to_response(&format!("Stream translation error: {error}"));
+        }
+    };
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
+        monitor.stream_progress(
+            &ctx.req_id,
+            sse_bytes.len() as u64,
+            count_sse_events(&sse_bytes),
+            input_tokens,
+            output_tokens,
+        );
+    }
+    update_continuation_from_upstream(
+        ctx.session_id.as_deref(),
+        turn_id,
+        request_body,
+        &upstream.body,
+    );
+
+    let headers = [
+        (http::header::CONTENT_TYPE, "text/event-stream"),
+        (http::header::CACHE_CONTROL, "no-cache"),
+        (http::header::CONNECTION, "keep-alive"),
+    ];
+    (headers, sse_bytes).into_response()
+}
+
+async fn buffered_http_stream_fallback(
+    client: &Arc<CodexHttpClient>,
+    message_id: &str,
+    model: &str,
+    ctx: &RequestContext,
+    turn_id: Option<u64>,
+    request_body: &translate::request::ResponsesRequest,
+    continuation: Option<&ContinuationCandidate>,
+) -> Response {
+    let upstream = match client
+        .post_codex_http(request_body, ctx, continuation)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            abort_continuation(ctx.session_id.as_deref(), turn_id);
+            return map_codex_error_to_response(&error);
+        }
+    };
+    buffered_stream_response(upstream, message_id, model, ctx, turn_id, request_body)
+}
+
 enum LiveStreamStart {
     Response(Response),
     Retry { error: client::CodexError },
@@ -336,8 +368,26 @@ async fn live_stream_response(
     let turn_id = continuation.turn_id;
     let mut attempt = 0_u32;
     let mut continuation = Some(continuation);
+    let circuit_key = ctx.session_id.as_deref();
+    let transport = config::codex_transport();
 
     loop {
+        if transport == config::CodexTransport::Auto
+            && circuit_key.is_some_and(websocket::codex_websocket_circuit_open)
+        {
+            client::log_websocket_circuit_fallback(&ctx);
+            return buffered_http_stream_fallback(
+                &client,
+                &message_id,
+                &model,
+                &ctx,
+                turn_id,
+                &request_body,
+                continuation.as_ref(),
+            )
+            .await;
+        }
+
         let upstream_events = match client
             .stream_codex_websocket_events(&request_body, &ctx, continuation.as_ref())
             .await
@@ -349,7 +399,13 @@ async fn live_stream_response(
                     attempt += 1;
                     continue;
                 }
-                if attempt >= max_live_retries(&err) {
+                if transport == config::CodexTransport::Auto
+                    && client::record_auto_websocket_failure(&ctx, &err)
+                {
+                    continue;
+                }
+                let max_retries = max_live_retries(&err);
+                if attempt >= max_retries {
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_error_to_response(&err);
                 }
@@ -358,6 +414,14 @@ async fn live_stream_response(
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_error_to_response(&err);
                 }
+                client::log_live_transport_retry(
+                    &ctx,
+                    transport,
+                    attempt + 1,
+                    max_retries + 1,
+                    delay.wait_ms,
+                    &err,
+                );
                 attempt += 1;
                 sleep(delay.wait_ms).await;
                 continue;
@@ -379,14 +443,46 @@ async fn live_stream_response(
         )
         .await
         {
-            LiveStreamStart::Response(response) => return response,
+            LiveStreamStart::Response(response) => {
+                if transport == config::CodexTransport::Auto
+                    && let Some(key) = circuit_key
+                {
+                    websocket::record_codex_websocket_success(key);
+                }
+                return response;
+            }
             LiveStreamStart::Retry { error } => {
+                if transport == config::CodexTransport::Auto
+                    && client::should_fallback_to_http(&error)
+                {
+                    client::record_auto_websocket_failure(&ctx, &error);
+                    return buffered_http_stream_fallback(
+                        &client,
+                        &message_id,
+                        &model,
+                        &ctx,
+                        turn_id,
+                        &request_body,
+                        continuation.as_ref(),
+                    )
+                    .await;
+                }
+                if !retryable_live_start_codex_error(&error) {
+                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    return map_codex_error_to_response(&error);
+                }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if dropped && is_missing_previous_response_error(&error) {
                     attempt += 1;
                     continue;
                 }
-                if attempt >= max_live_retries(&error) {
+                if transport == config::CodexTransport::Auto
+                    && client::record_auto_websocket_failure(&ctx, &error)
+                {
+                    continue;
+                }
+                let max_retries = max_live_retries(&error);
+                if attempt >= max_retries {
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_error_to_response(&error);
                 }
@@ -395,6 +491,14 @@ async fn live_stream_response(
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
                     return map_codex_error_to_response(&error);
                 }
+                client::log_live_transport_retry(
+                    &ctx,
+                    transport,
+                    attempt + 1,
+                    max_retries + 1,
+                    delay.wait_ms,
+                    &error,
+                );
                 attempt += 1;
                 sleep(delay.wait_ms).await;
             }
@@ -419,7 +523,9 @@ async fn live_stream_response_once(
         let payload = match item {
             Ok(payload) => payload,
             Err(err) => {
-                if retryable_live_start_codex_error(&err) {
+                if retryable_live_start_codex_error(&err)
+                    || err.origin == client::CodexErrorOrigin::WebSocketHandshake
+                {
                     return LiveStreamStart::Retry { error: err };
                 }
                 abort_continuation(ctx.session_id.as_deref(), turn_id);

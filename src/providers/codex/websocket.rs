@@ -54,6 +54,9 @@ pub(super) fn is_retryable_transport_detail(detail: Option<&str>) -> bool {
 
 const POOL_MAX_AGE_MS: u64 = 30 * 60 * 1000;
 const MAX_POOL_ENTRIES: usize = 10_000;
+pub(super) const WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+pub(super) const WEBSOCKET_CIRCUIT_COOLDOWN_MS: u64 = 30_000;
+const MAX_CIRCUIT_ENTRIES: usize = 10_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CodexWebSocketTimeouts {
@@ -153,6 +156,72 @@ struct PoolEntry {
 static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<PoolEntry>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
+#[derive(Debug, Clone)]
+struct CircuitEntry {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    updated_at: Instant,
+}
+
+#[derive(Default)]
+struct WebSocketCircuitBreaker {
+    entries: HashMap<String, CircuitEntry>,
+}
+
+impl WebSocketCircuitBreaker {
+    fn should_route_http(&mut self, key: &str, now: Instant, probe_lease: Duration) -> bool {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return false;
+        };
+        match entry.open_until {
+            Some(open_until) if now < open_until => true,
+            Some(_) => {
+                // Reserve one half-open probe. Concurrent requests keep using
+                // HTTP until the probe succeeds or this lease expires.
+                entry.open_until = Some(now + probe_lease);
+                entry.consecutive_failures = WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD - 1;
+                entry.updated_at = now;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_failure(&mut self, key: &str, now: Instant) -> bool {
+        if !self.entries.contains_key(key)
+            && self.entries.len() >= MAX_CIRCUIT_ENTRIES
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.updated_at)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+
+        let entry = self.entries.entry(key.to_string()).or_insert(CircuitEntry {
+            consecutive_failures: 0,
+            open_until: None,
+            updated_at: now,
+        });
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.updated_at = now;
+        if entry.consecutive_failures >= WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD {
+            entry.consecutive_failures = WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD;
+            entry.open_until = Some(now + Duration::from_millis(WEBSOCKET_CIRCUIT_COOLDOWN_MS));
+            return true;
+        }
+        false
+    }
+
+    fn record_success(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+}
+
+static WS_CIRCUIT_BREAKER: once_cell::sync::Lazy<Mutex<WebSocketCircuitBreaker>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(WebSocketCircuitBreaker::default()));
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -163,6 +232,34 @@ fn now_ms() -> u64 {
 pub fn clear_codex_websocket_pool_for_tests() {
     let mut guard = WS_POOL.lock().unwrap();
     guard.clear();
+    drop(guard);
+    WS_CIRCUIT_BREAKER.lock().unwrap().entries.clear();
+}
+
+pub(super) fn codex_websocket_circuit_open(key: &str) -> bool {
+    let timeouts = CodexWebSocketTimeouts::configured();
+    let probe_lease = Duration::from_millis(
+        timeouts
+            .connect_ms
+            .saturating_add(timeouts.pool_probe_ms)
+            .saturating_add(timeouts.response_start_ms)
+            .saturating_add(1_000),
+    );
+    WS_CIRCUIT_BREAKER
+        .lock()
+        .unwrap()
+        .should_route_http(key, Instant::now(), probe_lease)
+}
+
+pub(super) fn record_codex_websocket_failure(key: &str) -> bool {
+    WS_CIRCUIT_BREAKER
+        .lock()
+        .unwrap()
+        .record_failure(key, Instant::now())
+}
+
+pub(super) fn record_codex_websocket_success(key: &str) {
+    WS_CIRCUIT_BREAKER.lock().unwrap().record_success(key);
 }
 
 pub fn invalidate_codex_websocket_pool_key(session_id: &str) {
@@ -1427,6 +1524,53 @@ mod tests {
             pong_ms: 100,
             pool_probe_ms: 100,
         }
+    }
+
+    #[test]
+    fn websocket_circuit_opens_cools_down_and_resets() {
+        let mut breaker = WebSocketCircuitBreaker::default();
+        let now = Instant::now();
+        let probe_lease = Duration::from_secs(90);
+
+        assert!(!breaker.should_route_http("session", now, probe_lease));
+        assert!(!breaker.record_failure("session", now));
+        assert!(!breaker.record_failure("session", now));
+        assert!(breaker.record_failure("session", now));
+        assert!(breaker.should_route_http(
+            "session",
+            now + Duration::from_millis(WEBSOCKET_CIRCUIT_COOLDOWN_MS - 1),
+            probe_lease,
+        ));
+
+        let probe_at = now + Duration::from_millis(WEBSOCKET_CIRCUIT_COOLDOWN_MS);
+        assert!(!breaker.should_route_http("session", probe_at, probe_lease));
+        assert!(breaker.should_route_http("session", probe_at, probe_lease));
+
+        let next_probe_at = probe_at + probe_lease;
+        assert!(!breaker.should_route_http("session", next_probe_at, probe_lease));
+        assert!(breaker.record_failure("session", next_probe_at));
+        breaker.record_success("session");
+        assert!(!breaker.should_route_http("session", next_probe_at, probe_lease));
+    }
+
+    #[test]
+    fn websocket_circuit_isolates_keys_and_bounds_entries() {
+        let mut breaker = WebSocketCircuitBreaker::default();
+        let now = Instant::now();
+        for _ in 0..WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD {
+            breaker.record_failure("session-a", now);
+        }
+        let probe_lease = Duration::from_secs(90);
+        assert!(breaker.should_route_http("session-a", now, probe_lease));
+        assert!(!breaker.should_route_http("session-b", now, probe_lease));
+
+        for index in 0..=MAX_CIRCUIT_ENTRIES {
+            breaker.record_failure(
+                &format!("session-{index}"),
+                now + Duration::from_nanos(index as u64),
+            );
+        }
+        assert!(breaker.entries.len() <= MAX_CIRCUIT_ENTRIES);
     }
 
     #[test]

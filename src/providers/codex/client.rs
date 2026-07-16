@@ -296,6 +296,16 @@ impl CodexHttpClient {
             .await
     }
 
+    pub(super) async fn post_codex_http(
+        &self,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationCandidate>,
+    ) -> Result<CodexResponse, CodexError> {
+        self.post_codex_with_transport(body, ctx, continuation, crate::config::CodexTransport::Http)
+            .await
+    }
+
     async fn post_codex_with_transport(
         &self,
         body: &ResponsesRequest,
@@ -332,13 +342,7 @@ impl CodexHttpClient {
             let pool_key = websocket_pool_key(ctx, active_continuation.as_ref());
             let result = match transport {
                 CodexTransport::Http => {
-                    let body_json = serde_json::to_string(body).map_err(|e| CodexError {
-                        status: 500,
-                        message: "Failed to serialize request".to_string(),
-                        detail: Some(e.to_string()),
-                        retry_after: None,
-                        origin: CodexErrorOrigin::Http,
-                    })?;
+                    let body_json = serialize_request(body)?;
                     self.attempt_post_http(&auth, &body_json, ctx, body.client_metadata.is_some())
                         .await
                 }
@@ -361,45 +365,60 @@ impl CodexHttpClient {
                     .await
                 }
                 CodexTransport::Auto => {
-                    let ws_headers =
-                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
-                    let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
-                    let ws_body = build_websocket_request(body, active_continuation.as_ref());
+                    let circuit_key = ctx.session_id.as_deref();
+                    if circuit_key.is_some_and(super::websocket::codex_websocket_circuit_open) {
+                        log_websocket_circuit_fallback(ctx);
+                        let body_json = serialize_request(body)?;
+                        self.attempt_post_http(
+                            &auth,
+                            &body_json,
+                            ctx,
+                            body.client_metadata.is_some(),
+                        )
+                        .await
+                    } else {
+                        let ws_headers =
+                            build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
+                        let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
+                        let ws_body = build_websocket_request(body, active_continuation.as_ref());
 
-                    // Try WebSocket first
-                    let ws_result = super::websocket::codex_websocket_request(
-                        &self.base_url,
-                        &ws_headers,
-                        &ws_body,
-                        ctx,
-                        ctx.traffic.as_deref(),
-                        pool_key,
-                        websocket_timeouts,
-                        active_continuation.as_ref(),
-                    )
-                    .await;
+                        // Try WebSocket first
+                        let ws_result = super::websocket::codex_websocket_request(
+                            &self.base_url,
+                            &ws_headers,
+                            &ws_body,
+                            ctx,
+                            ctx.traffic.as_deref(),
+                            pool_key,
+                            websocket_timeouts,
+                            active_continuation.as_ref(),
+                        )
+                        .await;
 
-                    match ws_result {
-                        Ok(response) => Ok(response),
-                        Err(err) if should_fallback_to_http(&err) => {
-                            // Fall back to HTTP only if WebSocket failed before sending
-                            let body_json =
-                                serde_json::to_string(body).map_err(|e| CodexError {
-                                    status: 500,
-                                    message: "Failed to serialize request".to_string(),
-                                    detail: Some(e.to_string()),
-                                    retry_after: None,
-                                    origin: CodexErrorOrigin::Http,
-                                })?;
-                            self.attempt_post_http(
-                                &auth,
-                                &body_json,
-                                ctx,
-                                body.client_metadata.is_some(),
-                            )
-                            .await
+                        match ws_result {
+                            Ok(response) => {
+                                if let Some(key) = circuit_key {
+                                    super::websocket::record_codex_websocket_success(key);
+                                }
+                                Ok(response)
+                            }
+                            Err(err) if should_fallback_to_http(&err) => {
+                                record_auto_websocket_failure(ctx, &err);
+                                // Fall back to HTTP only if WebSocket failed before sending
+                                let body_json = serialize_request(body)?;
+                                self.attempt_post_http(
+                                    &auth,
+                                    &body_json,
+                                    ctx,
+                                    body.client_metadata.is_some(),
+                                )
+                                .await
+                            }
+                            Err(err) => {
+                                record_auto_websocket_failure(ctx, &err);
+                                Err(err)
+                            }
                         }
-                        Err(err) => Err(err),
                     }
                 }
             };
@@ -1115,6 +1134,16 @@ fn buffered_origin(transport: crate::config::CodexTransport) -> CodexErrorOrigin
     }
 }
 
+fn serialize_request(body: &ResponsesRequest) -> Result<String, CodexError> {
+    serde_json::to_string(body).map_err(|error| CodexError {
+        status: 500,
+        message: "Failed to serialize request".to_string(),
+        detail: Some(error.to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::Http,
+    })
+}
+
 fn should_retry_codex_status(status: u16) -> bool {
     should_retry_status(status) || status == 529
 }
@@ -1175,7 +1204,87 @@ fn log_buffered_retry_exhausted(
     create_logger("codex").warn("buffered_transport_retry_exhausted", Some(fields));
 }
 
-fn is_retryable_transport_error(err: &CodexError) -> bool {
+pub(super) fn log_live_transport_retry(
+    ctx: &RequestContext,
+    transport: crate::config::CodexTransport,
+    failed_attempt: u32,
+    max_attempts: u32,
+    delay_ms: u64,
+    err: &CodexError,
+) {
+    create_logger("codex").warn(
+        "live_transport_retry",
+        Some(serde_json::Map::from_iter([
+            ("reqId".into(), serde_json::json!(ctx.req_id)),
+            ("transport".into(), serde_json::json!(transport.as_str())),
+            ("failedAttempt".into(), serde_json::json!(failed_attempt)),
+            ("nextAttempt".into(), serde_json::json!(failed_attempt + 1)),
+            ("maxAttempts".into(), serde_json::json!(max_attempts)),
+            ("delayMs".into(), serde_json::json!(delay_ms)),
+            ("status".into(), serde_json::json!(err.status)),
+            (
+                "origin".into(),
+                serde_json::json!(codex_error_origin_name(err.origin)),
+            ),
+            ("reason".into(), serde_json::json!(err.message)),
+        ])),
+    );
+}
+
+pub(super) fn log_websocket_circuit_fallback(ctx: &RequestContext) {
+    create_logger("codex").warn(
+        "websocket_circuit_fallback",
+        Some(serde_json::Map::from_iter([
+            ("reqId".into(), serde_json::json!(ctx.req_id)),
+            (
+                "cooldownMs".into(),
+                serde_json::json!(super::websocket::WEBSOCKET_CIRCUIT_COOLDOWN_MS),
+            ),
+            ("fallbackTransport".into(), serde_json::json!("http")),
+        ])),
+    );
+}
+
+pub(super) fn record_auto_websocket_failure(ctx: &RequestContext, err: &CodexError) -> bool {
+    let Some(key) = ctx.session_id.as_deref() else {
+        return false;
+    };
+    if !should_count_auto_websocket_failure(err) {
+        // A non-transport response proves the WebSocket path is reachable and
+        // breaks a run of consecutive transport failures.
+        super::websocket::record_codex_websocket_success(key);
+        return false;
+    }
+
+    let opened = super::websocket::record_codex_websocket_failure(key);
+    if opened {
+        create_logger("codex").warn(
+            "websocket_circuit_opened",
+            Some(serde_json::Map::from_iter([
+                ("reqId".into(), serde_json::json!(ctx.req_id)),
+                (
+                    "failures".into(),
+                    serde_json::json!(super::websocket::WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD),
+                ),
+                (
+                    "cooldownMs".into(),
+                    serde_json::json!(super::websocket::WEBSOCKET_CIRCUIT_COOLDOWN_MS),
+                ),
+            ])),
+        );
+    }
+    opened
+}
+
+fn should_count_auto_websocket_failure(err: &CodexError) -> bool {
+    matches!(
+        err.origin,
+        CodexErrorOrigin::WebSocket | CodexErrorOrigin::WebSocketHandshake
+    ) && err.detail.as_deref() != Some("previous_response_not_found")
+        && is_retryable_transport_error(err)
+}
+
+pub(super) fn is_retryable_transport_error(err: &CodexError) -> bool {
     if err.origin == CodexErrorOrigin::WebSocketHandshake {
         return err.status == 0 || should_retry_codex_status(err.status);
     }
@@ -1229,7 +1338,7 @@ fn should_refresh_after_unauthorized(
     }
 }
 
-fn should_fallback_to_http(err: &CodexError) -> bool {
+pub(super) fn should_fallback_to_http(err: &CodexError) -> bool {
     err.origin == CodexErrorOrigin::WebSocketHandshake
 }
 
@@ -1438,6 +1547,48 @@ mod tests {
             .await
             .unwrap();
         server.await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"data: keep\n\n");
+    }
+
+    #[tokio::test]
+    async fn auto_routes_directly_to_http_while_websocket_circuit_is_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
+            let body = b"data: keep\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let mut ctx = http_test_context();
+        let circuit_key = "auto-circuit-http-test";
+        ctx.session_id = Some(circuit_key.to_string());
+        for _ in 0..super::super::websocket::WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD {
+            super::super::websocket::record_codex_websocket_failure(circuit_key);
+        }
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &ctx,
+                None,
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        super::super::websocket::record_codex_websocket_success(circuit_key);
 
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"data: keep\n\n");
@@ -2016,6 +2167,60 @@ mod tests {
         ));
         assert!(should_fallback_to_http(rejected_handshake_err));
         assert!(!should_fallback_to_http(&stale_pool));
+    }
+
+    #[test]
+    fn auto_circuit_counts_only_retryable_websocket_transport_failures() {
+        let retryable_handshake = CodexError {
+            status: 503,
+            message: "Service unavailable".into(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        };
+        let response_timeout = CodexError {
+            status: 0,
+            message: "Response start timeout".into(),
+            detail: Some(super::super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.into()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+        let bad_request = CodexError {
+            status: 400,
+            message: "Bad request".into(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        };
+        let http_reset = CodexError {
+            status: 0,
+            message: "Connection reset".into(),
+            detail: None,
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        };
+        let missing_continuation = CodexError {
+            status: 404,
+            message: "Previous response not found".into(),
+            detail: Some("previous_response_not_found".into()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(should_count_auto_websocket_failure(&retryable_handshake));
+        assert!(should_count_auto_websocket_failure(&response_timeout));
+        assert!(!should_count_auto_websocket_failure(&bad_request));
+        assert!(!should_count_auto_websocket_failure(&http_reset));
+        assert!(!should_count_auto_websocket_failure(&missing_continuation));
+
+        let mut ctx = http_test_context();
+        let circuit_key = "auto-circuit-reset-test";
+        ctx.session_id = Some(circuit_key.into());
+        assert!(!record_auto_websocket_failure(&ctx, &response_timeout));
+        assert!(!record_auto_websocket_failure(&ctx, &response_timeout));
+        assert!(!record_auto_websocket_failure(&ctx, &bad_request));
+        assert!(!record_auto_websocket_failure(&ctx, &response_timeout));
+        super::super::websocket::record_codex_websocket_success(circuit_key);
     }
 
     #[test]

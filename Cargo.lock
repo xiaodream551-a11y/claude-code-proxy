@@ -348,6 +348,7 @@ dependencies = [
  "hostname",
  "http",
  "http-body-util",
+ "httpdate",
  "jiff",
  "once_cell",
  "predicates",

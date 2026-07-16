@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
@@ -240,6 +241,70 @@ async fn spawn_websocket_delayed_terminal_upstream() -> String {
                 let _ = ws.send(Message::Text(event.to_string())).await;
             }
         }
+    });
+
+    addr_str
+}
+
+async fn spawn_websocket_rejection_then_http_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        let (mut websocket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 16 * 1024];
+        let read = websocket.read(&mut request).await.unwrap();
+        assert!(read > 0);
+        assert!(
+            String::from_utf8_lossy(&request[..read])
+                .to_ascii_lowercase()
+                .contains("upgrade: websocket")
+        );
+        websocket
+            .write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        drop(websocket);
+
+        let (mut http, _) = listener.accept().await.unwrap();
+        let read = http.read(&mut request).await.unwrap();
+        assert!(read > 0);
+        assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"auto http fallback\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        http.write_all(response.as_bytes()).await.unwrap();
+        http.write_all(body.as_bytes()).await.unwrap();
+    });
+
+    addr_str
+}
+
+async fn spawn_non_retryable_websocket_rejection_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        let (mut websocket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 16 * 1024];
+        assert!(websocket.read(&mut request).await.unwrap() > 0);
+        websocket
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\ncontent-length: 11\r\nconnection: close\r\n\r\nunsupported",
+            )
+            .await
+            .unwrap();
     });
 
     addr_str
@@ -878,20 +943,75 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
-async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
+async fn smoke_codex_websocket_and_auto_stream_return_delta_before_terminal() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+    for transport in ["websocket", "auto"] {
+        clear_codex_websocket_pool_for_tests();
+        let upstream = spawn_websocket_delayed_terminal_upstream().await;
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+        let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", transport);
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            call_messages_body(json!({
+                "model": "gpt-5.5",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role":"user","content":"hello"}]
+            })),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{transport} stream should start before terminal event"));
+        assert_eq!(response.status(), StatusCode::OK, "transport={transport}");
+
+        let mut body = response.into_body();
+        let mut collected = Vec::new();
+        let read = tokio::time::timeout(Duration::from_millis(500), async {
+            while !String::from_utf8_lossy(&collected).contains("text_delta") {
+                let Some(frame) = body.frame().await else {
+                    break;
+                };
+                let frame = frame.unwrap();
+                if let Ok(data) = frame.into_data() {
+                    collected.extend_from_slice(&data);
+                }
+            }
+        })
+        .await;
+        assert!(
+            read.is_ok(),
+            "{transport} stream did not yield an early text delta"
+        );
+        let text = String::from_utf8_lossy(&collected);
+        assert!(
+            text.contains("early chunk"),
+            "{transport} stream body: {text}"
+        );
+        assert!(
+            !text.contains("message_stop"),
+            "{transport} stream finished too early: {text}"
+        );
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_auto_stream_falls_back_after_websocket_handshake_rejection() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
-
-    let upstream = spawn_websocket_delayed_terminal_upstream().await;
+    let upstream = spawn_websocket_rejection_then_http_upstream().await;
 
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
-    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
-
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
     let response = tokio::time::timeout(
-        Duration::from_millis(500),
+        Duration::from_secs(1),
         call_messages_body(json!({
             "model": "gpt-5.5",
             "max_tokens": 64,
@@ -900,30 +1020,42 @@ async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
         })),
     )
     .await
-    .expect("streaming response should start before terminal upstream event");
+    .expect("auto should fall back without waiting for WebSocket retry backoff");
     assert_eq!(response.status(), StatusCode::OK);
-
-    let mut body = response.into_body();
-    let mut collected = Vec::new();
-    let read = tokio::time::timeout(Duration::from_millis(500), async {
-        while !String::from_utf8_lossy(&collected).contains("text_delta") {
-            let Some(frame) = body.frame().await else {
-                break;
-            };
-            let frame = frame.unwrap();
-            if let Ok(data) = frame.into_data() {
-                collected.extend_from_slice(&data);
-            }
-        }
-    })
-    .await;
-    assert!(read.is_ok(), "stream did not yield an early text delta");
-    let text = String::from_utf8_lossy(&collected);
-    assert!(text.contains("early chunk"), "stream body: {text}");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert!(
-        !text.contains("message_stop"),
-        "stream finished too early: {text}"
+        String::from_utf8_lossy(&body).contains("auto http fallback"),
+        "stream body: {}",
+        String::from_utf8_lossy(&body)
     );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_stream_does_not_retry_permanent_handshake_rejection() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+    let upstream = spawn_non_retryable_websocket_rejection_upstream().await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        call_messages_body(json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        })),
+    )
+    .await
+    .expect("permanent WebSocket rejection should fail without retry backoff");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
 
 #[allow(clippy::await_holding_lock)]
