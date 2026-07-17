@@ -8,6 +8,9 @@ use super::constants::{CLIENT_ID, ISSUER, REFRESH_MARGIN_MS};
 use super::jwt::{TokenResponse, extract_account_id, validate_token_response};
 use super::token_store::{CodexTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
+use crate::oauth_http::{
+    MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_async, read_text_async,
+};
 use crate::oauth_rotation::{
     AuthMutationLock, clear_refresh_pending, generation_fingerprint, read_refresh_pending,
     write_refresh_pending,
@@ -112,6 +115,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             refresh_safety: Arc::new(AsyncMutex::new(RefreshSafetyState::default())),
             refresh_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -334,10 +338,10 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
                 }
                 self.store.clear_auth()?;
             }
-            let err_msg = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "Token refresh unauthorized".to_string());
+            let err_msg =
+                read_text_async(resp, MAX_OAUTH_ERROR_BYTES, "Codex refresh error response")
+                    .await
+                    .unwrap_or_else(|_| "Token refresh unauthorized".to_string());
             return Err(CodexAuthError::credentials_invalid(err_msg));
         }
 
@@ -348,9 +352,12 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             )));
         }
 
-        let tokens: TokenResponse = resp.json().await.map_err(|error| {
-            refresh_outcome_unknown(format!("the token response was invalid: {error}"))
-        })?;
+        let tokens: TokenResponse =
+            read_json_async(resp, MAX_OAUTH_JSON_BYTES, "Codex refresh response")
+                .await
+                .map_err(|error| {
+                    refresh_outcome_unknown(format!("the token response was invalid: {error}"))
+                })?;
         validate_token_response(&tokens).map_err(|error| {
             refresh_outcome_unknown(format!("the token response was incomplete: {error}"))
         })?;
@@ -407,9 +414,11 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
 
     async fn clear_refresh_pending_for(&self, auth: &StoredAuth) -> Result<(), anyhow::Error> {
         let coordination_path = self.store.coordination_path();
-        clear_refresh_pending(coordination_path.as_deref())?;
         let fingerprint = generation_fingerprint(auth)?;
         let mut safety = self.refresh_safety.lock().await;
+        // Once the durable marker is removed there must be no cancellation
+        // point before the matching in-memory ambiguity is cleared.
+        clear_refresh_pending(coordination_path.as_deref())?;
         if safety.ambiguous_generation == Some(fingerprint) {
             safety.ambiguous_generation = None;
         }
@@ -742,6 +751,46 @@ mod tests {
         let error = restarted.get_auth().await.unwrap_err();
         assert!(error.to_string().contains("outcome is unknown"));
         assert!(refresh_pending_path(&auth_path).exists());
+    }
+
+    #[tokio::test]
+    async fn cancelling_marker_clear_while_waiting_for_state_lock_keeps_marker() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let auth_path = temp.path().join("codex/auth.json");
+        let auth_path_string = auth_path.to_string_lossy().into_owned();
+        let store = CodexTokenStore::new(FileAuthStore::new(
+            auth_path_string.clone(),
+            auth_path_string,
+        ));
+        let current = expired_auth();
+        store.save_auth(current.clone()).unwrap();
+        let manager = Arc::new(CodexAuthManager::new(store));
+        manager.mark_refresh_pending(&current).await.unwrap();
+
+        let state_guard = manager.refresh_safety.lock().await;
+        let clear_manager = manager.clone();
+        let clear_auth = current.clone();
+        let mut clear =
+            tokio::spawn(async move { clear_manager.clear_refresh_pending_for(&clear_auth).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut clear)
+                .await
+                .is_err(),
+            "marker clear should be waiting for the in-memory state lock"
+        );
+        assert!(
+            refresh_pending_path(&auth_path).exists(),
+            "cancellation before the state lock is acquired must leave the durable marker"
+        );
+        clear.abort();
+        drop(state_guard);
+        let _ = clear.await;
+
+        assert!(refresh_pending_path(&auth_path).exists());
+        assert_eq!(
+            manager.refresh_safety.lock().await.ambiguous_generation,
+            Some(generation_fingerprint(&current).unwrap())
+        );
     }
 
     #[tokio::test]

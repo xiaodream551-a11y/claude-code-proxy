@@ -2,6 +2,9 @@ use std::time::{Duration, Instant};
 
 use super::constants::{CLIENT_ID, DEVICE_POLL_SAFETY_MARGIN_MS, ISSUER};
 use super::jwt::TokenResponse;
+use crate::oauth_http::{
+    MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_blocking, read_text_blocking,
+};
 
 const MAX_DEVICE_POLL_WAIT: Duration = Duration::from_secs(300);
 
@@ -64,6 +67,7 @@ impl DeviceAuthClient {
             issuer: issuer.into(),
             client: reqwest::blocking::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("failed to create Codex device auth client"),
@@ -89,13 +93,21 @@ impl DeviceAuthClient {
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = read_text_blocking(
+                resp,
+                MAX_OAUTH_ERROR_BYTES,
+                "Codex device authorization error response",
+            )
+            .unwrap_or_else(|error| format!("<unavailable: {error}>"));
             anyhow::bail!("Device init failed: {status} {text}");
         }
 
-        let init: DeviceInit = resp
-            .json()
-            .map_err(|e| anyhow::anyhow!("failed to parse device init response: {e}"))?;
+        let init: DeviceInit = read_json_blocking(
+            resp,
+            MAX_OAUTH_JSON_BYTES,
+            "Codex device authorization response",
+        )
+        .map_err(|e| anyhow::anyhow!("failed to parse device init response: {e}"))?;
         Ok(init)
     }
 
@@ -117,15 +129,20 @@ impl DeviceAuthClient {
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
-            let poll: DeviceTokenPoll = resp
-                .json()
-                .map_err(|e| anyhow::anyhow!("failed to parse device poll response: {e}"))?;
+            let poll: DeviceTokenPoll =
+                read_json_blocking(resp, MAX_OAUTH_JSON_BYTES, "Codex device poll response")
+                    .map_err(|e| anyhow::anyhow!("failed to parse device poll response: {e}"))?;
             return Ok(Some(poll));
         }
         if status == 403 || status == 404 {
             return Ok(None);
         }
-        let text = resp.text().unwrap_or_default();
+        let text = read_text_blocking(
+            resp,
+            MAX_OAUTH_ERROR_BYTES,
+            "Codex device poll error response",
+        )
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
         anyhow::bail!("Device poll failed: {status} {text}");
     }
 
@@ -153,13 +170,15 @@ impl DeviceAuthClient {
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text =
+                read_text_blocking(resp, MAX_OAUTH_ERROR_BYTES, "Codex token error response")
+                    .unwrap_or_else(|error| format!("<unavailable: {error}>"));
             anyhow::bail!("Token exchange failed: {status} {text}");
         }
 
-        let tokens: TokenResponse = resp
-            .json()
-            .map_err(|e| anyhow::anyhow!("failed to parse token exchange response: {e}"))?;
+        let tokens: TokenResponse =
+            read_json_blocking(resp, MAX_OAUTH_JSON_BYTES, "Codex token response")
+                .map_err(|e| anyhow::anyhow!("failed to parse token exchange response: {e}"))?;
         Ok(tokens)
     }
 
@@ -461,6 +480,7 @@ mod tests {
             issuer: server.url().to_string(),
             client: reqwest::blocking::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
@@ -526,6 +546,7 @@ mod tests {
             issuer: server.url.clone(),
             client: reqwest::blocking::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
@@ -589,6 +610,7 @@ mod tests {
             issuer: server.url.clone(),
             client: reqwest::blocking::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),

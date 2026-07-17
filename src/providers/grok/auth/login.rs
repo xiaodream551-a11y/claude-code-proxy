@@ -9,6 +9,7 @@ use url::Url;
 use super::pkce::{PkceCodes, generate_pkce, generate_state};
 use super::token_store::{GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
+use crate::oauth_http::{MAX_OAUTH_JSON_BYTES, read_json_blocking};
 
 pub const CANONICAL_ISSUER: &str = "https://auth.x.ai";
 pub const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -70,6 +71,7 @@ pub fn login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> anyhow::R
 fn client() -> anyhow::Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .build()?)
@@ -78,17 +80,8 @@ fn client() -> anyhow::Result<reqwest::blocking::Client> {
 fn discover(client: &reqwest::blocking::Client) -> anyhow::Result<Discovery> {
     let url = format!("{CANONICAL_ISSUER}/.well-known/openid-configuration");
     let response = client.get(url).send()?.error_for_status()?;
-    if response
-        .content_length()
-        .is_some_and(|size| size as usize > MAX_METADATA_BYTES)
-    {
-        anyhow::bail!("Grok OIDC metadata exceeds the size limit");
-    }
-    let bytes = response.bytes()?;
-    if bytes.len() > MAX_METADATA_BYTES {
-        anyhow::bail!("Grok OIDC metadata exceeds the size limit");
-    }
-    let discovery: Discovery = serde_json::from_slice(&bytes)?;
+    let discovery: Discovery =
+        read_json_blocking(response, MAX_METADATA_BYTES, "Grok OIDC metadata")?;
     validate_discovery(&discovery)?;
     Ok(discovery)
 }
@@ -171,7 +164,8 @@ fn exchange_code(
             response.status()
         );
     }
-    let tokens: TokenResponse = response.json()?;
+    let tokens: TokenResponse =
+        read_json_blocking(response, MAX_OAUTH_JSON_BYTES, "Grok token response")?;
     validate_tokens(&tokens)?;
     Ok(tokens)
 }

@@ -68,14 +68,18 @@ fn codex_auth_status_no_auth() -> Result<(), Box<dyn std::error::Error>> {
 fn codex_auth_status_shows_storage_path() -> Result<(), Box<dyn std::error::Error>> {
     let (mut cmd, temp) = codex_cmd();
     let auth_dir = temp.path().join("codex");
+    let auth_path = auth_dir.join("auth.json");
     std::fs::create_dir_all(&auth_dir)?;
     std::fs::write(
-        auth_dir.join("auth.json"),
+        &auth_path,
         r#"{"access":"a","refresh":"r","expires":4102444800000,"accountId":"acct_3"}"#,
     )?;
     let output = cmd.assert().success().get_output().stdout.clone();
     let out = String::from_utf8(output)?;
-    assert!(out.contains("Storage:"), "{out}");
+    assert!(
+        out.contains(&format!("Storage: {}", auth_path.display())),
+        "{out}"
+    );
     assert!(!out.contains("Auth path:"), "{out}");
     Ok(())
 }

@@ -11,6 +11,7 @@ use url::Url;
 use super::login::{CANONICAL_ISSUER, CLIENT_ID};
 use super::token_store::{AuthMutationLock, GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
+use crate::oauth_http::{MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_async};
 
 const REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
 
@@ -168,6 +169,7 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
             .build()?;
@@ -195,7 +197,7 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
     }
 
     pub async fn get_auth_with_status(&self) -> Result<(StoredAuth, bool), GrokAuthError> {
-        let auth = match self.load_current_auth().await {
+        let auth = match self.load_current_auth(None).await {
             Ok(auth) => auth,
             Err(GrokAuthError::RefreshOutcomeUnknown) => {
                 // A pending marker may belong to another request currently holding
@@ -221,8 +223,8 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         rejected_access: Option<&str>,
     ) -> Result<StoredAuth, GrokAuthError> {
         let _guard = self.refresh_lock.lock().await;
-        let _file_lock = self.acquire_refresh_file_lock().await?;
-        let auth = self.load_current_auth().await?;
+        let file_lock = self.acquire_refresh_file_lock().await?;
+        let auth = self.load_current_auth(Some(&file_lock)).await?;
         if (!force && auth.expires_at_ms > now_ms().saturating_add(REFRESH_SKEW_MS))
             || rejected_access.is_some_and(|access| auth.access != access)
         {
@@ -281,7 +283,13 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
                 },
             );
         }
-        let discovery: Discovery = discovery_response.json().await.map_err(|error| {
+        let discovery: Discovery = read_json_async(
+            discovery_response,
+            MAX_OAUTH_JSON_BYTES,
+            "Grok OIDC discovery response",
+        )
+        .await
+        .map_err(|error| {
             GrokAuthError::temporary(format!("OIDC discovery response is invalid: {error}"))
         })?;
         if discovery.issuer.trim_end_matches('/') != self.issuer {
@@ -333,11 +341,14 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         if !refresh_status.is_success() {
             self.clear_refresh_pending(&auth).await?;
             let oauth_error = if refresh_status == reqwest::StatusCode::BAD_REQUEST {
-                refresh_response
-                    .json::<OAuthErrorResponse>()
-                    .await
-                    .ok()
-                    .map(|response| response.error)
+                read_json_async::<OAuthErrorResponse>(
+                    refresh_response,
+                    MAX_OAUTH_ERROR_BYTES,
+                    "Grok token refresh error response",
+                )
+                .await
+                .ok()
+                .map(|response| response.error)
             } else {
                 None
             };
@@ -355,7 +366,13 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
                 refresh_status.as_u16()
             )));
         }
-        let refreshed: RefreshResponse = match refresh_response.json().await {
+        let refreshed: RefreshResponse = match read_json_async(
+            refresh_response,
+            MAX_OAUTH_JSON_BYTES,
+            "Grok token refresh response",
+        )
+        .await
+        {
             Ok(refreshed) => refreshed,
             Err(error) => {
                 return Err(GrokAuthError::temporary(format!(
@@ -407,7 +424,10 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         Ok(updated)
     }
 
-    async fn load_current_auth(&self) -> Result<StoredAuth, GrokAuthError> {
+    async fn load_current_auth(
+        &self,
+        mutation_lock: Option<&AuthMutationLock>,
+    ) -> Result<StoredAuth, GrokAuthError> {
         let stored = self.store.load_auth();
         let volatile = self.refresh_safety.lock().await.volatile_auth.clone();
         if let Some(volatile) = volatile {
@@ -415,7 +435,16 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
                 Ok(Some(disk_auth))
                     if auth_generation_fingerprint(disk_auth) == volatile.base_generation =>
                 {
-                    if self.store.save_auth(volatile.auth.clone()).is_ok() {
+                    // Lock-free auth reads may use the in-memory rotated
+                    // credentials, but must never repair persistence: an
+                    // explicit login or logout in another process could win
+                    // between this durable read and the write. The refresh
+                    // path supplies a live lock guard only after acquiring the
+                    // cross-process mutation lock and rereading the durable
+                    // generation above.
+                    if mutation_lock.is_some()
+                        && self.store.save_auth(volatile.auth.clone()).is_ok()
+                    {
                         self.clear_refresh_pending(disk_auth).await?;
                         self.refresh_safety.lock().await.volatile_auth = None;
                     }
@@ -501,9 +530,11 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
     }
 
     async fn clear_refresh_pending(&self, auth: &StoredAuth) -> Result<(), GrokAuthError> {
-        clear_refresh_pending_file(&self.store.auth_path())?;
         let fingerprint = auth_generation_fingerprint(auth);
         let mut safety = self.refresh_safety.lock().await;
+        // Once the durable marker is removed there must be no cancellation
+        // point before the matching in-memory ambiguity is cleared.
+        clear_refresh_pending_file(&self.store.auth_path())?;
         if safety.ambiguous_generation == Some(fingerprint) {
             safety.ambiguous_generation = None;
         }
@@ -944,6 +975,192 @@ mod tests {
         let reused = manager.get_auth().await.unwrap();
         assert_eq!(reused.access, "rotated-access");
         assert_eq!(inner.load().unwrap().unwrap().refresh, "old-refresh");
+    }
+
+    #[tokio::test]
+    async fn volatile_rotation_is_repaired_only_from_the_mutation_locked_path() {
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("grok/auth.json");
+        let auth_path_string = auth_path.to_string_lossy().into_owned();
+        let durable = auth("durable-access");
+        let rotated = auth("rotated-access");
+        let store = GrokTokenStore::new(FileAuthStore::new(
+            auth_path_string.clone(),
+            auth_path_string.clone(),
+        ));
+        store.save_auth(durable.clone()).unwrap();
+        let manager = GrokAuthManager::new(store).unwrap();
+        manager.mark_refresh_pending(&durable).await.unwrap();
+        manager.refresh_safety.lock().await.volatile_auth = Some(VolatileAuth {
+            auth: rotated.clone(),
+            base_generation: auth_generation_fingerprint(&durable),
+        });
+
+        assert_eq!(manager.get_auth().await.unwrap().access, rotated.access);
+        assert_eq!(
+            manager.store().load_auth().unwrap().unwrap().access,
+            durable.access,
+            "lock-free reads must not write the volatile generation"
+        );
+        assert!(refresh_pending_path(&auth_path_string).unwrap().exists());
+
+        let repaired = manager.force_refresh("rejected-access").await.unwrap();
+        assert_eq!(repaired.access, rotated.access);
+        assert_eq!(
+            manager.store().load_auth().unwrap().unwrap().access,
+            rotated.access
+        );
+        assert!(!refresh_pending_path(&auth_path_string).unwrap().exists());
+        assert!(manager.refresh_safety.lock().await.volatile_auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_login_and_logout_win_over_an_older_volatile_rotation() {
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("grok/auth.json");
+        let auth_path_string = auth_path.to_string_lossy().into_owned();
+        let original = auth("original-access");
+        let volatile = auth("volatile-access");
+        let store = GrokTokenStore::new(FileAuthStore::new(
+            auth_path_string.clone(),
+            auth_path_string,
+        ));
+        store.save_auth(original.clone()).unwrap();
+        let manager = GrokAuthManager::new(store).unwrap();
+
+        manager.refresh_safety.lock().await.volatile_auth = Some(VolatileAuth {
+            auth: volatile.clone(),
+            base_generation: auth_generation_fingerprint(&original),
+        });
+        let explicit_login = auth("explicit-login-access");
+        manager
+            .store()
+            .save_auth_exclusive(explicit_login.clone())
+            .unwrap();
+        assert_eq!(
+            manager.get_auth().await.unwrap().access,
+            explicit_login.access
+        );
+        assert!(manager.refresh_safety.lock().await.volatile_auth.is_none());
+
+        manager.store().save_auth(original.clone()).unwrap();
+        manager.refresh_safety.lock().await.volatile_auth = Some(VolatileAuth {
+            auth: volatile,
+            base_generation: auth_generation_fingerprint(&original),
+        });
+        manager.store().clear_auth_exclusive().unwrap();
+        assert!(matches!(
+            manager.get_auth().await,
+            Err(GrokAuthError::CredentialsInvalid { .. })
+        ));
+        assert!(manager.refresh_safety.lock().await.volatile_auth.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_explicit_mutations_win_before_volatile_repair() {
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("grok/auth.json");
+        let auth_path_string = auth_path.to_string_lossy().into_owned();
+        let original = auth("original-access");
+        let volatile = auth("volatile-access");
+        let file_store = FileAuthStore::new(auth_path_string.clone(), auth_path_string.clone());
+        file_store.save(original.clone()).unwrap();
+        let manager = Arc::new(
+            GrokAuthManager::new(GrokTokenStore::new(FileAuthStore::new(
+                auth_path_string.clone(),
+                auth_path_string.clone(),
+            )))
+            .unwrap(),
+        );
+
+        manager.refresh_safety.lock().await.volatile_auth = Some(VolatileAuth {
+            auth: volatile.clone(),
+            base_generation: auth_generation_fingerprint(&original),
+        });
+        let held = AuthMutationLock::try_acquire(&auth_path_string).unwrap();
+        let refresh_manager = manager.clone();
+        let mut refresh =
+            tokio::spawn(async move { refresh_manager.force_refresh("rejected-access").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut refresh)
+                .await
+                .is_err(),
+            "volatile repair should wait for the cross-process mutation lock"
+        );
+        let explicit_login = auth("explicit-login-access");
+        file_store.save(explicit_login.clone()).unwrap();
+        drop(held);
+        assert_eq!(
+            refresh.await.unwrap().unwrap().access,
+            explicit_login.access
+        );
+        assert_eq!(
+            file_store.load().unwrap().unwrap().access,
+            explicit_login.access
+        );
+
+        file_store.save(original.clone()).unwrap();
+        manager.refresh_safety.lock().await.volatile_auth = Some(VolatileAuth {
+            auth: volatile,
+            base_generation: auth_generation_fingerprint(&original),
+        });
+        let held = AuthMutationLock::try_acquire(&auth_path_string).unwrap();
+        let refresh_manager = manager.clone();
+        let mut refresh =
+            tokio::spawn(async move { refresh_manager.force_refresh("rejected-access").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut refresh)
+                .await
+                .is_err(),
+            "volatile repair should wait for the cross-process mutation lock"
+        );
+        file_store.clear().unwrap();
+        drop(held);
+        assert!(matches!(
+            refresh.await.unwrap(),
+            Err(GrokAuthError::CredentialsInvalid { .. })
+        ));
+        assert!(file_store.load().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_marker_clear_while_waiting_for_state_lock_keeps_marker() {
+        let temp = TempDir::new().unwrap();
+        let auth_path = temp.path().join("grok/auth.json");
+        let auth_path_string = auth_path.to_string_lossy().into_owned();
+        let current = auth("current-access");
+        let store = GrokTokenStore::new(FileAuthStore::new(
+            auth_path_string.clone(),
+            auth_path_string.clone(),
+        ));
+        store.save_auth(current.clone()).unwrap();
+        let manager = Arc::new(GrokAuthManager::new(store).unwrap());
+        manager.mark_refresh_pending(&current).await.unwrap();
+
+        let state_guard = manager.refresh_safety.lock().await;
+        let clear_manager = manager.clone();
+        let clear_auth = current.clone();
+        let mut clear =
+            tokio::spawn(async move { clear_manager.clear_refresh_pending(&clear_auth).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut clear)
+                .await
+                .is_err(),
+            "marker clear should be waiting for the in-memory state lock"
+        );
+        assert!(
+            refresh_pending_path(&auth_path_string).unwrap().exists(),
+            "cancellation before the state lock is acquired must leave the durable marker"
+        );
+        clear.abort();
+        drop(state_guard);
+        let _ = clear.await;
+
+        assert!(refresh_pending_path(&auth_path_string).unwrap().exists());
+        assert_eq!(
+            manager.refresh_safety.lock().await.ambiguous_generation,
+            Some(auth_generation_fingerprint(&current))
+        );
     }
 
     #[tokio::test]

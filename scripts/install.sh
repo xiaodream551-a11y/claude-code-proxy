@@ -7,6 +7,7 @@
 #   CLAUDE_CODE_PROXY_VERSION      - Pin a specific version (e.g., v0.1.0)
 #   CLAUDE_CODE_PROXY_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
 #   CLAUDE_CODE_PROXY_REPOSITORY   - Override the GitHub release repository
+#   CLAUDE_CODE_PROXY_REQUIRE_ATTESTATION=1 - Require GitHub-signed release and build provenance
 #
 # Examples:
 #   CLAUDE_CODE_PROXY_VERSION=v0.1.0 bash install.sh
@@ -30,6 +31,35 @@ log_info()    { echo -e "${BLUE}==>${NC} $1"; }
 log_success() { echo -e "${GREEN}==>${NC} $1"; }
 log_warning() { echo -e "${YELLOW}==>${NC} $1"; }
 log_error()   { echo -e "${RED}Error:${NC} $1" >&2; }
+
+verify_release_attestations() {
+	local version=$1
+	local archive_name=$2
+
+	if [[ "${CLAUDE_CODE_PROXY_REQUIRE_ATTESTATION:-0}" != "1" ]]; then
+		return
+	fi
+
+	if ! command -v gh &>/dev/null; then
+		log_error "GitHub CLI is required when CLAUDE_CODE_PROXY_REQUIRE_ATTESTATION=1"
+		exit 1
+	fi
+
+	log_info "Verifying GitHub-signed release and build provenance..."
+	if ! gh release verify-asset "$version" "$archive_name" --repo "$REPO" &>/dev/null; then
+		log_error "Release asset attestation verification failed"
+		exit 1
+	fi
+	if ! gh attestation verify "$archive_name" \
+		--repo "$REPO" \
+		--signer-workflow "$REPO/.github/workflows/release.yml" \
+		--source-ref "refs/tags/$version" \
+		--source-digest "$EXPECTED_GIT_SHA" &>/dev/null; then
+		log_error "Build provenance attestation verification failed"
+		exit 1
+	fi
+	log_success "GitHub attestations verified"
+}
 
 detect_platform() {
 	local os arch
@@ -188,6 +218,7 @@ install_from_release() {
 		exit 1
 	}
 	read -r EXPECTED_GIT_SHA EXPECTED_BINARY_SHA <<<"$provenance_identity"
+	verify_release_attestations "$version" "$archive_name"
 
 	log_info "Extracting archive..."
 	if ! tar -xzf "$archive_name"; then

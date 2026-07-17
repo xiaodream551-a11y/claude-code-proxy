@@ -29,6 +29,15 @@ ended up forking it and applying some patches, but would much rather not do it.
 curl -fsSL https://raw.githubusercontent.com/xiaodream551-a11y/claude-code-proxy/main/scripts/install.sh | bash
 ```
 
+For a high-assurance install, first install and authenticate the GitHub CLI,
+then require both the immutable-release attestation and the build-workflow
+attestation:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xiaodream551-a11y/claude-code-proxy/main/scripts/install.sh -o /tmp/ccproxy-install.sh
+CLAUDE_CODE_PROXY_REQUIRE_ATTESTATION=1 bash /tmp/ccproxy-install.sh
+```
+
 **Manual:** download a prebuilt binary for your platform from the
 [releases page](https://github.com/xiaodream551-a11y/claude-code-proxy/releases). Windows
 artifacts are published as `claude-code-proxy-windows-amd64.zip` and
@@ -83,11 +92,14 @@ Cursor authentication uses Cursor's browser login, but the proxy stores its own
 tokens. It does not read Cursor Agent's Keychain/auth.json. You can also set
 `CCP_CURSOR_AUTH_TOKEN` for the proxy process.
 
-On macOS credentials go to Keychain. On Windows they are written under
-`%APPDATA%\claude-code-proxy\<provider>\auth.json`; on Linux they are written
-under `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/<provider>/auth.json`
-(mode 0600 where supported). Set `CCP_CONFIG_DIR` before `cursor auth login` to
-store a separate Cursor login at `$CCP_CONFIG_DIR/cursor/auth.json`.
+Codex and Cursor prefer macOS Keychain, but fall back to a mode-0600 provider
+file when non-interactive Keychain writes are unavailable; auth commands report
+the backend actually in use. Kimi and Grok use provider files on every platform.
+Windows stores them under `%APPDATA%\claude-code-proxy\<provider>\auth.json`;
+Linux and macOS file fallbacks use
+`${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/<provider>/auth.json`.
+Set `CCP_CONFIG_DIR` before `cursor auth login` to store a separate Cursor login
+at `$CCP_CONFIG_DIR/cursor/auth.json`.
 
 Verify:
 
@@ -545,9 +557,10 @@ compact request layouts.
 
 Runs the PKCE browser flow against `auth.openai.com` using the Codex CLI's
 client ID. Prints a URL, opens a local callback listener on port 1455, waits for
-the browser to redirect back, and stores the resulting access / refresh tokens
-in Keychain on macOS or locally on other platforms. The process exits
-automatically once the tokens are saved.
+the browser to redirect back, and stores the resulting access / refresh tokens.
+On macOS it prefers Keychain and safely falls back to a mode-0600 file when
+non-interactive Keychain writes are unavailable. The process reports the actual
+backend and exits automatically once the tokens are saved.
 
 ```sh
 claude-code-proxy codex auth login
@@ -589,7 +602,7 @@ Example output:
 ```
 Account: 79342a5e-57b7-44ea-bfdc-a83ba070dad6
 Expires: 2026-04-28T16:46:04.827Z (in 863946s)
-Storage: macOS Keychain
+Storage: File fallback: /Users/alice/.config/claude-code-proxy/codex/auth.json (macOS Keychain write unavailable)
 ```
 
 The proxy refreshes the access token 5 minutes before expiry with a
@@ -598,8 +611,9 @@ calls.
 
 #### `codex auth logout`
 
-Removes stored auth credentials. On macOS this deletes the Keychain entry. No
-server call is needed; the refresh token just becomes dead.
+Removes stored auth credentials. On macOS this clears both the Keychain entry
+and any file fallback. No server call is needed; the refresh token just becomes
+dead.
 
 ```sh
 claude-code-proxy codex auth logout
@@ -616,7 +630,7 @@ Run `codex auth login` again to re-authenticate.
 Runs a device-code OAuth flow (RFC 8628) against `auth.kimi.com` using the
 kimi-cli client ID. Prints a verification URL and a short user code; open the
 URL in any browser, confirm the code, and the CLI polls until the tokens are
-issued. Tokens are stored in Keychain on macOS or a mode-0600 file elsewhere.
+issued. Tokens are stored in a provider file (mode 0600 where supported).
 
 ```sh
 claude-code-proxy kimi auth login
@@ -645,8 +659,8 @@ backend. Non-zero exit if no auth is present.
 claude-code-proxy kimi auth logout
 ```
 
-Removes stored auth credentials (Keychain entry on macOS, file elsewhere). Run
-`kimi auth login` again to re-authenticate.
+Removes the stored credential file. Run `kimi auth login` again to
+re-authenticate.
 
 ---
 
@@ -949,24 +963,25 @@ CCP_TRAFFIC_LOG=1`.
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/config.json` on Linux,
   and `%APPDATA%\claude-code-proxy\config.json` on Windows. `CCP_CONFIG_DIR`
   replaces the platform config directory for the current process.
-- Codex tokens — macOS uses Keychain under service `claude-code-proxy.codex`.
-  Linux uses
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/codex/auth.json`.
-  Windows uses `%APPDATA%\claude-code-proxy\codex\auth.json`.
-- Kimi tokens — macOS uses Keychain under service `claude-code-proxy.kimi`.
-  Linux uses
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/auth.json`.
-  Windows uses `%APPDATA%\claude-code-proxy\kimi\auth.json`.
+- Codex tokens — macOS prefers Keychain service `claude-code-proxy.codex`; when
+  writes are unavailable it falls back to
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/codex/auth.json` and
+  reports that backend. Linux uses the same file path; Windows uses
+  `%APPDATA%\claude-code-proxy\codex\auth.json`.
+- Kimi tokens — stored in
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/auth.json` on macOS
+  and Linux, or `%APPDATA%\claude-code-proxy\kimi\auth.json` on Windows.
 - Kimi device ID — persistent UUID bound into the Kimi JWT at login. Linux uses
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/kimi/device_id`; Windows
   uses `%APPDATA%\claude-code-proxy\kimi\device_id`. Reused for the lifetime
   of the install.
-- Cursor tokens — macOS uses Keychain under service
-  `claude-code-proxy.cursor`. Linux uses
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/cursor/auth.json`.
-  Windows uses `%APPDATA%\claude-code-proxy\cursor\auth.json`. When
-  `CCP_CONFIG_DIR` is set, Cursor tokens are written to `cursor/auth.json` under
-  that directory, including on macOS.
+- Cursor tokens — macOS prefers Keychain service `claude-code-proxy.cursor` and
+  falls back to
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/cursor/auth.json` when
+  writes are unavailable. Linux uses the same file path; Windows uses
+  `%APPDATA%\claude-code-proxy\cursor\auth.json`. When `CCP_CONFIG_DIR` is set,
+  Cursor tokens are written to `cursor/auth.json` under that directory,
+  including on macOS.
   `CCP_CURSOR_AUTH_TOKEN` overrides local proxy-owned storage.
 
 ## Switching models and backends

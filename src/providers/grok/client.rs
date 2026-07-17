@@ -352,6 +352,7 @@ impl GrokClient {
         let client = Arc::new(
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .connect_timeout(Duration::from_millis(timeouts.connect_ms))
                 .build()?,
         );
@@ -375,6 +376,7 @@ impl GrokClient {
         let client = Arc::new(
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .connect_timeout(Duration::from_millis(timeouts.connect_ms))
                 .build()?,
         );

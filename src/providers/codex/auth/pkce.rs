@@ -1,6 +1,9 @@
 use sha2::{Digest, Sha256};
 
 use super::constants::{CLIENT_ID, ORIGINATOR};
+use crate::oauth_http::{
+    MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_blocking, read_text_blocking,
+};
 
 // ---------------------------------------------------------------------------
 // PKCE types
@@ -78,6 +81,9 @@ pub fn exchange_code_for_tokens(
 ) -> Result<crate::providers::codex::auth::jwt::TokenResponse, anyhow::Error> {
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
         .build()?;
     let form = [
         ("grant_type", "authorization_code"),
@@ -95,12 +101,12 @@ pub fn exchange_code_for_tokens(
 
     let status = resp.status().as_u16();
     if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
+        let text = read_text_blocking(resp, MAX_OAUTH_ERROR_BYTES, "Codex token error response")
+            .unwrap_or_else(|error| format!("<unavailable: {error}>"));
         anyhow::bail!("Token exchange failed: {status} {text}");
     }
 
-    let tokens = resp
-        .json()
+    let tokens = read_json_blocking(resp, MAX_OAUTH_JSON_BYTES, "Codex token response")
         .map_err(|e| anyhow::anyhow!("failed to parse token exchange response: {e}"))?;
     Ok(tokens)
 }

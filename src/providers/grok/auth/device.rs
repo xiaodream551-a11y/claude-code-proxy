@@ -7,6 +7,7 @@ use serde::Deserialize;
 use super::login::{CANONICAL_ISSUER, CLIENT_ID, SCOPES};
 use super::token_store::{GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
+use crate::oauth_http::{MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_blocking};
 
 const GRANT_DEVICE_CODE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -99,6 +100,8 @@ fn device_login_inner<S: AuthStorage<StoredAuth>>(
 
 fn client() -> anyhow::Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()?)
@@ -170,7 +173,11 @@ fn request_device_code(
             response.status()
         );
     }
-    Ok(response.json()?)
+    read_json_blocking(
+        response,
+        MAX_OAUTH_JSON_BYTES,
+        "Grok device authorization response",
+    )
 }
 
 fn poll_token(
@@ -187,10 +194,19 @@ fn poll_token(
         ])
         .send()?;
     if response.status().is_success() {
-        return Ok(DevicePoll::Tokens(response.json()?));
+        return Ok(DevicePoll::Tokens(read_json_blocking(
+            response,
+            MAX_OAUTH_JSON_BYTES,
+            "Grok device token response",
+        )?));
     }
     let status = response.status();
-    let body: serde_json::Value = response.json().unwrap_or_else(|_| serde_json::json!({}));
+    let body: serde_json::Value = read_json_blocking(
+        response,
+        MAX_OAUTH_ERROR_BYTES,
+        "Grok device token error response",
+    )
+    .unwrap_or_else(|_| serde_json::json!({}));
     match body.get("error").and_then(|value| value.as_str()) {
         Some("authorization_pending") => Ok(DevicePoll::Pending),
         Some("slow_down") => Ok(DevicePoll::SlowDown),
@@ -219,6 +235,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::sync::mpsc;
     use std::thread;
 
     const TEST_UNIX_TIME_MS: u64 = 1_700_000_000_000;
@@ -297,9 +314,62 @@ mod tests {
 
     fn test_client() -> reqwest::blocking::Client {
         reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .pool_max_idle_per_host(0)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn device_client_does_not_follow_redirects() {
+        for status in [302, 303, 307, 308] {
+            let target = TcpListener::bind("127.0.0.1:0").unwrap();
+            target.set_nonblocking(true).unwrap();
+            let target_url = format!("http://{}", target.local_addr().unwrap());
+            let (hit_tx, hit_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(250);
+                loop {
+                    match target.accept() {
+                        Ok(_) => {
+                            let _ = hit_tx.send(true);
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                let _ = hit_tx.send(false);
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => {
+                            let _ = hit_tx.send(false);
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let issuer = format!("http://{}", origin.local_addr().unwrap());
+            thread::spawn(move || {
+                let (mut stream, _) = origin.accept().unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 {status} Redirect\r\nLocation: {target_url}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+
+            let error = match request_device_code(&client().unwrap(), &issuer) {
+                Ok(_) => panic!("redirect response must not be accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(&format!("status {status}")));
+            assert!(!hit_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
     }
 
     #[test]

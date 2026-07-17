@@ -161,6 +161,16 @@ where
             _marker: Default::default(),
         }
     }
+
+    fn load_with_source(&self) -> Option<(T, String)> {
+        if let Some(parsed) = load_auth_file::<T>(&self.file) {
+            return Some((parsed, self.file.clone()));
+        }
+        if self.file == self.legacy_file {
+            return None;
+        }
+        load_auth_file::<T>(&self.legacy_file).map(|parsed| (parsed, self.legacy_file.clone()))
+    }
 }
 
 impl<T> AuthStorage<T> for FileAuthStore<T>
@@ -168,14 +178,7 @@ where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
     fn load(&self) -> Result<Option<T>> {
-        let parsed = load_auth_file::<T>(&self.file);
-        if parsed.is_some() {
-            return Ok(parsed);
-        }
-        if self.file == self.legacy_file {
-            return Ok(None);
-        }
-        Ok(load_auth_file::<T>(&self.legacy_file))
+        Ok(self.load_with_source().map(|(parsed, _path)| parsed))
     }
 
     fn save(&self, value: T) -> Result<()> {
@@ -218,7 +221,19 @@ where
     account: String,
     use_keychain: bool,
     keychain_path: String,
+    active_backend: std::sync::Mutex<KeychainFileBackend>,
     _marker: PhantomData<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeychainFileBackend {
+    Undetermined,
+    Keychain,
+    File(String),
+    FileFallback {
+        path: String,
+        fallback_reason: Option<&'static str>,
+    },
 }
 
 impl<T, K> KeychainFileAuthStore<T, K>
@@ -234,6 +249,11 @@ where
         use_keychain: bool,
         keychain: K,
     ) -> Self {
+        let active_backend = if use_keychain {
+            KeychainFileBackend::Undetermined
+        } else {
+            KeychainFileBackend::File(file.clone())
+        };
         Self {
             file_store: FileAuthStore::new(file, legacy_file),
             keychain,
@@ -241,8 +261,23 @@ where
             account: account.into(),
             use_keychain,
             keychain_path: "macOS Keychain".to_string(),
+            active_backend: std::sync::Mutex::new(active_backend),
             _marker: PhantomData,
         }
+    }
+
+    fn set_active_backend(&self, backend: KeychainFileBackend) {
+        *self
+            .active_backend
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = backend;
+    }
+
+    fn active_backend(&self) -> KeychainFileBackend {
+        self.active_backend
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -252,46 +287,91 @@ where
     K: Keychain,
 {
     fn load(&self) -> Result<Option<T>> {
-        if let Some(parsed) = self.file_store.load()? {
+        if let Some((parsed, path)) = self.file_store.load_with_source() {
+            self.set_active_backend(if self.use_keychain {
+                KeychainFileBackend::FileFallback {
+                    path,
+                    fallback_reason: None,
+                }
+            } else {
+                KeychainFileBackend::File(path)
+            });
             return Ok(Some(parsed));
         }
         if self.use_keychain
             && let Some(raw) = self.keychain.read(&self.service, &self.account)?
         {
-            return serde_json::from_str::<T>(&raw)
+            let parsed = serde_json::from_str::<T>(&raw)
                 .map(Some)
-                .map_err(|err| anyhow::anyhow!("Failed to parse Keychain auth JSON: {err}"));
+                .map_err(|err| anyhow::anyhow!("Failed to parse Keychain auth JSON: {err}"))?;
+            self.set_active_backend(KeychainFileBackend::Keychain);
+            return Ok(parsed);
         }
+        self.set_active_backend(KeychainFileBackend::Undetermined);
         Ok(None)
     }
 
     fn save(&self, value: T) -> Result<()> {
         if self.use_keychain {
+            // A readable file is authoritative on load. Keep updating that
+            // backend instead of writing a newer value only to Keychain and
+            // leaving the next process to load stale file credentials.
+            if self.file_store.load_with_source().is_some() {
+                self.file_store.save(value)?;
+                self.set_active_backend(KeychainFileBackend::FileFallback {
+                    path: self.file_store.path(),
+                    fallback_reason: Some("existing file fallback remains authoritative"),
+                });
+                return Ok(());
+            }
             let raw = serde_json::to_string(&value)?;
             if self
                 .keychain
                 .write(&self.service, &self.account, &raw)
                 .is_ok()
             {
+                self.set_active_backend(KeychainFileBackend::Keychain);
                 return Ok(());
             }
-            return self.file_store.save(value);
+            self.file_store.save(value)?;
+            self.set_active_backend(KeychainFileBackend::FileFallback {
+                path: self.file_store.path(),
+                fallback_reason: Some("macOS Keychain write unavailable"),
+            });
+            return Ok(());
         }
-        self.file_store.save(value)
+        self.file_store.save(value)?;
+        self.set_active_backend(KeychainFileBackend::File(self.file_store.path()));
+        Ok(())
     }
 
     fn clear(&self) -> Result<()> {
         if self.use_keychain {
             self.keychain.delete(&self.service, &self.account)?;
         }
-        self.file_store.clear()
+        self.file_store.clear()?;
+        self.set_active_backend(if self.use_keychain {
+            KeychainFileBackend::Undetermined
+        } else {
+            KeychainFileBackend::File(self.file_store.path())
+        });
+        Ok(())
     }
 
     fn path(&self) -> String {
-        if self.use_keychain {
-            self.keychain_path.clone()
-        } else {
-            self.file_store.path()
+        match self.active_backend() {
+            KeychainFileBackend::Undetermined | KeychainFileBackend::Keychain => {
+                self.keychain_path.clone()
+            }
+            KeychainFileBackend::FileFallback {
+                path,
+                fallback_reason: Some(reason),
+            } => format!("File fallback: {path} ({reason})"),
+            KeychainFileBackend::FileFallback {
+                path,
+                fallback_reason: None,
+            } => format!("File fallback: {path}"),
+            KeychainFileBackend::File(path) => path,
         }
     }
 
@@ -552,11 +632,11 @@ mod tests {
         keychain.set_raw("svc", "acct", json!({"source": "keychain"}));
 
         let store: KeychainFileAuthStore<serde_json::Value, _> =
-            KeychainFileAuthStore::new(file, legacy, "svc", "acct", true, keychain);
+            KeychainFileAuthStore::new(file.clone(), legacy, "svc", "acct", true, keychain);
 
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded["source"], json!("file"));
-        assert_eq!(store.path(), "macOS Keychain");
+        assert_eq!(store.path(), format!("File fallback: {file}"));
     }
 
     #[test]
@@ -593,6 +673,27 @@ mod tests {
 
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded["source"], json!("keychain"));
+        assert_eq!(store.path(), "macOS Keychain");
+    }
+
+    #[test]
+    fn keychain_file_store_reports_the_legacy_file_it_loaded() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        write_atomically(&legacy, &json!({"source": "legacy"})).unwrap();
+
+        let store: KeychainFileAuthStore<serde_json::Value, _> = KeychainFileAuthStore::new(
+            file,
+            legacy.clone(),
+            "svc",
+            "acct",
+            true,
+            MockKeychain::default(),
+        );
+
+        assert_eq!(store.load().unwrap().unwrap()["source"], json!("legacy"));
+        assert_eq!(store.path(), format!("File fallback: {legacy}"));
     }
 
     #[test]
@@ -600,7 +701,6 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let file = temp_auth_path(&temp, "auth.json");
         let legacy = temp_auth_path(&temp, "legacy.json");
-        write_atomically(&file, &json!({"source": "file"})).unwrap();
 
         let keychain = MockKeychain::default();
         let store: KeychainFileAuthStore<serde_json::Value, _> =
@@ -612,10 +712,32 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&raw).unwrap()["source"],
             json!("saved")
         );
+        assert_eq!(store.path(), "macOS Keychain");
 
         store.clear().unwrap();
         assert!(keychain.raw("svc", "acct").is_none());
         assert!(!std::path::Path::new(&file).exists());
+    }
+
+    #[test]
+    fn keychain_file_store_keeps_an_existing_file_authoritative_on_save() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        write_atomically(&file, &json!({"source": "old-file"})).unwrap();
+
+        let keychain = MockKeychain::default();
+        let store: KeychainFileAuthStore<serde_json::Value, _> =
+            KeychainFileAuthStore::new(file.clone(), legacy, "svc", "acct", true, keychain.clone());
+
+        store.save(json!({"source": "new-file"})).unwrap();
+
+        assert!(keychain.raw("svc", "acct").is_none());
+        assert_eq!(
+            store.path(),
+            format!("File fallback: {file} (existing file fallback remains authoritative)")
+        );
+        assert_eq!(store.load().unwrap().unwrap()["source"], json!("new-file"));
     }
 
     #[test]
@@ -634,10 +756,15 @@ mod tests {
 
         store.save(json!({"source": "file-fallback"})).unwrap();
         assert_eq!(
+            store.path(),
+            format!("File fallback: {file} (macOS Keychain write unavailable)")
+        );
+        assert_eq!(
             store.load().unwrap().unwrap()["source"],
             json!("file-fallback")
         );
         assert!(std::path::Path::new(&file).exists());
+        assert_eq!(store.path(), format!("File fallback: {file}"));
     }
 
     #[test]

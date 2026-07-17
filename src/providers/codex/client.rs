@@ -337,6 +337,7 @@ impl Default for CodexHttpClient {
 fn build_codex_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .connect_timeout(Duration::from_secs(15))
         .build()
         .expect("failed to create HTTP client")
