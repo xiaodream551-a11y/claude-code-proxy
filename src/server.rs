@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     response::Response,
     routing::{get, post},
 };
@@ -44,6 +44,22 @@ const ERROR_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_RESPONSE_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_CAPTURE_FILES: usize = 128;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const COMPACTION_MODEL_HEADER: &str = "x-ccproxy-compaction-model";
+
+fn compaction_model_override(
+    headers: &HeaderMap,
+    request: &crate::anthropic::schema::MessagesRequest,
+) -> Option<String> {
+    if !crate::providers::translate_shared::is_claude_code_compaction_request(request) {
+        return None;
+    }
+    headers
+        .get(COMPACTION_MODEL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
 
 #[derive(Debug, Clone)]
 pub struct ServerLimits {
@@ -773,7 +789,7 @@ async fn dispatch_request(
         monitor.project_resolved(&req_id, project);
     }
 
-    let model = match body.model.as_deref() {
+    let requested_model = match body.model.clone() {
         Some(model) => model,
         None => {
             let response = json_error(
@@ -819,7 +835,20 @@ async fn dispatch_request(
         }
     };
 
-    let normalized_model = normalize_incoming_model(model);
+    let effective_model =
+        compaction_model_override(&headers, &body).unwrap_or_else(|| requested_model.clone());
+    let normalized_model = normalize_incoming_model(&effective_model);
+    if normalized_model != normalize_incoming_model(&requested_model) {
+        log.info(
+            "internal request model override",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(&req_id)),
+                ("reason".to_string(), json!("claude_code_compaction")),
+                ("requestedModel".to_string(), json!(&requested_model)),
+                ("model".to_string(), json!(&normalized_model)),
+            ])),
+        );
+    }
     request_guard.set_route(None, Some(&normalized_model));
     body.model = Some(normalized_model.clone());
     let (selection, current) =
@@ -1899,6 +1928,36 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures_util::stream;
+
+    fn compaction_request() -> crate::anthropic::schema::MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{
+                "role": "user",
+                "content": "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn compaction_override_requires_both_header_and_compaction_prompt() {
+        let mut headers = HeaderMap::new();
+        headers.insert(COMPACTION_MODEL_HEADER, "grok-4.5-high".parse().unwrap());
+
+        assert_eq!(
+            compaction_model_override(&headers, &compaction_request()).as_deref(),
+            Some("grok-4.5-high")
+        );
+
+        let ordinary = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "normal work"}]
+        }))
+        .unwrap();
+        assert!(compaction_model_override(&headers, &ordinary).is_none());
+        assert!(compaction_model_override(&HeaderMap::new(), &compaction_request()).is_none());
+    }
 
     fn response_log_context(req_id: &str) -> ResponseLogContext {
         ResponseLogContext {

@@ -165,7 +165,7 @@ by the Homebrew launch service.
 
 - `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4-mini`, `gpt-5.2` → **codex**
 - `kimi-for-coding`, `kimi-k2.6`, `k2.6` → **kimi**
-- `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.5-high` → **grok**
+- `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.5-medium`, `grok-4.5-high` → **grok**
 - `cursor`, `cursor-plan`, `cursor-ask`, `composer-2.5`, `composer-2.5-fast`, `cursor:<model-id>`, `cursor-plan:<model-id>`, `cursor-ask:<model-id>` → **cursor**
 
 An unknown model returns a 400 listing the supported ids. There is no
@@ -174,19 +174,20 @@ implicit default provider.
 Claude Code also issues background requests (session title generation, token
 counts) against its built-in "small/fast" haiku model id. Those requests
 would 400 because no provider claims it, so set
-`ANTHROPIC_SMALL_FAST_MODEL` to a concrete id too (the same value as
-`ANTHROPIC_MODEL` is usually fine):
+`ANTHROPIC_DEFAULT_HAIKU_MODEL` to a concrete id too. Claude Code 2.1.212 still
+prefers its deprecated `ANTHROPIC_SMALL_FAST_MODEL` variable when both are set,
+so gateways supporting that version should set both to the same value:
 
 ```sh
 # Codex
 ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=gpt-5.6-sol \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna \
 ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000 \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
@@ -217,6 +218,17 @@ CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 ```
+
+Claude Code sends automatic and manual compaction with the main-loop model. To
+route only its recognized compaction summary request to another proxy model,
+add a custom header to the Claude Code environment:
+
+```sh
+ANTHROPIC_CUSTOM_HEADERS='x-ccproxy-compaction-model: grok-4.5-high'
+```
+
+The header is ignored for ordinary prompts. An unknown override model returns
+400 instead of silently falling back.
 
 `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` is recommended because the
 proxy always talks to upstream providers with streaming requests, even when it
@@ -309,11 +321,12 @@ so simple prompts can emit no thinking block. Set `codex.reasoningSummary` /
 `CCP_CODEX_REASONING_SUMMARY` to `off` or `none` to suppress summaries while
 keeping `reasoning.effort` and encrypted continuation content.
 
-Claude Code's automatic and manual compaction requests keep the selected Codex
-model but cap reasoning effort at `medium`. Compaction is a structured summary
-pass, and avoiding `max` reasoning substantially reduces the wait without
-changing the effort used by normal turns. An explicit global `codex.effort` /
-`CCP_CODEX_EFFORT` override still takes precedence.
+Without `x-ccproxy-compaction-model`, Claude Code's automatic and manual
+compaction requests keep the selected Codex model but cap reasoning effort at
+`medium`. Compaction is a structured summary pass, and avoiding `max` reasoning
+substantially reduces the wait without changing the effort used by normal
+turns. An explicit global `codex.effort` / `CCP_CODEX_EFFORT` override still
+takes precedence.
 
 Claude Code's hosted `web_search_20250305` tool is translated to Codex's native
 Responses `web_search` tool with live external web access and non-empty native
@@ -378,10 +391,12 @@ Auth:
 Upstream: `https://cli-chat-proxy.grok.com/v1/responses` (Responses API).
 
 Supported model ids are `grok-composer-2.5-fast`, `grok-4.5`, and the
-`grok-4.5-high` profile. The profile sends `grok-4.5` upstream and forces its
-reasoning effort to `high`, regardless of the incoming effort. Model access can
-vary by account and region. The proxy translates Claude Code messages, function
-tools, tool results, thinking, token counts, and streaming events.
+`grok-4.5-medium` / `grok-4.5-high` profiles. The profiles send `grok-4.5`
+upstream and force their named reasoning effort, regardless of the incoming
+effort. Model access can vary by account and region. The proxy translates Claude
+Code messages, function tools, tool results, structured output, thinking, token
+counts, and streaming events. Recognized compaction requests do not receive the
+otherwise-default hosted search tool.
 The CLI endpoint's plaintext reasoning summaries are suppressed because they are
 not signed Anthropic thinking blocks and can contain draft answers; periodic
 Anthropic `ping` events preserve downstream liveness while Grok reasons.
@@ -1227,6 +1242,8 @@ supported shape.
 - **Codex — `output_config.format`:** translated to Responses API `text.format`
   (json_schema with `strict: true`); other Anthropic-specific `output_config`
   fields are dropped.
+- **Grok — `output_config.format`:** translated to Responses API `text.format`
+  for structured background requests such as session title generation.
 - **Cursor — protobuf bundle dependency:** the provider speaks Cursor's
   underlying protocol directly, but reuses the installed Cursor Agent bundle's
   generated protobuf classes. Set `CCP_CURSOR_AGENT_BUNDLE` if auto-detection

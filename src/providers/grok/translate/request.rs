@@ -4,7 +4,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
-use crate::providers::translate_shared::read_effort;
+use crate::providers::translate_shared::{
+    is_claude_code_compaction_request, normalize_strict_json_schema, read_effort,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -22,11 +24,30 @@ pub struct GrokResponsesRequest {
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<GrokReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<GrokText>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokReasoning {
     pub effort: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GrokText {
+    pub format: GrokTextFormat,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GrokTextFormat {
+    JsonSchema {
+        name: String,
+        schema: Value,
+        strict: bool,
+    },
+    JsonObject,
+    Text,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,38 +140,50 @@ pub fn translate_request(
 ) -> anyhow::Result<GrokResponsesRequest> {
     reject_unknown_top_level(req)?;
     let reasoning_effort = read_effort(req)?;
+    let compaction = is_claude_code_compaction_request(req);
+    let text = read_output_format(req).map(|format| GrokText { format });
+    let internal_text_request = compaction || text.is_some();
     let mut instructions = parse_system(req.extra.get("system"))?;
-    let mut tools = parse_tools(req.extra.get("tools"))?;
+    let mut tools = if compaction {
+        None
+    } else {
+        parse_tools(req.extra.get("tools"))?
+    };
     let hosted_web_search = tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "web_search"));
     let dedicated_x_search = tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "x_search"));
-    let x_search_intent = requests_x_search(req);
+    let x_search_intent = !internal_text_request && requests_x_search(req);
     let force_x_search = dedicated_x_search || x_search_intent;
-    let force_web_search = !force_x_search && hosted_web_search && requests_web_search(req);
+    let force_web_search =
+        !force_x_search && !internal_text_request && hosted_web_search && requests_web_search(req);
     if force_x_search {
         tools = Some(vec![GrokTool::hosted("x_search")]);
     } else if force_web_search {
         tools = Some(vec![GrokTool::hosted("web_search")]);
-    } else {
+    } else if !internal_text_request {
         let tools = tools.get_or_insert_default();
         if !tools.iter().any(|tool| tool.kind == "x_search") {
             tools.push(GrokTool::hosted("x_search"));
         }
     }
-    if hosted_web_search {
+    if !internal_text_request && hosted_web_search {
         append_guidance(
             &mut instructions,
             "For general web searches, use the hosted web_search tool. Do not use shell commands, HTTP clients, or local tools to search the web.",
         );
     }
-    append_guidance(
-        &mut instructions,
-        "For requests to search X or Twitter, use the hosted x_search tool. XSearch accepts a query and supports allowed_x_handles, excluded_x_handles, from_date, and to_date filters. Do not use Bash, curl, HTTP clients, or general web_search for X searches.",
-    );
-    let tool_choice = if force_x_search || force_web_search {
+    if !internal_text_request {
+        append_guidance(
+            &mut instructions,
+            "For requests to search X or Twitter, use the hosted x_search tool. XSearch accepts a query and supports allowed_x_handles, excluded_x_handles, from_date, and to_date filters. Do not use Bash, curl, HTTP clients, or general web_search for X searches.",
+        );
+    }
+    let tool_choice = if compaction {
+        None
+    } else if force_x_search || force_web_search {
         Some(GrokToolChoice::Required("required".into()))
     } else {
         parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?
@@ -181,7 +214,26 @@ pub fn translate_request(
         stream: true,
         max_output_tokens: req.max_tokens,
         reasoning,
+        text,
     })
+}
+
+fn read_output_format(req: &MessagesRequest) -> Option<GrokTextFormat> {
+    let output_config = req.extra.get("output_config")?.as_object()?;
+    let format = output_config.get("format")?.as_object()?;
+    match format.get("type")?.as_str()? {
+        "json_schema" => Some(GrokTextFormat::JsonSchema {
+            name: format
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("response")
+                .to_string(),
+            schema: normalize_strict_json_schema(format.get("schema")?),
+            strict: true,
+        }),
+        "json_object" => Some(GrokTextFormat::JsonObject),
+        _ => Some(GrokTextFormat::Text),
+    }
 }
 
 fn append_guidance(instructions: &mut Option<String>, guidance: &str) {
@@ -619,6 +671,58 @@ mod tests {
                     .unwrap();
             assert_eq!(translated["reasoning"]["effort"], expected);
         }
+    }
+
+    #[test]
+    fn grok_translation_forwards_title_schema_without_search_tools() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"Generate a concise session title"}],
+            "output_config": {"format": {
+                "type": "json_schema",
+                "name": "session_title",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "short": {"type": "boolean"}
+                    },
+                    "required": ["title"]
+                }
+            }}
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["text"]["format"]["type"], "json_schema");
+        assert_eq!(translated["text"]["format"]["name"], "session_title");
+        assert_eq!(translated["text"]["format"]["strict"], true);
+        let required = translated["text"]["format"]["schema"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(required.iter().any(|value| value == "title"));
+        assert!(required.iter().any(|value| value == "short"));
+        assert!(translated.get("tools").is_none());
+        assert!(!translated.to_string().contains("x_search"));
+    }
+
+    #[test]
+    fn grok_compaction_disables_all_tools_and_keeps_high_effort() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5-high",
+            "messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}],
+            "tools":[{"name":"Bash","input_schema":{"type":"object"}}],
+            "output_config":{"effort":"high"}
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["reasoning"]["effort"], "high");
+        assert!(translated.get("tools").is_none());
+        assert!(translated.get("tool_choice").is_none());
+        assert!(!translated.to_string().contains("x_search"));
     }
 
     #[test]

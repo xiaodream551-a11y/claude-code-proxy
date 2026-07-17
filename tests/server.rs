@@ -527,6 +527,89 @@ async fn context_window_hint_is_removed_before_provider_dispatch() {
 }
 
 #[tokio::test]
+async fn compaction_header_routes_only_compaction_requests_to_grok() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let compaction = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("x-ccproxy-compaction-model", "grok-4.5-high")
+                .body(body_string(
+                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compaction.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(compaction.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let ordinary = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("x-ccproxy-compaction-model", "grok-4.5-high")
+                .body(body_string(
+                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"ordinary request"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(ordinary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 2);
+    let compact = state
+        .recent
+        .iter()
+        .find(|request| request.model.as_deref() == Some("grok-4.5-high"))
+        .expect("compaction route must be recorded");
+    assert_eq!(compact.provider.as_deref(), Some("grok"));
+    let normal = state
+        .recent
+        .iter()
+        .find(|request| request.model.as_deref() == Some("gpt-5.4"))
+        .expect("ordinary route must be recorded");
+    assert_eq!(normal.provider.as_deref(), Some("codex"));
+}
+
+#[tokio::test]
+async fn invalid_compaction_override_model_is_rejected() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("x-ccproxy-compaction-model", "not-a-model")
+                .body(body_string(
+                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn unknown_routes_use_anthropic_not_found_error() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app

@@ -1277,6 +1277,7 @@ mod tests {
             stream: true,
             max_output_tokens: None,
             reasoning: None,
+            text: None,
         }
     }
 

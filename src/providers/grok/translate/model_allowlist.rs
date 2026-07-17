@@ -6,6 +6,10 @@ pub struct ResolvedModel {
 
 pub fn resolve_model_request(model: &str) -> ResolvedModel {
     match model {
+        "grok-4.5-medium" => ResolvedModel {
+            model: "grok-4.5".into(),
+            reasoning_effort: Some("medium"),
+        },
         "grok-4.5-high" => ResolvedModel {
             model: "grok-4.5".into(),
             reasoning_effort: Some("high"),
@@ -36,6 +40,17 @@ mod tests {
             ResolvedModel {
                 model: "grok-4.5".into(),
                 reasoning_effort: Some("high"),
+            }
+        );
+    }
+
+    #[test]
+    fn medium_effort_alias_resolves_to_grok_4_5() {
+        assert_eq!(
+            resolve_model_request("grok-4.5-medium"),
+            ResolvedModel {
+                model: "grok-4.5".into(),
+                reasoning_effort: Some("medium"),
             }
         );
     }

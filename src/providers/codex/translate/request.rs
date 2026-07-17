@@ -6,7 +6,8 @@ use serde_json::Value;
 use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, read_effort,
+    ContentBlock, flatten_system_text, image_source_to_url, is_claude_code_compaction_request,
+    normalize_content, normalize_strict_json_schema, read_effort,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -261,39 +262,6 @@ fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     }
 }
 
-fn content_contains_text(content: &Value, needle: &str) -> bool {
-    match content {
-        Value::String(text) => text.contains(needle),
-        Value::Array(blocks) => blocks.iter().any(|block| {
-            block
-                .get("text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains(needle))
-        }),
-        _ => false,
-    }
-}
-
-fn is_claude_code_compaction_request(req: &MessagesRequest) -> bool {
-    let Some(content) = req
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .map(|message| &message.content)
-    else {
-        return false;
-    };
-
-    [
-        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
-        "Your entire response must be plain text: an <analysis> block followed by a <summary> block.",
-        "Your task is to create a detailed summary",
-    ]
-    .iter()
-    .all(|marker| content_contains_text(content, marker))
-}
-
 fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Error> {
     resolve_effort_override(effort, config::codex_effort().as_deref())
 }
@@ -347,27 +315,6 @@ fn resolve_service_tier(
     match tier {
         Some(ref val) => Ok(Some(normalize_service_tier(val)?)),
         None => Ok(model_tier),
-    }
-}
-
-pub fn normalize_strict_json_schema(schema: &Value) -> Value {
-    match schema {
-        Value::Array(arr) => Value::Array(arr.iter().map(normalize_strict_json_schema).collect()),
-        Value::Object(map) => {
-            let mut out = map.clone();
-            if let Some(properties) = out.get("properties").and_then(|v| v.as_object()) {
-                let keys: Vec<String> = properties.keys().cloned().collect();
-                out.insert(
-                    "required".into(),
-                    Value::Array(keys.into_iter().map(Value::String).collect()),
-                );
-            }
-            for (key, val) in out.clone().iter() {
-                out.insert(key.clone(), normalize_strict_json_schema(val));
-            }
-            Value::Object(out)
-        }
-        _ => schema.clone(),
     }
 }
 

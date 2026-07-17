@@ -75,6 +75,67 @@ pub fn read_effort(req: &MessagesRequest) -> Result<Option<&str>, anyhow::Error>
     }
 }
 
+fn content_contains_text(content: &Value, needle: &str) -> bool {
+    match content {
+        Value::String(text) => text.contains(needle),
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains(needle))
+        }),
+        _ => false,
+    }
+}
+
+/// Detect Claude Code's automatic and manual compaction summary prompt.
+///
+/// Claude Code currently sends compaction with the selected main model, so
+/// providers and the server share this classifier when applying internal
+/// request policy.
+pub fn is_claude_code_compaction_request(req: &MessagesRequest) -> bool {
+    let Some(content) = req
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| &message.content)
+    else {
+        return false;
+    };
+
+    [
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
+        "Your entire response must be plain text: an <analysis> block followed by a <summary> block.",
+        "Your task is to create a detailed summary",
+    ]
+    .iter()
+    .all(|marker| content_contains_text(content, marker))
+}
+
+/// Normalize Anthropic JSON schemas for strict Responses API validation.
+pub fn normalize_strict_json_schema(schema: &Value) -> Value {
+    match schema {
+        Value::Array(items) => {
+            Value::Array(items.iter().map(normalize_strict_json_schema).collect())
+        }
+        Value::Object(map) => {
+            let mut out = map.clone();
+            if let Some(properties) = out.get("properties").and_then(Value::as_object) {
+                out.insert(
+                    "required".into(),
+                    Value::Array(properties.keys().cloned().map(Value::String).collect()),
+                );
+            }
+            for (key, value) in out.clone() {
+                out.insert(key, normalize_strict_json_schema(&value));
+            }
+            Value::Object(out)
+        }
+        _ => schema.clone(),
+    }
+}
+
 pub fn normalize_content(content: &Value, missing_tool_input: Value) -> Vec<ContentBlock> {
     match content {
         Value::String(s) => {
@@ -213,5 +274,59 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_detector_requires_all_markers_in_latest_user_message() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [
+                {"role": "user", "content": "Earlier task"},
+                {"role": "assistant", "content": "Earlier response"},
+                {"role": "user", "content": [{
+                    "type": "text",
+                    "text": "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."
+                }]}
+            ]
+        }))
+        .unwrap();
+
+        assert!(is_claude_code_compaction_request(&request));
+
+        let ordinary: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "fable",
+            "messages": [{"role": "user", "content": "Summarize this conversation"}]
+        }))
+        .unwrap();
+        assert!(!is_claude_code_compaction_request(&ordinary));
+    }
+
+    #[test]
+    fn strict_schema_requires_every_declared_property_recursively() {
+        let normalized = normalize_strict_json_schema(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "metadata": {
+                    "type": "object",
+                    "properties": {"short": {"type": "boolean"}}
+                }
+            },
+            "required": ["title"]
+        }));
+
+        assert_eq!(
+            normalized["required"],
+            serde_json::json!(["metadata", "title"])
+        );
+        assert_eq!(
+            normalized["properties"]["metadata"]["required"],
+            serde_json::json!(["short"])
+        );
     }
 }
