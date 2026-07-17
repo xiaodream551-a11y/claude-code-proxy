@@ -3,15 +3,18 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
+pub const LOG_QUEUE_CAPACITY: usize = 4_096;
 
 static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static LOG_WRITER: OnceLock<Option<LogWriter>> = OnceLock::new();
 
 pub const REDACT_KEYS: [&str; 14] = [
     "authorization",
@@ -110,7 +113,7 @@ impl Logger {
             let _ = writeln!(io::stderr(), "{line}");
         }
 
-        if write_log_line(&line).is_err() && mirror_to_stderr {
+        if enqueue_log_line(line).is_err() && mirror_to_stderr {
             // swallow logging errors intentionally
         }
     }
@@ -123,9 +126,172 @@ pub fn create_logger(service: &str) -> Logger {
     }
 }
 
-fn write_log_line(line: &str) -> io::Result<()> {
+#[derive(Debug)]
+struct LogRecord {
+    file: PathBuf,
+    line: String,
+}
+
+enum LogCommand {
+    Record(LogRecord),
+    Flush(mpsc::Sender<io::Result<()>>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueResult {
+    Enqueued,
+    Dropped,
+    Disconnected,
+}
+
+struct LogWriter {
+    sender: SyncSender<LogCommand>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl LogWriter {
+    fn spawn(capacity: usize) -> io::Result<Self> {
+        Self::spawn_with_sink(capacity, write_log_line_to)
+    }
+
+    fn spawn_with_sink<F>(capacity: usize, mut sink: F) -> io::Result<Self>
+    where
+        F: FnMut(&Path, &str) -> io::Result<()> + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker_dropped = dropped.clone();
+        std::thread::Builder::new()
+            .name("ccproxy-log-writer".to_string())
+            .spawn(move || run_log_writer(receiver, worker_dropped, capacity, &mut sink))?;
+        Ok(Self { sender, dropped })
+    }
+
+    fn enqueue(&self, file: PathBuf, line: String) -> EnqueueResult {
+        match self
+            .sender
+            .try_send(LogCommand::Record(LogRecord { file, line }))
+        {
+            Ok(()) => EnqueueResult::Enqueued,
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                EnqueueResult::Dropped
+            }
+            Err(TrySendError::Disconnected(_)) => EnqueueResult::Disconnected,
+        }
+    }
+
+    fn flush(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let mut command = LogCommand::Flush(ack_tx);
+        loop {
+            match self.sender.try_send(command) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    command = returned;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        matches!(ack_rx.recv_timeout(remaining), Ok(Ok(())))
+    }
+}
+
+fn run_log_writer<F>(
+    receiver: Receiver<LogCommand>,
+    dropped: Arc<AtomicU64>,
+    capacity: usize,
+    sink: &mut F,
+) where
+    F: FnMut(&Path, &str) -> io::Result<()>,
+{
+    let mut last_file = None;
+    let mut write_error: Option<String> = None;
+    while let Ok(command) = receiver.recv() {
+        match command {
+            LogCommand::Record(record) => {
+                if let Err(error) = write_dropped_summary(&dropped, capacity, &record.file, sink) {
+                    write_error.get_or_insert_with(|| error.to_string());
+                }
+                if let Err(error) = sink(&record.file, &record.line) {
+                    write_error.get_or_insert_with(|| error.to_string());
+                }
+                last_file = Some(record.file);
+            }
+            LogCommand::Flush(ack) => {
+                if let Some(file) = last_file.as_deref() {
+                    if let Err(error) = write_dropped_summary(&dropped, capacity, file, sink) {
+                        write_error.get_or_insert_with(|| error.to_string());
+                    }
+                }
+                let result = write_error
+                    .as_ref()
+                    .map_or_else(|| Ok(()), |error| Err(io::Error::other(error.clone())));
+                let _ = ack.send(result);
+            }
+        }
+    }
+}
+
+fn write_dropped_summary<F>(
+    dropped: &AtomicU64,
+    capacity: usize,
+    file: &Path,
+    sink: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(&Path, &str) -> io::Result<()>,
+{
+    let count = dropped.load(Ordering::Acquire);
+    if count == 0 {
+        return Ok(());
+    }
+    let summary = serde_json::json!({
+        "t": now_iso8601(),
+        "level": "warn",
+        "service": "logging",
+        "msg": "log_records_dropped",
+        "fields": {"count": count, "queueCapacity": capacity},
+    })
+    .to_string();
+    sink(file, &summary)?;
+    // Drops may race with the write. Subtract only the count represented by
+    // this successful summary so later drops remain pending.
+    dropped.fetch_sub(count, Ordering::AcqRel);
+    Ok(())
+}
+
+fn enqueue_log_line(line: String) -> io::Result<()> {
     let file = log_file();
-    write_log_line_to(&file, line)
+    match LOG_WRITER.get_or_init(|| LogWriter::spawn(LOG_QUEUE_CAPACITY).ok()) {
+        Some(writer) => match writer.enqueue(file, line) {
+            EnqueueResult::Enqueued | EnqueueResult::Dropped => Ok(()),
+            EnqueueResult::Disconnected => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "log writer thread stopped",
+            )),
+        },
+        None => write_log_line_to(&file, &line),
+    }
+}
+
+/// Wait until every log record queued before this call has been handled.
+///
+/// Returns `false` when the writer is unavailable, a sink write failed, or the
+/// timeout elapses. New records emitted concurrently may remain queued after
+/// this function returns.
+pub fn flush(timeout: Duration) -> bool {
+    match LOG_WRITER.get_or_init(|| LogWriter::spawn(LOG_QUEUE_CAPACITY).ok()) {
+        Some(writer) => writer.flush(timeout),
+        None => true,
+    }
 }
 
 fn write_log_line_to(file: &Path, line: &str) -> io::Result<()> {
@@ -197,10 +363,8 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
         Value::String(s) => {
             if config::log_verbose() {
                 Value::String(s)
-            } else if s.len() > 4000 {
-                Value::String(format!("{}…[{} more]", &s[..4000], s.len() - 4000))
             } else {
-                Value::String(s)
+                Value::String(truncate_log_string(s))
             }
         }
         Value::Array(values) => Value::Array(
@@ -222,6 +386,23 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
         }
         value => value,
     }
+}
+
+fn truncate_log_string(value: String) -> String {
+    if value.len() <= 4000 {
+        return value;
+    }
+
+    let end = floor_char_boundary(&value, 4000);
+    format!("{}…[{} more]", &value[..end], value.len() - end)
+}
+
+fn floor_char_boundary(value: &str, max_bytes: usize) -> usize {
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn redact_key_redaction(value: Value) -> Value {
@@ -269,6 +450,119 @@ mod tests {
 
         drop(outer);
         assert!(should_mirror_to_stderr("warn"));
+    }
+
+    #[test]
+    fn truncation_preserves_utf8_boundaries() {
+        for prefix_len in 3995..=4005 {
+            let value = format!("{}😊handled", "a".repeat(prefix_len));
+            let end = floor_char_boundary(&value, 4000);
+            assert!(value.is_char_boundary(end));
+            assert!(end <= 4000);
+            assert!(4000 - end < 4);
+
+            let text = truncate_log_string(value);
+            assert!(text.contains("…["));
+            assert!(serde_json::to_string(&text).is_ok());
+        }
+    }
+
+    #[test]
+    fn bounded_writer_drops_without_blocking_and_flushes_a_summary() {
+        let (sink_started_tx, sink_started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink_observed = observed.clone();
+        let mut first = true;
+        let writer = LogWriter::spawn_with_sink(1, move |_file, line| {
+            if first {
+                first = false;
+                let _ = sink_started_tx.send(());
+                let _ = release_rx.recv();
+            }
+            sink_observed.lock().unwrap().push(line.to_string());
+            Ok(())
+        })
+        .unwrap();
+        let file = PathBuf::from("proxy.log");
+
+        assert_eq!(
+            writer.enqueue(file.clone(), "first".to_string()),
+            EnqueueResult::Enqueued
+        );
+        sink_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            writer.enqueue(file.clone(), "second".to_string()),
+            EnqueueResult::Enqueued
+        );
+        assert_eq!(
+            writer.enqueue(file, "third".to_string()),
+            EnqueueResult::Dropped
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(writer.flush(Duration::from_secs(1)));
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.first().map(String::as_str), Some("first"));
+        assert_eq!(observed.last().map(String::as_str), Some("second"));
+        let summary: Value = serde_json::from_str(&observed[1]).unwrap();
+        assert_eq!(summary["msg"], "log_records_dropped");
+        assert_eq!(summary["fields"]["count"], 1);
+        assert_eq!(summary["fields"]["queueCapacity"], 1);
+    }
+
+    #[test]
+    fn writer_flush_waits_for_all_preceding_records() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink_observed = observed.clone();
+        let writer = LogWriter::spawn_with_sink(8, move |_file, line| {
+            sink_observed.lock().unwrap().push(line.to_string());
+            Ok(())
+        })
+        .unwrap();
+        let file = PathBuf::from("proxy.log");
+        for index in 0..4 {
+            assert_eq!(
+                writer.enqueue(file.clone(), format!("record-{index}")),
+                EnqueueResult::Enqueued
+            );
+        }
+
+        assert!(writer.flush(Duration::from_secs(1)));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            ["record-0", "record-1", "record-2", "record-3"]
+        );
+    }
+
+    #[test]
+    fn writer_flush_reports_sink_failure() {
+        let writer = LogWriter::spawn_with_sink(8, |_file, _line| {
+            Err(io::Error::other("simulated disk failure"))
+        })
+        .unwrap();
+        assert_eq!(
+            writer.enqueue(PathBuf::from("proxy.log"), "record".to_string()),
+            EnqueueResult::Enqueued
+        );
+        assert!(!writer.flush(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn failed_drop_summary_keeps_the_count_pending() {
+        let dropped = AtomicU64::new(3);
+        let mut failing_sink =
+            |_file: &Path, _line: &str| Err(io::Error::other("simulated disk failure"));
+        assert!(
+            write_dropped_summary(&dropped, 8, Path::new("proxy.log"), &mut failing_sink).is_err()
+        );
+        assert_eq!(dropped.load(Ordering::Acquire), 3);
+
+        let mut successful_sink = |_file: &Path, _line: &str| Ok(());
+        write_dropped_summary(&dropped, 8, Path::new("proxy.log"), &mut successful_sink).unwrap();
+        assert_eq!(dropped.load(Ordering::Acquire), 0);
     }
 
     #[test]

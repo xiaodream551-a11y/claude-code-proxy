@@ -9,6 +9,7 @@ use claude_code_proxy::{
     tui::{self, MonitorExit, MonitorUiConfig},
 };
 use std::io::IsTerminal;
+use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -72,6 +73,14 @@ enum ProviderGroup {
 }
 
 fn main() -> Result<()> {
+    let result = run();
+    if !logging::flush(Duration::from_secs(2)) {
+        eprintln!("warning: proxy logs could not be flushed completely");
+    }
+    result
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.version_flag {
@@ -107,11 +116,14 @@ fn main() -> Result<()> {
                 ServeMode::Plain => {
                     print_server_banner(&bind_address, effective_port, &registry);
                     runtime
-                        .block_on(server::serve(ServerConfig {
-                            bind_address,
-                            port: effective_port,
-                            monitor: None,
-                        }))
+                        .block_on(server::serve_with_shutdown(
+                            ServerConfig {
+                                bind_address,
+                                port: effective_port,
+                                monitor: None,
+                            },
+                            shutdown_signal(),
+                        ))
                         .map_err(|err| anyhow::anyhow!(err))
                 }
                 ServeMode::Monitor => {
@@ -128,7 +140,12 @@ fn main() -> Result<()> {
                     let server_task = runtime.spawn(async move {
                         let result =
                             server::serve_listener(listener, Some(server_monitor), async move {
-                                let _ = shutdown_rx.await;
+                                tokio::select! {
+                                    _ = async {
+                                        let _ = shutdown_rx.await;
+                                    } => {}
+                                    _ = shutdown_signal() => {}
+                                }
                             })
                             .await;
                         let _ = shutdown_complete_tx.send(());
@@ -147,7 +164,7 @@ fn main() -> Result<()> {
                     if matches!(&ui_result, Ok(MonitorExit::ForceQuit)) {
                         server_task.abort();
                         let _ = runtime.block_on(server_task);
-                        std::process::exit(130);
+                        exit_with_logs(130);
                     }
                     let server_result = runtime.block_on(server_task)?;
                     ui_result?;
@@ -167,6 +184,37 @@ fn main() -> Result<()> {
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
+    }
+}
+
+fn exit_with_logs(code: i32) -> ! {
+    if !logging::flush(Duration::from_secs(2)) {
+        eprintln!("warning: proxy logs could not be flushed completely");
+    }
+    std::process::exit(code)
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -195,14 +243,14 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
             claude_code_proxy::provider::AuthCommand::Login => {
                 if let Err(err) = handlers.login() {
                     eprintln!("{err}");
-                    std::process::exit(2);
+                    exit_with_logs(2);
                 }
                 Ok(())
             }
             claude_code_proxy::provider::AuthCommand::Device => {
                 if let Err(err) = handlers.device() {
                     eprintln!("{err}");
-                    std::process::exit(2);
+                    exit_with_logs(2);
                 }
                 Ok(())
             }
@@ -210,9 +258,9 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
                 if let Err(err) = handlers.status() {
                     println!("{err}");
                     if err.to_string() == "Not authenticated" {
-                        std::process::exit(1);
+                        exit_with_logs(1);
                     }
-                    std::process::exit(2);
+                    exit_with_logs(2);
                 }
                 Ok(())
             }

@@ -9,6 +9,7 @@ permissions:
 
 env:
   BIN_NAME: claude-code-proxy
+  RELEASE_REPOSITORY: ${{ github.repository }}
 
 jobs:
   checks:
@@ -16,8 +17,31 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        # Keep warnings fatal while carrying a narrow, explicit baseline for
+        # pre-existing monitor/Cursor lint debt outside the Codex/Grok scope.
+        run: >-
+          cargo clippy --all-targets --locked -- -D warnings
+          -A clippy::empty_line_after_doc_comments
+          -A clippy::manual_is_multiple_of
+          -A clippy::too_many_arguments
+          -A clippy::collapsible_if
+          -A clippy::manual_div_ceil
+          -A clippy::redundant_closure
+          -A clippy::let_and_return
+          -A clippy::unnecessary_filter_map
+          -A clippy::if_same_then_else
+          -A clippy::needless_borrow
+          -A clippy::await_holding_lock
+          -A clippy::manual_strip
+      - name: Build
+        run: cargo build --all --locked
       - name: Test
-        run: cargo test --locked
+        run: cargo test --all --locked
 
   build:
     needs: checks
@@ -70,7 +94,7 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           expected="claude-code-proxy ${VERSION#v}"
-          actual="$(target/${{ matrix.target }}/release/${BIN_NAME} --version)"
+          actual="$("target/${{ matrix.target }}/release/${BIN_NAME}" --version)"
           test "$actual" = "$expected"
       - name: Verify Windows binary
         if: runner.os == 'Windows'
@@ -87,10 +111,18 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${BIN_NAME}"
+          binary="target/${{ matrix.target }}/release/${BIN_NAME}"
+          cp "$binary" "dist/${BIN_NAME}"
           archive="${BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
           tar -C dist -czf "$archive" "${BIN_NAME}"
           shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256"
+          identity="$("$binary" version --json)"
+          checkout_sha="$(git rev-parse HEAD)"
+          binary_sha="$(shasum -a 256 "$binary" | awk '{print $1}')"
+          archive_sha="$(awk '{print $1}' "${BIN_NAME}-${{ matrix.platform }}.sha256")"
+          IDENTITY_JSON="$identity" CHECKOUT_SHA="$checkout_sha" BINARY_SHA="$binary_sha" ARCHIVE_SHA="$archive_sha" \
+            PLATFORM="${{ matrix.platform }}" python3 -c 'import json,os; d=json.loads(os.environ["IDENTITY_JSON"]); assert d["gitDirty"] is False; assert d["gitSha"] == os.environ["CHECKOUT_SHA"]; assert d["binarySha256"] == os.environ["BINARY_SHA"]; print(json.dumps({"repository":os.environ["GITHUB_REPOSITORY"],"tag":os.environ["GITHUB_REF_NAME"],"gitSha":d["gitSha"],"binarySha256":d["binarySha256"],"archiveSha256":os.environ["ARCHIVE_SHA"],"platform":os.environ["PLATFORM"]},separators=(",",":")))' \
+            > "${BIN_NAME}-${{ matrix.platform }}.provenance.json"
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -101,12 +133,28 @@ jobs:
           Compress-Archive -Path "dist/${env:BIN_NAME}.exe" -DestinationPath $archive -Force
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
           "$hash  $archive" | Out-File -FilePath "${env:BIN_NAME}-${{ matrix.platform }}.sha256" -Encoding ascii
+          $binary = "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe"
+          $identity = (& $binary version --json | ConvertFrom-Json)
+          $checkoutSha = (git rev-parse HEAD).Trim()
+          $binaryHash = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLower()
+          if ($identity.gitDirty -or $identity.gitSha -ne $checkoutSha -or $identity.binarySha256 -ne $binaryHash) {
+            throw "binary provenance does not match the release checkout"
+          }
+          [ordered]@{
+            repository = $env:GITHUB_REPOSITORY
+            tag = $env:GITHUB_REF_NAME
+            gitSha = $identity.gitSha
+            binarySha256 = $identity.binarySha256
+            archiveSha256 = $hash
+            platform = "${{ matrix.platform }}"
+          } | ConvertTo-Json -Compress | Set-Content -NoNewline -Encoding utf8 "${env:BIN_NAME}-${{ matrix.platform }}.provenance.json"
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.platform }}
           path: |
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.${{ matrix.archive }}
             ${{ env.BIN_NAME }}-${{ matrix.platform }}.sha256
+            ${{ env.BIN_NAME }}-${{ matrix.platform }}.provenance.json
 
   smoke-windows:
     needs: build
@@ -131,15 +179,17 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          token: ${{ secrets.RELEASE_TOKEN }}
+          token: ${{ github.token }}
           generate_release_notes: true
           files: |
             *.tar.gz
             *.zip
             *.sha256
+            *.provenance.json
 
   update-tap:
     needs: release
+    if: ${{ vars.HOMEBREW_TAP_REPOSITORY != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
@@ -147,8 +197,8 @@ jobs:
           merge-multiple: true
       - uses: actions/checkout@v5
         with:
-          repository: raine/homebrew-claude-code-proxy
-          token: ${{ secrets.RELEASE_TOKEN }}
+          repository: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: tap
       - name: Generate formula and push to tap
         env:
@@ -164,26 +214,26 @@ jobs:
           cat > tap/Formula/claude-code-proxy.rb << EOF
           class ClaudeCodeProxy < Formula
             desc "Local proxy: Claude Code to ChatGPT subscription via Codex Responses API"
-            homepage "https://github.com/raine/claude-code-proxy"
+            homepage "https://github.com/${RELEASE_REPOSITORY}"
             version "${VERSION}"
             license "MIT"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-darwin-arm64.tar.gz"
+                url "https://github.com/${RELEASE_REPOSITORY}/releases/download/v${VERSION}/claude-code-proxy-darwin-arm64.tar.gz"
                 sha256 "${SHA_ARM}"
               else
-                url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-darwin-amd64.tar.gz"
+                url "https://github.com/${RELEASE_REPOSITORY}/releases/download/v${VERSION}/claude-code-proxy-darwin-amd64.tar.gz"
                 sha256 "${SHA_INTEL}"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-linux-arm64.tar.gz"
+                url "https://github.com/${RELEASE_REPOSITORY}/releases/download/v${VERSION}/claude-code-proxy-linux-arm64.tar.gz"
                 sha256 "${SHA_LINUX_ARM}"
               else
-                url "https://github.com/raine/claude-code-proxy/releases/download/v${VERSION}/claude-code-proxy-linux-amd64.tar.gz"
+                url "https://github.com/${RELEASE_REPOSITORY}/releases/download/v${VERSION}/claude-code-proxy-linux-amd64.tar.gz"
                 sha256 "${SHA_LINUX_AMD}"
               end
             end

@@ -76,7 +76,9 @@ pub fn exchange_code_for_tokens(
     pkce: &PkceCodes,
     redirect_uri: &str,
 ) -> Result<crate::providers::codex::auth::jwt::TokenResponse, anyhow::Error> {
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -132,7 +134,7 @@ mod tests {
         let pkce = generate_pkce();
         let expected_hash = Sha256::digest(pkce.verifier.as_bytes());
         let expected_challenge =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&expected_hash);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected_hash);
         assert_eq!(pkce.challenge, expected_challenge);
     }
 

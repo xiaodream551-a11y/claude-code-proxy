@@ -15,6 +15,13 @@ where
     fn save(&self, value: T) -> Result<()>;
     fn clear(&self) -> Result<()>;
     fn path(&self) -> String;
+
+    /// Filesystem location used to coordinate credential mutations across
+    /// processes. This is intentionally separate from `path()`, which may be a
+    /// user-facing backend label such as `macOS Keychain`.
+    fn coordination_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 pub trait Keychain: Send + Sync {
@@ -194,6 +201,10 @@ where
     fn path(&self) -> String {
         self.file.clone()
     }
+
+    fn coordination_path(&self) -> Option<std::path::PathBuf> {
+        Some(std::path::PathBuf::from(&self.file))
+    }
 }
 
 pub struct KeychainFileAuthStore<T, K = SystemKeychain>
@@ -282,6 +293,10 @@ where
         } else {
             self.file_store.path()
         }
+    }
+
+    fn coordination_path(&self) -> Option<std::path::PathBuf> {
+        self.file_store.coordination_path()
     }
 }
 
@@ -542,6 +557,27 @@ mod tests {
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded["source"], json!("file"));
         assert_eq!(store.path(), "macOS Keychain");
+    }
+
+    #[test]
+    fn keychain_display_path_is_separate_from_mutation_coordination_path() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        let store: KeychainFileAuthStore<serde_json::Value, _> = KeychainFileAuthStore::new(
+            file.clone(),
+            legacy,
+            "svc",
+            "acct",
+            true,
+            MockKeychain::default(),
+        );
+
+        assert_eq!(store.path(), "macOS Keychain");
+        assert_eq!(
+            store.coordination_path().as_deref(),
+            Some(std::path::Path::new(&file))
+        );
     }
 
     #[test]

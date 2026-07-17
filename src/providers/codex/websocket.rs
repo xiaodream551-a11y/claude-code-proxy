@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,8 +53,12 @@ pub(super) fn is_retryable_transport_detail(detail: Option<&str>) -> bool {
     )
 }
 
-const POOL_MAX_AGE_MS: u64 = 30 * 60 * 1000;
-const MAX_POOL_ENTRIES: usize = 10_000;
+const DEFAULT_POOL_IDLE_TTL_MS: u64 = 5 * 60 * 1000;
+const DEFAULT_MAX_IDLE_POOL_ENTRIES: usize = 128;
+const MAX_CONFIGURED_IDLE_POOL_ENTRIES: usize = 4_096;
+const MAX_CONFIGURED_POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
+const MIN_POOL_REAPER_INTERVAL_MS: u64 = 1_000;
+const MAX_POOL_REAPER_INTERVAL_MS: u64 = 30_000;
 pub(super) const WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
 pub(super) const WEBSOCKET_CIRCUIT_COOLDOWN_MS: u64 = 30_000;
 const MAX_CIRCUIT_ENTRIES: usize = 10_000;
@@ -92,14 +97,6 @@ impl Default for CodexWebSocketTimeouts {
         }
     }
 }
-
-// Terminal WebSocket event types that signal the request is done
-const TERMINAL_EVENTS: &[&str] = &[
-    "response.completed",
-    "response.incomplete",
-    "response.failed",
-    "error",
-];
 
 pub type CodexWebSocketEventReceiver = mpsc::Receiver<Result<serde_json::Value, CodexError>>;
 
@@ -150,11 +147,36 @@ impl std::fmt::Display for CodexWebSocketError {
 
 struct PoolEntry {
     ws: Arc<AsyncMutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
-    created_at: u64,
 }
 
-static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<PoolEntry>>>> =
+struct IdlePoolEntry {
+    connection: Arc<PoolEntry>,
+    idle_since_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WebSocketPoolConfig {
+    max_idle_entries: usize,
+    idle_ttl_ms: u64,
+}
+
+impl WebSocketPoolConfig {
+    fn configured() -> Self {
+        let max_idle_entries =
+            crate::config::codex_max_idle_websockets(DEFAULT_MAX_IDLE_POOL_ENTRIES as u64)
+                .min(MAX_CONFIGURED_IDLE_POOL_ENTRIES as u64) as usize;
+        let idle_ttl_ms = crate::config::codex_idle_websocket_ttl_ms(DEFAULT_POOL_IDLE_TTL_MS)
+            .min(MAX_CONFIGURED_POOL_IDLE_TTL_MS);
+        Self {
+            max_idle_entries,
+            idle_ttl_ms,
+        }
+    }
+}
+
+static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<String, IdlePoolEntry>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+static WS_POOL_REAPER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 struct CircuitEntry {
@@ -241,6 +263,11 @@ pub(super) fn codex_websocket_pool_contains_for_tests(session_id: &str) -> bool 
     WS_POOL.lock().unwrap().contains_key(session_id)
 }
 
+#[cfg(test)]
+fn codex_websocket_pool_len_for_tests() -> usize {
+    WS_POOL.lock().unwrap().len()
+}
+
 pub(super) fn codex_websocket_circuit_open(key: &str) -> bool {
     let timeouts = CodexWebSocketTimeouts::configured();
     let probe_lease = Duration::from_millis(
@@ -282,7 +309,7 @@ fn invalidate_pool_entry(session_id: &str, entry: &Arc<PoolEntry>) {
     let mut guard = WS_POOL.lock().unwrap();
     if guard
         .get(session_id)
-        .is_some_and(|pooled| Arc::ptr_eq(pooled, entry))
+        .is_some_and(|pooled| Arc::ptr_eq(&pooled.connection, entry))
     {
         guard.remove(session_id);
     }
@@ -298,15 +325,15 @@ fn invalidate_pool_owner(pool_key: Option<&str>, entry: Option<&Arc<PoolEntry>>)
     }
 }
 
-fn pool_get_for_turn(key: &str, turn_id: Option<u64>) -> Option<Arc<PoolEntry>> {
+fn pool_take_for_turn(key: &str, turn_id: Option<u64>) -> Option<Arc<PoolEntry>> {
+    let idle_ttl_ms = WebSocketPoolConfig::configured().idle_ttl_ms;
     super::continuation::if_current_turn(Some(key), turn_id, || {
         let mut guard = WS_POOL.lock().ok()?;
-        let entry = guard.get(key).cloned()?;
-        if now_ms().saturating_sub(entry.created_at) >= POOL_MAX_AGE_MS {
-            guard.remove(key);
+        let idle = guard.remove(key)?;
+        if idle_pool_entry_expired(&idle, now_ms(), idle_ttl_ms) {
             return None;
         }
-        Some(entry)
+        Some(idle.connection)
     })
     .flatten()
 }
@@ -317,20 +344,83 @@ fn pool_insert_for_turn(key: String, entry: Arc<PoolEntry>, turn_id: Option<u64>
 }
 
 fn pool_insert(key: String, entry: Arc<PoolEntry>) {
-    let mut guard = WS_POOL.lock().unwrap();
-    // Evict oldest if at capacity
-    if guard.len() >= MAX_POOL_ENTRIES
-        && let Some(oldest_key) = guard
-            .iter()
-            .min_by_key(|(_, entry)| entry.created_at)
-            .map(|(key, _)| key.clone())
-    {
-        guard.remove(&oldest_key);
-    }
-    // Evict expired entries
+    let config = WebSocketPoolConfig::configured();
     let now = now_ms();
-    guard.retain(|_, e| now.saturating_sub(e.created_at) < POOL_MAX_AGE_MS);
-    guard.insert(key, entry);
+    {
+        let mut guard = WS_POOL.lock().unwrap();
+        guard.insert(
+            key,
+            IdlePoolEntry {
+                connection: entry,
+                idle_since_ms: now,
+            },
+        );
+        reap_idle_pool(&mut guard, now, config);
+    }
+    ensure_pool_reaper_started();
+}
+
+fn idle_pool_entry_expired(entry: &IdlePoolEntry, now_ms: u64, idle_ttl_ms: u64) -> bool {
+    now_ms.saturating_sub(entry.idle_since_ms) >= idle_ttl_ms
+}
+
+fn reap_idle_pool(
+    pool: &mut HashMap<String, IdlePoolEntry>,
+    now_ms: u64,
+    config: WebSocketPoolConfig,
+) {
+    pool.retain(|_, entry| !idle_pool_entry_expired(entry, now_ms, config.idle_ttl_ms));
+    while pool.len() > config.max_idle_entries {
+        let Some(oldest_key) = pool
+            .iter()
+            .min_by(|(left_key, left), (right_key, right)| {
+                left.idle_since_ms
+                    .cmp(&right.idle_since_ms)
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        pool.remove(&oldest_key);
+    }
+}
+
+struct PoolReaperRunningGuard;
+
+impl Drop for PoolReaperRunningGuard {
+    fn drop(&mut self) {
+        WS_POOL_REAPER_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+fn ensure_pool_reaper_started() {
+    if WS_POOL_REAPER_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        WS_POOL_REAPER_RUNNING.store(false, Ordering::Release);
+        return;
+    };
+    let running = PoolReaperRunningGuard;
+    runtime.spawn(async move {
+        // Capture the guard before the task is first polled so dropping an
+        // unstarted task during runtime shutdown still clears the flag.
+        let _running = running;
+        loop {
+            let configured = WebSocketPoolConfig::configured();
+            let interval_ms = (configured.idle_ttl_ms / 2)
+                .clamp(MIN_POOL_REAPER_INTERVAL_MS, MAX_POOL_REAPER_INTERVAL_MS);
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+
+            let configured = WebSocketPoolConfig::configured();
+            let mut guard = WS_POOL.lock().unwrap();
+            reap_idle_pool(&mut guard, now_ms(), configured);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -396,17 +486,6 @@ fn encode_sse(text: &str) -> Vec<u8> {
     }
     out.push('\n');
     out.into_bytes()
-}
-
-// ---------------------------------------------------------------------------
-// Terminal event detection
-// ---------------------------------------------------------------------------
-
-fn is_terminal_event(payload: &serde_json::Value) -> bool {
-    match payload.get("type").and_then(|v| v.as_str()) {
-        Some(t) => TERMINAL_EVENTS.contains(&t),
-        None => false,
-    }
 }
 
 fn is_response_event(payload: &serde_json::Value) -> bool {
@@ -503,7 +582,7 @@ pub async fn codex_websocket_request(
 
     // Check pool for existing connection
     let pooled = pool_key.and_then(|key| {
-        pool_get_for_turn(key, continuation.and_then(|candidate| candidate.turn_id))
+        pool_take_for_turn(key, continuation.and_then(|candidate| candidate.turn_id))
     });
 
     if let Some(entry) = pooled {
@@ -558,11 +637,20 @@ pub async fn codex_websocket_request(
             });
         }
 
-        let status = if terminal_event.event_type == "error" {
+        let status = if terminal_event.kind.is_failure() {
             event_error_status(&terminal_event.payload).unwrap_or(500)
         } else {
             200
         };
+        let reusable = terminal_event.kind.is_reusable();
+        drop(ws_guard);
+        if reusable && let Some(key) = pool_key {
+            pool_insert_for_turn(
+                key.to_string(),
+                entry.clone(),
+                continuation.and_then(|candidate| candidate.turn_id),
+            );
+        }
 
         if let Some(tc) = traffic {
             write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, true);
@@ -582,7 +670,6 @@ pub async fn codex_websocket_request(
     // New connection path (not pooled or pool miss)
     let entry = Arc::new(PoolEntry {
         ws: Arc::new(AsyncMutex::new(ws_stream)),
-        created_at: now_ms(),
     });
 
     // Send the request
@@ -617,23 +704,20 @@ pub async fn codex_websocket_request(
             });
         }
 
-        // Pool the connection if we have a key and it was successful
-        if let Some(key) = pool_key {
-            let should_pool = terminal_event.event_type == "response.completed";
-            if should_pool {
-                pool_insert_for_turn(
-                    key.to_string(),
-                    entry.clone(),
-                    continuation.and_then(|candidate| candidate.turn_id),
-                );
-            }
-        }
-
-        let status = if terminal_event.event_type == "error" {
+        let status = if terminal_event.kind.is_failure() {
             event_error_status(&terminal_event.payload).unwrap_or(500)
         } else {
             200
         };
+        let reusable = terminal_event.kind.is_reusable();
+        drop(ws_guard);
+        if reusable && let Some(key) = pool_key {
+            pool_insert_for_turn(
+                key.to_string(),
+                entry.clone(),
+                continuation.and_then(|candidate| candidate.turn_id),
+            );
+        }
 
         // Write traffic metadata
         if let Some(tc) = traffic {
@@ -693,7 +777,7 @@ pub async fn codex_websocket_event_stream(
     }
 
     let pooled = pool_key.and_then(|key| {
-        pool_get_for_turn(key, continuation.and_then(|candidate| candidate.turn_id))
+        pool_take_for_turn(key, continuation.and_then(|candidate| candidate.turn_id))
     });
     let used_pooled = pooled.is_some();
     let entry = if let Some(entry) = pooled {
@@ -702,7 +786,6 @@ pub async fn codex_websocket_event_stream(
         let (ws_stream, _) = connect_with_timeout(&ws_url, headers, timeouts.connect_ms).await?;
         Arc::new(PoolEntry {
             ws: Arc::new(AsyncMutex::new(ws_stream)),
-            created_at: now_ms(),
         })
     };
 
@@ -774,9 +857,7 @@ pub async fn codex_websocket_event_stream(
 
             if let Some(key) = pool_key.as_deref() {
                 if reusable {
-                    if !used_pooled {
-                        pool_insert_for_turn(key.to_string(), entry.clone(), turn_id);
-                    }
+                    pool_insert_for_turn(key.to_string(), entry.clone(), turn_id);
                 } else {
                     invalidate_pool_entry(key, &entry);
                 }
@@ -1292,7 +1373,7 @@ impl WebSocketWatchdog {
 
 #[derive(Debug)]
 struct WsEvent {
-    event_type: String,
+    kind: super::events::CodexTerminalKind,
     payload: serde_json::Value,
 }
 
@@ -1359,13 +1440,9 @@ async fn collect_ws_events(
                 }
 
                 // Check for terminal events
-                if is_terminal_event(&parsed) {
+                if let Some(kind) = super::events::CodexTerminalKind::from_payload(&parsed) {
                     terminal_event = Some(WsEvent {
-                        event_type: parsed
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string(),
+                        kind,
                         payload: parsed,
                     });
                     break;
@@ -1486,10 +1563,11 @@ async fn stream_ws_events(
                     watchdog.note_response_event();
                 }
 
-                if parsed.get("type").and_then(|v| v.as_str()) == Some("error") {
+                let terminal_kind = super::events::CodexTerminalKind::from_payload(&parsed);
+                if terminal_kind.is_some_and(super::events::CodexTerminalKind::is_failure) {
                     status = event_error_status(&parsed).unwrap_or(500);
                 }
-                let terminal = is_terminal_event(&parsed);
+                let terminal = terminal_kind.is_some();
                 if terminal && is_previous_response_missing(&parsed) {
                     invalidate_pool_owner(pool_key, pool_entry);
                     let _ = tx
@@ -1503,17 +1581,13 @@ async fn stream_ws_events(
                         .await;
                     break;
                 }
-                let event_type = parsed
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
                 if tx.send(Ok(parsed)).await.is_err() {
                     invalidate_pool_owner(pool_key, pool_entry);
                     break;
                 }
                 if terminal {
-                    reusable = event_type == "response.completed";
+                    reusable =
+                        terminal_kind.is_some_and(super::events::CodexTerminalKind::is_reusable);
                     break;
                 }
             }
@@ -1587,6 +1661,59 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn idle_pool_entry(
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        idle_since_ms: u64,
+    ) -> IdlePoolEntry {
+        IdlePoolEntry {
+            connection: Arc::new(PoolEntry {
+                ws: Arc::new(AsyncMutex::new(stream)),
+            }),
+            idle_since_ms,
+        }
+    }
+
+    fn test_context() -> RequestContext {
+        RequestContext {
+            req_id: "codex-websocket-test".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    async fn buffered_terminal_while_peer_stays_open(event: &'static str) -> CodexResponse {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(event.into())).await.unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            codex_websocket_request(
+                &format!("http://{addr}/responses"),
+                &HeaderMap::new(),
+                &serde_json::json!({"type":"response.create","input":[]}),
+                &test_context(),
+                None,
+                None,
+                test_timeouts(2_000, 2_000),
+                None,
+            ),
+        )
+        .await;
+        server.abort();
+        result
+            .expect("a terminal event must finish before the peer closes")
+            .unwrap()
+    }
 
     fn test_timeouts(response_start_ms: u64, idle_ms: u64) -> CodexWebSocketTimeouts {
         CodexWebSocketTimeouts {
@@ -1771,15 +1898,37 @@ mod tests {
     }
 
     #[test]
-    fn is_terminal_event_detection() {
+    fn websocket_terminal_detection_uses_shared_classifier() {
         let completed = serde_json::json!({"type": "response.completed"});
-        assert!(is_terminal_event(&completed));
+        assert!(super::super::events::CodexTerminalKind::from_payload(&completed).is_some());
 
         let delta = serde_json::json!({"type": "response.output_text.delta"});
-        assert!(!is_terminal_event(&delta));
+        assert!(super::super::events::CodexTerminalKind::from_payload(&delta).is_none());
 
         let error = serde_json::json!({"type": "error", "error": {"message": "fail"}});
-        assert!(is_terminal_event(&error));
+        assert!(super::super::events::CodexTerminalKind::from_payload(&error).is_some());
+    }
+
+    #[tokio::test]
+    async fn buffered_response_done_finishes_while_peer_stays_open() {
+        let response = buffered_terminal_while_peer_stays_open(
+            r#"{"type":"response.done","response":{"id":"resp_done"}}"#,
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert!(String::from_utf8_lossy(&response.body).contains("response.done"));
+    }
+
+    #[tokio::test]
+    async fn buffered_response_error_finishes_while_peer_stays_open() {
+        let response = buffered_terminal_while_peer_stays_open(
+            r#"{"type":"response.error","response":{"error":{"status":503,"message":"failed"}}}"#,
+        )
+        .await;
+
+        assert_eq!(response.status, 503);
+        assert!(String::from_utf8_lossy(&response.body).contains("response.error"));
     }
 
     #[test]
@@ -1823,10 +1972,7 @@ mod tests {
             let mut guard = WS_POOL.lock().unwrap();
             guard.insert(
                 "test-session".to_string(),
-                Arc::new(PoolEntry {
-                    ws: Arc::new(AsyncMutex::new(stream)),
-                    created_at: now_ms(),
-                }),
+                idle_pool_entry(stream, now_ms()),
             );
         }
         assert!(WS_POOL.lock().unwrap().contains_key("test-session"));
@@ -1836,20 +1982,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_pool_entry_is_not_reused() {
+    async fn expired_idle_pool_entry_is_reaped_without_lookup() {
         let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         clear_codex_websocket_pool_for_tests();
-        let entry = Arc::new(PoolEntry {
-            ws: Arc::new(AsyncMutex::new(create_dummy_stream_async().await)),
-            created_at: now_ms().saturating_sub(POOL_MAX_AGE_MS + 1),
-        });
+        let idle_ttl_ms = 50;
+        let now = 1_000;
+        let entry = idle_pool_entry(create_dummy_stream_async().await, now - idle_ttl_ms - 1);
         WS_POOL
             .lock()
             .unwrap()
             .insert("expired-session".to_string(), entry);
 
-        assert!(pool_get_for_turn("expired-session", None).is_none());
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            reap_idle_pool(
+                &mut guard,
+                now,
+                WebSocketPoolConfig {
+                    max_idle_entries: 128,
+                    idle_ttl_ms,
+                },
+            );
+        }
         assert!(!WS_POOL.lock().unwrap().contains_key("expired-session"));
+    }
+
+    #[tokio::test]
+    async fn idle_pool_capacity_evicts_oldest_entries_deterministically() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        let first = idle_pool_entry(create_dummy_stream_async().await, 10);
+        let second = idle_pool_entry(create_dummy_stream_async().await, 20);
+        let third = idle_pool_entry(create_dummy_stream_async().await, 30);
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            guard.insert("first".to_string(), first);
+            guard.insert("second".to_string(), second);
+            guard.insert("third".to_string(), third);
+            reap_idle_pool(
+                &mut guard,
+                30,
+                WebSocketPoolConfig {
+                    max_idle_entries: 2,
+                    idle_ttl_ms: 1_000,
+                },
+            );
+        }
+
+        assert_eq!(codex_websocket_pool_len_for_tests(), 2);
+        assert!(!codex_websocket_pool_contains_for_tests("first"));
+        assert!(codex_websocket_pool_contains_for_tests("second"));
+        assert!(codex_websocket_pool_contains_for_tests("third"));
+        clear_codex_websocket_pool_for_tests();
     }
 
     #[tokio::test]
@@ -1961,8 +2145,8 @@ mod tests {
         .expect("matching Pong should keep the stream alive")
         .unwrap();
         assert_eq!(
-            terminal.as_ref().map(|event| event.event_type.as_str()),
-            Some("response.completed")
+            terminal.as_ref().map(|event| event.kind),
+            Some(super::super::events::CodexTerminalKind::Completed)
         );
         server.await.unwrap();
     }
@@ -1998,12 +2182,14 @@ mod tests {
             .unwrap();
         let entry = Arc::new(PoolEntry {
             ws: Arc::new(AsyncMutex::new(ws)),
-            created_at: now_ms(),
         });
-        WS_POOL
-            .lock()
-            .unwrap()
-            .insert("cancel-session".to_string(), entry.clone());
+        WS_POOL.lock().unwrap().insert(
+            "cancel-session".to_string(),
+            IdlePoolEntry {
+                connection: entry.clone(),
+                idle_since_ms: now_ms(),
+            },
+        );
 
         let ctx = RequestContext {
             req_id: "cancel-request".to_string(),
@@ -2123,10 +2309,7 @@ mod tests {
             let mut guard = WS_POOL.lock().unwrap();
             guard.insert(
                 "binary-session".to_string(),
-                Arc::new(PoolEntry {
-                    ws: Arc::new(AsyncMutex::new(pooled_stream)),
-                    created_at: now_ms(),
-                }),
+                idle_pool_entry(pooled_stream, now_ms()),
             );
         }
 
@@ -2167,10 +2350,7 @@ mod tests {
             let mut guard = WS_POOL.lock().unwrap();
             guard.insert(
                 "start-timeout-session".to_string(),
-                Arc::new(PoolEntry {
-                    ws: Arc::new(AsyncMutex::new(pooled_stream)),
-                    created_at: now_ms(),
-                }),
+                idle_pool_entry(pooled_stream, now_ms()),
             );
         }
 
@@ -2229,10 +2409,7 @@ mod tests {
             let mut guard = WS_POOL.lock().unwrap();
             guard.insert(
                 "response-idle-session".to_string(),
-                Arc::new(PoolEntry {
-                    ws: Arc::new(AsyncMutex::new(pooled_stream)),
-                    created_at: now_ms(),
-                }),
+                idle_pool_entry(pooled_stream, now_ms()),
             );
         }
 

@@ -63,9 +63,10 @@ impl DeviceAuthClient {
         Self {
             issuer: issuer.into(),
             client: reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("failed to create Codex device auth client"),
             sleeper: Box::new(StdSleeper),
             max_wait: MAX_DEVICE_POLL_WAIT,
         }
@@ -459,6 +460,7 @@ mod tests {
         let client = DeviceAuthClient {
             issuer: server.url().to_string(),
             client: reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
@@ -523,6 +525,7 @@ mod tests {
         let client = DeviceAuthClient {
             issuer: server.url.clone(),
             client: reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
@@ -585,6 +588,7 @@ mod tests {
         let client = DeviceAuthClient {
             issuer: server.url.clone(),
             client: reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),

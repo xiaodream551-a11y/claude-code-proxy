@@ -43,7 +43,7 @@
 
             meta = with pkgs.lib; {
               description = cargoToml.package.description;
-              homepage = "https://github.com/raine/claude-code-proxy";
+              homepage = "https://github.com/xiaodream551-a11y/claude-code-proxy";
               license = licenses.mit;
               mainProgram = "claude-code-proxy";
             };

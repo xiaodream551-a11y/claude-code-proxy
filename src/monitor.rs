@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
@@ -11,6 +11,10 @@ pub use mock::{MockMonitor, mock_state};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
+const SESSION_TOKEN_HISTORY_WINDOW_SECS: u64 = 60 * 60;
+const SESSION_TOKEN_HISTORY_BUCKET_LIMIT: usize =
+    (SESSION_TOKEN_HISTORY_WINDOW_SECS / SESSION_TOKEN_BUCKET_SECS) as usize;
+const SESSION_TOKEN_HISTORY_SESSION_LIMIT: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointKind {
@@ -304,7 +308,7 @@ impl MonitorHandle {
 
     pub fn snapshot(&self) -> MonitorState {
         match self.store.lock() {
-            Ok(store) => store.snapshot(),
+            Ok(mut store) => store.snapshot(),
             Err(_) => MonitorState {
                 started_at: SystemTime::now(),
                 sessions: Vec::new(),
@@ -779,18 +783,24 @@ impl MonitorStore {
             error: error.or(active.error),
             traffic_capture_path: active.traffic_capture_path,
         };
-        if let Some(tokens) = completed.output_tokens.filter(|tokens| *tokens > 0) {
-            self.record_session_output(
-                completed.session_id.clone(),
-                completed
-                    .generation_finished_at
-                    .unwrap_or(completed.finished_at),
-                tokens,
-            );
-        }
+        let history_update = completed
+            .output_tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| {
+                (
+                    completed.session_id.clone(),
+                    completed
+                        .generation_finished_at
+                        .unwrap_or(completed.finished_at),
+                    tokens,
+                )
+            });
         self.recent.push_front(completed);
         while self.recent.len() > self.recent_limit {
             self.recent.pop_back();
+        }
+        if let Some((session_id, timestamp, tokens)) = history_update {
+            self.record_session_output(session_id, timestamp, tokens);
         }
     }
 
@@ -806,9 +816,94 @@ impl MonitorStore {
             Ok(index) => buckets[index].1 = buckets[index].1.saturating_add(tokens),
             Err(index) => buckets.insert(index, (bucket, tokens)),
         }
+        let excess_buckets = buckets
+            .len()
+            .saturating_sub(SESSION_TOKEN_HISTORY_BUCKET_LIMIT);
+        if excess_buckets > 0 {
+            buckets.drain(..excess_buckets);
+        }
+        self.enforce_session_history_limit();
     }
 
-    fn snapshot(&self) -> MonitorState {
+    fn enforce_session_history_limit(&mut self) {
+        if self.session_output_buckets.len() <= SESSION_TOKEN_HISTORY_SESSION_LIMIT {
+            return;
+        }
+
+        let available: HashSet<_> = self.session_output_buckets.keys().cloned().collect();
+        let mut keep = HashSet::with_capacity(SESSION_TOKEN_HISTORY_SESSION_LIMIT);
+
+        // Active sessions take precedence. Sorting makes eviction deterministic when the
+        // number of active sessions alone exceeds the hard limit.
+        let mut active_sessions: Vec<_> = self
+            .active
+            .values()
+            .map(|request| request.session_id.clone())
+            .filter(|session_id| available.contains(session_id))
+            .collect();
+        active_sessions.sort();
+        active_sessions.dedup();
+        for session_id in active_sessions {
+            if keep.len() == SESSION_TOKEN_HISTORY_SESSION_LIMIT {
+                break;
+            }
+            keep.insert(session_id);
+        }
+
+        // `recent` is newest-first, so recently completed sessions are retained next.
+        for request in &self.recent {
+            if keep.len() == SESSION_TOKEN_HISTORY_SESSION_LIMIT {
+                break;
+            }
+            if available.contains(&request.session_id) {
+                keep.insert(request.session_id.clone());
+            }
+        }
+
+        // Fill any remaining capacity with the histories that have the newest token bucket.
+        let mut remaining: Vec<_> = self
+            .session_output_buckets
+            .iter()
+            .filter(|(session_id, _)| !keep.contains(*session_id))
+            .map(|(session_id, buckets)| {
+                (
+                    session_id.clone(),
+                    buckets.last().map(|(bucket, _)| *bucket).unwrap_or(0),
+                )
+            })
+            .collect();
+        remaining.sort_by(|(left_id, left_bucket), (right_id, right_bucket)| {
+            right_bucket
+                .cmp(left_bucket)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        for (session_id, _) in remaining {
+            if keep.len() == SESSION_TOKEN_HISTORY_SESSION_LIMIT {
+                break;
+            }
+            keep.insert(session_id);
+        }
+
+        self.session_output_buckets
+            .retain(|session_id, _| keep.contains(session_id));
+    }
+
+    fn prune_session_output_window(&mut self, reference_bucket: u64) {
+        let oldest_bucket = reference_bucket
+            .saturating_sub(SESSION_TOKEN_HISTORY_BUCKET_LIMIT.saturating_sub(1) as u64);
+        for buckets in self.session_output_buckets.values_mut() {
+            let first_retained = buckets.partition_point(|(bucket, _)| *bucket < oldest_bucket);
+            let after_last_retained =
+                buckets.partition_point(|(bucket, _)| *bucket <= reference_bucket);
+            buckets.truncate(after_last_retained);
+            buckets.drain(..first_retained);
+        }
+        self.session_output_buckets
+            .retain(|_, buckets| !buckets.is_empty());
+    }
+
+    fn snapshot(&mut self) -> MonitorState {
+        self.prune_session_output_window(session_token_bucket(SystemTime::now()));
         let mut active: Vec<_> = self.active.values().cloned().collect();
         active.sort_by_key(|request| request.started_at);
         let sessions = session_summaries(&active, &self.recent, &self.session_output_buckets);
@@ -1420,6 +1515,131 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 .map(|(_, tokens)| *tokens)
                 .sum::<u64>(),
             100
+        );
+    }
+
+    #[test]
+    fn session_output_history_stays_bounded_after_multiple_days() {
+        let monitor = MonitorHandle::new(1);
+        let start = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+        let bucket_count = 2 * 24 * 60 * 60 / SESSION_TOKEN_BUCKET_SECS;
+
+        let mut store = monitor.store.lock().expect("monitor store");
+        for offset in 0..=bucket_count {
+            store.record_session_output(
+                Some("long-running".to_string()),
+                start + Duration::from_secs(offset * SESSION_TOKEN_BUCKET_SECS),
+                1,
+            );
+        }
+
+        let buckets = &store.session_output_buckets[&Some("long-running".to_string())];
+        assert_eq!(buckets.len(), SESSION_TOKEN_HISTORY_BUCKET_LIMIT);
+        assert_eq!(
+            buckets.last().expect("latest bucket").0 - buckets[0].0 + 1,
+            SESSION_TOKEN_HISTORY_BUCKET_LIMIT as u64
+        );
+    }
+
+    #[test]
+    fn session_output_history_caps_high_cardinality() {
+        let monitor = MonitorHandle::new(1);
+        let timestamp = SystemTime::now();
+        let mut store = monitor.store.lock().expect("monitor store");
+
+        for index in 0..(SESSION_TOKEN_HISTORY_SESSION_LIMIT + 100) {
+            store.record_session_output(Some(format!("session-{index:04}")), timestamp, 1);
+        }
+
+        assert_eq!(
+            store.session_output_buckets.len(),
+            SESSION_TOKEN_HISTORY_SESSION_LIMIT
+        );
+    }
+
+    #[test]
+    fn active_and_recent_session_histories_survive_cardinality_eviction() {
+        let monitor = MonitorHandle::new(1);
+        let recent_session = Some("zz-recent".to_string());
+        let active_session = Some("zz-active".to_string());
+
+        monitor.request_started(
+            "recent-request",
+            recent_session.clone(),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.request_completed("recent-request", 200, None, Some(1));
+        monitor.request_started(
+            "active-request",
+            active_session.clone(),
+            None,
+            EndpointKind::Messages,
+        );
+
+        let mut store = monitor.store.lock().expect("monitor store");
+        store.record_session_output(active_session.clone(), SystemTime::now(), 1);
+        for index in 0..(SESSION_TOKEN_HISTORY_SESSION_LIMIT + 100) {
+            store.record_session_output(
+                Some(format!("untracked-{index:04}")),
+                SystemTime::now(),
+                1,
+            );
+        }
+
+        assert_eq!(
+            store.session_output_buckets.len(),
+            SESSION_TOKEN_HISTORY_SESSION_LIMIT
+        );
+        assert!(store.session_output_buckets.contains_key(&active_session));
+        assert!(store.session_output_buckets.contains_key(&recent_session));
+    }
+
+    #[test]
+    fn snapshot_excludes_token_buckets_outside_the_history_window() {
+        let monitor = MonitorHandle::new(1);
+        let session_id = Some("visible-session".to_string());
+        monitor.request_started(
+            "active-request",
+            session_id.clone(),
+            None,
+            EndpointKind::Messages,
+        );
+        let current_bucket = session_token_bucket(SystemTime::now());
+        monitor
+            .store
+            .lock()
+            .expect("monitor store")
+            .session_output_buckets
+            .insert(
+                session_id,
+                vec![
+                    (current_bucket.saturating_sub(500), 10),
+                    (current_bucket, 20),
+                ],
+            );
+
+        let state = monitor.snapshot();
+
+        assert_eq!(
+            state.sessions[0]
+                .output_token_samples
+                .iter()
+                .map(|(_, tokens)| *tokens)
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+        assert_eq!(
+            monitor
+                .store
+                .lock()
+                .expect("monitor store")
+                .session_output_buckets
+                .values()
+                .next()
+                .expect("retained history")
+                .len(),
+            1
         );
     }
 

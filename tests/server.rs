@@ -138,6 +138,48 @@ async fn version_reports_build_and_runtime_identity() {
 }
 
 #[tokio::test]
+async fn models_returns_anthropic_catalog_contract() {
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    assert_eq!(body["has_more"], false);
+    let data = body["data"].as_array().unwrap();
+    assert!(!data.is_empty());
+
+    let ids: Vec<&str> = data
+        .iter()
+        .map(|model| {
+            assert_eq!(model["type"], "model");
+            assert_eq!(model["display_name"], model["id"]);
+            let created_at = model["created_at"].as_str().unwrap();
+            time::OffsetDateTime::parse(created_at, &time::format_description::well_known::Rfc3339)
+                .unwrap();
+            model["id"].as_str().unwrap()
+        })
+        .collect();
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(ids.contains(&"gpt-5.6-sol"));
+    assert!(ids.contains(&"grok-4.5"));
+    assert_eq!(body["first_id"].as_str(), ids.first().copied());
+    assert_eq!(body["last_id"].as_str(), ids.last().copied());
+}
+
+#[tokio::test]
 async fn invalid_json_request_is_json_error() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app

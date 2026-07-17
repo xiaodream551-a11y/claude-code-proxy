@@ -3,7 +3,7 @@ use claude_code_proxy::anthropic::{
 };
 use claude_code_proxy::auth::{AuthStorage, InMemoryAuthStore};
 use claude_code_proxy::config::{AliasProvider, load_config};
-use claude_code_proxy::logging::{create_logger, log_file, redact_value};
+use claude_code_proxy::logging::{create_logger, flush, log_file, redact_value};
 use claude_code_proxy::paths::{self, DirResolverEnv};
 use claude_code_proxy::retry::{RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay};
 use claude_code_proxy::traffic::{
@@ -15,6 +15,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
@@ -277,6 +278,7 @@ fn logger_factory_uses_test_process_log() {
     let marker = format!("foundation-logger-test-{}", std::process::id());
     fields.insert("marker".into(), json!(marker));
     logger.debug("ready", Some(fields));
+    assert!(flush(Duration::from_secs(1)));
 
     let contents = std::fs::read_to_string(test_log).unwrap();
     assert!(contents.contains(&marker));
@@ -309,6 +311,7 @@ fn logger_concurrent_writes_are_complete_jsonl_records() {
     for writer in writers {
         writer.join().unwrap();
     }
+    assert!(flush(Duration::from_secs(2)));
 
     let contents = std::fs::read_to_string(log_file()).unwrap();
     let mut observed = std::collections::HashSet::new();

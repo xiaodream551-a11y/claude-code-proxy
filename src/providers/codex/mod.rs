@@ -2,6 +2,7 @@ pub mod auth;
 pub mod client;
 pub mod continuation;
 pub mod count_tokens;
+pub(crate) mod dispatch_budget;
 pub(crate) mod events;
 pub mod request_summary;
 pub mod translate;
@@ -399,7 +400,7 @@ async fn live_stream_response_inner(
     let mut continuation = Some(continuation);
     let circuit_key = client.websocket_circuit_key().to_string();
     let transport = config::codex_transport();
-    let attempt_budget = client::CodexLiveAttemptBudget::new();
+    let dispatch_budget = dispatch_budget::CodexDispatchBudget::new();
     // Auto may fall back once, but it never switches back to WebSocket within
     // the same logical request. This prevents retry multiplication.
     let mut active_transport = transport;
@@ -416,7 +417,12 @@ async fn live_stream_response_inner(
         let upstream = match active_transport {
             config::CodexTransport::Http => {
                 client
-                    .stream_codex_http_events(&request_body, &ctx, deadline, attempt_budget.clone())
+                    .stream_codex_http_events(
+                        &request_body,
+                        &ctx,
+                        deadline,
+                        dispatch_budget.clone(),
+                    )
                     .await
             }
             config::CodexTransport::WebSocket | config::CodexTransport::Auto => {
@@ -425,7 +431,7 @@ async fn live_stream_response_inner(
                         &request_body,
                         &ctx,
                         continuation.as_ref(),
-                        attempt_budget.clone(),
+                        dispatch_budget.clone(),
                     )
                     .await
             }
@@ -1227,21 +1233,13 @@ where
 }
 
 fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("type").and_then(|v| v.as_str()),
-        Some("response.completed")
-            | Some("response.incomplete")
-            | Some("response.done")
-            | Some("response.failed")
-            | Some("response.error")
-            | Some("error")
-    )
+    events::CodexTerminalKind::from_payload(payload).is_some()
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
     if matches!(
         err.detail.as_deref(),
-        Some(client::CODEX_TOTAL_TIMEOUT_DETAIL | client::CODEX_LIVE_ATTEMPT_BUDGET_DETAIL)
+        Some(client::CODEX_TOTAL_TIMEOUT_DETAIL | dispatch_budget::CODEX_DISPATCH_BUDGET_DETAIL)
     ) {
         return false;
     }
@@ -1485,7 +1483,7 @@ impl CliHandlers for CodexCli {
 
     fn logout(&self) -> Result<(), anyhow::Error> {
         let store = file_store();
-        store.clear_auth()?;
+        store.clear_auth_exclusive()?;
         println!("Logged out");
         Ok(())
     }

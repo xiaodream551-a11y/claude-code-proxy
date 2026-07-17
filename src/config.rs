@@ -101,6 +101,10 @@ struct CodexConfig {
     pub websocket_response_start_timeout_ms: Option<u64>,
     #[serde(rename = "websocketIdleTimeoutMs")]
     pub websocket_idle_timeout_ms: Option<u64>,
+    #[serde(rename = "maxIdleWebSockets")]
+    pub max_idle_websockets: Option<u64>,
+    #[serde(rename = "idleWebSocketTtlMs")]
+    pub idle_websocket_ttl_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -345,6 +349,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS") {
         out.push("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_MAX_IDLE_WEBSOCKETS") {
+        out.push("CCP_CODEX_MAX_IDLE_WEBSOCKETS (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS") {
+        out.push("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS (env)".to_string());
+    }
     if let Some(file_cfg) = file {
         if let Some(bind_address) = file_cfg.bind_address {
             out.push(format!("bindAddress: {bind_address}"));
@@ -384,6 +394,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(timeout_ms) = codex.websocket_idle_timeout_ms {
                 out.push(format!("codex.websocketIdleTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(max_idle) = codex.max_idle_websockets {
+                out.push(format!("codex.maxIdleWebSockets: {max_idle}"));
+            }
+            if let Some(ttl_ms) = codex.idle_websocket_ttl_ms {
+                out.push(format!("codex.idleWebSocketTtlMs: {ttl_ms}"));
             }
         }
         if let Some(grok) = file_cfg.grok {
@@ -853,6 +869,22 @@ pub fn codex_websocket_idle_timeout_ms(default: u64) -> u64 {
     )
 }
 
+pub fn codex_max_idle_websockets(default: u64) -> u64 {
+    codex_positive_u64(
+        "CCP_CODEX_MAX_IDLE_WEBSOCKETS",
+        |codex| codex.max_idle_websockets,
+        default,
+    )
+}
+
+pub fn codex_idle_websocket_ttl_ms(default: u64) -> u64 {
+    codex_positive_u64(
+        "CCP_CODEX_IDLE_WEBSOCKET_TTL_MS",
+        |codex| codex.idle_websocket_ttl_ms,
+        default,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Codex transport config
 // ---------------------------------------------------------------------------
@@ -969,6 +1001,8 @@ mod tests {
             std::env::remove_var("CCP_CODEX_TOTAL_TIMEOUT_MS");
             std::env::remove_var("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS");
             std::env::remove_var("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS");
+            std::env::remove_var("CCP_CODEX_MAX_IDLE_WEBSOCKETS");
+            std::env::remove_var("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS");
             std::env::remove_var("CCP_GROK_CONNECT_TIMEOUT_MS");
             std::env::remove_var("CCP_GROK_HEADER_TIMEOUT_MS");
             std::env::remove_var("CCP_GROK_FIRST_BYTE_TIMEOUT_MS");
@@ -1209,7 +1243,7 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"totalTimeoutMs":150000,"websocketResponseStartTimeoutMs":45000,"websocketIdleTimeoutMs":180000}}"#,
+            r#"{"codex":{"totalTimeoutMs":150000,"websocketResponseStartTimeoutMs":45000,"websocketIdleTimeoutMs":180000,"maxIdleWebSockets":64,"idleWebSocketTtlMs":240000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -1217,13 +1251,19 @@ mod tests {
         assert_eq!(codex_total_timeout_ms(1), 150_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(1), 45_000);
         assert_eq!(codex_websocket_idle_timeout_ms(1), 180_000);
+        assert_eq!(codex_max_idle_websockets(1), 64);
+        assert_eq!(codex_idle_websocket_ttl_ms(1), 240_000);
 
         let _total_env = EnvGuard::set("CCP_CODEX_TOTAL_TIMEOUT_MS", "120000");
         let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "12000");
         let _idle_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS", "90000");
+        let _pool_cap_env = EnvGuard::set("CCP_CODEX_MAX_IDLE_WEBSOCKETS", "32");
+        let _pool_ttl_env = EnvGuard::set("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS", "120000");
         assert_eq!(codex_total_timeout_ms(1), 120_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(1), 12_000);
         assert_eq!(codex_websocket_idle_timeout_ms(1), 90_000);
+        assert_eq!(codex_max_idle_websockets(1), 32);
+        assert_eq!(codex_idle_websocket_ttl_ms(1), 120_000);
     }
 
     #[test]
@@ -1233,16 +1273,20 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"totalTimeoutMs":0,"websocketResponseStartTimeoutMs":0,"websocketIdleTimeoutMs":0}}"#,
+            r#"{"codex":{"totalTimeoutMs":0,"websocketResponseStartTimeoutMs":0,"websocketIdleTimeoutMs":0,"maxIdleWebSockets":0,"idleWebSocketTtlMs":0}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "invalid");
         let _total_env = EnvGuard::set("CCP_CODEX_TOTAL_TIMEOUT_MS", "invalid");
+        let _pool_cap_env = EnvGuard::set("CCP_CODEX_MAX_IDLE_WEBSOCKETS", "invalid");
+        let _pool_ttl_env = EnvGuard::set("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS", "invalid");
 
         assert_eq!(codex_total_timeout_ms(540_000), 540_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(45_000), 45_000);
         assert_eq!(codex_websocket_idle_timeout_ms(180_000), 180_000);
+        assert_eq!(codex_max_idle_websockets(128), 128);
+        assert_eq!(codex_idle_websocket_ttl_ms(300_000), 300_000);
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::anthropic::sse::parse_sse_events;
@@ -10,8 +9,12 @@ use crate::retry::{compute_backoff_delay, should_retry_status, sleep};
 use crate::traffic::TrafficCapture;
 
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
-use super::auth::manager::CodexAuthManager;
+use super::auth::manager::{CodexAuthErrorKind, CodexAuthManager, codex_auth_error_kind};
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
+use super::dispatch_budget::{
+    CODEX_DISPATCH_BUDGET_DETAIL, CodexDispatchBudget, CodexDispatchBudgetExceeded,
+    CodexModelDispatchReservation, MAX_CODEX_MODEL_DISPATCHES,
+};
 use super::translate::request::ResponsesRequest;
 
 // ---------------------------------------------------------------------------
@@ -214,8 +217,7 @@ pub struct CodexResponse {
 // Client
 // ---------------------------------------------------------------------------
 
-const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
-const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
+const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_CODEX_MODEL_DISPATCHES;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const LIVE_HTTP_ERROR_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LIVE_HTTP_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -223,7 +225,6 @@ const MAX_BUFFERED_HTTP_SUCCESS_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BUFFERED_HTTP_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub(super) const DEFAULT_CODEX_TOTAL_TIMEOUT_MS: u64 = 540_000;
 pub(super) const CODEX_TOTAL_TIMEOUT_DETAIL: &str = "codex_total_timeout";
-pub(super) const CODEX_LIVE_ATTEMPT_BUDGET_DETAIL: &str = "codex_live_attempt_budget_exhausted";
 const MAX_CODEX_TOTAL_TIMEOUT_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -267,39 +268,6 @@ impl CodexRequestDeadline {
 
     pub(super) fn timeout_ms(self) -> u64 {
         self.timeout_ms
-    }
-}
-
-#[derive(Clone, Default)]
-pub(super) struct CodexLiveAttemptBudget {
-    attempts: Arc<AtomicU32>,
-}
-
-impl CodexLiveAttemptBudget {
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
-
-    fn reserve(&self, transport: crate::config::CodexTransport) -> Result<u32, CodexError> {
-        let attempt = self
-            .attempts
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                (used < MAX_BUFFERED_TRANSPORT_ATTEMPTS).then_some(used + 1)
-            })
-            .map_err(|used| CodexError {
-                status: 503,
-                message: format!(
-                    "Codex live request exhausted its {used} physical upstream attempts"
-                ),
-                detail: Some(CODEX_LIVE_ATTEMPT_BUDGET_DETAIL.to_string()),
-                retry_after: None,
-                origin: match transport {
-                    crate::config::CodexTransport::Http => CodexErrorOrigin::Http,
-                    crate::config::CodexTransport::WebSocket
-                    | crate::config::CodexTransport::Auto => CodexErrorOrigin::WebSocket,
-                },
-            })?;
-        Ok(attempt + 1)
     }
 }
 
@@ -366,15 +334,20 @@ impl Default for CodexHttpClient {
     }
 }
 
+fn build_codex_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .expect("failed to create HTTP client")
+}
+
 impl CodexHttpClient {
     pub fn new() -> Self {
         let timeout_ms = 60_000;
         let base_url = config::codex_base_url(CODEX_API_ENDPOINT);
         Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .build()
-                .expect("failed to create HTTP client"),
+            client: build_codex_http_client(),
             auth_manager: CodexAuthManager::new(file_store()),
             websocket_circuit_key: websocket_circuit_key_for_url(&base_url),
             base_url,
@@ -385,7 +358,8 @@ impl CodexHttpClient {
         }
     }
 
-    pub fn new_with_client(
+    #[cfg(test)]
+    pub(crate) fn new_with_client(
         client: reqwest::Client,
         auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
         base_url: String,
@@ -405,7 +379,6 @@ impl CodexHttpClient {
 
     #[cfg(test)]
     pub fn new_for_test(
-        client: reqwest::Client,
         base_url: String,
         header_timeout_ms: u64,
         body_idle_timeout_ms: u64,
@@ -414,7 +387,7 @@ impl CodexHttpClient {
     ) -> Self {
         let websocket_circuit_key = websocket_circuit_key_for_url(&base_url);
         Self {
-            client,
+            client: build_codex_http_client(),
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
             websocket_circuit_key,
@@ -486,9 +459,16 @@ impl CodexHttpClient {
         deadline: CodexRequestDeadline,
     ) -> Result<CodexResponse, CodexError> {
         let mut guard = CodexRequestGuard::new(ctx, continuation, transport);
+        let dispatch_budget = CodexDispatchBudget::new();
         let result = match tokio::time::timeout_at(
             deadline.at(),
-            self.post_codex_with_transport_inner(body, ctx, continuation, transport),
+            self.post_codex_with_transport_inner(
+                body,
+                ctx,
+                continuation,
+                transport,
+                &dispatch_budget,
+            ),
         )
         .await
         {
@@ -507,16 +487,15 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
         transport: crate::config::CodexTransport,
+        dispatch_budget: &CodexDispatchBudget,
     ) -> Result<CodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self
+            .auth_manager
+            .get_auth_with_budget(dispatch_budget)
+            .await
+            .map_err(auth_refresh_error)?;
 
         let initial_pool_key = websocket_pool_key(ctx, continuation);
         if should_reset_websocket_pool(continuation)
@@ -533,15 +512,20 @@ impl CodexHttpClient {
         // Auto may degrade to HTTP, but never switches back within this logical request.
         let mut active_transport = transport;
         let mut auth_refresh_attempted = false;
-        // Count every actual Codex request, including an immediate Auto fallback.
-        let mut physical_attempts = 0u32;
+        let mut reserved_model_replay: Option<CodexModelDispatchReservation> = None;
         let websocket_timeouts = super::websocket::CodexWebSocketTimeouts::configured();
         loop {
+            let reservation = match reserved_model_replay.take() {
+                Some(reservation) => reservation,
+                None => dispatch_budget
+                    .reserve_model()
+                    .map_err(|error| model_dispatch_budget_error(error, active_transport))?,
+            };
+            let mut physical_attempts = reservation.attempt;
             let pool_key = websocket_pool_key(ctx, active_continuation.as_ref());
             let (result, result_transport) = match active_transport {
                 CodexTransport::Http => {
                     let body_json = serialize_request(body)?;
-                    physical_attempts += 1;
                     (
                         self.attempt_post_http(
                             &auth,
@@ -559,7 +543,6 @@ impl CodexHttpClient {
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(body, active_continuation.as_ref());
 
-                    physical_attempts += 1;
                     (
                         super::websocket::codex_websocket_request(
                             &self.base_url,
@@ -581,7 +564,6 @@ impl CodexHttpClient {
                         log_websocket_circuit_fallback(ctx);
                         active_transport = CodexTransport::Http;
                         let body_json = serialize_request(body)?;
-                        physical_attempts += 1;
                         (
                             self.attempt_post_http(
                                 &auth,
@@ -598,8 +580,7 @@ impl CodexHttpClient {
                         let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                         let ws_body = build_websocket_request(body, active_continuation.as_ref());
 
-                        // Try WebSocket first
-                        physical_attempts += 1;
+                        // Try WebSocket first.
                         let ws_result = super::websocket::codex_websocket_request(
                             &self.base_url,
                             &ws_headers,
@@ -619,9 +600,7 @@ impl CodexHttpClient {
                             }
                             Err(err) if should_fallback_to_http(&err) => {
                                 record_auto_websocket_failure(ctx, circuit_key, &err);
-                                if physical_attempts >= MAX_BUFFERED_TRANSPORT_ATTEMPTS {
-                                    (Err(err), CodexTransport::WebSocket)
-                                } else {
+                                if dispatch_budget.can_reserve_model() {
                                     log_auto_http_fallback(ctx, &err);
                                     if let Some(key) = pool_key {
                                         super::websocket::invalidate_codex_websocket_pool_turn(
@@ -633,7 +612,11 @@ impl CodexHttpClient {
                                     active_transport = CodexTransport::Http;
                                     // Immediate buffered HTTP for retryable pre-output WS transport faults.
                                     let body_json = serialize_request(body)?;
-                                    physical_attempts += 1;
+                                    let fallback =
+                                        dispatch_budget.reserve_model().map_err(|error| {
+                                            model_dispatch_budget_error(error, CodexTransport::Http)
+                                        })?;
+                                    physical_attempts = fallback.attempt;
                                     (
                                         self.attempt_post_http(
                                             &auth,
@@ -644,6 +627,8 @@ impl CodexHttpClient {
                                         .await,
                                         CodexTransport::Http,
                                     )
+                                } else {
+                                    (Err(err), CodexTransport::WebSocket)
                                 }
                             }
                             Err(err) => {
@@ -655,13 +640,18 @@ impl CodexHttpClient {
                 }
             };
 
-            if physical_attempts < MAX_BUFFERED_TRANSPORT_ATTEMPTS
-                && should_refresh_after_unauthorized(&result, auth_refresh_attempted)
+            if should_refresh_after_unauthorized(&result, auth_refresh_attempted)
+                && let Ok(replay) = dispatch_budget.reserve_model()
             {
                 auth_refresh_attempted = true;
-                match self.auth_manager.force_refresh(&auth.access).await {
+                match self
+                    .auth_manager
+                    .force_refresh_with_budget(&auth.access, dispatch_budget)
+                    .await
+                {
                     Ok(new_auth) => {
                         auth = new_auth;
+                        reserved_model_replay = Some(replay);
                         if let Some(key) = pool_key {
                             super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                         }
@@ -669,15 +659,7 @@ impl CodexHttpClient {
                             full_context_continuation(active_continuation.as_ref());
                         continue;
                     }
-                    Err(e) => {
-                        return Err(CodexError {
-                            status: 401,
-                            message: "Unauthorized".to_string(),
-                            detail: Some(e.to_string()),
-                            retry_after: None,
-                            origin: CodexErrorOrigin::Http,
-                        });
-                    }
+                    Err(error) => return Err(auth_refresh_error(error)),
                 }
             }
 
@@ -685,7 +667,7 @@ impl CodexHttpClient {
                 && (200..300).contains(&response.status)
                 && let Some(failure) = super::events::first_retryable_failure(&response.body)
             {
-                if physical_attempts < MAX_BUFFERED_TRANSPORT_ATTEMPTS {
+                if dispatch_budget.can_reserve_model() {
                     let delay = compute_backoff_delay(
                         physical_attempts.saturating_sub(1),
                         failure.retry_after.as_deref(),
@@ -756,7 +738,7 @@ impl CodexHttpClient {
                         .iter()
                         .find(|(k, _)| k.to_lowercase() == "retry-after")
                         .map(|(_, v)| v.clone());
-                    if physical_attempts < MAX_BUFFERED_TRANSPORT_ATTEMPTS {
+                    if dispatch_budget.can_reserve_model() {
                         let delay = compute_backoff_delay(
                             physical_attempts.saturating_sub(1),
                             retry_after.as_deref(),
@@ -800,7 +782,7 @@ impl CodexHttpClient {
                     });
                 }
                 Ok(response) if should_retry_codex_status(response.status) => {
-                    if physical_attempts < MAX_BUFFERED_TRANSPORT_ATTEMPTS {
+                    if dispatch_budget.can_reserve_model() {
                         let retry_after = response
                             .headers
                             .iter()
@@ -837,7 +819,7 @@ impl CodexHttpClient {
                 }
                 Ok(response) => return Ok(response),
                 Err(err)
-                    if physical_attempts < MAX_BUFFERED_TRANSPORT_ATTEMPTS
+                    if dispatch_budget.can_reserve_model()
                         && should_retry_without_continuation(
                             &err,
                             active_continuation.as_ref(),
@@ -852,7 +834,7 @@ impl CodexHttpClient {
                 Err(err) => {
                     // Determine if retryable
                     let retryable = is_retryable_transport_error(&err);
-                    if retryable && physical_attempts < MAX_BUFFERED_TRANSPORT_ATTEMPTS {
+                    if retryable && dispatch_budget.can_reserve_model() {
                         let delay = compute_backoff_delay(
                             physical_attempts.saturating_sub(1),
                             err.retry_after.as_deref(),
@@ -892,15 +874,13 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
-        attempt_budget: CodexLiveAttemptBudget,
+        dispatch_budget: CodexDispatchBudget,
     ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
-        let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let auth = self
+            .auth_manager
+            .get_auth_with_budget(&dispatch_budget)
+            .await
+            .map_err(auth_refresh_error)?;
 
         let turn_id = continuation.and_then(|candidate| candidate.turn_id);
         let pool_key = websocket_pool_key(ctx, continuation).map(str::to_string);
@@ -923,7 +903,7 @@ impl CodexHttpClient {
                     continuation,
                     auth,
                     pool_key,
-                    attempt_budget,
+                    dispatch_budget,
                     tx,
                 )
                 .await;
@@ -940,7 +920,7 @@ impl CodexHttpClient {
         mut continuation: Option<super::continuation::ContinuationCandidate>,
         mut auth: StoredAuth,
         pool_key: Option<String>,
-        attempt_budget: CodexLiveAttemptBudget,
+        dispatch_budget: CodexDispatchBudget,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
     ) {
         let turn_id = continuation
@@ -952,6 +932,7 @@ impl CodexHttpClient {
             .and_then(|candidate| candidate.previous_response_id.as_deref())
             .is_some();
         let mut forwarded_any = false;
+        let mut reserved_model_replay: Option<CodexModelDispatchReservation> = None;
         let websocket_timeouts = super::websocket::CodexWebSocketTimeouts::configured();
 
         'attempt: loop {
@@ -964,10 +945,22 @@ impl CodexHttpClient {
                 }
             };
             let ws_body = build_websocket_request(&body, continuation.as_ref());
-            if let Err(err) = attempt_budget.reserve(crate::config::CodexTransport::WebSocket) {
-                let _ = tx.send(Err(err)).await;
-                return;
-            }
+            let reservation = match reserved_model_replay.take() {
+                Some(reservation) => reservation,
+                None => match dispatch_budget.reserve_model() {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(model_dispatch_budget_error(
+                                error,
+                                crate::config::CodexTransport::WebSocket,
+                            )))
+                            .await;
+                        return;
+                    }
+                },
+            };
+            let _model_attempt = reservation.attempt;
             let start = super::websocket::codex_websocket_event_stream(
                 &self.base_url,
                 &ws_headers,
@@ -989,11 +982,20 @@ impl CodexHttpClient {
                 result = start => match result {
                     Ok(stream) => stream,
                     Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
+                        let replay = match dispatch_budget.reserve_model() {
+                            Ok(replay) => replay,
+                            Err(_) => {
+                                let _ = tx.send(Err(err)).await;
+                                return;
+                            }
+                        };
                         auth_refresh_attempted = true;
                         if let Some(key) = pool_key.as_deref() {
                             super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                         }
-                        let refresh = self.auth_manager.force_refresh(&auth.access);
+                        let refresh = self
+                            .auth_manager
+                            .force_refresh_with_budget(&auth.access, &dispatch_budget);
                         auth = tokio::select! {
                             _ = tx.closed() => {
                                 super::continuation::abort_continuation(
@@ -1010,6 +1012,7 @@ impl CodexHttpClient {
                                 }
                             }
                         };
+                        reserved_model_replay = Some(replay);
                         continuation = full_context_continuation(continuation.as_ref());
                         continue 'attempt;
                     }
@@ -1051,11 +1054,20 @@ impl CodexHttpClient {
                     Ok(payload) => super::websocket::event_error_status(payload) == Some(401),
                 };
                 if unauthorized && !auth_refresh_attempted && !forwarded_any {
+                    let replay = match dispatch_budget.reserve_model() {
+                        Ok(replay) => replay,
+                        Err(_) => {
+                            let _ = tx.send(item).await;
+                            return;
+                        }
+                    };
                     auth_refresh_attempted = true;
                     if let Some(key) = pool_key.as_deref() {
                         super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                     }
-                    let refresh = self.auth_manager.force_refresh(&auth.access);
+                    let refresh = self
+                        .auth_manager
+                        .force_refresh_with_budget(&auth.access, &dispatch_budget);
                     auth = tokio::select! {
                         _ = tx.closed() => {
                             super::continuation::abort_continuation(
@@ -1072,6 +1084,7 @@ impl CodexHttpClient {
                             }
                         }
                     };
+                    reserved_model_replay = Some(replay);
                     continue 'attempt;
                 }
 
@@ -1107,25 +1120,27 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
         deadline: CodexRequestDeadline,
-        attempt_budget: CodexLiveAttemptBudget,
+        dispatch_budget: CodexDispatchBudget,
     ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
         let mut auth = self
             .auth_manager
-            .get_auth()
+            .get_auth_with_budget(&dispatch_budget)
             .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+            .map_err(auth_refresh_error)?;
         let body_json = serialize_request(body)?;
         let mut auth_refresh_attempted = false;
+        let mut reserved_model_replay: Option<CodexModelDispatchReservation> = None;
 
         loop {
             let headers = build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
-            attempt_budget.reserve(crate::config::CodexTransport::Http)?;
+            match reserved_model_replay.take() {
+                Some(_) => {}
+                None => {
+                    dispatch_budget.reserve_model().map_err(|error| {
+                        model_dispatch_budget_error(error, crate::config::CodexTransport::Http)
+                    })?;
+                }
+            }
             if let Some(traffic) = ctx.traffic.as_deref() {
                 write_codex_http_request_capture(traffic, &self.base_url, &headers, &body_json);
             }
@@ -1189,13 +1204,17 @@ impl CodexHttpClient {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
 
-            if status == 401 && !auth_refresh_attempted {
+            if status == 401
+                && !auth_refresh_attempted
+                && let Ok(replay) = dispatch_budget.reserve_model()
+            {
                 auth_refresh_attempted = true;
                 auth = self
                     .auth_manager
-                    .force_refresh(&auth.access)
+                    .force_refresh_with_budget(&auth.access, &dispatch_budget)
                     .await
                     .map_err(auth_refresh_error)?;
+                reserved_model_replay = Some(replay);
                 continue;
             }
             if !(200..300).contains(&status) {
@@ -1467,17 +1486,7 @@ fn decode_codex_sse_record(
 }
 
 fn live_http_terminal_event(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("type").and_then(|value| value.as_str()),
-        Some(
-            "response.completed"
-                | "response.incomplete"
-                | "response.done"
-                | "response.failed"
-                | "response.error"
-                | "error"
-        )
-    )
+    super::events::CodexTerminalKind::from_payload(payload).is_some()
 }
 
 fn live_http_body_error(message: String) -> CodexError {
@@ -1787,12 +1796,48 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 }
 
 fn auth_refresh_error(err: anyhow::Error) -> CodexError {
+    let kind = codex_auth_error_kind(&err);
+    let budget_exhausted = err.downcast_ref::<CodexDispatchBudgetExceeded>().is_some();
     CodexError {
-        status: 401,
-        message: "Unauthorized".to_string(),
-        detail: Some(err.to_string()),
+        status: match kind {
+            CodexAuthErrorKind::CredentialsInvalid => 401,
+            CodexAuthErrorKind::Temporary | CodexAuthErrorKind::RefreshOutcomeUnknown => 503,
+        },
+        message: if budget_exhausted {
+            "Codex dispatch budget exhausted"
+        } else {
+            match kind {
+                CodexAuthErrorKind::CredentialsInvalid => "Unauthorized",
+                CodexAuthErrorKind::Temporary => "Authentication temporarily unavailable",
+                CodexAuthErrorKind::RefreshOutcomeUnknown => "Authentication state is ambiguous",
+            }
+        }
+        .to_string(),
+        detail: Some(if budget_exhausted {
+            CODEX_DISPATCH_BUDGET_DETAIL.to_string()
+        } else {
+            err.to_string()
+        }),
         retry_after: None,
         origin: CodexErrorOrigin::Auth,
+    }
+}
+
+fn model_dispatch_budget_error(
+    error: CodexDispatchBudgetExceeded,
+    transport: crate::config::CodexTransport,
+) -> CodexError {
+    CodexError {
+        status: 503,
+        message: error.to_string(),
+        detail: Some(CODEX_DISPATCH_BUDGET_DETAIL.to_string()),
+        retry_after: None,
+        origin: match transport {
+            crate::config::CodexTransport::Http => CodexErrorOrigin::Http,
+            crate::config::CodexTransport::WebSocket | crate::config::CodexTransport::Auto => {
+                CodexErrorOrigin::WebSocket
+            }
+        },
     }
 }
 
@@ -2179,14 +2224,7 @@ mod tests {
     }
 
     fn http_test_client(base_url: String, body_idle_timeout_ms: u64) -> CodexHttpClient {
-        CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
-            base_url,
-            100,
-            body_idle_timeout_ms,
-            10_000,
-            0,
-        )
+        CodexHttpClient::new_for_test(base_url, 100, body_idle_timeout_ms, 10_000, 0)
     }
 
     fn buffered_test_request() -> ResponsesRequest {
@@ -2215,6 +2253,179 @@ mod tests {
         let client = http_test_client(base_url, 100);
         client.auth_manager().set_test_auth(http_test_auth());
         client
+    }
+
+    fn dispatch_budget_test_client(
+        temp: &tempfile::TempDir,
+        model_endpoint: String,
+        token_endpoint: String,
+        auth: StoredAuth,
+    ) -> CodexHttpClient {
+        use super::super::auth::token_store::{
+            CodexTokenStore, KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE,
+        };
+        use crate::auth::{KeychainFileAuthStore, SystemKeychain};
+
+        let auth_path = temp.path().join("codex-auth.json");
+        let legacy_path = temp.path().join("legacy-codex-auth.json");
+        let store = CodexTokenStore::new(KeychainFileAuthStore::new(
+            auth_path.to_string_lossy().into_owned(),
+            legacy_path.to_string_lossy().into_owned(),
+            KEYCHAIN_SERVICE,
+            KEYCHAIN_ACCOUNT,
+            false,
+            SystemKeychain,
+        ));
+        store.save_auth(auth).unwrap();
+        let manager = CodexAuthManager::new_with_token_endpoint(store, token_endpoint);
+        CodexHttpClient::new_with_client(build_codex_http_client(), manager, model_endpoint)
+    }
+
+    async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "peer closed before completing the HTTP request");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers_end = headers_end + 4;
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= headers_end + content_length {
+                return String::from_utf8_lossy(&request).into_owned();
+            }
+        }
+    }
+
+    async fn write_test_http_response(
+        stream: &mut tokio::net::TcpStream,
+        status: &str,
+        content_type: &str,
+        extra_headers: &str,
+        body: &[u8],
+    ) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+    }
+
+    async fn assert_model_post_does_not_follow_redirect(status: &'static str) {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_server = tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(250), target_listener.accept()).await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                return None;
+            };
+            let request = read_complete_http_request(&mut stream).await;
+            write_test_http_response(
+                &mut stream,
+                "200 OK",
+                "text/event-stream",
+                "",
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"redirected\",\"usage\":{}}}\n\n",
+            )
+            .await;
+            Some(request)
+        });
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let location = format!("http://{target_addr}/redirect-target");
+        let origin_server = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let request = read_complete_http_request(&mut stream).await;
+            let headers = format!("location: {location}\r\n");
+            write_test_http_response(
+                &mut stream,
+                status,
+                "text/plain",
+                &headers,
+                b"redirects are not accepted",
+            )
+            .await;
+            request
+        });
+
+        let client = CodexHttpClient::new_for_test(
+            format!("http://{origin_addr}/responses"),
+            500,
+            500,
+            2_000,
+            0,
+        );
+        client.auth_manager().set_test_auth(http_test_auth());
+        let result = client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await;
+
+        let origin_request = origin_server.await.unwrap();
+        let target_request = target_server.await.unwrap();
+        assert!(origin_request.starts_with("POST /responses "));
+        assert!(origin_request.contains("Bearer test"));
+        assert!(
+            target_request.is_none(),
+            "the redirected endpoint must not receive a replayed model POST"
+        );
+        let error = match result {
+            Ok(_) => panic!("Codex model redirects must remain terminal responses"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.status,
+            status[..3].parse::<u16>().expect("numeric test status")
+        );
+        assert_eq!(error.origin, CodexErrorOrigin::BufferedHttp);
+    }
+
+    #[tokio::test]
+    async fn model_post_does_not_follow_307_or_308_redirects() {
+        assert_model_post_does_not_follow_redirect("307 Temporary Redirect").await;
+        assert_model_post_does_not_follow_redirect("308 Permanent Redirect").await;
+    }
+
+    #[test]
+    fn auth_error_mapping_only_uses_401_for_invalid_credentials() {
+        use super::super::auth::manager::CodexAuthError;
+
+        let invalid = auth_refresh_error(anyhow::Error::new(CodexAuthError::CredentialsInvalid {
+            message: "invalid".into(),
+        }));
+        let temporary = auth_refresh_error(anyhow::Error::new(CodexAuthError::Temporary {
+            message: "temporary".into(),
+        }));
+        let ambiguous =
+            auth_refresh_error(anyhow::Error::new(CodexAuthError::RefreshOutcomeUnknown {
+                message: "ambiguous".into(),
+            }));
+
+        assert_eq!(invalid.status, 401);
+        assert_eq!(temporary.status, 503);
+        assert_eq!(ambiguous.status, 503);
+        assert_eq!(invalid.origin, CodexErrorOrigin::Auth);
+        assert_eq!(temporary.origin, CodexErrorOrigin::Auth);
+        assert_eq!(ambiguous.origin, CodexErrorOrigin::Auth);
     }
 
     #[tokio::test]
@@ -2601,23 +2812,201 @@ mod tests {
     }
 
     #[test]
-    fn live_attempt_budget_is_a_terminal_four_request_cap() {
-        let budget = CodexLiveAttemptBudget::new();
+    fn model_dispatch_budget_maps_to_a_terminal_codex_error() {
+        let budget = CodexDispatchBudget::new();
         for expected in 1..=MAX_BUFFERED_TRANSPORT_ATTEMPTS {
-            assert_eq!(
-                budget.reserve(crate::config::CodexTransport::Http).unwrap(),
-                expected
-            );
+            assert_eq!(budget.reserve_model().unwrap().attempt, expected);
         }
 
-        let error = budget
-            .reserve(crate::config::CodexTransport::WebSocket)
-            .unwrap_err();
-        assert_eq!(error.status, 503);
-        assert_eq!(
-            error.detail.as_deref(),
-            Some(CODEX_LIVE_ATTEMPT_BUDGET_DETAIL)
+        let error = model_dispatch_budget_error(
+            budget.reserve_model().unwrap_err(),
+            crate::config::CodexTransport::WebSocket,
         );
+        assert_eq!(error.status, 503);
+        assert_eq!(error.detail.as_deref(), Some(CODEX_DISPATCH_BUDGET_DETAIL));
+    }
+
+    #[tokio::test]
+    async fn expired_refresh_then_401_refresh_then_replay_shares_one_dispatch_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut oauth_hits = 0_usize;
+            let mut model_hits = 0_usize;
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_complete_http_request(&mut stream).await;
+                if request.starts_with("POST /oauth/token ") {
+                    oauth_hits += 1;
+                    let (expected_refresh, access, refresh) = if oauth_hits == 1 {
+                        ("refresh_token=r0", "a1", "r1")
+                    } else {
+                        ("refresh_token=r1", "a2", "r2")
+                    };
+                    assert!(request.contains(expected_refresh));
+                    let body = format!(
+                        r#"{{"access_token":"{access}","refresh_token":"{refresh}","expires_in":3600}}"#
+                    );
+                    write_test_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        "",
+                        body.as_bytes(),
+                    )
+                    .await;
+                } else {
+                    assert!(request.starts_with("POST /responses "));
+                    model_hits += 1;
+                    if model_hits == 1 {
+                        assert!(request.contains("Bearer a1"));
+                        write_test_http_response(
+                            &mut stream,
+                            "401 Unauthorized",
+                            "application/json",
+                            "",
+                            br#"{"error":{"message":"expired access"}}"#,
+                        )
+                        .await;
+                    } else {
+                        assert!(request.contains("Bearer a2"));
+                        write_test_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "text/event-stream",
+                            "",
+                            b"data: keep\n\n",
+                        )
+                        .await;
+                    }
+                }
+            }
+            (model_hits, oauth_hits)
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let client = dispatch_budget_test_client(
+            &temp,
+            format!("http://{addr}/responses"),
+            format!("http://{addr}/oauth/token"),
+            StoredAuth {
+                access: "expired".into(),
+                refresh: "r0".into(),
+                expires: 0,
+                account_id: Some("acct".into()),
+            },
+        );
+        let response = client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(server.await.unwrap(), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn fourth_model_401_does_not_refresh_without_replay_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut oauth_hits = 0_usize;
+            let mut model_hits = 0_usize;
+            loop {
+                let accepted = if model_hits >= MAX_CODEX_MODEL_DISPATCHES as usize {
+                    match tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+                    {
+                        Ok(accepted) => accepted.unwrap(),
+                        Err(_) => break,
+                    }
+                } else {
+                    listener.accept().await.unwrap()
+                };
+                let (mut stream, _) = accepted;
+                let request = read_complete_http_request(&mut stream).await;
+                if request.starts_with("POST /oauth/token ") {
+                    oauth_hits += 1;
+                    write_test_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        "",
+                        br#"{"access_token":"unexpected","refresh_token":"unexpected-r","expires_in":3600}"#,
+                    )
+                    .await;
+                    continue;
+                }
+
+                assert!(request.starts_with("POST /responses "));
+                model_hits += 1;
+                match model_hits {
+                    1..=3 => {
+                        write_test_http_response(
+                            &mut stream,
+                            "503 Service Unavailable",
+                            "application/json",
+                            "retry-after: 0\r\n",
+                            br#"{"error":{"message":"retry"}}"#,
+                        )
+                        .await;
+                    }
+                    4 => {
+                        write_test_http_response(
+                            &mut stream,
+                            "401 Unauthorized",
+                            "application/json",
+                            "",
+                            br#"{"error":{"message":"expired access"}}"#,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        write_test_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "text/event-stream",
+                            "",
+                            b"data: unexpected replay\n\n",
+                        )
+                        .await;
+                    }
+                }
+            }
+            (model_hits, oauth_hits)
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let client = dispatch_budget_test_client(
+            &temp,
+            format!("http://{addr}/responses"),
+            format!("http://{addr}/oauth/token"),
+            StoredAuth {
+                access: "valid-until-rejected".into(),
+                refresh: "r0".into(),
+                expires: u64::MAX,
+                account_id: Some("acct".into()),
+            },
+        );
+        let result = client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("a fourth model 401 must be returned without refresh or replay"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, 401);
+        assert_eq!(server.await.unwrap(), (4, 0));
     }
 
     #[tokio::test]
@@ -2654,7 +3043,7 @@ mod tests {
                 &buffered_test_request(),
                 &http_test_context(),
                 CodexRequestDeadline::from_timeout_ms(1_000),
-                CodexLiveAttemptBudget::new(),
+                CodexDispatchBudget::new(),
             )
             .await
             .unwrap();
@@ -2704,7 +3093,7 @@ mod tests {
                 &buffered_test_request(),
                 &http_test_context(),
                 CodexRequestDeadline::from_timeout_ms(1_000),
-                CodexLiveAttemptBudget::new(),
+                CodexDispatchBudget::new(),
             )
             .await
             .unwrap_err();
@@ -2730,7 +3119,6 @@ mod tests {
                 .unwrap()
         });
         let client = Arc::new(CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
             format!("http://{addr}/responses"),
             5_000,
             5_000,
@@ -2744,7 +3132,7 @@ mod tests {
                 &buffered_test_request(),
                 &http_test_context(),
                 CodexRequestDeadline::from_timeout_ms(80),
-                CodexLiveAttemptBudget::new(),
+                CodexDispatchBudget::new(),
             )
             .await
             .unwrap_err();
@@ -2780,7 +3168,6 @@ mod tests {
             }
         });
         let client = Arc::new(CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
             format!("http://{addr}/responses"),
             1_000,
             1_000,
@@ -2793,7 +3180,7 @@ mod tests {
                 &buffered_test_request(),
                 &http_test_context(),
                 CodexRequestDeadline::from_timeout_ms(100),
-                CodexLiveAttemptBudget::new(),
+                CodexDispatchBudget::new(),
             )
             .await
             .unwrap();
@@ -2842,7 +3229,7 @@ mod tests {
                 &buffered_test_request(),
                 &http_test_context(),
                 CodexRequestDeadline::from_timeout_ms(1_000),
-                CodexLiveAttemptBudget::new(),
+                CodexDispatchBudget::new(),
             )
             .await
             .unwrap();
@@ -2986,14 +3373,8 @@ mod tests {
             assert!(stream.read(&mut request).await.unwrap() > 0);
             futures_util::future::pending::<()>().await;
         });
-        let client = CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
-            format!("http://{addr}/responses"),
-            5_000,
-            5_000,
-            100,
-            0,
-        );
+        let client =
+            CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 5_000, 5_000, 100, 0);
         client.auth_manager().set_test_auth(http_test_auth());
 
         let started_at = Instant::now();
@@ -3042,14 +3423,8 @@ mod tests {
             let _ = fallback_started_tx.send(());
             futures_util::future::pending::<()>().await;
         });
-        let client = CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
-            format!("http://{addr}/responses"),
-            5_000,
-            5_000,
-            120,
-            0,
-        );
+        let client =
+            CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 5_000, 5_000, 120, 0);
         client.auth_manager().set_test_auth(http_test_auth());
 
         let started_at = Instant::now();
@@ -3135,7 +3510,6 @@ mod tests {
         let mut ctx = http_test_context();
         ctx.session_id = Some(session_id.to_string());
         let client = CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
             format!("http://{addr}/responses"),
             2_000,
             2_000,

@@ -43,6 +43,7 @@ const MAX_ERROR_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 const ERROR_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_RESPONSE_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_CAPTURE_FILES: usize = 128;
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct ServerLimits {
@@ -139,6 +140,15 @@ pub async fn serve_listener(
     monitor: Option<MonitorHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    serve_listener_with_timeout(listener, monitor, shutdown, GRACEFUL_SHUTDOWN_TIMEOUT).await
+}
+
+async fn serve_listener_with_timeout(
+    listener: TcpListener,
+    monitor: Option<MonitorHandle>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    graceful_timeout: Duration,
+) -> anyhow::Result<()> {
     initialize_process_identity();
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
@@ -167,10 +177,44 @@ pub async fn serve_listener(
         Some(local_addr.port()),
     );
     let app = app_with_limits(Arc::new(Registry::with_default_alias()), monitor, limits);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
-    Ok(())
+    let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+    let graceful_shutdown = async move {
+        shutdown.await;
+        let _ = shutdown_started_tx.send(());
+    };
+    let server = axum::serve(listener, app).with_graceful_shutdown(graceful_shutdown);
+    let result = await_server_with_grace_timeout(
+        server.into_future(),
+        shutdown_started_rx,
+        graceful_timeout,
+    )
+    .await;
+    let _ = crate::logging::flush(Duration::from_secs(2));
+    result
+}
+
+async fn await_server_with_grace_timeout(
+    server: impl Future<Output = std::io::Result<()>>,
+    shutdown_started: tokio::sync::oneshot::Receiver<()>,
+    graceful_timeout: Duration,
+) -> anyhow::Result<()> {
+    let timeout_after_shutdown = async move {
+        if shutdown_started.await.is_ok() {
+            tokio::time::sleep(graceful_timeout).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(server);
+    tokio::pin!(timeout_after_shutdown);
+    tokio::select! {
+        biased;
+        result = &mut server => result.map_err(anyhow::Error::from),
+        () = &mut timeout_after_shutdown => Err(anyhow::anyhow!(
+            "server graceful shutdown exceeded {} ms",
+            graceful_timeout.as_millis()
+        )),
+    }
 }
 
 pub fn app(registry: Arc<Registry>) -> Router {
@@ -197,6 +241,7 @@ pub fn app_with_limits(
     Router::new()
         .route("/healthz", get(healthz))
         .route("/version", get(version))
+        .route("/v1/models", get(models))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .fallback(fallback_handler)
@@ -279,6 +324,46 @@ async fn healthz() -> Json<serde_json::Value> {
 
 async fn version() -> Json<serde_json::Value> {
     Json(version_info())
+}
+
+async fn models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let created_at = model_catalog_created_at();
+    let mut catalog = state.registry.all_supported_models();
+    catalog.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    catalog.dedup_by(|left, right| left.0 == right.0);
+
+    let first_id = catalog.first().map(|(model, _)| model.clone());
+    let last_id = catalog.last().map(|(model, _)| model.clone());
+    let data: Vec<Value> = catalog
+        .into_iter()
+        .map(|(model, _provider)| {
+            let display_name = model.clone();
+            json!({
+                "type": "model",
+                "id": model,
+                "display_name": display_name,
+                "created_at": created_at.clone(),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id,
+    }))
+}
+
+fn model_catalog_created_at() -> String {
+    let timestamp = env!("CCPROXY_BUILD_UNIX_EPOCH")
+        .parse::<i64>()
+        .ok()
+        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    timestamp
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 struct ProcessIdentity {
@@ -2093,6 +2178,36 @@ mod tests {
             effective_config_fingerprint(&first, "127.0.0.1", 18765, "codex"),
             effective_config_fingerprint(&second, "127.0.0.1", 18765, "codex")
         );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_timeout_bounds_a_stalled_server() {
+        let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+        shutdown_started_tx.send(()).unwrap();
+        let result = await_server_with_grace_timeout(
+            std::future::pending::<std::io::Result<()>>(),
+            shutdown_started_rx,
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("graceful shutdown exceeded")
+        );
+    }
+
+    #[tokio::test]
+    async fn server_completion_wins_before_shutdown_timeout() {
+        let (_shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+        await_server_with_grace_timeout(
+            std::future::ready(Ok(())),
+            shutdown_started_rx,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

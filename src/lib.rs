@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod logging;
 pub mod monitor;
+pub mod oauth_rotation;
 pub mod paths;
 pub mod project;
 pub mod provider;

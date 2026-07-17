@@ -1554,7 +1554,7 @@ mod tests {
     #[test]
     fn reduce_reasoning_summary_before_text() {
         let upstream = format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}",
             sse(
                 "response.reasoning_summary_text.delta",
                 json!({"output_index":0,"summary_index":0,"delta":"Plan"})
@@ -1575,17 +1575,14 @@ mod tests {
                 "response.output_text.delta",
                 json!({"output_index":1,"delta":"answer"})
             ),
-            format!(
-                "{}{}",
-                sse(
-                    "response.output_item.done",
-                    json!({"output_index":1,"item":{"type":"message"}})
-                ),
-                sse(
-                    "response.completed",
-                    json!({"response":{"id":"resp_1","usage":{}}})
-                )
+            sse(
+                "response.output_item.done",
+                json!({"output_index":1,"item":{"type":"message"}})
             ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            )
         );
         let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
         assert!(matches!(
@@ -1620,7 +1617,7 @@ mod tests {
     #[test]
     fn reduce_empty_reasoning_summary_emits_no_thinking() {
         let upstream = format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}{}",
             sse(
                 "response.output_item.added",
                 json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
@@ -1633,21 +1630,18 @@ mod tests {
                 "response.output_item.added",
                 json!({"output_index":1,"item":{"type":"message","id":"msg_up"}})
             ),
-            format!(
-                "{}{}{}",
-                sse(
-                    "response.output_text.delta",
-                    json!({"output_index":1,"delta":"answer"})
-                ),
-                sse(
-                    "response.output_item.done",
-                    json!({"output_index":1,"item":{"type":"message"}})
-                ),
-                sse(
-                    "response.completed",
-                    json!({"response":{"id":"resp_1","usage":{}}})
-                )
+            sse(
+                "response.output_text.delta",
+                json!({"output_index":1,"delta":"answer"})
             ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":1,"item":{"type":"message"}})
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            )
         );
         let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
         assert!(!out.iter().any(|event| matches!(

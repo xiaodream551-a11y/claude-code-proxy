@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # claude-code-proxy installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/xiaodream551-a11y/claude-code-proxy/main/scripts/install.sh | bash
 #
 # Environment variables:
 #   CLAUDE_CODE_PROXY_VERSION      - Pin a specific version (e.g., v0.1.0)
 #   CLAUDE_CODE_PROXY_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
+#   CLAUDE_CODE_PROXY_REPOSITORY   - Override the GitHub release repository
 #
 # Examples:
 #   CLAUDE_CODE_PROXY_VERSION=v0.1.0 bash install.sh
@@ -15,7 +16,9 @@
 set -e
 
 BIN_NAME="claude-code-proxy"
-REPO="raine/claude-code-proxy"
+REPO="${CLAUDE_CODE_PROXY_REPOSITORY:-xiaodream551-a11y/claude-code-proxy}"
+EXPECTED_GIT_SHA=""
+EXPECTED_BINARY_SHA=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,7 +41,7 @@ detect_platform() {
 		log_error "Unsupported operating system: $(uname -s)"
 		echo ""
 		echo "${BIN_NAME} supports macOS and Linux."
-		echo "For other platforms, build from source with Bun:"
+		echo "For other platforms, build from source with Rust/Cargo:"
 		echo "  git clone https://github.com/${REPO}"
 		echo ""
 		exit 1
@@ -52,7 +55,7 @@ detect_platform() {
 		log_error "Unsupported architecture: $(uname -m)"
 		echo ""
 		echo "${BIN_NAME} prebuilt binaries are available for amd64 and arm64."
-		echo "For other architectures, build from source with Bun:"
+		echo "For other architectures, build from source with Rust/Cargo:"
 		echo "  git clone https://github.com/${REPO}"
 		echo ""
 		exit 1
@@ -127,6 +130,8 @@ install_from_release() {
 	log_info "Verifying checksum..."
 	local checksum_file="${BIN_NAME}-${platform}.sha256"
 	local checksum_url="https://github.com/${REPO}/releases/download/${version}/${checksum_file}"
+	local provenance_file="${BIN_NAME}-${platform}.provenance.json"
+	local provenance_url="https://github.com/${REPO}/releases/download/${version}/${provenance_file}"
 
 	if command -v curl &>/dev/null; then
 		if ! curl -fsSL --retry 3 --retry-connrefused --connect-timeout 10 --max-time 30 -o "$checksum_file" "$checksum_url"; then
@@ -155,16 +160,51 @@ install_from_release() {
 			exit 1
 		fi
 	else
-		log_warning "Neither sha256sum nor shasum found, skipping checksum verification"
+		log_error "Neither sha256sum nor shasum found; refusing an unverified install"
+		exit 1
 	fi
 
 	log_success "Checksum verified"
+
+	if ! command -v python3 &>/dev/null; then
+		log_error "python3 is required to verify release provenance"
+		exit 1
+	fi
+	if command -v curl &>/dev/null; then
+		curl -fsSL --retry 3 --retry-connrefused --connect-timeout 10 --max-time 30 \
+			-o "$provenance_file" "$provenance_url"
+	else
+		wget --tries=3 --timeout=30 -q -O "$provenance_file" "$provenance_url"
+	fi
+	local archive_sha
+	if command -v sha256sum &>/dev/null; then
+		archive_sha=$(sha256sum "$archive_name" | awk '{print $1}')
+	else
+		archive_sha=$(shasum -a 256 "$archive_name" | awk '{print $1}')
+	fi
+	local provenance_identity
+	provenance_identity=$(python3 -c 'import json,re,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); git=d.get("gitSha",""); binary=d.get("binarySha256",""); ok=d.get("repository")==sys.argv[2] and d.get("tag")==sys.argv[3] and d.get("platform")==sys.argv[4] and d.get("archiveSha256","").lower()==sys.argv[5].lower() and re.fullmatch(r"[0-9a-fA-F]{40}",git) and re.fullmatch(r"[0-9a-fA-F]{64}",binary); print(git.lower(),binary.lower()) if ok else sys.exit(1)' "$provenance_file" "$REPO" "$version" "$platform" "$archive_sha") || {
+		log_error "Release provenance does not match repository, tag, platform, or archive"
+		exit 1
+	}
+	read -r EXPECTED_GIT_SHA EXPECTED_BINARY_SHA <<<"$provenance_identity"
 
 	log_info "Extracting archive..."
 	if ! tar -xzf "$archive_name"; then
 		log_error "Failed to extract archive"
 		exit 1
 	fi
+	local extracted_sha identity_json
+	if command -v sha256sum &>/dev/null; then
+		extracted_sha=$(sha256sum "$BIN_NAME" | awk '{print $1}')
+	else
+		extracted_sha=$(shasum -a 256 "$BIN_NAME" | awk '{print $1}')
+	fi
+	identity_json=$("./$BIN_NAME" version --json)
+	python3 -c 'import json,sys; identity=json.loads(sys.argv[1]); ok=sys.argv[2].lower()==sys.argv[3].lower() and identity.get("binarySha256","").lower()==sys.argv[2].lower() and identity.get("gitSha","").lower()==sys.argv[4].lower() and identity.get("gitDirty") is False; raise SystemExit(0 if ok else 1)' "$identity_json" "$EXPECTED_BINARY_SHA" "$extracted_sha" "$EXPECTED_GIT_SHA" || {
+		log_error "Extracted binary does not match release provenance"
+		exit 1
+	}
 
 	local install_dir="${CLAUDE_CODE_PROXY_INSTALL_DIR:-}"
 	if [ -z "$install_dir" ]; then
@@ -203,10 +243,6 @@ install_from_release() {
 		if command -v xattr &>/dev/null; then
 			xattr -d com.apple.quarantine "$install_dir/${BIN_NAME}" 2>/dev/null || true
 		fi
-		if command -v codesign &>/dev/null; then
-			codesign --remove-signature "$install_dir/${BIN_NAME}" 2>/dev/null || true
-			codesign --sign - --force "$install_dir/${BIN_NAME}" 2>/dev/null || true
-		fi
 	fi
 
 	log_success "${BIN_NAME} installed to $install_dir/${BIN_NAME}"
@@ -236,6 +272,17 @@ verify_installation() {
 		log_error "${BIN_NAME} binary exists but failed to run"
 		exit 1
 	fi
+	local installed_sha installed_identity
+	if command -v sha256sum &>/dev/null; then
+		installed_sha=$(sha256sum "$install_dir/${BIN_NAME}" | awk '{print $1}')
+	else
+		installed_sha=$(shasum -a 256 "$install_dir/${BIN_NAME}" | awk '{print $1}')
+	fi
+	installed_identity=$("$install_dir/${BIN_NAME}" version --json)
+	python3 -c 'import json,sys; d=json.loads(sys.argv[1]); expected=sys.argv[2].lower(); installed=sys.argv[3].lower(); ok=installed==expected and d.get("gitSha","").lower()==sys.argv[4].lower() and d.get("gitDirty") is False and d.get("binarySha256","").lower()==expected; raise SystemExit(0 if ok else 1)' "$installed_identity" "$EXPECTED_BINARY_SHA" "$installed_sha" "$EXPECTED_GIT_SHA" || {
+		log_error "Installed binary identity does not match release provenance"
+		exit 1
+	}
 
 	log_success "${BIN_NAME} is installed and ready!"
 	echo ""
@@ -244,7 +291,7 @@ verify_installation() {
 
 	echo "Get started:"
 	echo "  ${BIN_NAME} codex auth login    # authenticate with your ChatGPT account, or"
-	echo "  ${BIN_NAME} kimi auth login     # authenticate with your kimi.com account"
+	echo "  ${BIN_NAME} grok auth login     # authenticate with your grok.com account"
 	echo "  ${BIN_NAME} serve               # start the proxy"
 	echo ""
 	echo "Documentation: https://github.com/${REPO}"

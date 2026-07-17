@@ -108,6 +108,32 @@ deploy-homebrew:
         launchctl print "gui/$(id -u)/homebrew.mxcl.claude-code-proxy" 2>/dev/null \
             | awk '$1 == "pid" && $2 == "=" { print $3; exit }'
     }
+    verify_running_image() {
+        local pid="$1" expected_path="$2" expected_sha="$3" mapping
+        [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+        mapping="$(lsof -a -p "$pid" -d txt -FDin 2>/dev/null)" || return 1
+        python3 -c 'import hashlib,os,sys; records=[]; current=None
+    for line in sys.argv[1].splitlines():
+        if not line: continue
+        tag,value=line[0],line[1:]
+        if tag=="f":
+            if current is not None: records.append(current)
+            current={"f":value}
+        elif current is not None and tag in {"D","i","n"}: current[tag]=value
+    if current is not None: records.append(current)
+    path=sys.argv[2]; real=os.path.realpath(path)
+    matches=[record for record in records if record.get("f")=="txt" and record.get("n") and os.path.realpath(record["n"])==real]
+    if len(matches)!=1: raise SystemExit(1)
+    with open(path,"rb") as stream:
+        stat=os.fstat(stream.fileno()); digest=hashlib.sha256()
+        while True:
+            chunk=stream.read(1024*1024)
+            if not chunk: break
+            digest.update(chunk)
+    record=matches[0]
+    ok=record.get("D") and record.get("i") and int(record["D"],0)==stat.st_dev and int(record["i"])==stat.st_ino and digest.hexdigest()==sys.argv[3].lower()
+    raise SystemExit(0 if ok else 1)' "$mapping" "$expected_path" "$expected_sha"
+    }
     trap release_lock EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
@@ -148,9 +174,8 @@ deploy-homebrew:
             sleep 1
         done
         restored_pid="$(service_pid || true)"
-        restored_mapping="$(lsof -a -p "$restored_pid" -d txt -FDi 2>/dev/null || true)"
-        if python3 -c 'import os,sys; lines=sys.argv[1].splitlines(); d=next((x[1:] for x in lines if x.startswith("D")), ""); i=next((x[1:] for x in lines if x.startswith("i")), ""); s=os.stat(sys.argv[2]); raise SystemExit(0 if d and i and int(d,0)==s.st_dev and int(i)==s.st_ino else 1)' "$restored_mapping" "$target" 2>/dev/null; then
-            restored_running_sha="$(shasum -a 256 "$target" 2>/dev/null | awk '{print $1}')"
+        if verify_running_image "$restored_pid" "$target" "$old_sha" 2>/dev/null; then
+            restored_running_sha="$old_sha"
         else
             restored_running_sha=""
         fi
@@ -180,8 +205,20 @@ deploy-homebrew:
         sleep 1
     done
     curl -fsS --max-time 2 "$health_url" >/dev/null
-    python3 -c 'import json,os,sys; d=json.loads(sys.argv[1]); old=sys.argv[4]; ok=d.get("binarySha256")==sys.argv[2] and d.get("gitSha")==sys.argv[3] and d.get("gitDirty") is False and os.path.realpath(d.get("executable", ""))==sys.argv[5] and (not old or str(d.get("pid", ""))!=old); raise SystemExit(0 if ok else 1)' "$runtime" "$expected" "$expected_git" "$old_pid" "$target_real"
-    running_pid="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["pid"])' "$runtime")"
+    final_runtime="$(curl -fsS --max-time 2 "$version_url")"
+    python3 -c 'import json,os,sys; d=json.loads(sys.argv[1]); old=sys.argv[4]; ok=d.get("binarySha256")==sys.argv[2] and d.get("gitSha")==sys.argv[3] and d.get("gitDirty") is False and os.path.realpath(d.get("executable", ""))==sys.argv[5] and (not old or str(d.get("pid", ""))!=old); raise SystemExit(0 if ok else 1)' "$final_runtime" "$expected" "$expected_git" "$old_pid" "$target_real"
+    running_pid="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["pid"])' "$final_runtime")"
+    launch_pid="$(service_pid || true)"
+    [[ -n "$launch_pid" && "$running_pid" == "$launch_pid" ]]
+    kill -0 "$running_pid"
+    verify_running_image "$running_pid" "$target" "$expected"
+    confirmed_runtime="$(curl -fsS --max-time 2 "$version_url")"
+    python3 -c 'import json,os,sys; first=json.loads(sys.argv[1]); final=json.loads(sys.argv[2]); old=sys.argv[5]; same=final.get("pid")==first.get("pid") and final.get("startedAtMs")==first.get("startedAtMs"); expected=final.get("binarySha256")==sys.argv[3] and final.get("gitSha")==sys.argv[4] and final.get("gitDirty") is False and os.path.realpath(final.get("executable", ""))==sys.argv[6] and (not old or str(final.get("pid", ""))!=old); raise SystemExit(0 if same and expected else 1)' "$final_runtime" "$confirmed_runtime" "$expected" "$expected_git" "$old_pid" "$target_real"
+    confirmed_launch_pid="$(service_pid || true)"
+    [[ -n "$confirmed_launch_pid" && "$running_pid" == "$confirmed_launch_pid" ]]
+    kill -0 "$running_pid"
+    verify_running_image "$running_pid" "$target" "$expected"
+    runtime="$confirmed_runtime"
     trap - ERR INT TERM HUP
     echo "deployed pid=$running_pid sha256=$expected git=$expected_git backup=$backup"
 
@@ -195,8 +232,8 @@ run *ARGS:
 
 # Internal release helper
 _release bump *ARGS:
-    @cargo-release {{bump}} {{ARGS}}
+    @cargo-release {{ bump }} {{ ARGS }}
 
 # Release a new patch version
 release *ARGS:
-    @just _release patch --skip-publish {{ARGS}}
+    @just _release patch --skip-publish {{ ARGS }}

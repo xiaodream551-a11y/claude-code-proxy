@@ -23,20 +23,14 @@ ended up forking it and applying some patches, but would much rather not do it.
 
 ### 1. Install
 
-**Homebrew** (macOS and Linux):
-
-```sh
-brew install raine/claude-code-proxy/claude-code-proxy
-```
-
 **Install script** (macOS and Linux):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/xiaodream551-a11y/claude-code-proxy/main/scripts/install.sh | bash
 ```
 
 **Manual:** download a prebuilt binary for your platform from the
-[releases page](https://github.com/raine/claude-code-proxy/releases). Windows
+[releases page](https://github.com/xiaodream551-a11y/claude-code-proxy/releases). Windows
 artifacts are published as `claude-code-proxy-windows-amd64.zip` and
 `claude-code-proxy-windows-arm64.zip`; extract the `.exe` somewhere on your
 `PATH`.
@@ -739,6 +733,8 @@ Windows, and at
     "totalTimeoutMs": 540000,
     "websocketResponseStartTimeoutMs": 60000,
     "websocketIdleTimeoutMs": 300000,
+    "maxIdleWebSockets": 128,
+    "idleWebSocketTtlMs": 300000,
     "previousResponseId": false
   },
   "kimi": {
@@ -797,6 +793,8 @@ Windows, and at
 | `CCP_CODEX_TOTAL_TIMEOUT_MS`     | `codex.totalTimeoutMs`     | `540000`                                          | Total wall-clock budget across WebSocket retries, Auto HTTP fallback, and the remaining live stream; caps stragglers while remaining configurable                                   |
 | `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event before refreshing the WebSocket and retrying safely                                                                                |
 | `CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS` | `codex.websocketIdleTimeoutMs` | `300000` | Maximum gap between Codex response events; WebSocket control frames do not extend this business-event deadline                                                                    |
+| `CCP_CODEX_MAX_IDLE_WEBSOCKETS` | `codex.maxIdleWebSockets` | `128` | Maximum continuation WebSockets retained while idle; values above 4096 are clamped                                                                                                |
+| `CCP_CODEX_IDLE_WEBSOCKET_TTL_MS` | `codex.idleWebSocketTtlMs` | `300000` | Time an idle continuation WebSocket remains pooled; values above 30 minutes are clamped and a background reaper closes expired entries                                            |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false`                                           | Enable WebSocket continuation with `previous_response_id` when the request is append-only                                                                                         |
 | `CCP_CODEX_ORIGINATOR`           | `codex.originator`         | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                                                                                    |
 | `CCP_CODEX_USER_AGENT`           | `codex.userAgent`          | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                                                                                    |
@@ -843,14 +841,17 @@ request that could duplicate tool execution.
 Both live transports emit a standard Anthropic `ping` after 15 seconds without
 visible output. HTTP SSE is decoded incrementally, so cancellation closes the
 upstream socket instead of waiting for a buffered response. WebSocket retries,
-authentication retries, and an Auto HTTP fallback share a hard ceiling of four
-physical upstream requests; after Auto falls back, that logical request remains
-on HTTP rather than probing WebSocket again. Live WebSocket messages are capped
-at 1 MiB at the wire, intermediary event channels hold two items each, and the
-final downstream queue has a 2 MiB byte budget. Buffered HTTP success bodies are
-capped at 8 MiB, and live translator input has the same cumulative ceiling. A
-downstream that remains backpressured for 60 seconds is terminated and its
-upstream request is cancelled.
+HTTP retries, and an Auto HTTP fallback share one request-level dispatch budget:
+at most four model HTTP/WebSocket dispatches, at most two OAuth token POSTs, and
+at most six combined dispatches. OAuth is counted only immediately before a
+token POST; reusing credentials already rotated by another request is free. A
+model 401 triggers refresh only after the proxy reserves capacity for its replay.
+After Auto falls back, that logical request remains on HTTP rather than probing
+WebSocket again. Live WebSocket messages are capped at 1 MiB at the wire,
+intermediary event channels hold two items each, and the final downstream queue
+has a 2 MiB byte budget. Buffered HTTP success bodies are capped at 8 MiB, and
+live translator input has the same cumulative ceiling. A downstream that remains
+backpressured for 60 seconds is terminated and its upstream request is cancelled.
 Unsignaled retries use jittered exponential backoff capped at 30 seconds. Numeric
 and HTTP-date `Retry-After` values are honored directly within that retry budget.
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
@@ -860,6 +861,10 @@ session id, reuses a session WebSocket while it remains open, and sends
 the new input strictly extends the previous transcript. On mismatch, missing
 state, missing upstream response, closed connections, or setup failure, the
 proxy clears unsafe continuation state and sends the full request instead.
+The idle continuation pool retains at most 128 sockets for five minutes by
+default. Checkout removes a socket from the idle set, successful completion
+returns it with a fresh idle timestamp, and a single background reaper closes
+expired or excess idle entries even when no later request touches that session.
 Continuation reduces repeated request upload size, but it does not increase the
 upstream model context window. Multi-process or load-balanced deployments need
 sticky sessions or shared state before enabling continuation.

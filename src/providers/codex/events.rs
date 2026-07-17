@@ -1,6 +1,38 @@
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexTerminalKind {
+    Completed,
+    Done,
+    Incomplete,
+    Failed,
+    ResponseError,
+    Error,
+}
+
+impl CodexTerminalKind {
+    pub(crate) fn from_payload(payload: &Value) -> Option<Self> {
+        match payload.get("type").and_then(Value::as_str) {
+            Some("response.completed") => Some(Self::Completed),
+            Some("response.done") => Some(Self::Done),
+            Some("response.incomplete") => Some(Self::Incomplete),
+            Some("response.failed") => Some(Self::Failed),
+            Some("response.error") => Some(Self::ResponseError),
+            Some("error") => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_failure(self) -> bool {
+        matches!(self, Self::Failed | Self::ResponseError | Self::Error)
+    }
+
+    pub(crate) fn is_reusable(self) -> bool {
+        matches!(self, Self::Completed | Self::Done)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexFailureKind {
     RateLimit,
     Overloaded,
@@ -41,7 +73,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
             retry_after: scalar_string(payload.pointer("/rate_limits/primary/reset_after_seconds")),
         });
     }
-    if !matches!(event_type, "response.failed" | "response.error" | "error") {
+    if !CodexTerminalKind::from_payload(payload).is_some_and(CodexTerminalKind::is_failure) {
         return None;
     }
 
@@ -184,6 +216,48 @@ fn retryable_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_kinds_are_classified_consistently() {
+        let cases = [
+            (
+                "response.completed",
+                CodexTerminalKind::Completed,
+                true,
+                false,
+            ),
+            ("response.done", CodexTerminalKind::Done, true, false),
+            (
+                "response.incomplete",
+                CodexTerminalKind::Incomplete,
+                false,
+                false,
+            ),
+            ("response.failed", CodexTerminalKind::Failed, false, true),
+            (
+                "response.error",
+                CodexTerminalKind::ResponseError,
+                false,
+                true,
+            ),
+            ("error", CodexTerminalKind::Error, false, true),
+        ];
+
+        for (event_type, expected, reusable, failure) in cases {
+            let payload = serde_json::json!({"type": event_type});
+            let actual = CodexTerminalKind::from_payload(&payload);
+            assert_eq!(actual, Some(expected), "event type {event_type}");
+            assert_eq!(expected.is_reusable(), reusable, "event type {event_type}");
+            assert_eq!(expected.is_failure(), failure, "event type {event_type}");
+        }
+
+        assert_eq!(
+            CodexTerminalKind::from_payload(
+                &serde_json::json!({"type": "response.output_text.delta"})
+            ),
+            None
+        );
+    }
 
     #[test]
     fn classifies_retryable_failure_kinds() {
