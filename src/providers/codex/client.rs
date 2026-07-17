@@ -334,13 +334,15 @@ impl Default for CodexHttpClient {
     }
 }
 
-fn build_codex_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+fn build_codex_http_client(base_url: &str) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .expect("failed to create HTTP client")
+        .connect_timeout(Duration::from_secs(15));
+    if crate::oauth_http::is_loopback_url(base_url) {
+        builder = builder.no_proxy();
+    }
+    builder.build().expect("failed to create HTTP client")
 }
 
 impl CodexHttpClient {
@@ -348,7 +350,7 @@ impl CodexHttpClient {
         let timeout_ms = 60_000;
         let base_url = config::codex_base_url(CODEX_API_ENDPOINT);
         Self {
-            client: build_codex_http_client(),
+            client: build_codex_http_client(&base_url),
             auth_manager: CodexAuthManager::new(file_store()),
             websocket_circuit_key: websocket_circuit_key_for_url(&base_url),
             base_url,
@@ -388,7 +390,7 @@ impl CodexHttpClient {
     ) -> Self {
         let websocket_circuit_key = websocket_circuit_key_for_url(&base_url);
         Self {
-            client: build_codex_http_client(),
+            client: build_codex_http_client(&base_url),
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
             websocket_circuit_key,
@@ -1086,6 +1088,8 @@ impl CodexHttpClient {
                         }
                     };
                     reserved_model_replay = Some(replay);
+                    continuation_retry_available = false;
+                    continuation = full_context_continuation(continuation.as_ref());
                     continue 'attempt;
                 }
 
@@ -2279,7 +2283,11 @@ mod tests {
         ));
         store.save_auth(auth).unwrap();
         let manager = CodexAuthManager::new_with_token_endpoint(store, token_endpoint);
-        CodexHttpClient::new_with_client(build_codex_http_client(), manager, model_endpoint)
+        CodexHttpClient::new_with_client(
+            build_codex_http_client(&model_endpoint),
+            manager,
+            model_endpoint,
+        )
     }
 
     async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> String {
@@ -2635,6 +2643,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_websocket_401_refresh_replays_with_full_context() {
+        use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = futures_util::StreamExt::next(&mut websocket)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            assert!(first.contains("\"previous_response_id\":\"resp_prev\""));
+            assert!(first.contains("delta only"));
+            assert!(!first.contains("full context"));
+            futures_util::SinkExt::send(
+                &mut websocket,
+                Message::Text(
+                    r#"{"type":"error","error":{"status":401,"message":"Unauthorized"}}"#.into(),
+                ),
+            )
+            .await
+            .unwrap();
+            drop(websocket);
+
+            let (mut oauth, _) = listener.accept().await.unwrap();
+            let refresh_request = read_complete_http_request(&mut oauth).await;
+            assert!(refresh_request.starts_with("POST /oauth/token "));
+            assert!(refresh_request.contains("refresh_token=r0"));
+            write_test_http_response(
+                &mut oauth,
+                "200 OK",
+                "application/json",
+                "",
+                br#"{"access_token":"a1","refresh_token":"r1","expires_in":3600}"#,
+            )
+            .await;
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut retried_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let retried = futures_util::StreamExt::next(&mut retried_websocket)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            assert!(!retried.contains("previous_response_id"));
+            assert!(retried.contains("full context"));
+            assert!(!retried.contains("delta only"));
+            futures_util::SinkExt::send(
+                &mut retried_websocket,
+                Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp_ok","usage":{}}}"#
+                        .into(),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let full_input = ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "full context".into(),
+            }],
+        };
+        let delta_input = ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "delta only".into(),
+            }],
+        };
+        let mut request = buffered_test_request();
+        request.input = vec![full_input];
+        let continuation = super::super::continuation::ContinuationCandidate {
+            turn_id: Some(7),
+            previous_response_id: Some("resp_prev".into()),
+            input_delta: Some(vec![delta_input]),
+            input_delta_count: 1,
+            disabled_reason: None,
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(dispatch_budget_test_client(
+            &temp,
+            format!("http://{addr}/responses"),
+            format!("http://{addr}/oauth/token"),
+            StoredAuth {
+                access: "a0".into(),
+                refresh: "r0".into(),
+                expires: u64::MAX,
+                account_id: Some("acct".into()),
+            },
+        ));
+
+        let mut events = client
+            .stream_codex_websocket_events(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+                CodexDispatchBudget::new(),
+            )
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("the refreshed full-context replay should complete")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(completed["type"], "response.completed");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn auto_fallback_counts_websocket_and_http_against_one_attempt_budget() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2749,6 +2874,61 @@ mod tests {
         server.await.unwrap();
         assert_eq!(error.status, 503);
         assert_eq!(error.retry_after.as_deref(), Some("120"));
+    }
+
+    #[tokio::test]
+    async fn buffered_completed_response_ignores_trailing_rate_limit_telemetry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let completed_with_tail = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n".to_vec();
+        let expected_body = completed_with_tail.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_complete_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /responses "));
+            write_test_http_response(
+                &mut stream,
+                "200 OK",
+                "text/event-stream",
+                "",
+                &completed_with_tail,
+            )
+            .await;
+
+            let Ok(Ok((mut replay, _))) =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept()).await
+            else {
+                return 1;
+            };
+            let _ = read_complete_http_request(&mut replay).await;
+            write_test_http_response(
+                &mut replay,
+                "200 OK",
+                "text/event-stream",
+                "",
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"unexpected_replay\",\"usage\":{}}}\n\n",
+            )
+            .await;
+            2
+        });
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, expected_body);
+        assert_eq!(
+            server.await.unwrap(),
+            1,
+            "completed response must not replay"
+        );
     }
 
     #[tokio::test]

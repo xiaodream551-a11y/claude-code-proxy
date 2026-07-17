@@ -725,6 +725,44 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_nonstream_keeps_completed_response_after_rate_limit_telemetry() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let upstream = spawn_http_upstream(|_body: Value| {
+        concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"completed answer\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n",
+            "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":60}}}\n\n"
+        )
+        .as_bytes()
+        .to_vec()
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages("gpt-5.5").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["text"], "completed answer");
+    assert_eq!(value["stop_reason"], "end_turn");
+    assert_eq!(value["usage"]["input_tokens"], 5);
+    assert_eq!(value["usage"]["output_tokens"], 2);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_context_window_error_requests_compaction() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();

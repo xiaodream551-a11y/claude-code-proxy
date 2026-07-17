@@ -5,6 +5,7 @@ pub const RETRY_INITIAL_DELAY_MS: u64 = 2000;
 pub const RETRY_MAX_DELAY_MS: u64 = 30_000;
 pub const RETRY_BACKOFF_FACTOR: u64 = 2;
 pub const MAX_RATE_LIMIT_RETRIES: u32 = 3;
+const RETRY_AFTER_MIN_DELAY_MS: u64 = 100;
 const RETRY_JITTER_MIN_PERCENT: u64 = 80;
 const RETRY_JITTER_MAX_PERCENT: u64 = 120;
 
@@ -32,7 +33,7 @@ fn compute_backoff_delay_at(
 ) -> BackoffOutcome {
     if let Some(target_ms) = retry_after.and_then(|raw| retry_after_ms(raw, now)) {
         return BackoffOutcome {
-            wait_ms: target_ms.min(RETRY_MAX_DELAY_MS),
+            wait_ms: target_ms.clamp(RETRY_AFTER_MIN_DELAY_MS, RETRY_MAX_DELAY_MS),
             exceeds_budget: target_ms > RETRY_MAX_DELAY_MS,
         };
     }
@@ -118,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_accepts_http_date_and_past_dates() {
+    fn retry_after_accepts_http_date_and_applies_a_minimum_delay() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let future = httpdate::fmt_http_date(now + Duration::from_secs(5));
         let past = httpdate::fmt_http_date(now - Duration::from_secs(5));
@@ -129,7 +130,11 @@ mod tests {
         );
         assert_eq!(
             compute_backoff_delay_at(0, Some(&past), now, 100).wait_ms,
-            0
+            RETRY_AFTER_MIN_DELAY_MS
+        );
+        assert_eq!(
+            compute_backoff_delay_at(0, Some("0"), now, 100).wait_ms,
+            RETRY_AFTER_MIN_DELAY_MS
         );
     }
 

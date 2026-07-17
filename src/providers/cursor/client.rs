@@ -48,6 +48,12 @@ impl CursorHttpClient {
             .http2_keep_alive_timeout(std::time::Duration::from_secs(30))
             .http2_keep_alive_while_idle(true);
 
+        // The cross-provider reqwest system-proxy feature must not route local
+        // mock or explicitly local upstreams through the host proxy.
+        if crate::oauth_http::is_loopback_url(&base_url) {
+            builder = builder.no_proxy();
+        }
+
         if is_cleartext {
             builder = builder.http2_prior_knowledge();
         }

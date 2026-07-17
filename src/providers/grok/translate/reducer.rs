@@ -8,8 +8,17 @@ use super::stream::SseDecoder;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_INCOMPLETE_TOOL_CALLS: usize = 128;
 const MAX_SEQUENCE_HISTORY: usize = 1024;
+const MAX_INCOMPLETE_REASON_BYTES: usize = 256;
 
-#[derive(Default)]
+/// Return whether an event is known to be non-semantic telemetry after a response terminal.
+///
+/// Usage belongs to the terminal response payload, so it is intentionally absent. Extend this
+/// exact allowlist only after a real upstream capture proves another event safe to discard.
+fn is_ignorable_post_terminal_event(event_type: &str) -> bool {
+    matches!(event_type, "rate_limits.updated")
+}
+
+#[derive(Clone, Default)]
 enum SequenceState {
     #[default]
     Undecided,
@@ -113,6 +122,8 @@ pub enum ReducerEvent {
         query: String,
     },
     Citation(usize, Value),
+    Terminal(GrokTerminal),
+    Usage(GrokUsage),
     Finish {
         stop_reason: String,
         input_tokens: u64,
@@ -126,12 +137,110 @@ impl ReducerEvent {
     pub fn is_semantic(&self) -> bool {
         !matches!(
             self,
-            Self::ThinkingStart(_) | Self::ThinkingDelta(_, _) | Self::ThinkingStop(_)
+            Self::ThinkingStart(_)
+                | Self::ThinkingDelta(_, _)
+                | Self::ThinkingStop(_)
+                | Self::Terminal(_)
+                | Self::Usage(_)
         )
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokTerminal {
+    Completed,
+    IncompleteMaxOutputTokens,
+    IncompleteContentFilter,
+    IncompleteMissingReason,
+    IncompleteOther,
+}
+
+impl GrokTerminal {
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::IncompleteMaxOutputTokens
+            | Self::IncompleteContentFilter
+            | Self::IncompleteMissingReason
+            | Self::IncompleteOther => "incomplete",
+        }
+    }
+
+    pub fn incomplete_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Completed => None,
+            Self::IncompleteMaxOutputTokens => Some("max_output_tokens"),
+            Self::IncompleteContentFilter => Some("content_filter"),
+            Self::IncompleteMissingReason => Some("missing"),
+            Self::IncompleteOther => Some("other"),
+        }
+    }
+
+    fn stop_reason(self) -> &'static str {
+        match self {
+            Self::Completed => "end_turn",
+            Self::IncompleteMaxOutputTokens => "max_tokens",
+            Self::IncompleteContentFilter
+            | Self::IncompleteMissingReason
+            | Self::IncompleteOther => "refusal",
+        }
+    }
+}
+
+/// Token counters reported by the upstream Responses API.
+///
+/// Every field remains optional so an omitted counter is distinguishable from a real zero. The
+/// upstream input counter includes cached tokens; [`GrokUsage::mapped_input_tokens`] splits them
+/// out for the Anthropic usage shape when the cached-token detail is internally consistent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrokUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+impl GrokUsage {
+    pub fn availability_state(&self) -> &'static str {
+        let any = self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cached_input_tokens.is_some()
+            || self.reasoning_tokens.is_some()
+            || self.total_tokens.is_some();
+        if !any {
+            "unavailable"
+        } else if self.input_tokens.is_some() && self.output_tokens.is_some() {
+            "reported"
+        } else {
+            "partial"
+        }
+    }
+
+    pub fn mapped_input_tokens(&self) -> Option<u64> {
+        match (self.input_tokens, self.cached_input_tokens) {
+            (Some(total), Some(cached)) if cached <= total => Some(total - cached),
+            (Some(total), _) => Some(total),
+            (None, _) => None,
+        }
+    }
+
+    pub fn mapped_cache_read_input_tokens(&self) -> Option<u64> {
+        match (self.input_tokens, self.cached_input_tokens) {
+            (Some(total), Some(cached)) if cached <= total => Some(cached),
+            _ => None,
+        }
+    }
+
+    pub fn cache_breakdown_is_inconsistent(&self) -> bool {
+        matches!(
+            (self.input_tokens, self.cached_input_tokens),
+            (Some(total), Some(cached)) if cached > total
+        )
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct Reducer {
     sequence: SequenceState,
     next_index: usize,
@@ -147,20 +256,30 @@ pub struct Reducer {
     x_search_requests: u64,
     saw_tool: bool,
     completed: bool,
+    incomplete_reason: Option<String>,
+    usage: Option<GrokUsage>,
 }
 
 impl Reducer {
     pub fn push(&mut self, value: Value) -> anyhow::Result<Vec<ReducerEvent>> {
-        if !self.sequence.accept(&value)? {
-            return Ok(vec![]);
-        }
-        if self.completed {
-            anyhow::bail!("event after terminal completion");
-        }
         let typ = value
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("event lacks type"))?;
+        // Rate-limit telemetry is transport metadata rather than part of the sequenced response
+        // event stream. Once the response is terminal, ignore it before sequence validation so a
+        // numbered response can safely be followed by unnumbered or repeated telemetry.
+        if self.completed && is_ignorable_post_terminal_event(typ) {
+            return Ok(vec![]);
+        }
+        if !self.sequence.accept(&value)? {
+            return Ok(vec![]);
+        }
+        if self.completed {
+            // Text, tools, and unknown future events fail closed until a real capture proves that
+            // they are safe to ignore.
+            anyhow::bail!("event after terminal completion: {typ}");
+        }
         match typ {
             "response.created" | "response.in_progress" => Ok(vec![]),
             "response.reasoning_summary_part.added"
@@ -436,18 +555,19 @@ impl Reducer {
                             .ok_or_else(|| anyhow::anyhow!("completed function call is unknown"))?;
                         let args = self.tool_args.remove(id).unwrap_or_default();
                         self.completed_arguments.remove(id);
-                        serde_json::from_str::<Value>(&args)
-                            .map_err(|_| anyhow::anyhow!("function arguments are incomplete"))?;
+                        parse_function_arguments(&args)?;
                         Ok(vec![ReducerEvent::ToolStop(index)])
                     }
                     _ => Ok(vec![]),
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
+                let response = value.get("response").unwrap_or(&value);
+                let usage = grok_usage(response);
+                self.usage = Some(usage.clone());
                 if !self.calls.is_empty() {
                     anyhow::bail!("function call is incomplete");
                 }
-                let response = value.get("response").unwrap_or(&value);
                 let fallback_text = if self.saw_text_output {
                     Vec::new()
                 } else {
@@ -458,21 +578,41 @@ impl Reducer {
                     out.extend(self.delta("text", &text)?);
                     out.extend(self.close_kind("text")?);
                 }
-                let usage = response.get("usage").unwrap_or(&Value::Null);
-                let input = usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let output = usage
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                // Keep the legacy Finish field as the upstream total for the non-streaming
+                // accumulator. The streaming renderer uses GrokUsage to split cached input into
+                // Anthropic's input/cache-read counters without double counting.
+                let input = usage.input_tokens.unwrap_or(0);
+                let output = usage.output_tokens.unwrap_or(0);
+                let incomplete_reason = response
+                    .get("incomplete_details")
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str);
+                let response_is_incomplete = typ == "response.incomplete"
+                    || response.get("status").and_then(Value::as_str) == Some("incomplete")
+                    || incomplete_reason.is_some();
+                let terminal = if response_is_incomplete {
+                    match incomplete_reason {
+                        Some("content_filter") => GrokTerminal::IncompleteContentFilter,
+                        Some("max_output_tokens" | "max_tokens" | "length") => {
+                            GrokTerminal::IncompleteMaxOutputTokens
+                        }
+                        None => GrokTerminal::IncompleteMissingReason,
+                        Some(_) => GrokTerminal::IncompleteOther,
+                    }
+                } else {
+                    GrokTerminal::Completed
+                };
+                self.incomplete_reason = response_is_incomplete
+                    .then(|| incomplete_reason.map(bounded_incomplete_reason))
+                    .flatten();
                 let stop = if self.saw_tool {
                     "tool_use"
                 } else {
-                    "end_turn"
+                    terminal.stop_reason()
                 };
                 self.completed = true;
+                out.push(ReducerEvent::Terminal(terminal));
+                out.push(ReducerEvent::Usage(usage));
                 out.push(ReducerEvent::Finish {
                     stop_reason: stop.into(),
                     input_tokens: input,
@@ -482,9 +622,31 @@ impl Reducer {
                 });
                 Ok(out)
             }
-            "error" | "response.failed" => anyhow::bail!("upstream Grok stream failed"),
+            "error" | "response.failed" => {
+                let response = value.get("response").unwrap_or(&value);
+                self.usage = Some(grok_usage(response));
+                anyhow::bail!("upstream Grok stream failed")
+            }
             _ => anyhow::bail!("unsupported Grok stream event: {typ}"),
         }
+    }
+
+    /// Apply every event decoded from one upstream byte chunk atomically.
+    ///
+    /// A terminal event followed by an invalid semantic tail must not commit the terminal or any
+    /// preceding text/tool state from that same chunk. Callers can render the returned events only
+    /// after this method succeeds.
+    pub fn push_batch(
+        &mut self,
+        values: impl IntoIterator<Item = Value>,
+    ) -> anyhow::Result<Vec<ReducerEvent>> {
+        let mut staged = self.clone();
+        let mut out = Vec::new();
+        for value in values {
+            out.extend(staged.push(value)?);
+        }
+        *self = staged;
+        Ok(out)
     }
     fn delta(&mut self, kind: &str, delta: &str) -> anyhow::Result<Vec<ReducerEvent>> {
         let mut out = Vec::new();
@@ -560,6 +722,53 @@ impl Reducer {
     pub fn finished(&self) -> bool {
         self.completed
     }
+
+    pub fn usage(&self) -> Option<&GrokUsage> {
+        self.usage.as_ref()
+    }
+
+    pub fn incomplete_reason(&self) -> Option<&str> {
+        self.incomplete_reason.as_deref()
+    }
+}
+
+fn bounded_incomplete_reason(reason: &str) -> String {
+    if reason.len() <= MAX_INCOMPLETE_REASON_BYTES {
+        return reason.to_owned();
+    }
+    let mut end = MAX_INCOMPLETE_REASON_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_owned()
+}
+
+fn grok_usage(response: &Value) -> GrokUsage {
+    let Some(usage) = response.get("usage") else {
+        return GrokUsage::default();
+    };
+    GrokUsage {
+        input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
+        output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+        cached_input_tokens: usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64),
+        reasoning_tokens: usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
+        total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+    }
+}
+
+pub(super) fn parse_function_arguments(arguments: &str) -> anyhow::Result<Value> {
+    let value = serde_json::from_str::<Value>(arguments)
+        .map_err(|_| anyhow::anyhow!("function arguments are incomplete"))?;
+    if !value.is_object() {
+        anyhow::bail!("function arguments must be a JSON object");
+    }
+    Ok(value)
 }
 
 fn response_output_text(response: &Value) -> Vec<String> {
@@ -587,13 +796,16 @@ fn response_output_text(response: &Value) -> Vec<String> {
 
 pub fn reduce_upstream_bytes(bytes: &[u8]) -> anyhow::Result<Vec<ReducerEvent>> {
     let mut reducer = Reducer::default();
-    let mut out = Vec::new();
     let mut decoder = SseDecoder::default();
-    for event in decoder.push(bytes)? {
-        let value: Value = serde_json::from_str(&event.data)
-            .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))?;
-        out.extend(reducer.push(value)?);
-    }
+    let values = decoder
+        .push(bytes)?
+        .into_iter()
+        .map(|event| {
+            serde_json::from_str(&event.data)
+                .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))
+        })
+        .collect::<anyhow::Result<Vec<Value>>>()?;
+    let out = reducer.push_batch(values)?;
     decoder.finish()?;
     if !reducer.finished() {
         anyhow::bail!("Grok stream ended without completion");
@@ -747,6 +959,170 @@ mod tests {
     }
 
     #[test]
+    fn terminal_tail_policy_allows_only_rate_limit_telemetry() {
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {"usage": {}}
+        });
+        let mut allowed = Reducer::default();
+        let events = allowed
+            .push_batch([
+                completed.clone(),
+                serde_json::json!({"type":"rate_limits.updated","remaining":42}),
+            ])
+            .unwrap();
+        assert!(allowed.finished());
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ReducerEvent::Finish { .. }))
+        );
+
+        for tail in [
+            serde_json::json!({"type":"response.output_text.delta","delta":"unsafe"}),
+            serde_json::json!({"type":"response.output_item.added","item":{"type":"message"}}),
+            serde_json::json!({"type":"response.usage","usage":{}}),
+            serde_json::json!({"type":"future.telemetry"}),
+        ] {
+            let mut reducer = Reducer::default();
+            let error = reducer.push_batch([completed.clone(), tail]).unwrap_err();
+            assert!(
+                error.to_string().contains("event after terminal"),
+                "{error:#}"
+            );
+            assert!(
+                !reducer.finished(),
+                "a rejected same-batch tail must roll back the terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn numbered_terminal_ignores_unsequenced_and_duplicate_rate_limit_telemetry() {
+        let completed = serde_json::json!({
+            "sequence_number": 41,
+            "type": "response.completed",
+            "response": {"usage": {}}
+        });
+        let telemetry = serde_json::json!({
+            "type": "rate_limits.updated",
+            "remaining": 42
+        });
+        let mut reducer = Reducer::default();
+        let events = reducer
+            .push_batch([completed, telemetry.clone(), telemetry])
+            .unwrap();
+
+        assert!(reducer.finished());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ReducerEvent::Finish { .. }))
+                .count(),
+            1
+        );
+
+        let unsequenced_text = reducer
+            .push(serde_json::json!({
+                "type":"response.output_text.delta",
+                "delta":"unsafe"
+            }))
+            .unwrap_err();
+        assert!(
+            unsequenced_text
+                .to_string()
+                .contains("omitted sequence_number"),
+            "{unsequenced_text:#}"
+        );
+
+        let sequenced_text = reducer
+            .push(serde_json::json!({
+                "sequence_number":42,
+                "type":"response.output_text.delta",
+                "delta":"unsafe"
+            }))
+            .unwrap_err();
+        assert!(
+            sequenced_text.to_string().contains("event after terminal"),
+            "{sequenced_text:#}"
+        );
+    }
+
+    #[test]
+    fn incomplete_reason_mapping_is_explicit_and_conservative() {
+        let cases = [
+            (
+                Some("max_output_tokens"),
+                GrokTerminal::IncompleteMaxOutputTokens,
+                "max_tokens",
+            ),
+            (
+                Some("max_tokens"),
+                GrokTerminal::IncompleteMaxOutputTokens,
+                "max_tokens",
+            ),
+            (
+                Some("length"),
+                GrokTerminal::IncompleteMaxOutputTokens,
+                "max_tokens",
+            ),
+            (
+                Some("content_filter"),
+                GrokTerminal::IncompleteContentFilter,
+                "refusal",
+            ),
+            (
+                Some("upstream_capacity"),
+                GrokTerminal::IncompleteOther,
+                "refusal",
+            ),
+            (None, GrokTerminal::IncompleteMissingReason, "refusal"),
+        ];
+
+        for (reason, expected_terminal, expected_stop) in cases {
+            let mut response = serde_json::json!({"status":"incomplete","usage":{}});
+            if let Some(reason) = reason {
+                response["incomplete_details"] = serde_json::json!({"reason":reason});
+            }
+            let mut reducer = Reducer::default();
+            let events = reducer
+                .push(serde_json::json!({
+                    "type":"response.incomplete",
+                    "response":response
+                }))
+                .unwrap();
+            assert!(events.iter().any(
+                |event| matches!(event, ReducerEvent::Terminal(status) if *status == expected_terminal)
+            ));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ReducerEvent::Finish { stop_reason, .. } if stop_reason == expected_stop
+            )));
+            assert_eq!(reducer.incomplete_reason(), reason);
+        }
+    }
+
+    #[test]
+    fn unknown_incomplete_reason_is_utf8_safely_bounded_for_logs() {
+        let reason = format!("{}😊tail", "x".repeat(255));
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.incomplete",
+                "response":{
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":reason},
+                    "usage":{}
+                }
+            }))
+            .unwrap();
+
+        let captured = reducer.incomplete_reason().unwrap();
+        assert!(captured.len() <= MAX_INCOMPLETE_REASON_BYTES);
+        assert_eq!(captured, "x".repeat(255));
+    }
+
+    #[test]
     fn grok_reducer_handles_text_tool_and_completion() {
         let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
         let events = reduce_upstream_bytes(input).unwrap();
@@ -841,5 +1217,72 @@ mod tests {
         assert!(events.iter().any(
             |event| matches!(event, ReducerEvent::TextDelta(0, text) if text == "snapshot only 😊")
         ));
+    }
+
+    #[test]
+    fn incomplete_response_closes_text_and_preserves_reported_usage_details() {
+        let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":7,\"output_tokens_details\":{\"reasoning_tokens\":5},\"total_tokens\":19}}}\n\n";
+        let events = reduce_upstream_bytes(input).unwrap();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ReducerEvent::TextStop(0)))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ReducerEvent::Terminal(GrokTerminal::IncompleteMaxOutputTokens)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ReducerEvent::Usage(GrokUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(7),
+                cached_input_tokens: Some(3),
+                reasoning_tokens: Some(5),
+                total_tokens: Some(19),
+            })
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(ReducerEvent::Finish {
+                stop_reason,
+                input_tokens: 12,
+                output_tokens: 7,
+                ..
+            }) if stop_reason == "max_tokens"
+        ));
+    }
+
+    #[test]
+    fn missing_usage_is_distinct_from_reported_zero() {
+        let missing = reduce_upstream_bytes(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+        )
+        .unwrap();
+        let zero = reduce_upstream_bytes(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+        )
+        .unwrap();
+
+        assert!(missing.iter().any(|event| matches!(
+            event,
+            ReducerEvent::Usage(usage) if usage.availability_state() == "unavailable"
+        )));
+        assert!(zero.iter().any(|event| matches!(
+            event,
+            ReducerEvent::Usage(usage) if usage.availability_state() == "reported"
+        )));
+    }
+
+    #[test]
+    fn completed_function_call_rejects_non_object_arguments() {
+        for arguments in ["null", "[]", "\"text\""] {
+            let input = format!(
+                "data: {{\"type\":\"response.output_item.added\",\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}}}\n\ndata: {{\"type\":\"response.function_call_arguments.done\",\"call_id\":\"call_1\",\"arguments\":{arguments:?}}}\n\ndata: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\"}}}}\n\n"
+            );
+            let error = reduce_upstream_bytes(input.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("JSON object"), "{error:#}");
+        }
     }
 }

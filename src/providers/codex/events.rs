@@ -151,6 +151,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
 }
 
 pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> {
+    let mut first_failure = None;
     for event in crate::anthropic::sse::parse_sse_events(body) {
         if event.data == "[DONE]" {
             continue;
@@ -158,13 +159,20 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
         let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
             continue;
         };
+        if CodexTerminalKind::from_payload(&payload).is_some_and(CodexTerminalKind::is_reusable) {
+            // A completed response is authoritative. Providers may append quota
+            // telemetry after it; that tail must not turn a successful buffered
+            // response into a whole-request replay.
+            return None;
+        }
         if let Some(failure) = classify_event_failure(&payload)
             && failure.retryable()
+            && first_failure.is_none()
         {
-            return Some(failure);
+            first_failure = Some(failure);
         }
     }
-    None
+    first_failure
 }
 
 pub(crate) fn numeric_status(payload: &Value) -> Option<u64> {
@@ -293,5 +301,22 @@ mod tests {
         }))
         .unwrap();
         assert!(!failure.retryable());
+    }
+
+    #[test]
+    fn completed_response_wins_over_trailing_rate_limit_telemetry() {
+        let body = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n";
+
+        assert!(first_retryable_failure(body).is_none());
+    }
+
+    #[test]
+    fn rate_limit_without_completed_response_remains_retryable() {
+        let body = b"data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n";
+
+        assert_eq!(
+            first_retryable_failure(body).map(|failure| failure.status),
+            Some(429)
+        );
     }
 }

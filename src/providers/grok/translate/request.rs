@@ -5,8 +5,11 @@ use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::providers::translate_shared::{
-    is_claude_code_compaction_request, normalize_strict_json_schema, read_effort,
+    ImageSource, flatten_system_text, image_source_to_url, is_claude_code_compaction_request,
+    normalize_strict_json_schema, read_effort,
 };
+
+const MAX_GROK_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -18,6 +21,8 @@ pub struct GrokResponsesRequest {
     pub tools: Option<Vec<GrokTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<GrokToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     pub store: bool,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,6 +78,8 @@ pub enum GrokInputItem {
 pub enum GrokContentPart {
     #[serde(rename = "input_text")]
     InputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage { image_url: String },
     #[serde(rename = "output_text")]
     OutputText { text: String },
 }
@@ -188,6 +195,16 @@ pub fn translate_request(
     } else {
         parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?
     };
+    let parallel_tool_calls = if compaction {
+        None
+    } else {
+        req.extra
+            .get("tool_choice")
+            .and_then(Value::as_object)
+            .and_then(|choice| choice.get("disable_parallel_tool_use"))
+            .and_then(Value::as_bool)
+            .map(|disabled| !disabled)
+    };
     let mut call_ids = HashSet::new();
     let mut input = Vec::new();
     for message in &req.messages {
@@ -210,6 +227,7 @@ pub fn translate_request(
         input,
         tools,
         tool_choice,
+        parallel_tool_calls,
         store: false,
         stream: true,
         max_output_tokens: req.max_tokens,
@@ -324,9 +342,8 @@ fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
 fn parse_system(value: Option<&Value>) -> anyhow::Result<Option<String>> {
     let Some(value) = value else { return Ok(None) };
     match value {
-        Value::String(text) => Ok(Some(text.clone())),
+        Value::String(_) => Ok(flatten_system_text(Some(value))),
         Value::Array(blocks) => {
-            let mut text = String::new();
             for block in blocks {
                 let object = block
                     .as_object()
@@ -339,13 +356,11 @@ fn parse_system(value: Option<&Value>) -> anyhow::Result<Option<String>> {
                 {
                     anyhow::bail!("unsupported system block");
                 }
-                let part = object
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("system text is invalid"))?;
-                text.push_str(part);
+                if object.get("text").and_then(Value::as_str).is_none() {
+                    anyhow::bail!("system text is invalid");
+                }
             }
-            Ok(Some(text))
+            Ok(flatten_system_text(Some(value)))
         }
         _ => anyhow::bail!("system must be text"),
     }
@@ -363,10 +378,24 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("tool must be an object"))?;
         for key in obj.keys() {
-            if !["name", "description", "input_schema", "cache_control"].contains(&key.as_str()) {
+            if ![
+                "type",
+                "name",
+                "description",
+                "input_schema",
+                "cache_control",
+            ]
+            .contains(&key.as_str())
+            {
                 anyhow::bail!("unsupported tool field: {key}");
             }
         }
+        let declared_type = obj.get("type").map(|kind| {
+            kind.as_str()
+                .filter(|kind| !kind.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("tool type is invalid"))
+        });
+        let declared_type = declared_type.transpose()?;
         if !valid_cache_control(obj.get("cache_control")) {
             anyhow::bail!("unsupported tool cache_control");
         }
@@ -378,7 +407,8 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
         if !names.insert(name.to_string()) {
             anyhow::bail!("duplicate tool name");
         }
-        if name == "WebSearch" {
+        if name == "WebSearch" || declared_type.is_some_and(|kind| kind.starts_with("web_search_"))
+        {
             out.push(GrokTool::hosted("web_search"));
             continue;
         }
@@ -414,11 +444,29 @@ fn parse_tool_choice(
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("tool_choice type is invalid"))?;
+    if let Some(disable_parallel) = obj.get("disable_parallel_tool_use")
+        && !disable_parallel.is_boolean()
+    {
+        anyhow::bail!("tool_choice disable_parallel_tool_use must be boolean");
+    }
     match kind {
-        "auto" if obj.len() == 1 => Ok(Some(GrokToolChoice::Auto("auto".into()))),
-        "any" if obj.len() == 1 => Ok(Some(GrokToolChoice::Required("required".into()))),
-        "none" if obj.len() == 1 => Ok(Some(GrokToolChoice::None("none".into()))),
-        "tool" if obj.len() == 2 => {
+        "auto" | "any" | "none"
+            if obj
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "disable_parallel_tool_use")) =>
+        {
+            Ok(Some(match kind {
+                "auto" => GrokToolChoice::Auto("auto".into()),
+                "any" => GrokToolChoice::Required("required".into()),
+                "none" => GrokToolChoice::None("none".into()),
+                _ => unreachable!(),
+            }))
+        }
+        "tool"
+            if obj.keys().all(|key| {
+                matches!(key.as_str(), "type" | "name" | "disable_parallel_tool_use")
+            }) =>
+        {
             let name = obj
                 .get("name")
                 .and_then(Value::as_str)
@@ -477,6 +525,19 @@ fn parse_message(
                     GrokContentPart::OutputText { text: text.into() }
                 } else {
                     GrokContentPart::InputText { text: text.into() }
+                });
+            }
+            ("user", "image") => {
+                if object
+                    .keys()
+                    .any(|key| !["type", "source", "cache_control"].contains(&key.as_str()))
+                    || !valid_cache_control(object.get("cache_control"))
+                {
+                    anyhow::bail!("unsupported image block field");
+                }
+                let source = parse_image_source(object.get("source"))?;
+                content.push(GrokContentPart::InputImage {
+                    image_url: image_source_to_url(&source),
                 });
             }
             ("assistant", "server_tool_use") => {
@@ -572,6 +633,19 @@ fn parse_message(
                         .join(""),
                     _ => anyhow::bail!("tool result supports text only"),
                 };
+                let output = if object
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    if output.is_empty() {
+                        "[tool execution error]".to_string()
+                    } else {
+                        format!("[tool execution error]\n{output}")
+                    }
+                } else {
+                    output
+                };
                 out.push(GrokInputItem::FunctionCallOutput {
                     call_id: id.into(),
                     output,
@@ -582,6 +656,78 @@ fn parse_message(
     }
     flush_message(&message.role, &mut content, out);
     Ok(())
+}
+
+fn parse_image_source(value: Option<&Value>) -> anyhow::Result<ImageSource> {
+    let source = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("image source must be an object"))?;
+    let source_type = source
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("image source type is invalid"))?;
+    match source_type {
+        "base64" => {
+            if !source
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "media_type" | "data"))
+            {
+                anyhow::bail!("unsupported base64 image source field");
+            }
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "image/jpeg" | "image/png"))
+                .ok_or_else(|| anyhow::anyhow!("unsupported image media type"))?;
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("image base64 data is empty"))?;
+            let mut decoder = base64::read::DecoderReader::new(
+                data.as_bytes(),
+                &base64::engine::general_purpose::STANDARD,
+            );
+            let decoded_bytes = std::io::copy(&mut decoder, &mut std::io::sink())
+                .map_err(|_| anyhow::anyhow!("image base64 data is invalid"))?;
+            if decoded_bytes > MAX_GROK_IMAGE_BYTES {
+                anyhow::bail!("image exceeds the 20 MiB size limit");
+            }
+            Ok(ImageSource {
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+                source_type: source_type.to_string(),
+            })
+        }
+        "url" => {
+            if !source
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "url"))
+            {
+                anyhow::bail!("unsupported URL image source field");
+            }
+            let raw = source
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("image URL is empty"))?;
+            let parsed =
+                url::Url::parse(raw).map_err(|_| anyhow::anyhow!("image URL is invalid"))?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+            {
+                anyhow::bail!("image URL must be an HTTP(S) URL without credentials");
+            }
+            Ok(ImageSource {
+                media_type: String::new(),
+                data: raw.to_string(),
+                source_type: source_type.to_string(),
+            })
+        }
+        _ => anyhow::bail!("unsupported image source type"),
+    }
 }
 
 fn valid_cache_control(value: Option<&Value>) -> bool {
@@ -608,6 +754,157 @@ fn flush_message(role: &str, content: &mut Vec<GrokContentPart>, out: &mut Vec<G
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_translation_filters_billing_header_and_separates_system_blocks() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "system":[
+                {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.212"},
+                {"type":"text","text":"Follow repository rules."},
+                {"type":"text","text":"Keep answers concise.","cache_control":{"type":"ephemeral"}}
+            ],
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+
+        let translated = translate_request(&request, "grok-4.5".into()).unwrap();
+        let instructions = translated.instructions.unwrap();
+        assert!(instructions.starts_with("Follow repository rules.\n\nKeep answers concise."));
+        assert!(!instructions.contains("x-anthropic-billing-header:"));
+    }
+
+    #[test]
+    fn grok_translation_accepts_tool_type_and_disable_parallel_tool_use() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[{
+                "type":"custom",
+                "name":"lookup",
+                "description":"Look things up",
+                "input_schema":{"type":"object"}
+            }],
+            "tool_choice":{"type":"auto","disable_parallel_tool_use":true},
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(
+            translated["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["type"] == "function" && tool["name"] == "lookup" })
+        );
+        assert_eq!(translated["tool_choice"], "auto");
+        assert_eq!(translated["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn grok_translation_maps_typed_anthropic_web_search() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search"
+            }],
+            "messages":[{"role":"user","content":"search online for the project"}]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(
+            translated["tools"],
+            serde_json::json!([{"type":"web_search"}])
+        );
+        assert_eq!(translated["tool_choice"], "required");
+    }
+
+    #[test]
+    fn grok_translation_rejects_invalid_tool_type_and_parallel_flag() {
+        for request in [
+            serde_json::json!({
+                "model":"grok-4.5",
+                "tools":[{"type":1,"name":"lookup","input_schema":{"type":"object"}}],
+                "messages":[{"role":"user","content":"hello"}]
+            }),
+            serde_json::json!({
+                "model":"grok-4.5",
+                "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+                "tool_choice":{"type":"auto","disable_parallel_tool_use":"yes"},
+                "messages":[{"role":"user","content":"hello"}]
+            }),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(request).unwrap();
+            assert!(translate_request(&request, "grok-4.5".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn grok_translation_preserves_tool_result_error_semantics() {
+        let request = request_with_blocks(serde_json::json!([{
+            "type":"tool_result",
+            "tool_use_id":"call_1",
+            "content":"permission denied",
+            "is_error":true
+        }]));
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(
+            translated["input"][1]["output"],
+            "[tool execution error]\npermission denied"
+        );
+    }
+
+    #[test]
+    fn grok_translation_maps_base64_and_url_images() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"compare these"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="},"cache_control":{"type":"ephemeral"}},
+                {"type":"image","source":{"type":"url","url":"https://example.com/image.png?size=large"}}
+            ]}]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let content = translated["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,aGVsbG8=");
+        assert_eq!(content[2]["type"], "input_image");
+        assert_eq!(
+            content[2]["image_url"],
+            "https://example.com/image.png?size=large"
+        );
+        assert!(!translated.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn grok_translation_rejects_unsafe_or_malformed_images() {
+        for source in [
+            serde_json::json!({"type":"base64","media_type":"image/svg+xml","data":"aGVsbG8="}),
+            serde_json::json!({"type":"base64","media_type":"image/gif","data":"R0lGODlhAQABAAAAACw="}),
+            serde_json::json!({"type":"base64","media_type":"image/webp","data":"UklGRgAAAABXRUJQ"}),
+            serde_json::json!({"type":"base64","media_type":"image/png","data":"not base64"}),
+            serde_json::json!({"type":"url","url":"file:///tmp/image.png"}),
+            serde_json::json!({"type":"url","url":"https://user:pass@example.com/image.png"}),
+            serde_json::json!({"type":"file","file_id":"file_1"}),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"user","content":[{"type":"image","source":source}]}]
+            }))
+            .unwrap();
+            assert!(translate_request(&request, "grok-4.5".into()).is_err());
+        }
+    }
+
     #[test]
     fn grok_translation_replays_hosted_search_history() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({

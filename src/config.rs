@@ -915,21 +915,55 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
     }
 }
 
+fn resolve_codex_transport(
+    requested: CodexTransport,
+    system_proxy_intercepts_upstream: bool,
+) -> CodexTransport {
+    if requested == CodexTransport::Auto && system_proxy_intercepts_upstream {
+        CodexTransport::Http
+    } else {
+        requested
+    }
+}
+
+fn default_codex_transport(system_proxy_intercepts_upstream: bool) -> CodexTransport {
+    if system_proxy_intercepts_upstream {
+        CodexTransport::Http
+    } else {
+        CodexTransport::WebSocket
+    }
+}
+
+fn codex_system_proxy_intercepts_upstream() -> bool {
+    const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+    let upstream = codex_base_url(DEFAULT_CODEX_BASE_URL);
+    if crate::oauth_http::is_loopback_url(&upstream) {
+        return false;
+    }
+    let Ok(uri) = upstream.parse::<http::Uri>() else {
+        return false;
+    };
+    hyper_util::client::proxy::matcher::Matcher::from_system()
+        .intercept(&uri)
+        .is_some()
+}
+
 pub fn codex_transport() -> CodexTransport {
     let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
         && let Some(transport) = parse_codex_transport(raw)
     {
-        return transport;
+        return resolve_codex_transport(transport, codex_system_proxy_intercepts_upstream());
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(transport) = codex.transport.as_deref().and_then(parse_codex_transport)
     {
-        return transport;
+        return resolve_codex_transport(transport, codex_system_proxy_intercepts_upstream());
     }
-    CodexTransport::WebSocket
+    default_codex_transport(codex_system_proxy_intercepts_upstream())
 }
 
 // ---------------------------------------------------------------------------
@@ -989,40 +1023,68 @@ mod tests {
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-    fn clear_env() {
+    const TEST_ENV_KEYS: &[&str] = &[
+        "CCP_BIND_ADDRESS",
+        "CCP_CODEX_TRANSPORT",
+        "CCP_CONFIG_DIR",
+        "CCP_LOG_VERBOSE",
+        "CCP_LOG_STDERR",
+        "CCP_CODEX_REASONING_SUMMARY",
+        "CCP_CODEX_RESPONSES_LITE",
+        "CCP_CODEX_TOTAL_TIMEOUT_MS",
+        "CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS",
+        "CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS",
+        "CCP_CODEX_MAX_IDLE_WEBSOCKETS",
+        "CCP_CODEX_IDLE_WEBSOCKET_TTL_MS",
+        "CCP_GROK_CONNECT_TIMEOUT_MS",
+        "CCP_GROK_HEADER_TIMEOUT_MS",
+        "CCP_GROK_FIRST_BYTE_TIMEOUT_MS",
+        "CCP_GROK_BODY_IDLE_TIMEOUT_MS",
+        "CCP_GROK_TOTAL_TIMEOUT_MS",
+        "CCP_GROK_STREAM_HEARTBEAT_MS",
+        "CCP_MAX_REQUEST_BODY_BYTES",
+        "CCP_MAX_BUFFERED_REQUEST_BYTES",
+        "CCP_MAX_CONCURRENT_REQUESTS",
+        "CCP_MAX_CONCURRENT_PER_PROVIDER",
+        "CCP_MAX_CONCURRENT_PER_SESSION",
+        "CCP_REQUEST_BODY_IDLE_TIMEOUT_MS",
+        "CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS",
+    ];
+
+    struct ClearedEnvGuard {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    fn clear_env() -> ClearedEnvGuard {
+        let previous = TEST_ENV_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
         unsafe {
-            std::env::remove_var("CCP_BIND_ADDRESS");
-            std::env::remove_var("CCP_CODEX_TRANSPORT");
-            std::env::remove_var("CCP_CONFIG_DIR");
-            std::env::remove_var("CCP_LOG_VERBOSE");
-            std::env::remove_var("CCP_LOG_STDERR");
-            std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
-            std::env::remove_var("CCP_CODEX_RESPONSES_LITE");
-            std::env::remove_var("CCP_CODEX_TOTAL_TIMEOUT_MS");
-            std::env::remove_var("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS");
-            std::env::remove_var("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS");
-            std::env::remove_var("CCP_CODEX_MAX_IDLE_WEBSOCKETS");
-            std::env::remove_var("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS");
-            std::env::remove_var("CCP_GROK_CONNECT_TIMEOUT_MS");
-            std::env::remove_var("CCP_GROK_HEADER_TIMEOUT_MS");
-            std::env::remove_var("CCP_GROK_FIRST_BYTE_TIMEOUT_MS");
-            std::env::remove_var("CCP_GROK_BODY_IDLE_TIMEOUT_MS");
-            std::env::remove_var("CCP_GROK_TOTAL_TIMEOUT_MS");
-            std::env::remove_var("CCP_GROK_STREAM_HEARTBEAT_MS");
-            std::env::remove_var("CCP_MAX_REQUEST_BODY_BYTES");
-            std::env::remove_var("CCP_MAX_BUFFERED_REQUEST_BYTES");
-            std::env::remove_var("CCP_MAX_CONCURRENT_REQUESTS");
-            std::env::remove_var("CCP_MAX_CONCURRENT_PER_PROVIDER");
-            std::env::remove_var("CCP_MAX_CONCURRENT_PER_SESSION");
-            std::env::remove_var("CCP_REQUEST_BODY_IDLE_TIMEOUT_MS");
-            std::env::remove_var("CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS");
+            for key in TEST_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+        }
+        ClearedEnvGuard { previous }
+    }
+
+    impl Drop for ClearedEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, value) in self.previous.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
         }
     }
 
     #[test]
     fn bind_address_defaults_to_loopback() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
@@ -1032,7 +1094,7 @@ mod tests {
     #[test]
     fn bind_address_reads_config_and_env_takes_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1073,21 +1135,59 @@ mod tests {
     }
 
     #[test]
+    fn cleared_env_restores_existing_config_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let sentinel = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", sentinel.path());
+
+        {
+            let _cleared_env = clear_env();
+            assert!(std::env::var_os("CCP_CONFIG_DIR").is_none());
+        }
+
+        assert_eq!(
+            std::env::var_os("CCP_CONFIG_DIR").as_deref(),
+            Some(sentinel.path().as_os_str())
+        );
+    }
+
+    #[test]
     fn codex_transport_defaults_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
         let result = codex_transport();
         assert_eq!(result, CodexTransport::WebSocket);
     }
 
     #[test]
+    fn codex_transport_uses_http_when_system_proxy_intercepts() {
+        assert_eq!(
+            default_codex_transport(true),
+            CodexTransport::Http,
+            "the implicit default must not bypass an active system proxy"
+        );
+        assert_eq!(
+            resolve_codex_transport(CodexTransport::Auto, true),
+            CodexTransport::Http,
+            "Auto must start on the proxy-aware HTTP transport"
+        );
+        assert_eq!(
+            resolve_codex_transport(CodexTransport::WebSocket, true),
+            CodexTransport::WebSocket,
+            "an explicit strict WebSocket selection remains an opt-in direct connection"
+        );
+    }
+
+    #[test]
     fn codex_transport_reads_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "auto");
         }
@@ -1097,7 +1197,7 @@ mod tests {
     #[test]
     fn codex_transport_env_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         unsafe {
@@ -1109,9 +1209,10 @@ mod tests {
     #[test]
     fn codex_transport_invalid_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
         }
@@ -1121,9 +1222,10 @@ mod tests {
     #[test]
     fn codex_transport_empty_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _no_proxy = EnvGuard::set("NO_PROXY", "*");
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }
@@ -1153,7 +1255,7 @@ mod tests {
     #[test]
     fn log_env_presence_enables_legacy_verbose_and_stderr() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         let _verbose_env = EnvGuard::set("CCP_LOG_VERBOSE", "0");
@@ -1167,7 +1269,7 @@ mod tests {
     #[test]
     fn log_config_values_apply_without_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1184,7 +1286,7 @@ mod tests {
     #[test]
     fn codex_reasoning_summary_reads_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1199,7 +1301,7 @@ mod tests {
     #[test]
     fn codex_responses_lite_defaults_true_and_reads_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
@@ -1218,7 +1320,7 @@ mod tests {
     #[test]
     fn codex_reasoning_summary_env_overrides_config_and_empty_falls_through() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1239,7 +1341,7 @@ mod tests {
     #[test]
     fn codex_timeouts_read_config_and_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1269,7 +1371,7 @@ mod tests {
     #[test]
     fn codex_timeouts_ignore_zero_and_invalid_values() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1292,7 +1394,7 @@ mod tests {
     #[test]
     fn grok_timeouts_read_config_and_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1325,7 +1427,7 @@ mod tests {
     #[test]
     fn grok_timeouts_ignore_zero_and_invalid_values() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1347,7 +1449,7 @@ mod tests {
     #[test]
     fn grok_timeouts_appear_in_override_summary() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1400,7 +1502,7 @@ mod tests {
     #[test]
     fn server_resource_limits_read_config_env_and_clamp() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),

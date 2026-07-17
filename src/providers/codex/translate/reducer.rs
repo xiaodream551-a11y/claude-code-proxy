@@ -329,6 +329,14 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         event_count += 1;
         last_event_type = Some(t.clone());
 
+        if _saw_terminal && t == "codex.rate_limits" {
+            // A successful Codex terminal is authoritative. The upstream may append a final
+            // quota snapshot, including `limit_reached=true`, after the response has already
+            // completed. Treat that tail as telemetry instead of retroactively failing the
+            // completed request.
+            continue;
+        }
+
         if t == "codex.rate_limits" {
             if let Some(true) = p
                 .get("rate_limits")
@@ -718,8 +726,8 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 None => continue,
             };
 
-            if let Some(item_val) = item {
-                if let BlockState::Tool {
+            if let Some(item_val) = item
+                && let BlockState::Tool {
                     args_accum,
                     name,
                     call_id,
@@ -729,32 +737,30 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     index,
                     ..
                 } = &mut state
+            {
+                if let Some(final_args) = item_val
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
                 {
-                    if let Some(final_args) = item_val
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        if !args_accum.is_empty() && !*emitted_args {
-                            // Already have accum from deltas - skip
-                        } else if *had_delta {
-                            // Already emitted deltas
-                        } else {
-                            *args_accum = final_args.to_string();
-                        }
+                    if !args_accum.is_empty() && !*emitted_args {
+                        // Already have accum from deltas - skip
+                    } else if *had_delta {
+                        // Already emitted deltas
+                    } else {
+                        *args_accum = final_args.to_string();
                     }
+                }
 
-                    if !args_accum.is_empty() {
-                        let sanitized =
-                            sanitize_read_args(name, args_accum, Some(call_id.as_str()));
-                        *args_accum = sanitized;
-                        if *buffer_until_done || !*emitted_args {
-                            *emitted_args = true;
-                            out.push(ReducerEvent::ToolDelta {
-                                index: *index,
-                                partial_json: args_accum.clone(),
-                            });
-                        }
+                if !args_accum.is_empty() {
+                    let sanitized = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
+                    *args_accum = sanitized;
+                    if *buffer_until_done || !*emitted_args {
+                        *emitted_args = true;
+                        out.push(ReducerEvent::ToolDelta {
+                            index: *index,
+                            partial_json: args_accum.clone(),
+                        });
                     }
                 }
             }

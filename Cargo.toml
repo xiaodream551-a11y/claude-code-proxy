@@ -19,6 +19,7 @@ tower = { version = "0.5", features = ["util"] }
 http = "1"
 httpdate = "1"
 http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"] }
 bytes = "1"
 futures-core = "0.3"
 futures-util = "0.3"
@@ -28,7 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tiktoken-rs = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "blocking", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots", "system-proxy", "blocking", "http2"] }
 base64 = "0.22"
 rand = "0.8"
 sha2 = "0.10"

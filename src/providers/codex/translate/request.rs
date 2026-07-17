@@ -247,6 +247,25 @@ pub struct TranslateOptions {
     pub use_responses_lite: bool,
 }
 
+/// Runtime configuration is injected by the provider so pure translation
+/// tests never depend on a developer's process environment or config file.
+#[derive(Debug, Clone, Default)]
+pub struct TranslationOverrides {
+    pub service_tier: Option<String>,
+    pub effort: Option<String>,
+    pub reasoning_summary: Option<String>,
+}
+
+impl TranslationOverrides {
+    pub fn configured() -> Self {
+        Self {
+            service_tier: config::codex_service_tier(),
+            effort: config::codex_effort(),
+            reasoning_summary: config::codex_reasoning_summary(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Translation entry point
 // ---------------------------------------------------------------------------
@@ -262,8 +281,11 @@ fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     }
 }
 
-fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Error> {
-    resolve_effort_override(effort, config::codex_effort().as_deref())
+fn resolve_effort(
+    effort: Option<Effort>,
+    override_effort: Option<&str>,
+) -> Result<Option<Effort>, anyhow::Error> {
+    resolve_effort_override(effort, override_effort)
 }
 
 fn resolve_effort_override(
@@ -310,10 +332,10 @@ fn normalize_service_tier(tier: &str) -> Result<ServiceTier, anyhow::Error> {
 
 fn resolve_service_tier(
     model_tier: Option<ServiceTier>,
+    override_tier: Option<&str>,
 ) -> Result<Option<ServiceTier>, anyhow::Error> {
-    let tier = config::codex_service_tier();
-    match tier {
-        Some(ref val) => Ok(Some(normalize_service_tier(val)?)),
+    match override_tier {
+        Some(val) => Ok(Some(normalize_service_tier(val)?)),
         None => Ok(model_tier),
     }
 }
@@ -335,6 +357,14 @@ pub fn has_hosted_web_search(req: &MessagesRequest) -> bool {
 pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
+) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_with_overrides(req, opts, TranslationOverrides::configured())
+}
+
+pub fn translate_request_with_overrides(
+    req: &MessagesRequest,
+    opts: TranslateOptions,
+    overrides: TranslationOverrides,
 ) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let input = build_input(req);
@@ -425,7 +455,7 @@ pub fn translate_request(
         out.prompt_cache_key = Some(sid);
     }
 
-    let service_tier = resolve_service_tier(opts.service_tier)?;
+    let service_tier = resolve_service_tier(opts.service_tier, overrides.service_tier.as_deref())?;
     if let Some(ref tier) = service_tier {
         out.service_tier = Some(tier.clone());
     }
@@ -438,10 +468,10 @@ pub fn translate_request(
     } else {
         to_codex_effort(effort).or_else(|| (out.model == "gpt-5.6-luna").then_some(Effort::Medium))
     };
-    let resolved_effort = resolve_effort(codex_effort)?;
+    let resolved_effort = resolve_effort(codex_effort, overrides.effort.as_deref())?;
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if resolved_effort.is_some()
-            && reasoning_summary_requested(config::codex_reasoning_summary().as_deref())
+            && reasoning_summary_requested(overrides.reasoning_summary.as_deref())
         {
             Some("auto".to_string())
         } else {
@@ -1032,6 +1062,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // Translation tests exercise protocol semantics only. Runtime configuration
+    // is injected explicitly by the provider and covered by dedicated tests.
+    fn translate_request(
+        req: &MessagesRequest,
+        opts: TranslateOptions,
+    ) -> Result<ResponsesRequest, anyhow::Error> {
+        translate_request_with_overrides(req, opts, TranslationOverrides::default())
+    }
+
     fn opts() -> TranslateOptions {
         TranslateOptions {
             session_id: None,
@@ -1451,6 +1490,39 @@ mod tests {
     fn translate_effort_override_max_maps_to_max() {
         let effort = resolve_effort_override(Some(Effort::Low), Some("max")).unwrap();
         assert!(matches!(effort, Some(Effort::Max)));
+    }
+
+    #[test]
+    fn runtime_overrides_are_explicit_translation_inputs() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":"hello"}],
+            "output_config": {"effort": "low"}
+        }))
+        .unwrap();
+
+        let baseline = translate_request(&req, opts()).unwrap();
+        assert!(matches!(
+            baseline.reasoning.unwrap().effort,
+            Some(Effort::Low)
+        ));
+
+        let overridden = translate_request_with_overrides(
+            &req,
+            opts(),
+            TranslationOverrides {
+                service_tier: Some("priority".to_string()),
+                effort: Some("max".to_string()),
+                reasoning_summary: Some("off".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            overridden.reasoning.as_ref().and_then(|r| r.effort.clone()),
+            Some(Effort::Max)
+        ));
+        assert_eq!(overridden.reasoning.unwrap().summary, None);
+        assert_eq!(overridden.service_tier, Some(ServiceTier::Priority));
     }
 
     #[test]

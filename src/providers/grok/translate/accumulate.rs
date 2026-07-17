@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::reducer::{ReducerEvent, reduce_upstream_bytes};
+use super::reducer::{GrokUsage, ReducerEvent, parse_function_arguments, reduce_upstream_bytes};
 use crate::traffic::TrafficCapture;
 use serde_json::Value;
 
@@ -50,6 +50,7 @@ pub fn accumulate_response_with_traffic(
     let mut stop = "end_turn".to_string();
     let mut input = 0;
     let mut output = 0;
+    let mut reported_usage: Option<GrokUsage> = None;
     let mut web_search_requests = 0;
     let mut x_search_requests = 0;
     let reduced = match reduce_upstream_bytes(upstream) {
@@ -103,14 +104,14 @@ pub fn accumulate_response_with_traffic(
                     .and_then(|position| blocks.get_mut(*position))
                 {
                     let raw = block.get("_args").and_then(Value::as_str).unwrap_or("{}");
-                    match serde_json::from_str(raw) {
+                    match parse_function_arguments(raw) {
                         Ok(input) => block["input"] = input,
                         Err(error) => {
                             if let Some(capture) = capture.as_mut() {
                                 capture.malformed("reducer", "invalid_tool_arguments");
                             }
                             finish_capture(capture.take(), traffic, "error");
-                            return Err(error.into());
+                            return Err(error);
                         }
                     }
                     block.as_object_mut().unwrap().remove("_args");
@@ -146,6 +147,7 @@ pub fn accumulate_response_with_traffic(
                     }));
                 }
             }
+            ReducerEvent::Usage(usage) => reported_usage = Some(usage),
             ReducerEvent::Finish {
                 stop_reason,
                 input_tokens,
@@ -163,7 +165,33 @@ pub fn accumulate_response_with_traffic(
         }
     }
     let hosted_search_requests = web_search_requests + x_search_requests;
-    let response = serde_json::json!({"id":message_id,"type":"message","role":"assistant","model":model,"content":blocks,"stop_reason":stop,"stop_sequence":null,"usage":{"input_tokens":input,"output_tokens":output,"server_tool_use":{"web_search_requests":hosted_search_requests,"x_search_requests":x_search_requests}}});
+    let mapped_input = reported_usage
+        .as_ref()
+        .and_then(GrokUsage::mapped_input_tokens)
+        .unwrap_or(input);
+    let mapped_output = reported_usage
+        .as_ref()
+        .and_then(|usage| usage.output_tokens)
+        .unwrap_or(output);
+    let usage = serde_json::Map::from_iter([
+        ("input_tokens".into(), serde_json::json!(mapped_input)),
+        ("output_tokens".into(), serde_json::json!(mapped_output)),
+        ("cache_creation_input_tokens".into(), serde_json::json!(0)),
+        (
+            "cache_read_input_tokens".into(),
+            serde_json::json!(
+                reported_usage
+                    .as_ref()
+                    .and_then(GrokUsage::mapped_cache_read_input_tokens)
+                    .unwrap_or(0)
+            ),
+        ),
+        (
+            "server_tool_use".into(),
+            serde_json::json!({"web_search_requests":hosted_search_requests}),
+        ),
+    ]);
+    let response = serde_json::json!({"id":message_id,"type":"message","role":"assistant","model":model,"content":blocks,"stop_reason":stop,"stop_sequence":null,"usage":usage});
     if let Some(mut capture) = capture {
         capture.downstream_event("response", response.clone());
         finish_capture(Some(capture), traffic, "completed");
@@ -188,6 +216,25 @@ fn finish_capture(
 mod tests {
     use super::*;
 
+    fn streaming_final_usage(upstream: &[u8]) -> Value {
+        let bytes =
+            super::super::stream::translate_stream_bytes(upstream, "message", "grok-4.5").unwrap();
+        let mut decoder = super::super::stream::SseDecoder::default();
+        decoder
+            .push(&bytes)
+            .unwrap()
+            .into_iter()
+            .find_map(|event| {
+                let value: Value = serde_json::from_str(&event.data).ok()?;
+                if value.get("type").and_then(Value::as_str) == Some("message_delta") {
+                    value.get("usage").cloned()
+                } else {
+                    None
+                }
+            })
+            .expect("stream must contain final usage")
+    }
+
     #[test]
     fn accumulate_response_tracks_two_interleaved_tool_calls() {
         let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"first\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"second\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{\\\"value\\\":1}\"}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_2\",\"delta\":\"{\\\"value\\\":2}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
@@ -209,6 +256,60 @@ mod tests {
     }
 
     #[test]
+    fn accumulate_response_splits_cached_input_usage_like_streaming() {
+        let input = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":7}}}\n\n";
+        let response = accumulate_response(input, "message", "grok-4.5").unwrap();
+
+        assert_eq!(response["usage"]["input_tokens"], 9);
+        assert_eq!(response["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(response["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(response["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn streaming_and_non_streaming_emit_the_same_standard_usage_schema() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"xs_1\",\"delta\":\"{\\\"query\\\":\\\"rust\\\"}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":7}}}\n\n";
+        let non_streaming = accumulate_response(input, "message", "grok-4.5").unwrap();
+        let streaming = streaming_final_usage(input);
+        let expected = serde_json::json!({
+            "input_tokens":9,
+            "output_tokens":7,
+            "cache_creation_input_tokens":0,
+            "cache_read_input_tokens":3,
+            "server_tool_use":{"web_search_requests":1}
+        });
+
+        assert_eq!(non_streaming["usage"], expected);
+        assert_eq!(streaming, expected);
+        assert!(non_streaming["usage"].get("x_search_requests").is_none());
+        assert!(streaming.get("x_search_requests").is_none());
+    }
+
+    #[test]
+    fn missing_usage_is_zero_filled_consistently_downstream() {
+        let input = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let non_streaming = accumulate_response(input, "message", "grok-4.5").unwrap();
+        let streaming = streaming_final_usage(input);
+        let expected = serde_json::json!({
+            "input_tokens":0,
+            "output_tokens":0,
+            "cache_creation_input_tokens":0,
+            "cache_read_input_tokens":0,
+            "server_tool_use":{"web_search_requests":0}
+        });
+
+        assert_eq!(non_streaming["usage"], expected);
+        assert_eq!(streaming, expected);
+    }
+
+    #[test]
+    fn accumulate_response_rejects_non_object_tool_arguments() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.done\",\"call_id\":\"call_1\",\"arguments\":\"[]\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\n";
+
+        assert!(accumulate_response(input, "message", "grok-4.5").is_err());
+    }
+
+    #[test]
     fn accumulate_response_preserves_emoji_in_final_text() {
         let input = "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"draft 😊\"}\n\ndata: {\"type\":\"response.reasoning_text.done\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer 😊\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
         let response = accumulate_response(input.as_bytes(), "message", "grok-4.5").unwrap();
@@ -217,5 +318,35 @@ mod tests {
             response["content"],
             serde_json::json!([{"type":"text","text":"answer 😊"}])
         );
+    }
+
+    #[test]
+    fn terminal_tail_policy_matches_streaming_translation() {
+        let telemetry_tail = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\ndata: {\"type\":\"rate_limits.updated\",\"remaining\":42}\n\n";
+        let non_streaming = accumulate_response(telemetry_tail, "message", "grok-4.5").unwrap();
+        let streaming =
+            super::super::stream::translate_stream_bytes(telemetry_tail, "message", "grok-4.5")
+                .unwrap();
+        assert_eq!(non_streaming["content"][0]["text"], "answer");
+        assert_eq!(
+            String::from_utf8(streaming)
+                .unwrap()
+                .matches("answer")
+                .count(),
+            1
+        );
+
+        let semantic_tail = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"unsafe\"}\n\n";
+        let non_streaming_error =
+            accumulate_response(semantic_tail, "message", "grok-4.5").unwrap_err();
+        let streaming_error =
+            super::super::stream::translate_stream_bytes(semantic_tail, "message", "grok-4.5")
+                .unwrap_err();
+        for error in [non_streaming_error, streaming_error] {
+            assert!(
+                error.to_string().contains("event after terminal"),
+                "{error:#}"
+            );
+        }
     }
 }

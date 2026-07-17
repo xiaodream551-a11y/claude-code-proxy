@@ -167,12 +167,15 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         if require_https && issuer_url.scheme() != "https" {
             anyhow::bail!("Grok OAuth issuer must use HTTPS");
         }
-        let client = reqwest::Client::builder()
+        let mut client_builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .build()?;
+            .timeout(Duration::from_secs(20));
+        if crate::oauth_http::is_loopback_url(&issuer) {
+            client_builder = client_builder.no_proxy();
+        }
+        let client = client_builder.build()?;
         Ok(Self {
             store,
             client,

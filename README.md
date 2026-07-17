@@ -818,7 +818,7 @@ Windows, and at
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it                     |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
-| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket`                                       | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or request-local sticky HTTP fallback plus an origin-wide WebSocket breaker in `auto`                         |
+| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket` without a system proxy; otherwise `http` | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or proxy-aware WebSocket/HTTP selection plus an origin-wide breaker in `auto`                              |
 | `CCP_CODEX_TOTAL_TIMEOUT_MS`     | `codex.totalTimeoutMs`     | `540000`                                          | Total wall-clock budget across WebSocket retries, Auto HTTP fallback, and the remaining live stream; caps stragglers while remaining configurable                                   |
 | `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event before refreshing the WebSocket and retrying safely                                                                                |
 | `CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS` | `codex.websocketIdleTimeoutMs` | `300000` | Maximum gap between Codex response events; WebSocket control frames do not extend this business-event deadline                                                                    |
@@ -847,10 +847,14 @@ A malformed `config.json` is reported on stderr and ignored; defaults are used
 in its place. Invalid types for individual keys are warned and skipped without
 affecting other keys.
 
-Codex uses the WebSocket Responses transport by default. Set
-`CCP_CODEX_TRANSPORT=http` to use the older HTTP SSE transport for debugging or
-compatibility. `CCP_CODEX_TRANSPORT=auto` keeps live WebSocket streaming while
-the connection is healthy and immediately falls back to incremental HTTP when a
+Codex uses the WebSocket Responses transport by default when no system proxy
+intercepts its upstream URL. When an HTTP(S) environment or operating-system
+proxy is active, the implicit default and `CCP_CODEX_TRANSPORT=auto` select
+incremental HTTP SSE so Codex traffic follows that proxy instead of silently
+bypassing it. Explicit `CCP_CODEX_TRANSPORT=websocket` remains a strict direct
+connection because the WebSocket connector does not implement HTTP CONNECT.
+Without a system proxy, `auto` keeps live WebSocket streaming while the
+connection is healthy and immediately falls back to incremental HTTP when a
 retryable WebSocket transport failure occurs before Anthropic output begins.
 This covers handshake rejection, response-start or idle timeouts, failed
 heartbeat and pool probes, busy pooled connections, connection loss, and a

@@ -579,9 +579,24 @@ async fn dispatch_request(
     req: Request<Body>,
     count_tokens: bool,
 ) -> Response {
+    let req_id = Uuid::new_v4().to_string();
+    let mut response = dispatch_request_with_id(state, req, count_tokens, req_id.clone()).await;
+    if let Ok(value) = http::HeaderValue::from_str(&req_id) {
+        response
+            .headers_mut()
+            .insert(http::HeaderName::from_static("request-id"), value);
+    }
+    response
+}
+
+async fn dispatch_request_with_id(
+    state: Arc<AppState>,
+    req: Request<Body>,
+    count_tokens: bool,
+    req_id: String,
+) -> Response {
     let started_at = Instant::now();
     let log = create_logger("server");
-    let req_id = Uuid::new_v4().to_string();
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();

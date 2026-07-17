@@ -1,9 +1,11 @@
-use super::reducer::{Reducer, ReducerEvent};
+use std::collections::BTreeSet;
+
+use super::reducer::{GrokUsage, Reducer, ReducerEvent};
 use crate::anthropic::sse::{SseEvent, encode_sse_event};
 
 pub const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SseDecoder {
     frame: Vec<u8>,
     line_start: usize,
@@ -91,11 +93,14 @@ fn parse_frame(frame: &[u8]) -> anyhow::Result<Option<SseEvent>> {
     }))
 }
 
+#[derive(Clone)]
 pub struct StreamTranslator {
     message_id: String,
     model: String,
     started: bool,
     finished: bool,
+    open_content: BTreeSet<usize>,
+    usage: GrokUsage,
 }
 
 pub struct LiveStreamTranslator {
@@ -114,12 +119,22 @@ impl LiveStreamTranslator {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mut out = Vec::new();
-        for event in self.decoder.push(chunk)? {
-            let value = serde_json::from_str(&event.data)
-                .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))?;
-            out.extend(self.renderer.render(self.reducer.push(value)?)?);
-        }
+        let mut decoder = self.decoder.clone();
+        let values = decoder
+            .push(chunk)?
+            .into_iter()
+            .map(|event| {
+                serde_json::from_str(&event.data)
+                    .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))
+            })
+            .collect::<anyhow::Result<Vec<serde_json::Value>>>()?;
+        let mut reducer = self.reducer.clone();
+        let reduced = reducer.push_batch(values)?;
+        let mut renderer = self.renderer.clone();
+        let out = renderer.render(reduced)?;
+        self.decoder = decoder;
+        self.reducer = reducer;
+        self.renderer = renderer;
         Ok(out)
     }
 
@@ -139,6 +154,8 @@ impl StreamTranslator {
             model,
             started: false,
             finished: false,
+            open_content: BTreeSet::new(),
+            usage: GrokUsage::default(),
         }
     }
 
@@ -148,6 +165,10 @@ impl StreamTranslator {
         }
         let mut out = Vec::new();
         for event in events {
+            if let ReducerEvent::Usage(usage) = &event {
+                self.usage = usage.clone();
+                continue;
+            }
             if !self.started
                 && matches!(
                     event,
@@ -161,15 +182,47 @@ impl StreamTranslator {
                 emit(
                     &mut out,
                     "message_start",
-                    serde_json::json!({"type":"message_start","message":{"id":self.message_id,"type":"message","role":"assistant","model":self.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}),
+                    serde_json::json!({"type":"message_start","message":{"id":self.message_id,"type":"message","role":"assistant","model":self.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
                 );
+            }
+            match &event {
+                ReducerEvent::TextStart(index) | ReducerEvent::ToolStart(index, _, _) => {
+                    self.open_content.insert(*index);
+                }
+                ReducerEvent::TextStop(index) | ReducerEvent::ToolStop(index) => {
+                    self.open_content.remove(index);
+                }
+                ReducerEvent::Finish { .. } => self.close_open_content(&mut out),
+                _ => {}
             }
             if matches!(event, ReducerEvent::Finish { .. }) {
                 self.finished = true;
             }
-            render(&mut out, event);
+            render(&mut out, event, &self.usage);
         }
         Ok(out)
+    }
+
+    /// Finish an in-band failed stream without leaving a started Anthropic content block open.
+    pub fn render_error(&mut self, message: &str) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        self.close_open_content(&mut out);
+        out.extend(stream_error_with_message(message));
+        self.finished = true;
+        out
+    }
+
+    fn close_open_content(&mut self, out: &mut Vec<u8>) {
+        for index in std::mem::take(&mut self.open_content) {
+            emit(
+                out,
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop","index":index}),
+            );
+        }
     }
 }
 
@@ -181,12 +234,15 @@ pub fn translate_stream_bytes(
     let mut decoder = SseDecoder::default();
     let mut reducer = Reducer::default();
     let mut translator = StreamTranslator::new(message_id.into(), model.into());
-    let mut out = Vec::new();
-    for event in decoder.push(upstream)? {
-        let value = serde_json::from_str(&event.data)
-            .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))?;
-        out.extend(translator.render(reducer.push(value)?)?);
-    }
+    let values = decoder
+        .push(upstream)?
+        .into_iter()
+        .map(|event| {
+            serde_json::from_str(&event.data)
+                .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))
+        })
+        .collect::<anyhow::Result<Vec<serde_json::Value>>>()?;
+    let out = translator.render(reducer.push_batch(values)?)?;
     decoder.finish()?;
     if !reducer.finished() {
         anyhow::bail!("Grok stream ended without completion");
@@ -211,7 +267,7 @@ fn emit(out: &mut Vec<u8>, event: &str, data: serde_json::Value) {
     out.extend(encode_sse_event(Some(event), &data.to_string()));
 }
 
-fn render(out: &mut Vec<u8>, event: ReducerEvent) {
+fn render(out: &mut Vec<u8>, event: ReducerEvent, usage: &GrokUsage) {
     match event {
         // The Grok CLI endpoint exposes a plaintext reasoning summary. It is not a signed
         // Anthropic thinking block and often contains draft answers or model chatter. The Grok
@@ -291,18 +347,19 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent) {
                 serde_json::json!({"type":"content_block_delta","index":i,"delta":{"type":"citations_delta","citation":citation}}),
             );
         }
+        ReducerEvent::Terminal(_) | ReducerEvent::Usage(_) => {}
         ReducerEvent::Finish {
             stop_reason,
+            input_tokens,
             output_tokens,
             web_search_requests,
             x_search_requests,
-            ..
         } => {
             let hosted_search_requests = web_search_requests + x_search_requests;
             emit(
                 out,
                 "message_delta",
-                serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens,"server_tool_use":{"web_search_requests":hosted_search_requests,"x_search_requests":x_search_requests}}}),
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":anthropic_usage(usage, input_tokens, output_tokens, hosted_search_requests)}),
             );
             emit(
                 out,
@@ -311,6 +368,37 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent) {
             );
         }
     }
+}
+
+fn anthropic_usage(
+    usage: &GrokUsage,
+    fallback_input_tokens: u64,
+    fallback_output_tokens: u64,
+    hosted_search_requests: u64,
+) -> serde_json::Value {
+    let mapped_input = usage.mapped_input_tokens();
+    let mapped_cache_read = usage.mapped_cache_read_input_tokens();
+    let output = usage.output_tokens;
+    let value = serde_json::Map::from_iter([
+        (
+            "input_tokens".into(),
+            serde_json::json!(mapped_input.unwrap_or(fallback_input_tokens)),
+        ),
+        (
+            "output_tokens".into(),
+            serde_json::json!(output.unwrap_or(fallback_output_tokens)),
+        ),
+        ("cache_creation_input_tokens".into(), serde_json::json!(0)),
+        (
+            "cache_read_input_tokens".into(),
+            serde_json::json!(mapped_cache_read.unwrap_or(0)),
+        ),
+        (
+            "server_tool_use".into(),
+            serde_json::json!({"web_search_requests":hosted_search_requests}),
+        ),
+    ]);
+    serde_json::Value::Object(value)
 }
 
 #[cfg(test)]
@@ -385,7 +473,7 @@ mod tests {
         assert!(output.contains("x_search_tool_result"));
         assert!(output.contains("https://x.com/example/status/1"));
         assert!(output.contains("\"web_search_requests\":1"));
-        assert!(output.contains("\"x_search_requests\":1"));
+        assert!(!output.contains("x_search_requests"));
         assert!(!output.contains("\"name\":\"Bash\""));
     }
 
@@ -431,5 +519,113 @@ mod tests {
             let output = String::from_utf8(output).unwrap();
             assert_eq!(output.matches("answer 😊").count(), 1, "split={split}");
         }
+    }
+
+    #[test]
+    fn completed_with_trailing_rate_limit_telemetry_succeeds_in_both_stream_paths() {
+        let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\ndata: {\"type\":\"rate_limits.updated\",\"remaining\":42}\n\n";
+
+        let buffered =
+            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
+        let mut live = LiveStreamTranslator::new("msg_1".into(), "grok-4.5".into());
+        let live_output = String::from_utf8(live.push(input).unwrap()).unwrap();
+        live.finish().unwrap();
+
+        for output in [buffered, live_output] {
+            assert_eq!(output.matches("answer").count(), 1, "{output}");
+            assert_eq!(output.matches("event: message_stop").count(), 1, "{output}");
+            assert!(!output.contains("rate_limits.updated"), "{output}");
+        }
+    }
+
+    #[test]
+    fn terminal_with_trailing_text_fails_and_rolls_back_live_same_chunk() {
+        let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"STAGED_ONLY\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"UNSAFE_TAIL\"}\n\n";
+
+        let buffered_error = translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap_err();
+        assert!(
+            buffered_error.to_string().contains("event after terminal"),
+            "{buffered_error:#}"
+        );
+
+        let mut live = LiveStreamTranslator::new("msg_1".into(), "grok-4.5".into());
+        let live_error = live.push(input).unwrap_err();
+        assert!(
+            live_error.to_string().contains("event after terminal"),
+            "{live_error:#}"
+        );
+        assert!(!live.reducer.finished());
+        assert!(!live.renderer.started);
+        assert!(!live.renderer.finished);
+    }
+
+    #[test]
+    fn incomplete_stream_closes_content_and_forwards_detailed_usage() {
+        let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":7,\"output_tokens_details\":{\"reasoning_tokens\":5},\"total_tokens\":19}}}\n\n";
+        let output =
+            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
+
+        let stop = output.find("event: content_block_stop").unwrap();
+        let finish = output.find("event: message_delta").unwrap();
+        assert!(stop < finish, "{output}");
+        assert!(
+            output.contains("\"stop_reason\":\"max_tokens\""),
+            "{output}"
+        );
+        assert!(output.contains("\"input_tokens\":9"), "{output}");
+        assert!(
+            output.contains("\"cache_creation_input_tokens\":0"),
+            "{output}"
+        );
+        assert!(output.contains("\"cache_read_input_tokens\":3"), "{output}");
+        assert!(output.contains("\"output_tokens\":7"), "{output}");
+        assert!(!output.contains("reasoning_tokens"), "{output}");
+        assert!(!output.contains("total_tokens"), "{output}");
+    }
+
+    #[test]
+    fn missing_usage_uses_only_protocol_placeholders_downstream() {
+        let input = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let output =
+            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
+
+        assert!(!output.contains("ccproxy_usage"), "{output}");
+        assert!(!output.contains("reasoning_tokens"), "{output}");
+        assert!(!output.contains("total_tokens"), "{output}");
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            assert_eq!(
+                output.matches(&format!("\"{field}\":")).count(),
+                2,
+                "field={field}, output={output}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_band_error_closes_every_open_content_block_first() {
+        let mut translator = StreamTranslator::new("msg_1".into(), "grok-4.5".into());
+        let mut output = translator
+            .render(vec![
+                ReducerEvent::TextStart(0),
+                ReducerEvent::TextDelta(0, "partial".into()),
+                ReducerEvent::ToolStart(1, "call_1".into(), "Read".into()),
+            ])
+            .unwrap();
+        output.extend(translator.render_error("Grok stream is invalid"));
+        let output = String::from_utf8(output).unwrap();
+
+        assert_eq!(
+            output.matches("event: content_block_stop").count(),
+            2,
+            "{output}"
+        );
+        let last_stop = output.rfind("event: content_block_stop").unwrap();
+        let error = output.find("event: error").unwrap();
+        assert!(last_stop < error, "{output}");
     }
 }

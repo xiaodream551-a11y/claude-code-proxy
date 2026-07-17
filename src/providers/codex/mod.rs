@@ -41,7 +41,8 @@ use self::translate::model_allowlist::{
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
-    ServiceTier, TranslateOptions, has_hosted_web_search, translate_request,
+    ServiceTier, TranslateOptions, TranslationOverrides, has_hosted_web_search,
+    translate_request_with_overrides,
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
@@ -53,6 +54,10 @@ const MAX_DOWNSTREAM_QUEUE_BYTES: usize = 2 * 1024 * 1024;
 const DOWNSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const DOWNSTREAM_PING: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+
+fn translation_overrides() -> TranslationOverrides {
+    TranslationOverrides::configured()
+}
 #[cfg(test)]
 pub(super) static CODEX_STATE_TEST_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
     once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
@@ -126,7 +131,7 @@ impl Provider for CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let translated = match translate_request(
+        let translated = match translate_request_with_overrides(
             &body,
             TranslateOptions {
                 session_id: ctx.session_id.clone(),
@@ -134,6 +139,7 @@ impl Provider for CodexProvider {
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
+            translation_overrides(),
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -239,7 +245,7 @@ impl Provider for CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let translated = match translate_request(
+        let translated = match translate_request_with_overrides(
             &body,
             TranslateOptions {
                 session_id: None,
@@ -247,6 +253,7 @@ impl Provider for CodexProvider {
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
+            translation_overrides(),
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -1553,7 +1560,7 @@ mod tests {
             "stream": true
         }))
         .unwrap();
-        translate_request(
+        translate_request_with_overrides(
             &body,
             TranslateOptions {
                 session_id: None,
@@ -1561,6 +1568,7 @@ mod tests {
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: true,
             },
+            TranslationOverrides::default(),
         )
         .unwrap()
     }

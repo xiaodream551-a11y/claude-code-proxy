@@ -6,6 +6,18 @@ use serde::de::DeserializeOwned;
 pub(crate) const MAX_OAUTH_JSON_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_OAUTH_ERROR_BYTES: usize = 64 * 1024;
 
+pub(crate) fn is_loopback_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
 fn reject_oversized_content_length(
     content_length: Option<u64>,
     limit: usize,
@@ -154,11 +166,21 @@ mod tests {
     }
 
     #[test]
+    fn loopback_url_detection_covers_localhost_and_ip_literals() {
+        assert!(is_loopback_url("http://localhost:18765/v1"));
+        assert!(is_loopback_url("http://127.0.0.1:18765/v1"));
+        assert!(is_loopback_url("http://[::1]:18765/v1"));
+        assert!(!is_loopback_url("https://api.openai.com/v1"));
+        assert!(!is_loopback_url("not a URL"));
+    }
+
+    #[test]
     fn blocking_reader_rejects_chunked_body_past_limit() {
         let url = spawn_chunked_response(vec![vec![b'a'; 32], vec![b'b'; 33]]);
         let response = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .no_proxy()
             .build()
             .unwrap()
             .get(url)
@@ -174,6 +196,7 @@ mod tests {
         let response = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .no_proxy()
             .build()
             .unwrap()
             .get(url)
@@ -191,6 +214,7 @@ mod tests {
         let response = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .no_proxy()
             .build()
             .unwrap()
             .get(url)
@@ -206,6 +230,7 @@ mod tests {
         let response = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .no_proxy()
             .build()
             .unwrap()
             .get(url)

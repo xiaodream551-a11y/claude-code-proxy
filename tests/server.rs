@@ -194,6 +194,12 @@ async fn invalid_json_request_is_json_error() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let request_id = response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("messages responses should expose their proxy request id");
+    uuid::Uuid::parse_str(request_id).expect("request-id should be a UUID");
     let value: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .ok()

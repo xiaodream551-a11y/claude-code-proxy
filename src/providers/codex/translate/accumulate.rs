@@ -316,6 +316,55 @@ mod tests {
     }
 
     #[test]
+    fn accumulate_completed_response_ignores_trailing_rate_limit_telemetry() {
+        let upstream = format!(
+            "{}{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                json!({
+                    "output_index":0,"delta":"completed answer"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,"item":{"type":"message"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}
+                })
+            ),
+            sse_event(
+                "codex.rate_limits",
+                json!({
+                    "rate_limits":{
+                        "limit_reached":true,
+                        "primary":{"reset_after_seconds":60}
+                    }
+                })
+            ),
+        );
+
+        let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.6-sol")
+            .expect("terminal response must remain successful after quota telemetry");
+
+        assert_eq!(response["content"][0]["text"], "completed answer");
+        assert_eq!(response["stop_reason"], "end_turn");
+        assert_eq!(response["usage"]["input_tokens"], 5);
+        assert_eq!(response["usage"]["output_tokens"], 2);
+    }
+
+    #[test]
     fn accumulate_tool_use_response() {
         let upstream = format!(
             "{}{}{}{}",

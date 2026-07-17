@@ -35,7 +35,7 @@ use self::translate::{
     accumulate::accumulate_response_with_traffic,
     model_allowlist::{assert_allowed_model, resolve_model_request},
     request::{GrokReasoning, GrokResponsesRequest, translate_request},
-    stream::{SseDecoder, StreamTranslator, stream_error, stream_error_with_message, stream_ping},
+    stream::{SseDecoder, StreamTranslator, stream_ping},
 };
 
 const GROK_DOWNSTREAM_CHANNEL_CAPACITY: usize = 3;
@@ -114,6 +114,7 @@ impl Provider for GrokProvider {
                 effort: effort.into(),
             });
         }
+        let estimated_input_tokens = count_tokens::count_tokens(&translated);
         crate::logging::create_logger("grok").info(
             "request_configuration",
             Some(serde_json::Map::from_iter([
@@ -129,6 +130,10 @@ impl Provider for GrokProvider {
                     ),
                 ),
                 ("transport".into(), serde_json::json!("http")),
+                (
+                    "estimatedInputTokens".into(),
+                    serde_json::json!(estimated_input_tokens),
+                ),
             ])),
         );
         if let Some(monitor) = &ctx.monitor {
@@ -273,11 +278,18 @@ async fn read_non_streaming_body(
                         state.transient_failures(),
                         error.retry_after.as_deref(),
                     );
-                    if delay.exceeds_budget {
-                        state.mark_terminal();
-                        return Err(error.into_terminal("retry delay exceeds budget"));
-                    }
                     state.note_transient_failure();
+                    let terminal_reason = if delay.exceeds_budget {
+                        Some("retry delay exceeds budget")
+                    } else if !deadline.permits_wait_ms(delay.wait_ms) {
+                        Some("retry delay exceeds remaining request deadline")
+                    } else {
+                        None
+                    };
+                    if let Some(terminal_reason) = terminal_reason {
+                        state.mark_terminal();
+                        return Err(error.into_terminal(terminal_reason));
+                    }
                     delay
                 };
                 client::run_before_deadline(
@@ -355,6 +367,9 @@ where
         .checked_add(heartbeat_interval)
         .unwrap_or_else(|| deadline.at())
         .min(deadline.at());
+    let estimated_input_tokens = reconnect
+        .as_ref()
+        .map(|reconnect| count_tokens::count_tokens(reconnect.request.as_ref()));
     let state = GrokStreamState {
         upstream: Box::pin(upstream),
         decoder: SseDecoder::default(),
@@ -366,6 +381,10 @@ where
         error_sent: false,
         downstream_emitted: false,
         attempt_bytes: 0,
+        usage: None,
+        terminal_status: None,
+        upstream_incomplete_reason: None,
+        estimated_input_tokens,
         monitor,
         req_id,
         bytes: 0,
@@ -459,6 +478,14 @@ async fn run_grok_stream_producer(mut state: GrokStreamState, tx: mpsc::Sender<G
         let Some(bytes) = output else {
             return;
         };
+        // `next_output` can itself observe the absolute deadline and render the
+        // terminal error. Sending that through the ordinary deadline-gated path
+        // would immediately time out a second time and replace it with an empty
+        // idempotent render. The reserved slot exists specifically for this case.
+        if state.error_sent {
+            send_reserved_grok_terminal(&mut terminal_permit, bytes);
+            return;
+        }
         match send_grok_chunk(&tx, &budget, bytes, state.deadline.at()).await {
             GrokChunkSendOutcome::Sent => {}
             GrokChunkSendOutcome::Closed => return,
@@ -511,6 +538,10 @@ struct GrokStreamState {
     error_sent: bool,
     downstream_emitted: bool,
     attempt_bytes: u64,
+    usage: Option<translate::reducer::GrokUsage>,
+    terminal_status: Option<translate::reducer::GrokTerminal>,
+    upstream_incomplete_reason: Option<String>,
+    estimated_input_tokens: Option<u64>,
     monitor: Option<MonitorHandle>,
     req_id: String,
     bytes: u64,
@@ -609,8 +640,7 @@ impl GrokStreamState {
                 Ok(events) => events,
                 Err(_) => return Some(self.fail_at("decoder", "malformed_sse")),
             };
-            let mut out = Vec::new();
-            let mut semantic_output = false;
+            let mut values = Vec::with_capacity(events.len());
             for event in events {
                 let value: serde_json::Value = match serde_json::from_str(&event.data) {
                     Ok(value) => value,
@@ -624,37 +654,63 @@ impl GrokStreamState {
                 if let Some(capture) = self.stream_capture.as_mut() {
                     capture.upstream_event(event.event.as_deref(), &value);
                 }
-                let reduced = match self.reducer.push(value) {
-                    Ok(events) => events,
-                    Err(_) => return Some(self.fail_at("reducer", "invalid_event")),
-                };
-                let usage = reduced.iter().find_map(|event| match event {
-                    translate::reducer::ReducerEvent::Finish {
-                        input_tokens,
-                        output_tokens,
-                        ..
-                    } => Some((*input_tokens, *output_tokens)),
-                    _ => None,
-                });
-                semantic_output |= reduced.iter().any(|event| event.is_semantic());
-                match self.translator.render(reduced) {
-                    Ok(bytes) => out.extend(bytes),
-                    Err(_) => return Some(self.fail_at("render", "invalid_event")),
+                values.push(value);
+            }
+
+            // Validate and render the entire decoded chunk transactionally. In particular, a
+            // terminal followed by text/tool/unknown data in the same chunk must not leak the
+            // staged completion (or any earlier staged delta) before the protocol error.
+            let mut reducer = self.reducer.clone();
+            let reduced = match reducer.push_batch(values) {
+                Ok(events) => events,
+                Err(_) => return Some(self.fail_at("reducer", "invalid_event")),
+            };
+            let usage = reduced.iter().find_map(|event| match event {
+                translate::reducer::ReducerEvent::Usage(usage) => Some(usage.clone()),
+                _ => None,
+            });
+            let terminal_status = reduced.iter().find_map(|event| match event {
+                translate::reducer::ReducerEvent::Terminal(status) => Some(*status),
+                _ => None,
+            });
+            let stop_reason = reduced.iter().find_map(|event| match event {
+                translate::reducer::ReducerEvent::Finish { stop_reason, .. } => {
+                    Some(stop_reason.clone())
                 }
-                if let Some((input_tokens, output_tokens)) = usage
-                    && let Some(monitor) = self.monitor.as_ref()
-                {
-                    monitor.usage_updated(&self.req_id, Some(input_tokens), Some(output_tokens));
+                _ => None,
+            });
+            let semantic_output = reduced.iter().any(|event| event.is_semantic());
+            let mut translator = self.translator.clone();
+            let out = match translator.render(reduced) {
+                Ok(bytes) => bytes,
+                Err(_) => return Some(self.fail_at("render", "invalid_event")),
+            };
+            let finished = reducer.finished();
+            let upstream_incomplete_reason = reducer.incomplete_reason().map(str::to_owned);
+            self.reducer = reducer;
+            self.translator = translator;
+            if let Some(usage) = usage {
+                if let Some(monitor) = self.monitor.as_ref() {
+                    monitor.usage_updated(&self.req_id, usage.input_tokens, usage.output_tokens);
                 }
-                if self.reducer.finished() {
-                    self.terminal = true;
-                    if semantic_output {
-                        self.downstream_emitted = true;
-                    }
-                    self.capture_downstream(&out);
-                    self.finish_capture(true);
-                    return if out.is_empty() { None } else { Some(out) };
+                self.usage = Some(usage);
+            }
+            if let Some(status) = terminal_status {
+                self.terminal_status = Some(status);
+                self.upstream_incomplete_reason = upstream_incomplete_reason;
+            }
+            if finished {
+                self.terminal = true;
+                if semantic_output {
+                    self.downstream_emitted = true;
                 }
+                let outcome = terminal_status
+                    .map(translate::reducer::GrokTerminal::outcome)
+                    .unwrap_or("completed");
+                self.log_stream_terminal(outcome, stop_reason.as_deref(), None, None);
+                self.capture_downstream(&out);
+                self.finish_capture(true);
+                return if out.is_empty() { None } else { Some(out) };
             }
             if !out.is_empty() {
                 if semantic_output {
@@ -722,11 +778,18 @@ impl GrokStreamState {
                 }
                 let delay =
                     compute_backoff_delay(state.transient_failures(), error.retry_after.as_deref());
-                if delay.exceeds_budget {
-                    state.mark_terminal();
-                    return Err(error.into_terminal("retry delay exceeds budget"));
-                }
                 state.note_transient_failure();
+                let terminal_reason = if delay.exceeds_budget {
+                    Some("retry delay exceeds budget")
+                } else if !deadline.permits_wait_ms(delay.wait_ms) {
+                    Some("retry delay exceeds remaining request deadline")
+                } else {
+                    None
+                };
+                if let Some(terminal_reason) = terminal_reason {
+                    state.mark_terminal();
+                    return Err(error.into_terminal(terminal_reason));
+                }
                 if let Some(traffic) = traffic.as_ref() {
                     traffic.write_json(
                         "024-upstream-stream-rebuild",
@@ -808,6 +871,9 @@ impl GrokStreamState {
         self.reducer = translate::reducer::Reducer::default();
         self.translator = StreamTranslator::new(self.message_id.clone(), self.model.clone());
         self.attempt_bytes = 0;
+        self.usage = None;
+        self.terminal_status = None;
+        self.upstream_incomplete_reason = None;
         self.error_sent = false;
         self.terminal = false;
     }
@@ -822,22 +888,20 @@ impl GrokStreamState {
 
     fn fail(&mut self, stage: &str, kind: &str, error: Option<&GrokError>) -> Vec<u8> {
         self.error_sent = true;
+        if self.usage.is_none() {
+            self.usage = self.reducer.usage().cloned();
+        }
         let stream_message = match error {
             Some(error) if error.origin == client::GrokErrorOrigin::Deadline => {
                 error.message.as_str()
             }
             _ => "Grok stream is invalid",
         };
+        let bytes = self.translator.render_error(stream_message);
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
-            capture.downstream_event(
-                "error",
-                serde_json::json!({
-                    "type":"error",
-                    "error":{"type":"api_error","message":stream_message}
-                }),
-            );
         }
+        self.capture_downstream(&bytes);
         if let Some(traffic) = self.traffic.as_ref() {
             let mut fields = serde_json::Map::from_iter([
                 ("stage".into(), serde_json::json!(stage)),
@@ -848,6 +912,7 @@ impl GrokStreamState {
                     "downstream_emitted".into(),
                     serde_json::json!(self.downstream_emitted),
                 ),
+                ("usage".into(), self.usage_observability()),
             ]);
             if let Some(error) = error {
                 fields.insert("status".into(), serde_json::json!(error.status.as_u16()));
@@ -863,32 +928,9 @@ impl GrokStreamState {
             }
             traffic.write_json("060-grok-stream-error", &serde_json::Value::Object(fields));
         }
-        if let Some(error) = error {
-            crate::logging::create_logger("grok").info(
-                "stream_error",
-                Some(serde_json::Map::from_iter([
-                    ("stage".into(), serde_json::json!(stage)),
-                    ("kind".into(), serde_json::json!(kind)),
-                    ("status".into(), serde_json::json!(error.status.as_u16())),
-                    (
-                        "origin".into(),
-                        serde_json::json!(client::origin_name(error.origin)),
-                    ),
-                    (
-                        "errorStage".into(),
-                        serde_json::json!(client::stage_name(error.stage)),
-                    ),
-                    ("message".into(), serde_json::json!(error.message)),
-                    ("reqId".into(), serde_json::json!(self.req_id)),
-                ])),
-            );
-        }
+        self.log_stream_terminal("failed", None, Some((stage, kind)), error);
         self.finish_capture(false);
-        if stream_message == "Grok stream is invalid" {
-            stream_error()
-        } else {
-            stream_error_with_message(stream_message)
-        }
+        bytes
     }
 
     fn capture_downstream(&mut self, bytes: &[u8]) {
@@ -914,10 +956,96 @@ impl GrokStreamState {
                     "kind": if completed { "stream_completion" } else { "stream_error" },
                     "bytes": self.bytes,
                     "chunks": self.chunks,
+                    "terminalOutcome":self.terminal_status.map(translate::reducer::GrokTerminal::outcome),
+                    "incompleteReason":self.terminal_status.and_then(translate::reducer::GrokTerminal::incomplete_reason),
+                    "upstreamIncompleteReason":self.upstream_incomplete_reason,
+                    "usage": self.usage_observability(),
                 }),
             );
         }
     }
+
+    fn log_stream_terminal(
+        &self,
+        outcome: &str,
+        stop_reason: Option<&str>,
+        failure: Option<(&str, &str)>,
+        error: Option<&GrokError>,
+    ) {
+        let mut fields = serde_json::Map::from_iter([
+            ("reqId".into(), serde_json::json!(self.req_id)),
+            ("model".into(), serde_json::json!(self.model)),
+            ("outcome".into(), serde_json::json!(outcome)),
+            ("stopReason".into(), serde_json::json!(stop_reason)),
+            ("bytes".into(), serde_json::json!(self.bytes)),
+            ("chunks".into(), serde_json::json!(self.chunks)),
+            (
+                "downstreamEmitted".into(),
+                serde_json::json!(self.downstream_emitted),
+            ),
+            ("usage".into(), self.usage_observability()),
+            (
+                "incompleteReason".into(),
+                serde_json::json!(
+                    self.terminal_status
+                        .and_then(translate::reducer::GrokTerminal::incomplete_reason)
+                ),
+            ),
+            (
+                "upstreamIncompleteReason".into(),
+                serde_json::json!(self.upstream_incomplete_reason),
+            ),
+        ]);
+        if let Some((stage, kind)) = failure {
+            fields.insert("stage".into(), serde_json::json!(stage));
+            fields.insert("kind".into(), serde_json::json!(kind));
+        }
+        if let Some(error) = error {
+            fields.insert("status".into(), serde_json::json!(error.status.as_u16()));
+            fields.insert(
+                "origin".into(),
+                serde_json::json!(client::origin_name(error.origin)),
+            );
+            fields.insert(
+                "errorStage".into(),
+                serde_json::json!(client::stage_name(error.stage)),
+            );
+        }
+        crate::logging::create_logger("grok").info("stream_terminal", Some(fields));
+    }
+
+    fn usage_observability(&self) -> serde_json::Value {
+        grok_usage_observability(self.usage.as_ref(), self.estimated_input_tokens)
+    }
+}
+
+fn grok_usage_observability(
+    usage: Option<&translate::reducer::GrokUsage>,
+    estimated_input_tokens: Option<u64>,
+) -> serde_json::Value {
+    let Some(usage) = usage else {
+        return serde_json::json!({
+            "state":"unavailable",
+            "inputTokens":null,
+            "outputTokens":null,
+            "cacheReadInputTokens":null,
+            "reasoningTokens":null,
+            "upstreamTotalTokens":null,
+            "estimatedInputTokens":estimated_input_tokens
+        });
+    };
+    serde_json::json!({
+        "state":usage.availability_state(),
+        "inputTokens":usage.input_tokens,
+        "mappedInputTokens":usage.mapped_input_tokens(),
+        "outputTokens":usage.output_tokens,
+        "cacheReadInputTokens":usage.mapped_cache_read_input_tokens(),
+        "cacheBreakdownInconsistent":usage.cache_breakdown_is_inconsistent(),
+        "cacheCreationInputTokensState":"unavailable",
+        "reasoningTokens":usage.reasoning_tokens,
+        "upstreamTotalTokens":usage.total_tokens,
+        "estimatedInputTokens":estimated_input_tokens
+    })
 }
 
 fn cumulative_stream_size_exceeded(current: u64, next: usize) -> bool {
@@ -987,32 +1115,29 @@ fn write_error(traffic: Option<&crate::traffic::TrafficCapture>, stage: &str, ki
 }
 
 fn map_error(error: client::GrokError) -> Response {
-    match error.status {
-        StatusCode::UNAUTHORIZED => json_error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            error.message,
-        ),
-        StatusCode::TOO_MANY_REQUESTS => {
-            let response = json_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                error.message,
-            );
-            if let Some(retry_after) = error.retry_after {
-                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
-            } else {
-                response
-            }
+    let status = error.status;
+    let mapped_status = if status.is_client_error() || status.is_server_error() {
+        status
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    let kind = match status {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::BAD_REQUEST | StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY => {
+            "invalid_request_error"
         }
-        StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN => {
-            json_error(error.status, "permission_error", error.message)
-        }
-        StatusCode::INTERNAL_SERVER_ERROR
-        | StatusCode::BAD_GATEWAY
-        | StatusCode::SERVICE_UNAVAILABLE
-        | StatusCode::GATEWAY_TIMEOUT => json_error(error.status, "api_error", error.message),
-        _ => json_error(StatusCode::BAD_GATEWAY, "api_error", error.message),
+        status if status.as_u16() == 529 => "overloaded_error",
+        status if status.is_client_error() => "invalid_request_error",
+        _ => "api_error",
+    };
+    let response = json_error(mapped_status, kind, error.message);
+    if let Some(retry_after) = error.retry_after {
+        ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+    } else {
+        response
     }
 }
 
@@ -1355,10 +1480,26 @@ mod tests {
             .expect("stream must remain open")
             .unwrap();
         assert!(String::from_utf8_lossy(first.data_ref().unwrap()).contains("event: ping"));
-        tokio::time::timeout(Duration::from_millis(200), request_seen_rx)
-            .await
-            .expect("the stalled rebuild request must start")
-            .expect("the rebuild server must observe the request");
+        let mut request_seen_rx = request_seen_rx;
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                tokio::select! {
+                    seen = &mut request_seen_rx => {
+                        seen.expect("the rebuild server must observe the request");
+                        break;
+                    }
+                    frame = body.frame() => {
+                        let frame = frame
+                            .expect("stream must remain open while rebuilding")
+                            .expect("rebuild heartbeat must be valid");
+                        assert!(String::from_utf8_lossy(frame.data_ref().unwrap())
+                            .contains("event: ping"));
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the stalled rebuild request must start while heartbeats are consumed");
         let second = tokio::time::timeout(Duration::from_millis(200), body.frame())
             .await
             .expect("rebuild wait must emit another ping")
@@ -1378,6 +1519,7 @@ mod tests {
             input: vec![],
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             store: false,
             stream: true,
             max_output_tokens: None,
@@ -1498,6 +1640,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn map_error_preserves_safe_upstream_client_failures() {
+        for (status, expected_kind) in [
+            (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            (StatusCode::NOT_FOUND, "not_found_error"),
+            (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request_error"),
+        ] {
+            let response = map_error(client::GrokError::http(
+                status,
+                None,
+                "tool schema is invalid",
+            ));
+            assert_eq!(response.status(), status);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], expected_kind);
+            assert_eq!(body["error"]["message"], "tool schema is invalid");
+        }
+    }
+
+    #[tokio::test]
     async fn streaming_usage_updates_completed_monitor_request() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started(
@@ -1540,6 +1702,84 @@ mod tests {
             .unwrap();
         assert_eq!(session.input_tokens, 12);
         assert_eq!(session.output_tokens, 3);
+    }
+
+    #[test]
+    fn usage_observability_distinguishes_missing_partial_and_reported_zero() {
+        let missing = grok_usage_observability(None, Some(11));
+        let partial_usage = translate::reducer::GrokUsage {
+            output_tokens: Some(7),
+            ..Default::default()
+        };
+        let partial = grok_usage_observability(Some(&partial_usage), Some(11));
+        let zero_usage = translate::reducer::GrokUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            ..Default::default()
+        };
+        let zero = grok_usage_observability(Some(&zero_usage), Some(11));
+
+        assert_eq!(missing["state"], "unavailable");
+        assert!(missing["inputTokens"].is_null());
+        assert_eq!(missing["estimatedInputTokens"], 11);
+        assert_eq!(partial["state"], "partial");
+        assert!(partial["inputTokens"].is_null());
+        assert_eq!(partial["outputTokens"], 7);
+        assert_eq!(zero["state"], "reported");
+        assert_eq!(zero["inputTokens"], 0);
+        assert_eq!(zero["outputTokens"], 0);
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_after_visible_text_closes_content_before_error() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.failed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n",
+            )),
+        ]);
+        let response = stream_body(
+            upstream,
+            "msg_failed".into(),
+            "grok-4.5".into(),
+            None,
+            "req_failed".into(),
+            None,
+            None,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(body.matches("partial").count(), 1, "{body}");
+        let stop = body.rfind("event: content_block_stop").unwrap();
+        let error = body.find("event: error").unwrap();
+        assert!(stop < error, "{body}");
+        assert!(!body.contains("event: message_stop"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn invalid_semantic_tail_rolls_back_every_event_from_the_same_chunk() {
+        let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"STAGED_ONLY\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"UNSAFE_TAIL\"}\n\n",
+        ))]);
+        let response = stream_body(
+            upstream,
+            "msg_invalid_tail".into(),
+            "grok-4.5".into(),
+            None,
+            "req_invalid_tail".into(),
+            None,
+            None,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("STAGED_ONLY"), "{body}");
+        assert!(!body.contains("UNSAFE_TAIL"), "{body}");
+        assert!(!body.contains("event: message_stop"), "{body}");
     }
 
     #[tokio::test]

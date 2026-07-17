@@ -107,17 +107,21 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         store: CodexTokenStore<S>,
         token_endpoint: String,
     ) -> Self {
+        let mut client_builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(30));
+        if crate::oauth_http::is_loopback_url(&token_endpoint) {
+            client_builder = client_builder.no_proxy();
+        }
         Self {
             store,
             #[cfg(test)]
             test_auth: Arc::new(Mutex::new(None)),
             refresh_lock: Arc::new(AsyncMutex::new(())),
             refresh_safety: Arc::new(AsyncMutex::new(RefreshSafetyState::default())),
-            refresh_client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-                .connect_timeout(Duration::from_secs(15))
-                .timeout(Duration::from_secs(30))
+            refresh_client: client_builder
                 .build()
                 .expect("failed to create Codex OAuth refresh client"),
             token_endpoint,

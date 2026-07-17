@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
+use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
 
@@ -16,6 +17,8 @@ use crate::traffic::TrafficCapture;
 
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REJECTED_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_REJECTED_DETAIL_BYTES: usize = 1_024;
 const MAX_WIRE_ATTEMPTS: u32 = MAX_RATE_LIMIT_RETRIES + 1;
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_HEADER_TIMEOUT_MS: u64 = 60_000;
@@ -199,6 +202,10 @@ impl GrokRequestDeadline {
     pub fn is_expired(self) -> bool {
         TokioInstant::now() >= self.at
     }
+
+    pub fn permits_wait_ms(self, wait_ms: u64) -> bool {
+        Duration::from_millis(wait_ms) < self.at.saturating_duration_since(TokioInstant::now())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -349,13 +356,14 @@ impl GrokResponse {
 impl GrokClient {
     pub fn new(base_url: String, client_version: String) -> anyhow::Result<Self> {
         let timeouts = GrokTimeouts::configured();
-        let client = Arc::new(
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-                .connect_timeout(Duration::from_millis(timeouts.connect_ms))
-                .build()?,
-        );
+        let mut client_builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .connect_timeout(Duration::from_millis(timeouts.connect_ms));
+        if crate::oauth_http::is_loopback_url(&base_url) {
+            client_builder = client_builder.no_proxy();
+        }
+        let client = Arc::new(client_builder.build()?);
         let auth = Arc::new(GrokAuthManager::new(file_store())?);
         Ok(Self::with_shared(
             url_for(base_url)?,
@@ -377,6 +385,9 @@ impl GrokClient {
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
+                // Unit tests use loopback fault servers and must not inherit the
+                // host's macOS/system proxy configuration.
+                .no_proxy()
                 .connect_timeout(Duration::from_millis(timeouts.connect_ms))
                 .build()?,
         );
@@ -486,21 +497,31 @@ impl GrokClient {
             }
             let delay =
                 compute_backoff_delay(state.transient_failures, error.retry_after.as_deref());
-            if delay.exceeds_budget {
+            state.note_transient_failure();
+            let terminal_reason = if delay.exceeds_budget {
+                Some(("retry_after_exceeds_budget", "retry delay exceeds budget"))
+            } else if !deadline.permits_wait_ms(delay.wait_ms) {
+                Some((
+                    "retry_delay_exceeds_deadline",
+                    "retry delay exceeds remaining request deadline",
+                ))
+            } else {
+                None
+            };
+            if let Some((failure_kind, terminal_reason)) = terminal_reason {
                 state.mark_terminal();
                 drop(state);
-                let error = error.into_terminal("retry delay exceeds budget");
+                let error = error.into_terminal(terminal_reason);
                 capture_terminal_failure(
                     traffic,
                     "auth",
-                    "retry_after_exceeds_budget",
+                    failure_kind,
                     auth_attempt,
                     Some(error.status.as_u16()),
                     Some(&error.message),
                 );
                 return Err(error);
             }
-            state.note_transient_failure();
             let transient = state.transient_failures;
             drop(state);
 
@@ -689,20 +710,30 @@ impl GrokClient {
                         state.transient_failures,
                         error.retry_after.as_deref(),
                     );
-                    if delay.exceeds_budget {
+                    state.note_transient_failure();
+                    let terminal_reason = if delay.exceeds_budget {
+                        Some(("retry_after_exceeds_budget", "retry delay exceeds budget"))
+                    } else if !deadline.permits_wait_ms(delay.wait_ms) {
+                        Some((
+                            "retry_delay_exceeds_deadline",
+                            "retry delay exceeds remaining request deadline",
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some((failure_kind, terminal_reason)) = terminal_reason {
                         state.mark_terminal();
                         drop(state);
                         capture_terminal_failure(
                             traffic.as_deref(),
                             stage_name(error.stage),
-                            "retry_after_exceeds_budget",
+                            failure_kind,
                             attempt,
                             Some(error.status.as_u16()),
                             Some(&error.message),
                         );
-                        return Err(error.into_terminal("retry delay exceeds budget"));
+                        return Err(error.into_terminal(terminal_reason));
                     }
-                    state.note_transient_failure();
                     let transient = state.transient_failures;
                     drop(state);
                     if let Some(capture) = traffic.as_ref() {
@@ -830,10 +861,15 @@ impl GrokClient {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
+            let (body, truncated, timed_out) = read_rejected_body(
+                response,
+                MAX_REJECTED_RESPONSE_BYTES,
+                self.timeouts,
+                deadline,
+                retry,
+            )
+            .await?;
             if let Some(capture) = traffic {
-                let (body, truncated, timed_out) =
-                    read_rejected_body(response, 64 * 1024, self.timeouts, deadline, retry.clone())
-                        .await?;
                 let detail = serde_json::from_slice::<serde_json::Value>(&body)
                     .unwrap_or_else(|_| serde_json::json!({"body_bytes": body.len()}));
                 capture.write_json(
@@ -846,13 +882,11 @@ impl GrokClient {
                         "body": detail
                     }),
                 );
-            } else {
-                read_rejected_body(response, 64 * 1024, self.timeouts, deadline, retry).await?;
             }
             return Err(GrokError::http(
                 status,
                 retry_after,
-                "Grok upstream rejected the request",
+                rejected_response_message(status, &body, truncated, timed_out),
             ));
         }
 
@@ -998,6 +1032,99 @@ async fn read_rejected_body(
             }
         }
     }
+}
+
+fn rejected_response_message(
+    status: StatusCode,
+    body: &[u8],
+    truncated: bool,
+    timed_out: bool,
+) -> String {
+    let mut message = format!("Grok upstream returned {status}");
+    if let Some(detail) = rejected_response_detail(body) {
+        message.push_str(": ");
+        message.push_str(&detail);
+    }
+    if truncated {
+        message.push_str(" [error detail truncated]");
+    }
+    if timed_out {
+        message.push_str(" [error detail timed out]");
+    }
+    message
+}
+
+fn rejected_response_detail(body: &[u8]) -> Option<String> {
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let (message, code) = if let Some(value) = parsed.as_ref() {
+        let message = value
+            .pointer("/error/message")
+            .or_else(|| value.pointer("/error/detail"))
+            .or_else(|| value.get("message"))
+            .or_else(|| value.get("detail"))
+            .or_else(|| value.get("error").filter(|error| error.is_string()))
+            .and_then(Value::as_str);
+        let code = value
+            .pointer("/error/code")
+            .or_else(|| value.get("code"))
+            .and_then(|code| match code {
+                Value::String(code) => Some(code.clone()),
+                Value::Number(code) => Some(code.to_string()),
+                _ => None,
+            });
+        (message.map(str::to_string), code)
+    } else {
+        (std::str::from_utf8(body).ok().map(str::to_string), None)
+    };
+
+    let message = message.as_deref().and_then(sanitize_rejected_detail);
+    let code = code.as_deref().and_then(sanitize_rejected_detail);
+    match (message, code) {
+        (Some(message), Some(code)) if !message.contains(&code) => {
+            Some(format!("{message} (code: {code})"))
+        }
+        (Some(message), _) => Some(message),
+        (None, Some(code)) => Some(format!("upstream error code: {code}")),
+        (None, None) => None,
+    }
+}
+
+fn sanitize_rejected_detail(value: &str) -> Option<String> {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let lower = collapsed.to_ascii_lowercase();
+    if [
+        "authorization:",
+        "bearer ",
+        "access_token",
+        "refresh_token",
+        "api_key",
+        "client_secret",
+        "password=",
+        "password:",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return Some("[redacted upstream error detail]".to_string());
+    }
+    let end = floor_char_boundary(&collapsed, MAX_REJECTED_DETAIL_BYTES);
+    let suffix = if end < collapsed.len() {
+        "…[truncated]"
+    } else {
+        ""
+    };
+    Some(format!("{}{suffix}", &collapsed[..end]))
+}
+
+fn floor_char_boundary(value: &str, max_bytes: usize) -> usize {
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 pub(super) fn capture_terminal_failure(
@@ -1273,6 +1400,7 @@ mod tests {
             input: vec![],
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             store: false,
             stream: true,
             max_output_tokens: None,
@@ -1341,6 +1469,75 @@ mod tests {
         assert_eq!(timeouts.header_ms, 60_000);
         assert_eq!(timeouts.first_byte_ms, 60_000);
         assert_eq!(timeouts.body_idle_ms, 300_000);
+    }
+
+    #[test]
+    fn rejected_detail_is_bounded_and_redacts_inline_credentials() {
+        assert_eq!(
+            sanitize_rejected_detail("invalid request: Bearer top-secret").as_deref(),
+            Some("[redacted upstream error detail]")
+        );
+
+        let detail = format!("{}😊", "x".repeat(MAX_REJECTED_DETAIL_BYTES));
+        let sanitized = sanitize_rejected_detail(&detail).unwrap();
+        assert!(sanitized.ends_with("…[truncated]"));
+        assert!(sanitized.is_char_boundary(sanitized.len()));
+    }
+
+    #[test]
+    fn rate_limit_error_keeps_status_retry_after_and_classification() {
+        let error = GrokError::http(
+            StatusCode::TOO_MANY_REQUESTS,
+            Some("15".into()),
+            "rate limited",
+        );
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.retry_after.as_deref(), Some("15"));
+        assert!(error.is_retryable());
+        assert_eq!(error.origin, GrokErrorOrigin::Http);
+        assert_eq!(error.stage, GrokErrorStage::Status);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_4xx_preserves_status_and_safe_error_detail() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            write_http_response(
+                &mut stream,
+                "422 Unprocessable Entity",
+                "",
+                br#"{"error":{"message":"tool schema is invalid","code":"invalid_tool_schema"},"access_token":"must-not-leak"}"#,
+            )
+            .await;
+        });
+
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let error = match client.post(&sample_body(), None).await {
+            Ok(_) => panic!("422 response should be rejected"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.origin, GrokErrorOrigin::Http);
+        assert_eq!(error.stage, GrokErrorStage::Status);
+        assert!(!error.is_retryable());
+        assert!(error.message.contains("422 Unprocessable Entity"));
+        assert!(error.message.contains("tool schema is invalid"));
+        assert!(error.message.contains("invalid_tool_schema"));
+        assert!(!error.message.contains("must-not-leak"));
     }
 
     #[test]
@@ -1673,7 +1870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_refresh_connect_failure_obeys_the_total_deadline() {
+    async fn auth_refresh_connect_failure_stops_when_retry_delay_exceeds_deadline() {
         let unused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let issuer = format!("http://{}", unused_listener.local_addr().unwrap());
         drop(unused_listener);
@@ -1701,10 +1898,10 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(error.origin, GrokErrorOrigin::Deadline);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.origin, GrokErrorOrigin::Auth);
         assert!(!error.is_retryable());
-        assert!(error.message.contains("total wall-clock timeout"));
+        assert!(error.message.contains("remaining request deadline"));
         assert!(!error.message.contains("Re-authenticate"));
         assert_eq!(retry.lock().await.transient_failures(), 1);
         assert!(retry.lock().await.is_terminal());
@@ -2255,7 +2452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_backoff_is_bounded_by_original_total_deadline() {
+    async fn retry_delay_beyond_remaining_deadline_preserves_upstream_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2263,7 +2460,7 @@ mod tests {
             let _ = read_http_request(&mut stream).await;
             stream
                 .write_all(
-                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
                 )
                 .await
                 .unwrap();
@@ -2279,7 +2476,7 @@ mod tests {
         )
         .await;
         let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(
-            GrokRequestDeadline::after(Duration::from_millis(100)),
+            GrokRequestDeadline::after(Duration::from_millis(50)),
         )));
 
         let error = match client
@@ -2291,8 +2488,10 @@ mod tests {
         };
         server.await.unwrap();
 
-        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(error.origin, GrokErrorOrigin::Deadline);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.origin, GrokErrorOrigin::Http);
+        assert_eq!(error.retry_after.as_deref(), Some("0"));
+        assert!(error.message.contains("remaining request deadline"));
         assert!(!error.is_retryable());
         let state = retry.lock().await;
         assert_eq!(state.wire_attempt, 1);
