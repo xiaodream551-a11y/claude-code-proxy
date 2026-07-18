@@ -1016,6 +1016,7 @@ impl CodexHttpClient {
                             }
                         };
                         reserved_model_replay = Some(replay);
+                        continuation_retry_available = false;
                         continuation = full_context_continuation(continuation.as_ref());
                         continue 'attempt;
                     }
@@ -2760,6 +2761,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_websocket_handshake_401_consumes_continuation_retry() {
+        use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut rejected_handshake, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(rejected_handshake.read(&mut request).await.unwrap() > 0);
+            rejected_handshake
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut oauth, _) = listener.accept().await.unwrap();
+            let refresh_request = read_complete_http_request(&mut oauth).await;
+            assert!(refresh_request.starts_with("POST /oauth/token "));
+            write_test_http_response(
+                &mut oauth,
+                "200 OK",
+                "application/json",
+                "",
+                br#"{"access_token":"a1","refresh_token":"r1","expires_in":3600}"#,
+            )
+            .await;
+
+            let (mut full_context_handshake, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let read = full_context_handshake.read(&mut request).await.unwrap();
+            let handshake_request = String::from_utf8_lossy(&request[..read]);
+            assert!(handshake_request.starts_with("GET "));
+            full_context_handshake
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let Ok(Ok((mut unexpected_retry, _))) =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept()).await
+            else {
+                return false;
+            };
+            let _ = unexpected_retry.read(&mut request).await;
+            unexpected_retry
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            true
+        });
+
+        let full_input = ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "full context".into(),
+            }],
+        };
+        let delta_input = ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "delta only".into(),
+            }],
+        };
+        let mut request = buffered_test_request();
+        request.input = vec![full_input];
+        let continuation = super::super::continuation::ContinuationCandidate {
+            turn_id: Some(8),
+            previous_response_id: Some("resp_prev".into()),
+            input_delta: Some(vec![delta_input]),
+            input_delta_count: 1,
+            disabled_reason: None,
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(dispatch_budget_test_client(
+            &temp,
+            format!("http://{addr}/responses"),
+            format!("http://{addr}/oauth/token"),
+            StoredAuth {
+                access: "a0".into(),
+                refresh: "r0".into(),
+                expires: u64::MAX,
+                account_id: Some("acct".into()),
+            },
+        ));
+
+        let mut events = client
+            .stream_codex_websocket_events(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+                CodexDispatchBudget::new(),
+            )
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("the full-context handshake failure should be returned promptly")
+            .expect("the coordinator should send the handshake error")
+            .unwrap_err();
+
+        assert_eq!(error.status, 503);
+        assert_eq!(error.origin, CodexErrorOrigin::WebSocketHandshake);
+        assert!(
+            !server.await.unwrap(),
+            "a 401 full-context replay must consume the continuation retry allowance"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_fallback_counts_websocket_and_http_against_one_attempt_budget() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2928,6 +3042,52 @@ mod tests {
             server.await.unwrap(),
             1,
             "completed response must not replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_incomplete_response_ignores_trailing_rate_limit_telemetry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incomplete_with_tail = b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{}}}\n\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n".to_vec();
+        let expected_body = incomplete_with_tail.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_complete_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /responses "));
+            write_test_http_response(
+                &mut stream,
+                "200 OK",
+                "text/event-stream",
+                "",
+                &incomplete_with_tail,
+            )
+            .await;
+
+            let Ok(Ok((mut replay, _))) =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept()).await
+            else {
+                return false;
+            };
+            let _ = read_complete_http_request(&mut replay).await;
+            true
+        });
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, expected_body);
+        assert!(
+            !server.await.unwrap(),
+            "incomplete response must not replay after trailing quota telemetry"
         );
     }
 

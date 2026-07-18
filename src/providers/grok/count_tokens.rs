@@ -1,4 +1,6 @@
-use base64::Engine as _;
+use std::io::{Cursor, Read as _};
+
+use base64::read::DecoderReader;
 
 use super::translate::request::{GrokContentPart, GrokInputItem, GrokResponsesRequest};
 
@@ -9,6 +11,17 @@ const IMAGE_TILE_EDGE: u64 = 512;
 const IMAGE_TILE_TOKENS: u64 = 256;
 const IMAGE_FALLBACK_BYTES_PER_TILE: u64 = 256 * 1024;
 const MAX_IMAGE_ESTIMATE_TOKENS: u64 = 65_536;
+/// Enough for PNG's IHDR and for the usual JPEG APP/EXIF preamble. If a JPEG
+/// pushes its SOF marker farther into the file, use decoded byte count instead
+/// of retaining the entire image just to estimate tokens.
+const IMAGE_METADATA_PREFIX_BYTES: usize = 64 * 1024;
+const IMAGE_DECODE_BUFFER_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Base64ImageError {
+    Invalid,
+    TooLarge,
+}
 
 pub fn count_tokens(request: &GrokResponsesRequest) -> u64 {
     let instructions = request
@@ -50,7 +63,10 @@ fn count_input_item(item: &GrokInputItem) -> u64 {
                 GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => {
                     approx_token_count(text)
                 }
-                GrokContentPart::InputImage { image_url } => estimate_image_tokens(image_url),
+                GrokContentPart::InputImage {
+                    image_url,
+                    estimated_tokens,
+                } => estimated_tokens.unwrap_or_else(|| estimate_image_tokens(image_url)),
             })
             .sum(),
         GrokInputItem::FunctionCall {
@@ -67,10 +83,62 @@ fn estimate_image_tokens(image_url: &str) -> u64 {
     if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") {
         return IMAGE_OVERHEAD_TOKENS + approx_token_count(image_url);
     }
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-        return IMAGE_OVERHEAD_TOKENS;
-    };
-    let estimate = image_dimensions(&bytes)
+    validate_and_estimate_base64_image(encoded, usize::MAX).unwrap_or(IMAGE_OVERHEAD_TOKENS)
+}
+
+/// Validate an embedded image in one streaming decode pass and cache the
+/// estimate at translation time. Memory is bounded by the decoder buffers and
+/// [`IMAGE_METADATA_PREFIX_BYTES`], independent of the image's decoded size.
+pub(super) fn validate_and_estimate_base64_image(
+    encoded: &str,
+    max_decoded_bytes: usize,
+) -> Result<u64, Base64ImageError> {
+    if encoded.len() > max_base64_len(max_decoded_bytes) {
+        return Err(Base64ImageError::TooLarge);
+    }
+
+    let mut decoder = DecoderReader::new(
+        Cursor::new(encoded.as_bytes()),
+        &base64::engine::general_purpose::STANDARD,
+    );
+    let mut buffer = [0_u8; IMAGE_DECODE_BUFFER_BYTES];
+    let mut prefix = Vec::with_capacity(IMAGE_METADATA_PREFIX_BYTES.min(max_decoded_bytes));
+    let mut decoded_len = 0_usize;
+
+    loop {
+        let read = decoder
+            .read(&mut buffer)
+            .map_err(|_| Base64ImageError::Invalid)?;
+        if read == 0 {
+            break;
+        }
+        decoded_len = decoded_len
+            .checked_add(read)
+            .ok_or(Base64ImageError::TooLarge)?;
+        if decoded_len > max_decoded_bytes {
+            return Err(Base64ImageError::TooLarge);
+        }
+
+        let prefix_remaining = IMAGE_METADATA_PREFIX_BYTES.saturating_sub(prefix.len());
+        prefix.extend_from_slice(&buffer[..read.min(prefix_remaining)]);
+    }
+
+    Ok(estimate_image_tokens_from_summary(
+        &prefix,
+        decoded_len as u64,
+    ))
+}
+
+fn max_base64_len(max_decoded_bytes: usize) -> usize {
+    max_decoded_bytes
+        .saturating_add(2)
+        .checked_div(3)
+        .unwrap_or(0)
+        .saturating_mul(4)
+}
+
+fn estimate_image_tokens_from_summary(prefix: &[u8], decoded_len: u64) -> u64 {
+    let estimate = image_dimensions(prefix)
         .map(|(width, height)| {
             width
                 .div_ceil(IMAGE_TILE_EDGE)
@@ -78,7 +146,7 @@ fn estimate_image_tokens(image_url: &str) -> u64 {
                 .saturating_mul(IMAGE_TILE_TOKENS)
         })
         .unwrap_or_else(|| {
-            (bytes.len() as u64)
+            decoded_len
                 .div_ceil(IMAGE_FALLBACK_BYTES_PER_TILE)
                 .saturating_mul(IMAGE_TILE_TOKENS)
         });
@@ -175,6 +243,7 @@ mod tests {
     use super::*;
     use crate::anthropic::schema::MessagesRequest;
     use crate::providers::grok::translate::request::translate_request;
+    use base64::Engine as _;
     use serde_json::json;
 
     fn png_base64(width: u32, height: u32) -> String {
@@ -244,6 +313,101 @@ mod tests {
 
         assert!(count_tokens(&small) >= IMAGE_OVERHEAD_TOKENS);
         assert_eq!(count_tokens(&small), count_tokens(&larger_payload));
+    }
+
+    #[test]
+    fn streaming_base64_validation_enforces_the_decoded_byte_boundary() {
+        let at_limit = base64::engine::general_purpose::STANDARD.encode([0_u8; 8]);
+        let over_limit = base64::engine::general_purpose::STANDARD.encode([0_u8; 9]);
+
+        assert!(validate_and_estimate_base64_image(&at_limit, 8).is_ok());
+        assert_eq!(
+            validate_and_estimate_base64_image(&over_limit, 8),
+            Err(Base64ImageError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn streaming_base64_validation_reads_and_validates_the_entire_payload() {
+        let mut invalid_tail = base64::engine::general_purpose::STANDARD.encode([0_u8; 16 * 1024]);
+        invalid_tail.pop();
+        invalid_tail.push('%');
+
+        assert_eq!(
+            validate_and_estimate_base64_image(&invalid_tail, 20 * 1024),
+            Err(Base64ImageError::Invalid)
+        );
+    }
+
+    #[test]
+    fn streaming_image_estimate_reads_png_and_jpeg_dimensions() {
+        let png = png_base64(4096, 2048);
+        assert_eq!(
+            validate_and_estimate_base64_image(&png, 1024).unwrap(),
+            8 * 4 * IMAGE_TILE_TOKENS
+        );
+
+        let jpeg = base64::engine::general_purpose::STANDARD.encode([
+            0xff, 0xd8, // SOI
+            0xff, 0xc0, 0x00, 0x07, 0x08, // SOF + length + precision
+            0x08, 0x00, // height = 2048
+            0x10, 0x00, // width = 4096
+        ]);
+        assert_eq!(
+            validate_and_estimate_base64_image(&jpeg, 1024).unwrap(),
+            8 * 4 * IMAGE_TILE_TOKENS
+        );
+    }
+
+    #[test]
+    fn jpeg_metadata_beyond_the_bounded_prefix_uses_decoded_size_fallback() {
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0xff, 0xff];
+        jpeg.resize(2 + 2 + usize::from(u16::MAX), 0);
+        jpeg.extend_from_slice(&[
+            0xff, 0xc0, 0x00, 0x07, 0x08, // SOF + length + precision
+            0x10, 0x00, // height = 4096
+            0x10, 0x00, // width = 4096
+        ]);
+        assert!(jpeg.len() > IMAGE_METADATA_PREFIX_BYTES);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+
+        assert_eq!(
+            validate_and_estimate_base64_image(&encoded, jpeg.len()).unwrap(),
+            IMAGE_OVERHEAD_TOKENS
+        );
+    }
+
+    #[test]
+    fn translated_base64_image_reuses_validation_time_estimate() {
+        let mut request = translated_request(json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": [{
+                "type":"image",
+                "source":{"type":"base64","media_type":"image/png","data":png_base64(1024, 1024)}
+            }]}]
+        }));
+        let before = count_tokens(&request);
+        let image = request
+            .input
+            .iter_mut()
+            .find_map(|item| match item {
+                GrokInputItem::Message { content, .. } => {
+                    content.iter_mut().find_map(|part| match part {
+                        GrokContentPart::InputImage {
+                            image_url,
+                            estimated_tokens,
+                        } => Some((image_url, estimated_tokens)),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("translated image");
+        assert!(image.1.is_some());
+        *image.0 = "data:image/png;base64,this-is-deliberately-invalid".into();
+
+        // If counting decoded the URL again this would fall back to a different estimate.
+        assert_eq!(count_tokens(&request), before);
     }
 
     #[test]

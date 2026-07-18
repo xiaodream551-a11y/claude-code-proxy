@@ -23,6 +23,7 @@ pub struct KimiResponse {
 
 pub struct KimiHttpClient {
     client: reqwest::blocking::Client,
+    base_url: String,
     auth_manager: KimiAuthManager<crate::auth::FileAuthStore<StoredAuth>>,
 }
 
@@ -34,11 +35,17 @@ impl Default for KimiHttpClient {
 
 impl KimiHttpClient {
     pub fn new() -> Self {
+        let base_url = api_base_url();
+        let mut client =
+            reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(120));
+        // Keep local mocks and explicit loopback relays local even when the
+        // user has enabled a system-wide proxy without a matching NO_PROXY.
+        if crate::oauth_http::is_loopback_url(&base_url) {
+            client = client.no_proxy();
+        }
         Self {
-            client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("failed to create HTTP client"),
+            client: client.build().expect("failed to create HTTP client"),
+            base_url,
             auth_manager: KimiAuthManager::new(file_store()),
         }
     }
@@ -105,7 +112,7 @@ impl KimiHttpClient {
             retry_after: None,
         })?;
 
-        let url = format!("{}/chat/completions", api_base_url());
+        let url = format!("{}/chat/completions", self.base_url);
         let body_json = serde_json::to_string(body).map_err(|e| KimiError {
             status: 500,
             message: "Failed to serialize request".to_string(),

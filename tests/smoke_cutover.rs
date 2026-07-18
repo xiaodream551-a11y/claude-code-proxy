@@ -23,16 +23,14 @@ use tower::util::ServiceExt;
 // Helpers
 // ---------------------------------------------------------------------------
 
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 /// Serialize all env-var-mutating tests so they never run concurrently.
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    // Recover from a poisoned mutex so a failing test doesn't cascade
-    let m = ENV_LOCK.get_or_init(|| Mutex::new(()));
-    match m.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 /// Write a valid auth.json for `provider` under `config_dir`.
@@ -601,7 +599,7 @@ async fn smoke_healthz_returns_ok() {
 
 #[tokio::test]
 async fn smoke_codex_model_routes_to_real_provider() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let response = call_messages("gpt-5.5").await;
     // Should attempt auth (not return 501 placeholder)
     assert!(
@@ -634,10 +632,9 @@ fn smoke_kimi_model_is_registered() {
 // reqwest::blocking::Client internally.
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_kimi_messages_uses_mock_upstream() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "kimi");
 
@@ -680,10 +677,9 @@ async fn smoke_kimi_messages_uses_mock_upstream() {
 // Responses SSE events.
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_messages_uses_mock_upstream() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
 
@@ -723,10 +719,9 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
     assert_eq!(sent["stream"], true);
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_nonstream_keeps_completed_response_after_rate_limit_telemetry() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
 
@@ -761,10 +756,9 @@ async fn smoke_codex_http_nonstream_keeps_completed_response_after_rate_limit_te
     assert_eq!(value["usage"]["output_tokens"], 2);
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_context_window_error_requests_compaction() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
 
@@ -797,10 +791,9 @@ async fn smoke_codex_http_context_window_error_requests_compaction() {
     );
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_traffic_capture_writes_upstream_artifacts() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
@@ -845,10 +838,9 @@ async fn smoke_codex_http_traffic_capture_writes_upstream_artifacts() {
     traffic_file(&files, "040-upstream-event.json");
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_stream_traffic_captures_downstream_events() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
@@ -891,10 +883,9 @@ async fn smoke_codex_http_stream_traffic_captures_downstream_events() {
     assert!(downstream.get("data").is_some());
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
@@ -936,10 +927,9 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
 // the listener is registered with the I/O driver before connect_async starts.
 // A single-threaded runtime risks the root task (connect_async) outpacing the
 // spawned accept task, causing connection-refused races.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_messages_uses_mock_upstream() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
@@ -979,10 +969,9 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
     assert!(sent.get("stream").is_none());
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_and_auto_stream_return_delta_before_terminal() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -1036,10 +1025,9 @@ async fn smoke_codex_websocket_and_auto_stream_return_delta_before_terminal() {
     }
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_auto_stream_falls_back_after_websocket_handshake_rejection() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
@@ -1070,10 +1058,9 @@ async fn smoke_codex_auto_stream_falls_back_after_websocket_handshake_rejection(
     );
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_stream_does_not_retry_permanent_handshake_rejection() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
@@ -1096,10 +1083,9 @@ async fn smoke_codex_websocket_stream_does_not_retry_permanent_handshake_rejecti
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_context_window_error_requests_compaction() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
@@ -1134,10 +1120,9 @@ async fn smoke_codex_websocket_context_window_error_requests_compaction() {
     assert_eq!(value["error"]["message"], "input exceeds context window");
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_stream_uses_previous_response_id() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
@@ -1200,10 +1185,9 @@ async fn smoke_codex_websocket_stream_uses_previous_response_id() {
     clear_codex_websocket_pool_for_tests();
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_stream_retries_missing_previous_response_id() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
@@ -1265,10 +1249,9 @@ async fn smoke_codex_websocket_stream_retries_missing_previous_response_id() {
     clear_codex_websocket_pool_for_tests();
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
@@ -1330,10 +1313,9 @@ async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
     clear_codex_websocket_pool_for_tests();
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_previous_response_id_sends_delta_on_second_turn() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     clear_codex_websocket_pool_for_tests();
@@ -1427,10 +1409,9 @@ async fn smoke_codex_websocket_previous_response_id_sends_delta_on_second_turn()
     clear_codex_websocket_pool_for_tests();
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
-    let _guard = env_lock();
+    let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
     write_auth(config.path(), "codex");

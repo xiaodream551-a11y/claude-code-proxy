@@ -63,12 +63,20 @@ impl DeviceAuthClient {
     }
 
     pub fn with_issuer(issuer: impl Into<String>) -> Self {
+        let issuer = issuer.into();
+        let mut client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_secs(30));
+        // Local test issuers and developer OAuth relays must never be sent to
+        // a system proxy. Besides breaking tests, proxying loopback can leak
+        // device-flow codes to an unrelated local or corporate proxy.
+        if crate::oauth_http::is_loopback_url(&issuer) {
+            client = client.no_proxy();
+        }
         Self {
-            issuer: issuer.into(),
-            client: reqwest::blocking::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
-                .timeout(Duration::from_secs(30))
+            issuer,
+            client: client
                 .build()
                 .expect("failed to create Codex device auth client"),
             sleeper: Box::new(StdSleeper),

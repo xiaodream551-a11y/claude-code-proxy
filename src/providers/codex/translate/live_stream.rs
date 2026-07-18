@@ -7,7 +7,7 @@ use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
     CodexUsage, STOP_END_TURN, STOP_TOOL_USE, map_codex_usage_to_anthropic,
-    stop_reason_for_incomplete_response,
+    stop_reason_for_incomplete_response, validate_tool_arguments,
 };
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
@@ -48,6 +48,13 @@ struct LiveWebSearchResult {
 struct LiveThinking {
     output_index: usize,
     anthropic_index: usize,
+}
+
+struct PreparedToolArguments {
+    output_index: usize,
+    index: usize,
+    arguments: String,
+    emit: bool,
 }
 
 pub struct LiveStreamTranslator {
@@ -660,7 +667,10 @@ impl LiveStreamTranslator {
             .get("item")
             .and_then(|item| item.get("arguments"))
             .and_then(|value| value.as_str());
-        if let Some((index, arguments)) = self.complete_tool_arguments(output_index, final_args)? {
+        let prepared = self.prepare_tool_arguments(output_index, final_args)?;
+        if let Some((index, arguments)) =
+            prepared.and_then(|prepared| self.commit_tool_arguments(prepared))
+        {
             self.emit(
                 traffic,
                 out,
@@ -715,11 +725,11 @@ impl LiveStreamTranslator {
         Ok(())
     }
 
-    fn complete_tool_arguments(
-        &mut self,
+    fn prepare_tool_arguments(
+        &self,
         output_index: usize,
         final_args: Option<&str>,
-    ) -> Result<Option<(usize, String)>, String> {
+    ) -> Result<Option<PreparedToolArguments>, String> {
         let Some(LiveBlock::Tool {
             index,
             name,
@@ -728,26 +738,50 @@ impl LiveStreamTranslator {
             had_delta,
             emitted_args,
             ..
-        }) = self.blocks_by_output_index.get_mut(&output_index)
+        }) = self.blocks_by_output_index.get(&output_index)
         else {
             return Ok(None);
         };
 
+        let mut arguments = args_accum.clone();
         if let Some(final_args) = final_args.filter(|arguments| !arguments.is_empty())
-            && (args_accum.is_empty() || (!*had_delta && !*emitted_args))
+            && (arguments.is_empty() || (!*had_delta && !*emitted_args))
         {
-            *args_accum = final_args.to_string();
+            arguments = final_args.to_string();
         }
-        if !args_accum.is_empty() {
-            *args_accum = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
+        if !arguments.is_empty() {
+            arguments = sanitize_read_args(name, &arguments, Some(call_id.as_str()));
         }
-        validate_tool_arguments(name, call_id, args_accum)?;
+        validate_tool_arguments(name, call_id, &arguments)?;
 
-        if *emitted_args {
-            Ok(None)
-        } else {
+        Ok(Some(PreparedToolArguments {
+            output_index,
+            index: *index,
+            arguments,
+            emit: !*emitted_args,
+        }))
+    }
+
+    fn commit_tool_arguments(
+        &mut self,
+        prepared: PreparedToolArguments,
+    ) -> Option<(usize, String)> {
+        let LiveBlock::Tool {
+            args_accum,
+            emitted_args,
+            ..
+        } = self
+            .blocks_by_output_index
+            .get_mut(&prepared.output_index)?
+        else {
+            return None;
+        };
+        *args_accum = prepared.arguments.clone();
+        if prepared.emit {
             *emitted_args = true;
-            Ok(Some((*index, args_accum.clone())))
+            Some((prepared.index, prepared.arguments))
+        } else {
+            None
         }
     }
 
@@ -890,8 +924,14 @@ impl LiveStreamTranslator {
     ) -> Result<(), String> {
         let mut output_indices: Vec<_> = self.blocks_by_output_index.keys().copied().collect();
         output_indices.sort_unstable();
+        let mut prepared_tools = Vec::new();
         for output_index in output_indices {
-            if let Some((index, arguments)) = self.complete_tool_arguments(output_index, None)? {
+            if let Some(prepared) = self.prepare_tool_arguments(output_index, None)? {
+                prepared_tools.push(prepared);
+            }
+        }
+        for prepared in prepared_tools {
+            if let Some((index, arguments)) = self.commit_tool_arguments(prepared) {
                 self.emit(
                     traffic,
                     out,
@@ -1070,24 +1110,6 @@ impl LiveStreamTranslator {
             }),
         );
     }
-}
-
-fn validate_tool_arguments(name: &str, call_id: &str, arguments: &str) -> Result<(), String> {
-    if arguments.is_empty() {
-        return Err(format!(
-            "Codex tool call {name} ({call_id}) completed without JSON arguments"
-        ));
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(arguments).map_err(|error| {
-        format!("Codex tool call {name} ({call_id}) returned invalid JSON arguments: {error}")
-    })?;
-    if !parsed.is_object() {
-        return Err(format!(
-            "Codex tool call {name} ({call_id}) returned non-object JSON arguments"
-        ));
-    }
-    Ok(())
 }
 
 fn web_search_query(item: &serde_json::Value) -> String {
@@ -1437,6 +1459,91 @@ mod tests {
         assert!(rendered.contains(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#));
         assert!(rendered.contains(r#""stop_reason":"tool_use""#));
         assert!(rendered.contains("message_stop"));
+        assert!(translator.is_finished());
+    }
+
+    #[test]
+    fn terminal_tool_argument_completion_commits_all_tools_transactionally() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_a", "name": "Read"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{\"file_path\":\"/tmp/a\"}"
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "function_call", "call_id": "call_b", "name": "Read"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 1,
+                "arguments": "{\"file_path\":"
+            }),
+        ] {
+            translator.accept(&event, None).unwrap();
+        }
+
+        let error = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_bad", "usage": {}}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("invalid JSON arguments"));
+
+        for output_index in [0, 1] {
+            let Some(LiveBlock::Tool { emitted_args, .. }) =
+                translator.blocks_by_output_index.get(&output_index)
+            else {
+                panic!("tool {output_index} should remain pending after a failed transaction");
+            };
+            assert!(
+                !emitted_args,
+                "no tool may be marked emitted when the terminal transaction fails"
+            );
+        }
+
+        let repaired_b = translator
+            .accept(
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_b",
+                        "name": "Read",
+                        "arguments": "{\"file_path\":\"/tmp/b\"}"
+                    }
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(String::from_utf8(repaired_b).unwrap().contains("/tmp/b"));
+
+        let completed = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_ok", "usage": {}}
+                }),
+                None,
+            )
+            .unwrap();
+        let completed = String::from_utf8(completed).unwrap();
+        assert!(
+            completed.contains("/tmp/a"),
+            "the valid first tool must remain available after the failed transaction"
+        );
         assert!(translator.is_finished());
     }
 

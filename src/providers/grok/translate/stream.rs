@@ -128,8 +128,7 @@ impl LiveStreamTranslator {
                     .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))
             })
             .collect::<anyhow::Result<Vec<serde_json::Value>>>()?;
-        let mut reducer = self.reducer.clone();
-        let reduced = reducer.push_batch(values)?;
+        let (reducer, reduced) = self.reducer.stage_batch(values)?;
         let mut renderer = self.renderer.clone();
         let out = renderer.render(reduced)?;
         self.decoder = decoder;
@@ -370,7 +369,7 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent, usage: &GrokUsage) {
     }
 }
 
-fn anthropic_usage(
+pub(super) fn anthropic_usage(
     usage: &GrokUsage,
     fallback_input_tokens: u64,
     fallback_output_tokens: u64,

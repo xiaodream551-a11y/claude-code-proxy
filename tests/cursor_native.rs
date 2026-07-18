@@ -12,9 +12,8 @@
 //! - Provider end-to-end against mock upstream
 
 use once_cell::sync::Lazy;
-use std::sync::Mutex;
 
-static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static ENV_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
 // ---------------------------------------------------------------------------
 // Prost roundtrip
@@ -135,7 +134,7 @@ fn connect_frame_with_flags_decode() {
 
 #[test]
 fn auth_returns_token_from_env() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.blocking_lock();
     unsafe {
         std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "test-token-123");
     }
@@ -273,7 +272,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
         body: Vec<u8>,
     }
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
     let observed: Arc<Mutex<Option<ObservedRequest>>> = Arc::new(Mutex::new(None));
     let observed_handler = Arc::clone(&observed);
 
@@ -685,7 +684,7 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
     use claude_code_proxy::providers::cursor::sse::frame_cursor_stream;
     use prost::Message;
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
 
     // Build mock upstream response bytes
     let mut body = Vec::new();
@@ -804,7 +803,7 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
     use claude_code_proxy::providers::cursor::proto::*;
     use prost::Message;
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
 
     // Build mock response
     let mut body = Vec::new();
@@ -911,7 +910,7 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
         body: Vec<u8>,
     }
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
     let observed: Arc<Mutex<Option<ObservedRequest>>> = Arc::new(Mutex::new(None));
     let observed_handler = Arc::clone(&observed);
 
@@ -1525,13 +1524,12 @@ fn parse_sse_events(sse: &str) -> Vec<(String, serde_json::Value)> {
     let mut current_event = String::new();
 
     for line in sse.lines() {
-        if line.starts_with("event: ") {
-            current_event = line["event: ".len()..].to_string();
-        } else if line.starts_with("data: ") {
-            let data_str = &line["data: ".len()..];
-            if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
-                events.push((current_event.clone(), data));
-            }
+        if let Some(event) = line.strip_prefix("event: ") {
+            current_event = event.to_string();
+        } else if let Some(data_str) = line.strip_prefix("data: ")
+            && let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
+        {
+            events.push((current_event.clone(), data));
         }
     }
 

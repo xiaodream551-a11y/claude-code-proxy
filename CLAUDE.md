@@ -33,6 +33,19 @@ For an in-module unit test, use Cargo's name filter: `cargo test <test_name>`.
 
 `just format`, `just clippy`, `just build`, and `just test` run the corresponding `checkle` tasks. The configured Clippy task does not add `-D warnings`; use the explicit Cargo command above for the strict lint used by the README.
 
+## Parallel agent reliability
+
+- For failure-sensitive parallel work, use individually named background Agent tasks instead of one large Dynamic Workflow. Claude Code reports each background Agent API failure independently, while a Workflow may aggregate failures only after its entire `parallel()` batch finishes.
+- Limit each wave to at most four concurrent child agents. Record successful results by task or agent ID, and resume or retry only the failed lane. Never redeploy a completed lane because a sibling returned an API error.
+- If a Workflow is unavoidable, launch the following command through the Bash tool with `run_in_background: true` immediately after the Workflow returns its transcript directory:
+
+  ```sh
+  python3 scripts/watch-claude-workflow-failures '<workflow-transcript-dir>'
+  ```
+
+  Exit status 42 with `CLAUDE_WORKFLOW_AGENT_FAILURE`, or 43 with `CLAUDE_WORKFLOW_TERMINAL_FAILURE`, is an interrupt signal: stop queuing later phases, preserve completed results, inspect the named agent/request, and retry only that failed lane. Do not wait for the whole Workflow merely to learn which child failed.
+- A proxy request ID identifies one HTTP exchange, not an Agent tree. Do not infer parent/child ownership from the Claude session ID or cancel sibling requests at the proxy layer.
+
 ## Architecture
 
 ### Entry point and request lifecycle

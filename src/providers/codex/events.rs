@@ -159,10 +159,17 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
         let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
             continue;
         };
-        if CodexTerminalKind::from_payload(&payload).is_some_and(CodexTerminalKind::is_reusable) {
-            // A completed response is authoritative. Providers may append quota
-            // telemetry after it; that tail must not turn a successful buffered
-            // response into a whole-request replay.
+        if CodexTerminalKind::from_payload(&payload).is_some_and(|kind| {
+            matches!(
+                kind,
+                CodexTerminalKind::Completed
+                    | CodexTerminalKind::Done
+                    | CodexTerminalKind::Incomplete
+            )
+        }) {
+            // A non-error response terminal is authoritative. Providers may append
+            // quota telemetry after it; that tail must not turn either a completed
+            // response or a valid truncated response into a whole-request replay.
             return None;
         }
         if let Some(failure) = classify_event_failure(&payload)
@@ -306,6 +313,13 @@ mod tests {
     #[test]
     fn completed_response_wins_over_trailing_rate_limit_telemetry() {
         let body = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n";
+
+        assert!(first_retryable_failure(body).is_none());
+    }
+
+    #[test]
+    fn incomplete_response_wins_over_trailing_rate_limit_telemetry() {
+        let body = b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{}}}\n\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n";
 
         assert!(first_retryable_failure(body).is_none());
     }

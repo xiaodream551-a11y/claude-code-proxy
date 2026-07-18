@@ -4,6 +4,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::stream::SseDecoder;
+use crate::providers::translate_shared::{JsonObjectError, parse_json_object};
 
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_INCOMPLETE_TOOL_CALLS: usize = 128;
@@ -237,6 +238,38 @@ impl GrokUsage {
             (self.input_tokens, self.cached_input_tokens),
             (Some(total), Some(cached)) if cached > total
         )
+    }
+}
+
+/// A non-streaming reduction failure together with any usage reported by the failing response.
+///
+/// `response.failed` is still a hard protocol error. Keeping its usage beside the error lets the
+/// provider update diagnostics without turning the failed response into a successful message.
+#[derive(Debug)]
+pub struct GrokReductionError {
+    source: anyhow::Error,
+    usage: Option<GrokUsage>,
+}
+
+impl GrokReductionError {
+    fn new(source: anyhow::Error, usage: Option<GrokUsage>) -> Self {
+        Self { source, usage }
+    }
+
+    pub fn usage(&self) -> Option<&GrokUsage> {
+        self.usage.as_ref()
+    }
+}
+
+impl std::fmt::Display for GrokReductionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for GrokReductionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
     }
 }
 
@@ -643,10 +676,46 @@ impl Reducer {
         let mut staged = self.clone();
         let mut out = Vec::new();
         for value in values {
-            out.extend(staged.push(value)?);
+            let failed_usage = failed_event_usage(&value);
+            match staged.push(value) {
+                Ok(events) => out.extend(events),
+                Err(error) => {
+                    // Usage in an explicit upstream failure is diagnostic telemetry, not semantic
+                    // output. Preserve it while rolling back text/tool/terminal state.
+                    if let Some(usage) = failed_usage {
+                        self.usage = Some(usage);
+                    }
+                    return Err(error);
+                }
+            }
         }
         *self = staged;
         Ok(out)
+    }
+
+    /// Apply a decoded chunk without cloning all accumulated text/tool state.
+    ///
+    /// Callers must terminate the stream if this returns an error. Events remain staged in the
+    /// returned vector until the entire chunk succeeds, so an invalid tail cannot leak earlier
+    /// deltas downstream; retaining the partial reducer state also preserves failed-event usage.
+    pub fn push_batch_in_place(
+        &mut self,
+        values: impl IntoIterator<Item = Value>,
+    ) -> anyhow::Result<Vec<ReducerEvent>> {
+        let mut out = Vec::new();
+        for value in values {
+            out.extend(self.push(value)?);
+        }
+        Ok(out)
+    }
+
+    pub fn stage_batch(
+        &self,
+        values: impl IntoIterator<Item = Value>,
+    ) -> anyhow::Result<(Self, Vec<ReducerEvent>)> {
+        let mut staged = self.clone();
+        let events = staged.push_batch_in_place(values)?;
+        Ok((staged, events))
     }
     fn delta(&mut self, kind: &str, delta: &str) -> anyhow::Result<Vec<ReducerEvent>> {
         let mut out = Vec::new();
@@ -733,14 +802,9 @@ impl Reducer {
 }
 
 fn bounded_incomplete_reason(reason: &str) -> String {
-    if reason.len() <= MAX_INCOMPLETE_REASON_BYTES {
-        return reason.to_owned();
-    }
-    let mut end = MAX_INCOMPLETE_REASON_BYTES;
-    while !reason.is_char_boundary(end) {
-        end -= 1;
-    }
-    reason[..end].to_owned()
+    super::super::text::truncate_utf8(reason, MAX_INCOMPLETE_REASON_BYTES)
+        .0
+        .to_owned()
 }
 
 fn grok_usage(response: &Value) -> GrokUsage {
@@ -762,13 +826,26 @@ fn grok_usage(response: &Value) -> GrokUsage {
     }
 }
 
-pub(super) fn parse_function_arguments(arguments: &str) -> anyhow::Result<Value> {
-    let value = serde_json::from_str::<Value>(arguments)
-        .map_err(|_| anyhow::anyhow!("function arguments are incomplete"))?;
-    if !value.is_object() {
-        anyhow::bail!("function arguments must be a JSON object");
+fn failed_event_usage(value: &Value) -> Option<GrokUsage> {
+    let event_type = value.get("type").and_then(Value::as_str)?;
+    if !matches!(event_type, "error" | "response.failed") {
+        return None;
     }
-    Ok(value)
+    let response = value.get("response").unwrap_or(value);
+    response.get("usage")?;
+    Some(grok_usage(response))
+}
+
+pub(super) fn parse_function_arguments(arguments: &str) -> anyhow::Result<Value> {
+    match parse_json_object(arguments) {
+        Ok(value) => Ok(value),
+        Err(JsonObjectError::Empty | JsonObjectError::Invalid(_)) => {
+            anyhow::bail!("function arguments are incomplete")
+        }
+        Err(JsonObjectError::NotObject) => {
+            anyhow::bail!("function arguments must be a JSON object")
+        }
+    }
 }
 
 fn response_output_text(response: &Value) -> Vec<String> {
@@ -794,21 +871,30 @@ fn response_output_text(response: &Value) -> Vec<String> {
     text
 }
 
-pub fn reduce_upstream_bytes(bytes: &[u8]) -> anyhow::Result<Vec<ReducerEvent>> {
+pub fn reduce_upstream_bytes(bytes: &[u8]) -> Result<Vec<ReducerEvent>, GrokReductionError> {
     let mut reducer = Reducer::default();
     let mut decoder = SseDecoder::default();
     let values = decoder
-        .push(bytes)?
+        .push(bytes)
+        .map_err(|error| GrokReductionError::new(error, None))?
         .into_iter()
         .map(|event| {
             serde_json::from_str(&event.data)
                 .map_err(|_| anyhow::anyhow!("malformed Grok SSE event"))
         })
-        .collect::<anyhow::Result<Vec<Value>>>()?;
-    let out = reducer.push_batch(values)?;
-    decoder.finish()?;
+        .collect::<anyhow::Result<Vec<Value>>>()
+        .map_err(|error| GrokReductionError::new(error, None))?;
+    let out = reducer
+        .push_batch(values)
+        .map_err(|error| GrokReductionError::new(error, reducer.usage().cloned()))?;
+    decoder
+        .finish()
+        .map_err(|error| GrokReductionError::new(error, reducer.usage().cloned()))?;
     if !reducer.finished() {
-        anyhow::bail!("Grok stream ended without completion");
+        return Err(GrokReductionError::new(
+            anyhow::anyhow!("Grok stream ended without completion"),
+            reducer.usage().cloned(),
+        ));
     }
     Ok(out)
 }
@@ -995,6 +1081,31 @@ mod tests {
                 "a rejected same-batch tail must roll back the terminal"
             );
         }
+    }
+
+    #[test]
+    fn failed_event_usage_survives_transaction_rollback() {
+        let mut reducer = Reducer::default();
+        let error = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"discarded"}),
+                serde_json::json!({
+                    "type":"response.failed",
+                    "response":{"usage":{
+                        "input_tokens":12,
+                        "input_tokens_details":{"cached_tokens":3},
+                        "output_tokens":2
+                    }}
+                }),
+            ])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed"));
+        let usage = reducer.usage().expect("failed response usage must survive");
+        assert_eq!(usage.mapped_input_tokens(), Some(9));
+        assert_eq!(usage.mapped_cache_read_input_tokens(), Some(3));
+        assert_eq!(usage.output_tokens, Some(2));
+        assert!(!reducer.finished());
     }
 
     #[test]

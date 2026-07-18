@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Exit on the first Claude Workflow child-agent API error.
+
+Launch this through Claude Code's Bash tool with ``run_in_background: true``.
+Its non-zero exit becomes an independent task notification, so the parent can
+react before a large Workflow finishes aggregating every parallel child.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import json
+import re
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+
+FAILED_WORKFLOW_STATES = {"cancelled", "failed", "stopped"}
+TERMINAL_WORKFLOW_STATES = FAILED_WORKFLOW_STATES | {"completed"}
+DEFAULT_TERMINAL_SETTLE_SECONDS = 2.0
+RUNTIME_API_FAILURE_LOG = re.compile(
+    r"^\[[^\]\r\n]+\]\s+failed:\s+API Error:", re.IGNORECASE
+)
+
+
+def workflow_state_path(transcript_dir: Path) -> Path:
+    run_id = transcript_dir.name
+    workflows_dir = transcript_dir.parent
+    subagents_dir = workflows_dir.parent
+    if workflows_dir.name != "workflows" or subagents_dir.name != "subagents":
+        raise ValueError("expected <session>/subagents/workflows/<workflow-id>")
+    session_dir = subagents_dir.parent
+    return session_dir / "workflows" / f"{run_id}.json"
+
+
+def load_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def message_text(event: dict[str, Any]) -> str:
+    message = event.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, list):
+            texts = [
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            ]
+            if texts:
+                return " ".join(texts)
+    error = event.get("error")
+    return error if isinstance(error, str) else "unknown API error"
+
+
+def scan_transcripts(
+    transcript_dir: Path, offsets: dict[Path, int]
+) -> dict[str, Any] | None:
+    for path in sorted(transcript_dir.glob("agent-*.jsonl")):
+        try:
+            with path.open("rb") as stream:
+                stream.seek(offsets.get(path, 0))
+                while True:
+                    line_start = stream.tell()
+                    raw = stream.readline()
+                    if not raw:
+                        offsets[path] = stream.tell()
+                        break
+                    if not raw.endswith(b"\n"):
+                        offsets[path] = line_start
+                        break
+                    offsets[path] = stream.tell()
+                    try:
+                        event = json.loads(raw)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(event, dict) or not event.get("isApiErrorMessage"):
+                        continue
+                    return {
+                        "agent_id": event.get("agentId") or path.stem.removeprefix("agent-"),
+                        "request_id": event.get("requestId"),
+                        "timestamp": event.get("timestamp"),
+                        "error": message_text(event)[:500],
+                    }
+        except OSError:
+            continue
+    return None
+
+
+def state_log_failure(state: dict[str, Any]) -> dict[str, Any] | None:
+    logs = state.get("logs")
+    if not isinstance(logs, list):
+        return None
+    for entry in logs:
+        if not isinstance(entry, str):
+            continue
+        if RUNTIME_API_FAILURE_LOG.match(entry):
+            return {
+                "agent_id": None,
+                "request_id": None,
+                "timestamp": state.get("timestamp"),
+                "error": entry[:500],
+            }
+    return None
+
+
+def transcript_signature(transcript_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    signature = []
+    for path in sorted(transcript_dir.glob("agent-*.jsonl")):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        signature.append((path.name, stat.st_size, stat.st_mtime_ns))
+    return tuple(signature)
+
+
+def emit_agent_failure(
+    transcript_dir: Path, state: dict[str, Any], failure: dict[str, Any]
+) -> int:
+    failure.update(
+        {
+            "event": "CLAUDE_WORKFLOW_AGENT_FAILURE",
+            "workflow_id": transcript_dir.name,
+            "workflow_task_id": state.get("taskId"),
+            "transcript_dir": str(transcript_dir),
+        }
+    )
+    print(json.dumps(failure, ensure_ascii=False), flush=True)
+    return 42
+
+
+def emit_workflow_failure(
+    transcript_dir: Path, state: dict[str, Any], status: str
+) -> int:
+    print(
+        json.dumps(
+            {
+                "event": "CLAUDE_WORKFLOW_TERMINAL_FAILURE",
+                "workflow_id": transcript_dir.name,
+                "workflow_task_id": state.get("taskId"),
+                "status": status,
+                "transcript_dir": str(transcript_dir),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return 43
+
+
+def run(
+    transcript_dir: Path,
+    poll_seconds: float,
+    timeout_seconds: float,
+    terminal_settle_seconds: float = DEFAULT_TERMINAL_SETTLE_SECONDS,
+) -> int:
+    transcript_dir = transcript_dir.expanduser().resolve()
+    if not transcript_dir.is_dir() or not transcript_dir.name.startswith("wf_"):
+        print(f"invalid Workflow transcript directory: {transcript_dir}", file=sys.stderr)
+        return 2
+
+    try:
+        state_path = workflow_state_path(transcript_dir)
+    except ValueError as error:
+        print(f"invalid Workflow transcript directory: {error}", file=sys.stderr)
+        return 2
+    offsets: dict[Path, int] = {}
+    started = time.monotonic()
+    terminal_since: float | None = None
+    stable_since: float | None = None
+    stable_signature: tuple[tuple[str, int, int], ...] | None = None
+    while True:
+        failure = scan_transcripts(transcript_dir, offsets)
+        state = load_json(state_path) or {}
+        failure = failure or state_log_failure(state)
+        if failure is not None:
+            return emit_agent_failure(transcript_dir, state, failure)
+
+        status = state.get("status")
+        normalized_status = status.lower() if isinstance(status, str) else None
+        if normalized_status in FAILED_WORKFLOW_STATES:
+            return emit_workflow_failure(transcript_dir, state, normalized_status)
+        if normalized_status == "completed":
+            now = time.monotonic()
+            signature = transcript_signature(transcript_dir)
+            if terminal_since is None:
+                terminal_since = now
+            if signature != stable_signature:
+                stable_signature = signature
+                stable_since = now
+            if (
+                stable_since is not None
+                and now - terminal_since >= terminal_settle_seconds
+                and now - stable_since >= terminal_settle_seconds
+            ):
+                # The Workflow state and transcript files are separate writes. Re-read both after
+                # a stable terminal window so an APIError appended around completion is not lost.
+                failure = scan_transcripts(transcript_dir, offsets)
+                final_state = load_json(state_path) or state
+                failure = failure or state_log_failure(final_state)
+                if failure is not None:
+                    return emit_agent_failure(transcript_dir, final_state, failure)
+                final_status = final_state.get("status")
+                normalized_final = (
+                    final_status.lower() if isinstance(final_status, str) else None
+                )
+                if normalized_final in FAILED_WORKFLOW_STATES:
+                    return emit_workflow_failure(
+                        transcript_dir, final_state, normalized_final
+                    )
+                if (
+                    normalized_final == "completed"
+                    and transcript_signature(transcript_dir) == stable_signature
+                ):
+                    print(
+                        json.dumps(
+                            {
+                                "event": "CLAUDE_WORKFLOW_WATCH_FINISHED",
+                                "workflow_id": transcript_dir.name,
+                                "status": final_status,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    return 0
+        else:
+            terminal_since = None
+            stable_since = None
+            stable_signature = None
+        if terminal_since is None and time.monotonic() - started >= timeout_seconds:
+            print(
+                json.dumps(
+                    {
+                        "event": "CLAUDE_WORKFLOW_WATCH_TIMEOUT",
+                        "workflow_id": transcript_dir.name,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 0
+        time.sleep(poll_seconds)
+
+
+def self_test() -> int:
+    with tempfile.TemporaryDirectory() as root:
+        session = Path(root) / "session"
+        transcripts = session / "subagents" / "workflows" / "wf_test"
+        transcripts.mkdir(parents=True)
+        (session / "workflows").mkdir()
+        (session / "workflows" / "wf_test.json").write_text(
+            json.dumps({"status": "running", "taskId": "task_test"}),
+            encoding="utf-8",
+        )
+        event = {
+            "agentId": "agent_test",
+            "requestId": "request_test",
+            "timestamp": "2026-07-18T00:00:00Z",
+            "isApiErrorMessage": True,
+            "message": {"content": [{"type": "text", "text": "API Error: test"}]},
+        }
+        (transcripts / "agent-agent_test.jsonl").write_text(
+            json.dumps(event) + "\n", encoding="utf-8"
+        )
+        offsets: dict[Path, int] = {}
+        failure = scan_transcripts(transcripts, offsets)
+        assert failure is not None
+        assert failure["agent_id"] == "agent_test"
+        assert failure["error"] == "API Error: test"
+        assert workflow_state_path(transcripts).name == "wf_test.json"
+        assert state_log_failure(
+            {"logs": ["No API Error: observed", "审查 API Error: 修复已通过"]}
+        ) is None
+        assert state_log_failure(
+            {"logs": ["[G 简化] failed: API Error: Grok stream is invalid"]}
+        ) is not None
+
+        race_transcripts = session / "subagents" / "workflows" / "wf_race"
+        race_transcripts.mkdir()
+        race_state = session / "workflows" / "wf_race.json"
+        race_state.write_text(
+            json.dumps({"status": "running", "taskId": "task_race"}),
+            encoding="utf-8",
+        )
+        race_agent = race_transcripts / "agent-agent_race.jsonl"
+        race_agent.write_text("", encoding="utf-8")
+
+        def finish_then_append_error() -> None:
+            time.sleep(0.02)
+            race_state.write_text(
+                json.dumps({"status": "completed", "taskId": "task_race"}),
+                encoding="utf-8",
+            )
+            time.sleep(0.02)
+            race_event = dict(event, agentId="agent_race", requestId="request_race")
+            race_agent.write_text(json.dumps(race_event) + "\n", encoding="utf-8")
+
+        writer = threading.Thread(target=finish_then_append_error)
+        writer.start()
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert run(race_transcripts, 0.005, 1.0, 0.05) == 42
+        writer.join()
+
+        failed_transcripts = session / "subagents" / "workflows" / "wf_failed"
+        failed_transcripts.mkdir()
+        (session / "workflows" / "wf_failed.json").write_text(
+            json.dumps({"status": "failed", "taskId": "task_failed"}),
+            encoding="utf-8",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert run(failed_transcripts, 0.005, 1.0, 0.05) == 43
+
+        clean_transcripts = session / "subagents" / "workflows" / "wf_clean"
+        clean_transcripts.mkdir()
+        (session / "workflows" / "wf_clean.json").write_text(
+            json.dumps({"status": "completed", "taskId": "task_clean"}),
+            encoding="utf-8",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert run(clean_transcripts, 0.005, 1.0, 0.05) == 0
+    print("watch-claude-workflow-failures self-test passed")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("transcript_dir", nargs="?", type=Path)
+    parser.add_argument("--poll-seconds", type=float, default=0.5)
+    parser.add_argument("--timeout-seconds", type=float, default=7200.0)
+    parser.add_argument(
+        "--terminal-settle-seconds",
+        type=float,
+        default=DEFAULT_TERMINAL_SETTLE_SECONDS,
+    )
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    if args.transcript_dir is None:
+        parser.error("transcript_dir is required unless --self-test is used")
+    if (
+        args.poll_seconds <= 0
+        or args.timeout_seconds <= 0
+        or args.terminal_settle_seconds <= 0
+    ):
+        parser.error("poll, timeout, and terminal settle values must be positive")
+    return run(
+        args.transcript_dir,
+        args.poll_seconds,
+        args.timeout_seconds,
+        args.terminal_settle_seconds,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

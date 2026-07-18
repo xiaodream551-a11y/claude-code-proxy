@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::reducer::{GrokUsage, ReducerEvent, parse_function_arguments, reduce_upstream_bytes};
+use super::stream::anthropic_usage;
 use crate::traffic::TrafficCapture;
 use serde_json::Value;
 
@@ -26,7 +27,7 @@ pub fn accumulate_response_with_traffic(
             if let Some(capture) = capture.as_mut() {
                 capture.malformed("decoder", "malformed_sse");
             }
-            finish_capture(capture.take(), traffic, "error");
+            finish_capture(capture.take(), traffic, "error", None);
             return Err(error);
         }
     };
@@ -42,7 +43,7 @@ pub fn accumulate_response_with_traffic(
         if let Some(capture) = capture.as_mut() {
             capture.malformed("decoder", "incomplete_stream");
         }
-        finish_capture(capture.take(), traffic, "error");
+        finish_capture(capture.take(), traffic, "error", None);
         return Err(error);
     }
     let mut blocks: Vec<Value> = Vec::new();
@@ -56,11 +57,12 @@ pub fn accumulate_response_with_traffic(
     let reduced = match reduce_upstream_bytes(upstream) {
         Ok(events) => events,
         Err(error) => {
+            let usage = error.usage().cloned();
             if let Some(capture) = capture.as_mut() {
                 capture.malformed("reducer", "invalid_event");
             }
-            finish_capture(capture.take(), traffic, "error");
-            return Err(error);
+            finish_capture(capture.take(), traffic, "error", usage.as_ref());
+            return Err(error.into());
         }
     };
     for event in reduced {
@@ -110,7 +112,12 @@ pub fn accumulate_response_with_traffic(
                             if let Some(capture) = capture.as_mut() {
                                 capture.malformed("reducer", "invalid_tool_arguments");
                             }
-                            finish_capture(capture.take(), traffic, "error");
+                            finish_capture(
+                                capture.take(),
+                                traffic,
+                                "error",
+                                reported_usage.as_ref(),
+                            );
                             return Err(error);
                         }
                     }
@@ -165,36 +172,16 @@ pub fn accumulate_response_with_traffic(
         }
     }
     let hosted_search_requests = web_search_requests + x_search_requests;
-    let mapped_input = reported_usage
-        .as_ref()
-        .and_then(GrokUsage::mapped_input_tokens)
-        .unwrap_or(input);
-    let mapped_output = reported_usage
-        .as_ref()
-        .and_then(|usage| usage.output_tokens)
-        .unwrap_or(output);
-    let usage = serde_json::Map::from_iter([
-        ("input_tokens".into(), serde_json::json!(mapped_input)),
-        ("output_tokens".into(), serde_json::json!(mapped_output)),
-        ("cache_creation_input_tokens".into(), serde_json::json!(0)),
-        (
-            "cache_read_input_tokens".into(),
-            serde_json::json!(
-                reported_usage
-                    .as_ref()
-                    .and_then(GrokUsage::mapped_cache_read_input_tokens)
-                    .unwrap_or(0)
-            ),
-        ),
-        (
-            "server_tool_use".into(),
-            serde_json::json!({"web_search_requests":hosted_search_requests}),
-        ),
-    ]);
+    let usage = anthropic_usage(
+        reported_usage.as_ref().unwrap_or(&GrokUsage::default()),
+        input,
+        output,
+        hosted_search_requests,
+    );
     let response = serde_json::json!({"id":message_id,"type":"message","role":"assistant","model":model,"content":blocks,"stop_reason":stop,"stop_sequence":null,"usage":usage});
     if let Some(mut capture) = capture {
         capture.downstream_event("response", response.clone());
-        finish_capture(Some(capture), traffic, "completed");
+        finish_capture(Some(capture), traffic, "completed", reported_usage.as_ref());
     }
     Ok(response)
 }
@@ -203,11 +190,16 @@ fn finish_capture(
     capture: Option<crate::traffic::StreamTrafficCapture>,
     traffic: Option<&TrafficCapture>,
     outcome: &str,
+    usage: Option<&GrokUsage>,
 ) {
     if let (Some(capture), Some(traffic)) = (capture, traffic) {
         capture.finish(
             traffic,
-            serde_json::json!({"kind":"non_streaming","outcome":outcome}),
+            serde_json::json!({
+                "kind":"non_streaming",
+                "outcome":outcome,
+                "usage":super::super::grok_usage_observability(usage, None),
+            }),
         );
     }
 }

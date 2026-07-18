@@ -316,6 +316,40 @@ mod tests {
     }
 
     #[test]
+    fn accumulate_rejects_malformed_tool_arguments() {
+        let upstream = format!(
+            "{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index": 0,
+                    "item": {"type":"function_call","call_id":"call_1","name":"Bash"}
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index": 0,
+                    "item": {
+                        "type":"function_call",
+                        "call_id":"call_1",
+                        "name":"Bash",
+                        "arguments":"{\"command\":"
+                    }
+                })
+            ),
+            sse_event(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            ),
+        );
+
+        let error = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.6-sol")
+            .expect_err("non-stream responses must reject malformed tool arguments");
+        assert!(error.to_string().contains("invalid JSON arguments"));
+    }
+
+    #[test]
     fn accumulate_completed_response_ignores_trailing_rate_limit_telemetry() {
         let upstream = format!(
             "{}{}{}{}{}",

@@ -75,6 +75,25 @@ pub fn read_effort(req: &MessagesRequest) -> Result<Option<&str>, anyhow::Error>
     }
 }
 
+#[derive(Debug)]
+pub enum JsonObjectError {
+    Empty,
+    Invalid(serde_json::Error),
+    NotObject,
+}
+
+/// Parse a completed Responses API tool argument payload using one provider-independent rule.
+pub fn parse_json_object(value: &str) -> Result<Value, JsonObjectError> {
+    if value.is_empty() {
+        return Err(JsonObjectError::Empty);
+    }
+    let parsed = serde_json::from_str::<Value>(value).map_err(JsonObjectError::Invalid)?;
+    if !parsed.is_object() {
+        return Err(JsonObjectError::NotObject);
+    }
+    Ok(parsed)
+}
+
 fn content_contains_text(content: &Value, needle: &str) -> bool {
     match content {
         Value::String(text) => text.contains(needle),
@@ -327,6 +346,23 @@ mod tests {
         assert_eq!(
             normalized["properties"]["metadata"]["required"],
             serde_json::json!(["short"])
+        );
+    }
+
+    #[test]
+    fn completed_tool_arguments_must_be_a_json_object() {
+        assert!(matches!(parse_json_object(""), Err(JsonObjectError::Empty)));
+        assert!(matches!(
+            parse_json_object("{\"path\":"),
+            Err(JsonObjectError::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_json_object("[]"),
+            Err(JsonObjectError::NotObject)
+        ));
+        assert_eq!(
+            parse_json_object("{\"path\":\"/tmp/a\"}").unwrap(),
+            serde_json::json!({"path":"/tmp/a"})
         );
     }
 }

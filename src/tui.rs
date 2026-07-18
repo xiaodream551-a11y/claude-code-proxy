@@ -711,11 +711,9 @@ fn token_sparkline(samples: &[(SystemTime, u64)], width: usize, now: SystemTime)
                 return ' ';
             }
             let scaled = value.min(SESSION_SPARKLINE_MAX_TOKENS);
-            let level = ((u128::from(scaled) * LEVELS.len() as u128
-                + u128::from(SESSION_SPARKLINE_MAX_TOKENS)
-                - 1)
-                / u128::from(SESSION_SPARKLINE_MAX_TOKENS))
-            .saturating_sub(1) as usize;
+            let level = (u128::from(scaled) * LEVELS.len() as u128)
+                .div_ceil(u128::from(SESSION_SPARKLINE_MAX_TOKENS))
+                .saturating_sub(1) as usize;
             LEVELS[level]
         })
         .collect()

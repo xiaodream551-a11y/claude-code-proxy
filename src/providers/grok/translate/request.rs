@@ -5,11 +5,11 @@ use serde_json::Value;
 
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::providers::translate_shared::{
-    ImageSource, flatten_system_text, image_source_to_url, is_claude_code_compaction_request,
-    normalize_strict_json_schema, read_effort,
+    flatten_system_text, is_claude_code_compaction_request, normalize_strict_json_schema,
+    read_effort,
 };
 
-const MAX_GROK_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_GROK_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -79,7 +79,12 @@ pub enum GrokContentPart {
     #[serde(rename = "input_text")]
     InputText { text: String },
     #[serde(rename = "input_image")]
-    InputImage { image_url: String },
+    InputImage {
+        image_url: String,
+        /// Computed while validating embedded base64 so token estimation never decodes it again.
+        #[serde(skip)]
+        estimated_tokens: Option<u64>,
+    },
     #[serde(rename = "output_text")]
     OutputText { text: String },
 }
@@ -535,9 +540,10 @@ fn parse_message(
                 {
                     anyhow::bail!("unsupported image block field");
                 }
-                let source = parse_image_source(object.get("source"))?;
+                let (image_url, estimated_tokens) = parse_image_source(object.get("source"))?;
                 content.push(GrokContentPart::InputImage {
-                    image_url: image_source_to_url(&source),
+                    image_url,
+                    estimated_tokens,
                 });
             }
             ("assistant", "server_tool_use") => {
@@ -658,7 +664,7 @@ fn parse_message(
     Ok(())
 }
 
-fn parse_image_source(value: Option<&Value>) -> anyhow::Result<ImageSource> {
+fn parse_image_source(value: Option<&Value>) -> anyhow::Result<(String, Option<u64>)> {
     let source = value
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("image source must be an object"))?;
@@ -684,20 +690,30 @@ fn parse_image_source(value: Option<&Value>) -> anyhow::Result<ImageSource> {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("image base64 data is empty"))?;
-            let mut decoder = base64::read::DecoderReader::new(
-                data.as_bytes(),
-                &base64::engine::general_purpose::STANDARD,
+            let estimated_tokens =
+                match super::super::count_tokens::validate_and_estimate_base64_image(
+                    data,
+                    MAX_GROK_IMAGE_BYTES,
+                ) {
+                    Ok(estimate) => estimate,
+                    Err(super::super::count_tokens::Base64ImageError::Invalid) => {
+                        anyhow::bail!("image base64 data is invalid")
+                    }
+                    Err(super::super::count_tokens::Base64ImageError::TooLarge) => {
+                        anyhow::bail!("image exceeds the 20 MiB size limit")
+                    }
+                };
+
+            // Build the final request value directly from the borrowed Anthropic
+            // payload. Avoid an intermediate owned base64 String at peak size.
+            let mut image_url = String::with_capacity(
+                "data:".len() + media_type.len() + ";base64,".len() + data.len(),
             );
-            let decoded_bytes = std::io::copy(&mut decoder, &mut std::io::sink())
-                .map_err(|_| anyhow::anyhow!("image base64 data is invalid"))?;
-            if decoded_bytes > MAX_GROK_IMAGE_BYTES {
-                anyhow::bail!("image exceeds the 20 MiB size limit");
-            }
-            Ok(ImageSource {
-                media_type: media_type.to_string(),
-                data: data.to_string(),
-                source_type: source_type.to_string(),
-            })
+            image_url.push_str("data:");
+            image_url.push_str(media_type);
+            image_url.push_str(";base64,");
+            image_url.push_str(data);
+            Ok((image_url, Some(estimated_tokens)))
         }
         "url" => {
             if !source
@@ -720,11 +736,7 @@ fn parse_image_source(value: Option<&Value>) -> anyhow::Result<ImageSource> {
             {
                 anyhow::bail!("image URL must be an HTTP(S) URL without credentials");
             }
-            Ok(ImageSource {
-                media_type: String::new(),
-                data: raw.to_string(),
-                source_type: source_type.to_string(),
-            })
+            Ok((raw.to_string(), None))
         }
         _ => anyhow::bail!("unsupported image source type"),
     }

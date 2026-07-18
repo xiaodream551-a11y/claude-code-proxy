@@ -226,10 +226,10 @@ fn run_log_writer<F>(
                 last_file = Some(record.file);
             }
             LogCommand::Flush(ack) => {
-                if let Some(file) = last_file.as_deref() {
-                    if let Err(error) = write_dropped_summary(&dropped, capacity, file, sink) {
-                        write_error.get_or_insert_with(|| error.to_string());
-                    }
+                if let Some(file) = last_file.as_deref()
+                    && let Err(error) = write_dropped_summary(&dropped, capacity, file, sink)
+                {
+                    write_error.get_or_insert_with(|| error.to_string());
                 }
                 let result = write_error
                     .as_ref()

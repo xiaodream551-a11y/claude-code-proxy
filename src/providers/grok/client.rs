@@ -12,7 +12,7 @@ use tokio::time::Instant as TokioInstant;
 use super::auth::manager::{GrokAuthError, GrokAuthErrorKind, GrokAuthManager};
 use super::auth::token_store::{StoredAuth, file_store};
 use super::translate::request::GrokResponsesRequest;
-use crate::retry::{MAX_RATE_LIMIT_RETRIES, compute_backoff_delay, should_retry_status, sleep};
+use crate::retry::{MAX_RATE_LIMIT_RETRIES, should_retry_status, sleep};
 use crate::traffic::TrafficCapture;
 
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
@@ -284,6 +284,30 @@ impl GrokRetryState {
         self.transient_failures
     }
 
+    /// Reserve one transient retry and decide whether its delay fits both retry policy and the
+    /// request's absolute deadline. All Grok auth/model/body/rebuild paths use this single rule.
+    pub fn schedule_retry(
+        &mut self,
+        retry_after: Option<&str>,
+        deadline: GrokRequestDeadline,
+    ) -> Result<u64, GrokRetryStop> {
+        if !self.can_retry_transient() {
+            self.mark_terminal();
+            return Err(GrokRetryStop::RETRY_EXHAUSTED);
+        }
+        let delay = crate::retry::compute_backoff_delay(self.transient_failures, retry_after);
+        self.note_transient_failure();
+        if delay.exceeds_budget {
+            self.mark_terminal();
+            return Err(GrokRetryStop::DELAY_EXCEEDS_BUDGET);
+        }
+        if !deadline.permits_wait_ms(delay.wait_ms) {
+            self.mark_terminal();
+            return Err(GrokRetryStop::DELAY_EXCEEDS_DEADLINE);
+        }
+        Ok(delay.wait_ms)
+    }
+
     pub fn can_retry_transient(&self) -> bool {
         !self.terminal
             && self.transient_failures < MAX_RATE_LIMIT_RETRIES
@@ -314,6 +338,27 @@ impl GrokRetryState {
     fn has_wire_attempt_capacity(&self) -> bool {
         !self.terminal && self.wire_attempt < MAX_WIRE_ATTEMPTS
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrokRetryStop {
+    pub failure_kind: &'static str,
+    pub terminal_reason: &'static str,
+}
+
+impl GrokRetryStop {
+    const RETRY_EXHAUSTED: Self = Self {
+        failure_kind: "retry_exhausted",
+        terminal_reason: "retry exhausted",
+    };
+    const DELAY_EXCEEDS_BUDGET: Self = Self {
+        failure_kind: "retry_after_exceeds_budget",
+        terminal_reason: "retry delay exceeds budget",
+    };
+    const DELAY_EXCEEDS_DEADLINE: Self = Self {
+        failure_kind: "retry_delay_exceeds_deadline",
+        terminal_reason: "retry delay exceeds remaining request deadline",
+    };
 }
 
 pub struct GrokClient {
@@ -480,48 +525,26 @@ impl GrokClient {
             }
 
             let mut state = retry.lock().await;
-            if !state.can_retry_transient() {
-                state.mark_terminal();
-                drop(state);
-                let error = error.into_terminal("retry exhausted");
-                capture_terminal_failure(
-                    traffic,
-                    "auth",
-                    "retry_exhausted",
-                    auth_attempt,
-                    Some(error.status.as_u16()),
-                    Some(&error.message),
-                );
-                log_retry_exhausted(auth_attempt, &error);
-                return Err(error);
-            }
-            let delay =
-                compute_backoff_delay(state.transient_failures, error.retry_after.as_deref());
-            state.note_transient_failure();
-            let terminal_reason = if delay.exceeds_budget {
-                Some(("retry_after_exceeds_budget", "retry delay exceeds budget"))
-            } else if !deadline.permits_wait_ms(delay.wait_ms) {
-                Some((
-                    "retry_delay_exceeds_deadline",
-                    "retry delay exceeds remaining request deadline",
-                ))
-            } else {
-                None
+            let wait_ms = match state.schedule_retry(error.retry_after.as_deref(), deadline) {
+                Ok(wait_ms) => wait_ms,
+                Err(stop) => {
+                    let exhausted = stop.failure_kind == "retry_exhausted";
+                    let error = error.into_terminal(stop.terminal_reason);
+                    drop(state);
+                    capture_terminal_failure(
+                        traffic,
+                        "auth",
+                        stop.failure_kind,
+                        auth_attempt,
+                        Some(error.status.as_u16()),
+                        Some(&error.message),
+                    );
+                    if exhausted {
+                        log_retry_exhausted(auth_attempt, &error);
+                    }
+                    return Err(error);
+                }
             };
-            if let Some((failure_kind, terminal_reason)) = terminal_reason {
-                state.mark_terminal();
-                drop(state);
-                let error = error.into_terminal(terminal_reason);
-                capture_terminal_failure(
-                    traffic,
-                    "auth",
-                    failure_kind,
-                    auth_attempt,
-                    Some(error.status.as_u16()),
-                    Some(&error.message),
-                );
-                return Err(error);
-            }
             let transient = state.transient_failures;
             drop(state);
 
@@ -531,7 +554,7 @@ impl GrokClient {
                     &serde_json::json!({
                         "auth_attempt": auth_attempt,
                         "transient_failures": transient,
-                        "wait_ms": delay.wait_ms,
+                        "wait_ms": wait_ms,
                         "status": error.status.as_u16(),
                         "origin": origin_name(error.origin),
                         "stage": stage_name(error.stage),
@@ -539,12 +562,12 @@ impl GrokClient {
                     }),
                 );
             }
-            log_retry(auth_attempt, transient, delay.wait_ms, &error);
+            log_retry(auth_attempt, transient, wait_ms, &error);
             run_before_deadline(
                 deadline,
                 retry.clone(),
                 GrokErrorStage::Auth,
-                sleep(delay.wait_ms),
+                sleep(wait_ms),
             )
             .await?;
         }
@@ -692,48 +715,27 @@ impl GrokClient {
                 }
                 Err(error) if error.is_retryable() => {
                     let mut state = retry.lock().await;
-                    if !state.can_retry_transient() {
-                        state.mark_terminal();
-                        drop(state);
-                        capture_terminal_failure(
-                            traffic.as_deref(),
-                            stage_name(error.stage),
-                            "retry_exhausted",
-                            attempt,
-                            Some(error.status.as_u16()),
-                            Some(&error.message),
-                        );
-                        log_retry_exhausted(attempt, &error);
-                        return Err(error.into_terminal("retry exhausted"));
-                    }
-                    let delay = compute_backoff_delay(
-                        state.transient_failures,
-                        error.retry_after.as_deref(),
-                    );
-                    state.note_transient_failure();
-                    let terminal_reason = if delay.exceeds_budget {
-                        Some(("retry_after_exceeds_budget", "retry delay exceeds budget"))
-                    } else if !deadline.permits_wait_ms(delay.wait_ms) {
-                        Some((
-                            "retry_delay_exceeds_deadline",
-                            "retry delay exceeds remaining request deadline",
-                        ))
-                    } else {
-                        None
+                    let wait_ms = match state.schedule_retry(error.retry_after.as_deref(), deadline)
+                    {
+                        Ok(wait_ms) => wait_ms,
+                        Err(stop) => {
+                            let exhausted = stop.failure_kind == "retry_exhausted";
+                            let error = error.into_terminal(stop.terminal_reason);
+                            drop(state);
+                            capture_terminal_failure(
+                                traffic.as_deref(),
+                                stage_name(error.stage),
+                                stop.failure_kind,
+                                attempt,
+                                Some(error.status.as_u16()),
+                                Some(&error.message),
+                            );
+                            if exhausted {
+                                log_retry_exhausted(attempt, &error);
+                            }
+                            return Err(error);
+                        }
                     };
-                    if let Some((failure_kind, terminal_reason)) = terminal_reason {
-                        state.mark_terminal();
-                        drop(state);
-                        capture_terminal_failure(
-                            traffic.as_deref(),
-                            stage_name(error.stage),
-                            failure_kind,
-                            attempt,
-                            Some(error.status.as_u16()),
-                            Some(&error.message),
-                        );
-                        return Err(error.into_terminal(terminal_reason));
-                    }
                     let transient = state.transient_failures;
                     drop(state);
                     if let Some(capture) = traffic.as_ref() {
@@ -742,7 +744,7 @@ impl GrokClient {
                             &serde_json::json!({
                                 "attempt": attempt,
                                 "transient_failures": transient,
-                                "wait_ms": delay.wait_ms,
+                                "wait_ms": wait_ms,
                                 "status": error.status.as_u16(),
                                 "origin": origin_name(error.origin),
                                 "stage": stage_name(error.stage),
@@ -750,8 +752,8 @@ impl GrokClient {
                             }),
                         );
                     }
-                    log_retry(attempt, transient, delay.wait_ms, &error);
-                    run_before_deadline(deadline, retry.clone(), error.stage, sleep(delay.wait_ms))
+                    log_retry(attempt, transient, wait_ms, &error);
+                    run_before_deadline(deadline, retry.clone(), error.stage, sleep(wait_ms))
                         .await?;
                     continue;
                 }
@@ -1110,21 +1112,9 @@ fn sanitize_rejected_detail(value: &str) -> Option<String> {
     {
         return Some("[redacted upstream error detail]".to_string());
     }
-    let end = floor_char_boundary(&collapsed, MAX_REJECTED_DETAIL_BYTES);
-    let suffix = if end < collapsed.len() {
-        "…[truncated]"
-    } else {
-        ""
-    };
-    Some(format!("{}{suffix}", &collapsed[..end]))
-}
-
-fn floor_char_boundary(value: &str, max_bytes: usize) -> usize {
-    let mut end = max_bytes.min(value.len());
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
+    let (prefix, truncated) = super::text::truncate_utf8(&collapsed, MAX_REJECTED_DETAIL_BYTES);
+    let suffix = if truncated { "…[truncated]" } else { "" };
+    Some(format!("{prefix}{suffix}"))
 }
 
 pub(super) fn capture_terminal_failure(
@@ -1306,6 +1296,27 @@ fn auth_error_kind_name(kind: GrokAuthErrorKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_schedule_uses_one_terminal_policy_for_budget_and_deadline() {
+        let mut over_budget =
+            GrokRetryState::with_deadline(GrokRequestDeadline::after(Duration::from_secs(60)));
+        let stop = over_budget
+            .schedule_retry(Some("120"), over_budget.deadline())
+            .unwrap_err();
+        assert_eq!(stop.failure_kind, "retry_after_exceeds_budget");
+        assert!(over_budget.is_terminal());
+        assert_eq!(over_budget.transient_failures(), 1);
+
+        let mut out_of_time =
+            GrokRetryState::with_deadline(GrokRequestDeadline::after(Duration::ZERO));
+        let stop = out_of_time
+            .schedule_retry(Some("0"), out_of_time.deadline())
+            .unwrap_err();
+        assert_eq!(stop.failure_kind, "retry_delay_exceeds_deadline");
+        assert!(out_of_time.is_terminal());
+        assert_eq!(out_of_time.transient_failures(), 1);
+    }
     use crate::traffic::test_capture;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -1,4 +1,5 @@
 use crate::anthropic::sse::parse_sse_events;
+use crate::providers::translate_shared::{JsonObjectError, parse_json_object};
 
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
@@ -755,13 +756,23 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 if !args_accum.is_empty() {
                     let sanitized = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
                     *args_accum = sanitized;
-                    if *buffer_until_done || !*emitted_args {
-                        *emitted_args = true;
-                        out.push(ReducerEvent::ToolDelta {
-                            index: *index,
-                            partial_json: args_accum.clone(),
-                        });
+                }
+
+                validate_tool_arguments(name, call_id, args_accum).map_err(|message| {
+                    UpstreamStreamError {
+                        kind: UpstreamErrorKind::Failed,
+                        message,
+                        retry_after_seconds: None,
+                        diagnostics: None,
                     }
+                })?;
+
+                if *buffer_until_done || !*emitted_args {
+                    *emitted_args = true;
+                    out.push(ReducerEvent::ToolDelta {
+                        index: *index,
+                        partial_json: args_accum.clone(),
+                    });
                 }
             }
 
@@ -924,6 +935,25 @@ pub fn stop_reason_for_incomplete_response(
         Some("content_filter") => STOP_REFUSAL,
         Some(_) => STOP_REFUSAL,
     })
+}
+
+pub(super) fn validate_tool_arguments(
+    name: &str,
+    call_id: &str,
+    arguments: &str,
+) -> Result<(), String> {
+    match parse_json_object(arguments) {
+        Ok(_) => Ok(()),
+        Err(JsonObjectError::Empty) => Err(format!(
+            "Codex tool call {name} ({call_id}) completed without JSON arguments"
+        )),
+        Err(JsonObjectError::Invalid(error)) => Err(format!(
+            "Codex tool call {name} ({call_id}) returned invalid JSON arguments: {error}"
+        )),
+        Err(JsonObjectError::NotObject) => Err(format!(
+            "Codex tool call {name} ({call_id}) returned non-object JSON arguments"
+        )),
+    }
 }
 
 fn should_buffer_tool_args(name: &str) -> bool {
@@ -1257,6 +1287,50 @@ mod tests {
             assert_eq!(*stop_reason, "tool_use");
         } else {
             panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn reducer_rejects_invalid_tool_arguments_before_nonstream_accumulation() {
+        for (arguments, expected) in [
+            ("", "completed without JSON arguments"),
+            ("{\"command\":", "invalid JSON arguments"),
+            ("[]", "non-object JSON arguments"),
+        ] {
+            let upstream = format!(
+                "{}{}{}",
+                sse(
+                    "response.output_item.added",
+                    json!({
+                        "output_index": 0,
+                        "item": {"type":"function_call","call_id":"call_1","name":"Bash"}
+                    })
+                ),
+                sse(
+                    "response.output_item.done",
+                    json!({
+                        "output_index": 0,
+                        "item": {
+                            "type":"function_call",
+                            "call_id":"call_1",
+                            "name":"Bash",
+                            "arguments": arguments
+                        }
+                    })
+                ),
+                sse(
+                    "response.completed",
+                    json!({"response":{"id":"resp_1","usage":{}}})
+                ),
+            );
+
+            let error = reduce_upstream_bytes(upstream.as_bytes()).unwrap_err();
+            assert_eq!(error.kind, UpstreamErrorKind::Failed);
+            assert!(
+                error.message.contains(expected),
+                "unexpected error for {arguments:?}: {}",
+                error.message
+            );
         }
     }
 

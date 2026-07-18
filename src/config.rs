@@ -1,7 +1,10 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::paths;
 
@@ -934,6 +937,40 @@ fn default_codex_transport(system_proxy_intercepts_upstream: bool) -> CodexTrans
     }
 }
 
+const CODEX_PROXY_PROBE_TTL: Duration = Duration::from_secs(5);
+const PROXY_ENV_KEYS: [&str; 8] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
+struct CodexProxyProbe {
+    upstream: String,
+    environment: [Option<OsString>; PROXY_ENV_KEYS.len()],
+    checked_at: Instant,
+    intercepts: bool,
+}
+
+impl CodexProxyProbe {
+    fn is_fresh_for(
+        &self,
+        upstream: &str,
+        environment: &[Option<OsString>; PROXY_ENV_KEYS.len()],
+        now: Instant,
+    ) -> bool {
+        self.upstream == upstream
+            && &self.environment == environment
+            && now.saturating_duration_since(self.checked_at) < CODEX_PROXY_PROBE_TTL
+    }
+}
+
+static CODEX_PROXY_PROBE: OnceLock<Mutex<Option<CodexProxyProbe>>> = OnceLock::new();
+
 fn codex_system_proxy_intercepts_upstream() -> bool {
     const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
@@ -944,9 +981,28 @@ fn codex_system_proxy_intercepts_upstream() -> bool {
     let Ok(uri) = upstream.parse::<http::Uri>() else {
         return false;
     };
-    hyper_util::client::proxy::matcher::Matcher::from_system()
+    let environment = PROXY_ENV_KEYS.map(std::env::var_os);
+    let now = Instant::now();
+    let cache = CODEX_PROXY_PROBE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(probe) = cached.as_ref()
+        && probe.is_fresh_for(&upstream, &environment, now)
+    {
+        return probe.intercepts;
+    }
+
+    let intercepts = hyper_util::client::proxy::matcher::Matcher::from_system()
         .intercept(&uri)
-        .is_some()
+        .is_some();
+    *cached = Some(CodexProxyProbe {
+        upstream,
+        environment,
+        checked_at: now,
+        intercepts,
+    });
+    intercepts
 }
 
 pub fn codex_transport() -> CodexTransport {
@@ -1179,6 +1235,29 @@ mod tests {
             CodexTransport::WebSocket,
             "an explicit strict WebSocket selection remains an opt-in direct connection"
         );
+    }
+
+    #[test]
+    fn codex_system_proxy_probe_cache_is_keyed_and_short_lived() {
+        let now = Instant::now();
+        let environment: [Option<OsString>; PROXY_ENV_KEYS.len()] = std::array::from_fn(|_| None);
+        let probe = CodexProxyProbe {
+            upstream: "https://chatgpt.com/backend-api/codex/responses".into(),
+            environment: environment.clone(),
+            checked_at: now,
+            intercepts: true,
+        };
+
+        assert!(probe.is_fresh_for(&probe.upstream, &environment, now));
+        assert!(!probe.is_fresh_for("https://example.com/responses", &environment, now));
+        let mut changed_environment = environment;
+        changed_environment[0] = Some("http://127.0.0.1:8080".into());
+        assert!(!probe.is_fresh_for(&probe.upstream, &changed_environment, now));
+        assert!(!probe.is_fresh_for(
+            &probe.upstream,
+            &probe.environment,
+            now + CODEX_PROXY_PROBE_TTL
+        ));
     }
 
     #[test]
