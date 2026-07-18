@@ -190,11 +190,59 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
     ) -> Vec<u8> {
         let mut out = Vec::new();
-        if self.finished || !self.saw_tool_use || !self.blocks_by_output_index.is_empty() {
+        if self.finished || !self.saw_tool_use {
             return out;
         }
+
+        // A flaky transport can close after the model has sent a complete JSON
+        // function call but before `response.output_item.done` or the terminal
+        // response event. The tool block has already crossed the downstream
+        // replay boundary, so retrying the whole request could duplicate a tool
+        // invocation. Validate every remaining block transactionally and, when
+        // they are all complete tools, finish the Anthropic stream instead.
+        let mut prepared = Vec::with_capacity(self.blocks_by_output_index.len());
+        for output_index in self.blocks_by_output_index.keys().copied() {
+            let Ok(Some(arguments)) = self.prepare_tool_arguments(output_index, None) else {
+                return out;
+            };
+            prepared.push(arguments);
+        }
+        prepared.sort_by_key(|arguments| arguments.index);
+
         self.close_thinking(traffic, &mut out);
         self.ensure_message_start(traffic, &mut out);
+        for arguments in prepared {
+            let output_index = arguments.output_index;
+            if let Some((index, partial_json)) = self.commit_tool_arguments(arguments) {
+                self.emit(
+                    traffic,
+                    &mut out,
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": partial_json
+                        }
+                    }),
+                );
+            }
+            let Some(LiveBlock::Tool { index, .. }) =
+                self.blocks_by_output_index.remove(&output_index)
+            else {
+                return Vec::new();
+            };
+            self.emit(
+                traffic,
+                &mut out,
+                "content_block_stop",
+                &serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index,
+                }),
+            );
+        }
         self.emit_finish(STOP_TOOL_USE, None, traffic, &mut out);
         out
     }
@@ -1617,6 +1665,95 @@ mod tests {
         assert!(rendered.contains(r#""stop_reason":"tool_use""#));
         assert!(rendered.contains("message_stop"));
         assert!(!rendered.contains("event: error"));
+    }
+
+    #[test]
+    fn finishes_complete_tool_arguments_when_stream_closes_before_item_done() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let mut out = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"function_call","call_id":"call_1","name":"Workflow"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"script\":\"const result = await agent('inspect');\"}"
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        out.extend(translator.finish_after_closed_completed_tool_call(None));
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("content_block_start"));
+        assert!(rendered.contains("input_json_delta"));
+        assert!(rendered.contains(r#""stop_reason":"tool_use""#));
+        assert!(rendered.contains("message_stop"));
+        assert!(!rendered.contains("event: error"));
+        assert!(translator.is_finished());
+    }
+
+    #[test]
+    fn finishes_buffered_read_with_short_trailing_whitespace_on_close() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let mut out = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"function_call","call_id":"call_1","name":"Read"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"file_path\":\"/tmp/a\"}   "
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        out.extend(translator.finish_after_closed_completed_tool_call(None));
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("input_json_delta"));
+        assert!(rendered.contains("/tmp/a"));
+        assert!(rendered.contains(r#""stop_reason":"tool_use""#));
+        assert!(rendered.contains("message_stop"));
+        assert!(translator.is_finished());
+    }
+
+    #[test]
+    fn does_not_finish_partial_tool_arguments_after_close() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        translator
+            .accept(
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type":"function_call","call_id":"call_1","name":"Workflow"}
+                }),
+                None,
+            )
+            .unwrap();
+        translator
+            .accept(
+                &json!({
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "delta": "{\"script\":\"unfinished"
+                }),
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            translator
+                .finish_after_closed_completed_tool_call(None)
+                .is_empty()
+        );
+        assert!(!translator.is_finished());
     }
 
     #[test]

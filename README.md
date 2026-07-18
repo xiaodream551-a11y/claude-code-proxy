@@ -400,6 +400,12 @@ otherwise-default hosted search tool.
 The CLI endpoint's plaintext reasoning summaries are suppressed because they are
 not signed Anthropic thinking blocks and can contain draft answers; periodic
 Anthropic `ping` events preserve downstream liveness while Grok reasons.
+Failures delivered inside an HTTP 200 stream (`error`, `response.error`, or
+`response.failed`) retain their upstream status, message, and `Retry-After`.
+Retryable 429/5xx/529 failures rebuild the request only before semantic output;
+after text or tool output begins, the proxy emits a typed Anthropic in-band
+error instead of replaying a potentially duplicate tool call. Explicit 204 or
+non-SSE success responses are treated as retryable transport failures.
 Claude Code reasoning effort is forwarded as Responses `reasoning.effort` for
 Grok 4.5; `xhigh` and `max` are capped at Grok's supported `high` level.
 Claude Code's `WebSearch` uses Grok's hosted general web search. Requests to
@@ -758,7 +764,10 @@ Windows, and at
     "serviceTier": "fast",
     "responsesLite": true,
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
-    "transport": "websocket",
+    "transport": "auto",
+    "connectTimeoutMs": 15000,
+    "headerTimeoutMs": 60000,
+    "bodyIdleTimeoutMs": 300000,
     "totalTimeoutMs": 540000,
     "websocketResponseStartTimeoutMs": 60000,
     "websocketIdleTimeoutMs": 300000,
@@ -818,7 +827,10 @@ Windows, and at
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it                     |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
-| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `websocket` without a system proxy; otherwise `http` | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or proxy-aware WebSocket/HTTP selection plus an origin-wide breaker in `auto`                              |
+| `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `auto` (resolves to `http` when a system proxy intercepts the upstream) | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or WebSocket-first fallback plus an origin-wide breaker in `auto`                                         |
+| `CCP_CODEX_CONNECT_TIMEOUT_MS`   | `codex.connectTimeoutMs`   | `15000`                                           | Maximum time to establish the Codex HTTP TCP/TLS connection, including an HTTP fallback selected by `auto`                                                                       |
+| `CCP_CODEX_HEADER_TIMEOUT_MS`    | `codex.headerTimeoutMs`    | `60000`                                           | Maximum time to receive Codex HTTP response headers                                                                                                                               |
+| `CCP_CODEX_BODY_IDLE_TIMEOUT_MS` | `codex.bodyIdleTimeoutMs`  | `300000`                                          | Maximum gap between Codex HTTP response body chunks; this per-gap limit cannot extend the total request deadline                                                                 |
 | `CCP_CODEX_TOTAL_TIMEOUT_MS`     | `codex.totalTimeoutMs`     | `540000`                                          | Total wall-clock budget across WebSocket retries, Auto HTTP fallback, and the remaining live stream; caps stragglers while remaining configurable                                   |
 | `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event before refreshing the WebSocket and retrying safely                                                                                |
 | `CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS` | `codex.websocketIdleTimeoutMs` | `300000` | Maximum gap between Codex response events; WebSocket control frames do not extend this business-event deadline                                                                    |
@@ -847,15 +859,14 @@ A malformed `config.json` is reported on stderr and ignored; defaults are used
 in its place. Invalid types for individual keys are warned and skipped without
 affecting other keys.
 
-Codex uses the WebSocket Responses transport by default when no system proxy
-intercepts its upstream URL. When an HTTP(S) environment or operating-system
-proxy is active, the implicit default and `CCP_CODEX_TRANSPORT=auto` select
+Codex uses `auto` transport by default. Without a system proxy, `auto` starts
+with live WebSocket streaming while the connection is healthy and immediately
+falls back to incremental HTTP when a retryable WebSocket transport failure
+occurs before Anthropic output begins. When an HTTP(S) environment or
+operating-system proxy intercepts the upstream URL, `auto` starts directly on
 incremental HTTP SSE so Codex traffic follows that proxy instead of silently
 bypassing it. Explicit `CCP_CODEX_TRANSPORT=websocket` remains a strict direct
 connection because the WebSocket connector does not implement HTTP CONNECT.
-Without a system proxy, `auto` keeps live WebSocket streaming while the
-connection is healthy and immediately falls back to incremental HTTP when a
-retryable WebSocket transport failure occurs before Anthropic output begins.
 This covers handshake rejection, response-start or idle timeouts, failed
 heartbeat and pool probes, busy pooled connections, connection loss, and a
 close without a terminal event. Three consecutive retryable WebSocket transport

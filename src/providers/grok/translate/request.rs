@@ -389,6 +389,14 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
                 "description",
                 "input_schema",
                 "cache_control",
+                // Claude Code adds these execution hints to built-in and MCP
+                // tools. Grok's Responses endpoint does not consume them, but
+                // rejecting the whole request turns otherwise valid Workflow
+                // and deferred-tool turns into a local APIError.
+                "strict",
+                "defer_loading",
+                "allowed_callers",
+                "input_examples",
             ]
             .contains(&key.as_str())
             {
@@ -1248,6 +1256,33 @@ mod tests {
                 .any(|tool| { tool["type"] == "function" && tool["name"] == "lookup" })
         );
         assert!(!translated.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn grok_translation_ignores_claude_code_tool_execution_hints() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"inspect in parallel"}],
+            "tools":[{
+                "name":"Workflow",
+                "description":"Run a dynamic workflow",
+                "input_schema":{"type":"object","properties":{"script":{"type":"string"}}},
+                "strict":true,
+                "defer_loading":true,
+                "allowed_callers":["direct", "workflow"],
+                "input_examples":[{"script":"await agent('inspect')"}]
+            }]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let encoded = translated.to_string();
+        assert!(encoded.contains("Workflow"));
+        assert!(!encoded.contains("defer_loading"));
+        assert!(!encoded.contains("allowed_callers"));
+        assert!(!encoded.contains("input_examples"));
+        assert!(!encoded.contains("\"strict\""));
     }
 
     #[test]

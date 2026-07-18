@@ -84,7 +84,23 @@ impl GrokError {
             message: message.into(),
             origin: GrokErrorOrigin::Http,
             stage: GrokErrorStage::Status,
-            retryable: should_retry_status(status.as_u16()),
+            retryable: is_transient_http_status(status),
+        }
+    }
+
+    pub fn upstream_event(
+        status: StatusCode,
+        retry_after: Option<String>,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            status,
+            retry_after,
+            message: message.into(),
+            origin: GrokErrorOrigin::Http,
+            stage: GrokErrorStage::Stream,
+            retryable,
         }
     }
 
@@ -892,6 +908,43 @@ impl GrokClient {
             ));
         }
 
+        if status == StatusCode::NO_CONTENT {
+            let message = "Grok upstream returned an empty 204 response";
+            capture_attempt(
+                traffic,
+                attempt,
+                Some(status.as_u16()),
+                origin_name(GrokErrorOrigin::RequestTransport),
+                stage_name(GrokErrorStage::Header),
+                Some(message),
+            );
+            return Err(GrokError::request_transport(
+                GrokErrorStage::Header,
+                message,
+            ));
+        }
+
+        if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE)
+            && !is_event_stream_content_type(content_type)
+        {
+            let content_type = content_type.to_str().unwrap_or("<invalid>");
+            let message = format!(
+                "Grok upstream returned a non-SSE success response ({content_type})"
+            );
+            capture_attempt(
+                traffic,
+                attempt,
+                Some(status.as_u16()),
+                origin_name(GrokErrorOrigin::RequestTransport),
+                stage_name(GrokErrorStage::Header),
+                Some(&message),
+            );
+            return Err(GrokError::request_transport(
+                GrokErrorStage::Header,
+                message,
+            ));
+        }
+
         if let Some(capture) = traffic {
             capture.write_json(
                 "030-upstream-response-headers",
@@ -903,6 +956,18 @@ impl GrokClient {
         }
         Ok(response)
     }
+}
+
+fn is_transient_http_status(status: StatusCode) -> bool {
+    should_retry_status(status.as_u16()) || status.as_u16() == 529
+}
+
+fn is_event_stream_content_type(value: &reqwest::header::HeaderValue) -> bool {
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 pub(super) async fn run_before_deadline<F>(
@@ -1507,6 +1572,70 @@ mod tests {
         assert!(error.is_retryable());
         assert_eq!(error.origin, GrokErrorOrigin::Http);
         assert_eq!(error.stage, GrokErrorStage::Status);
+    }
+
+    #[test]
+    fn overloaded_529_is_retryable() {
+        let status = StatusCode::from_u16(529).unwrap();
+        let error = GrokError::http(status, Some("0".into()), "overloaded");
+
+        assert_eq!(error.status.as_u16(), 529);
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn event_stream_content_type_accepts_parameters_and_rejects_json() {
+        assert!(is_event_stream_content_type(
+            &reqwest::header::HeaderValue::from_static("text/event-stream; charset=utf-8")
+        ));
+        assert!(is_event_stream_content_type(
+            &reqwest::header::HeaderValue::from_static("TEXT/EVENT-STREAM")
+        ));
+        assert!(!is_event_stream_content_type(
+            &reqwest::header::HeaderValue::from_static("application/json")
+        ));
+        assert!(!is_event_stream_content_type(
+            &reqwest::header::HeaderValue::from_static("text/html")
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_non_sse_success_is_retryable_protocol_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: 15\r\nconnection: close\r\n\r\nproxy login page",
+                )
+                .await
+                .unwrap();
+        });
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let deadline = GrokRequestDeadline::after(Duration::from_secs(2));
+        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+
+        let error = client
+            .attempt("test-access", &sample_body(), 1, None, deadline, retry)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert_eq!(error.origin, GrokErrorOrigin::RequestTransport);
+        assert_eq!(error.stage, GrokErrorStage::Header);
+        assert!(error.is_retryable());
+        assert!(error.message.contains("text/html"));
     }
 
     #[tokio::test]

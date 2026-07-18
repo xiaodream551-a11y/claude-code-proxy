@@ -10,6 +10,7 @@ const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_INCOMPLETE_TOOL_CALLS: usize = 128;
 const MAX_SEQUENCE_HISTORY: usize = 1024;
 const MAX_INCOMPLETE_REASON_BYTES: usize = 256;
+const MAX_UPSTREAM_FAILURE_MESSAGE_BYTES: usize = 2 * 1024;
 
 /// Return whether an event is known to be non-semantic telemetry after a response terminal.
 ///
@@ -259,6 +260,10 @@ impl GrokReductionError {
     pub fn usage(&self) -> Option<&GrokUsage> {
         self.usage.as_ref()
     }
+
+    pub fn upstream_failure(&self) -> Option<&GrokUpstreamFailure> {
+        self.source.downcast_ref()
+    }
 }
 
 impl std::fmt::Display for GrokReductionError {
@@ -272,6 +277,28 @@ impl std::error::Error for GrokReductionError {
         Some(self.source.as_ref())
     }
 }
+
+/// A structured failure delivered inside an otherwise successful Grok SSE response.
+///
+/// The Responses API can report model, capacity, or request failures after the HTTP 200 headers.
+/// Keep the transport semantics intact so a caller can retry a known transient failure before it
+/// commits output, or render the matching Anthropic in-band error after output has started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokUpstreamFailure {
+    pub event_type: String,
+    pub status: u16,
+    pub retry_after: Option<String>,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for GrokUpstreamFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.event_type, self.message)
+    }
+}
+
+impl std::error::Error for GrokUpstreamFailure {}
 
 #[derive(Clone, Default)]
 pub struct Reducer {
@@ -655,10 +682,10 @@ impl Reducer {
                 });
                 Ok(out)
             }
-            "error" | "response.failed" => {
+            "error" | "response.failed" | "response.error" => {
                 let response = value.get("response").unwrap_or(&value);
                 self.usage = Some(grok_usage(response));
-                anyhow::bail!("upstream Grok stream failed")
+                Err(anyhow::Error::new(parse_upstream_failure(&value, typ)))
             }
             _ => anyhow::bail!("unsupported Grok stream event: {typ}"),
         }
@@ -828,12 +855,150 @@ fn grok_usage(response: &Value) -> GrokUsage {
 
 fn failed_event_usage(value: &Value) -> Option<GrokUsage> {
     let event_type = value.get("type").and_then(Value::as_str)?;
-    if !matches!(event_type, "error" | "response.failed") {
+    if !matches!(event_type, "error" | "response.failed" | "response.error") {
         return None;
     }
     let response = value.get("response").unwrap_or(value);
     response.get("usage")?;
     Some(grok_usage(response))
+}
+
+fn parse_upstream_failure(value: &Value, event_type: &str) -> GrokUpstreamFailure {
+    let response = value.get("response").unwrap_or(value);
+    let error = response
+        .get("error")
+        .or_else(|| value.get("error"))
+        .unwrap_or(response);
+    let message = failure_message(value, response, error);
+    let explicit_status = [error, response, value]
+        .into_iter()
+        .find_map(failure_status);
+    let classification = failure_code(error, response, value)
+        .and_then(classify_failure_code)
+        .or_else(|| classify_failure_message(&message));
+    let (status, classified) = explicit_status
+        .map(|status| (status, true))
+        .or_else(|| classification.map(|status| (status, true)))
+        .unwrap_or((502, false));
+    let retry_after = [error, response, value]
+        .into_iter()
+        .find_map(|object| object.get("retry_after").and_then(stringify_retry_after));
+
+    GrokUpstreamFailure {
+        event_type: event_type.to_owned(),
+        status,
+        retry_after,
+        message,
+        retryable: classified && matches!(status, 429 | 500 | 502 | 503 | 504 | 529),
+    }
+}
+
+fn failure_message(value: &Value, response: &Value, error: &Value) -> String {
+    let message = [error, response, value]
+        .into_iter()
+        .find_map(|object| {
+            object
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+        })
+        .or_else(|| error.as_str().filter(|message| !message.trim().is_empty()))
+        .unwrap_or("Grok upstream stream failed");
+    super::super::text::truncate_utf8(message, MAX_UPSTREAM_FAILURE_MESSAGE_BYTES)
+        .0
+        .to_owned()
+}
+
+fn failure_status(value: &Value) -> Option<u16> {
+    ["status_code", "http_status", "status"]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(parse_status))
+}
+
+fn parse_status(value: &Value) -> Option<u16> {
+    let status = value
+        .as_u64()
+        .and_then(|status| u16::try_from(status).ok())
+        .or_else(|| value.as_str()?.parse::<u16>().ok())?;
+    (400..=599).contains(&status).then_some(status)
+}
+
+fn failure_code<'a>(error: &'a Value, response: &'a Value, value: &'a Value) -> Option<&'a str> {
+    ["code", "error_type", "type"]
+        .into_iter()
+        .find_map(|field| error.get(field).and_then(Value::as_str))
+        .or_else(|| {
+            ["code", "error_type"]
+                .into_iter()
+                .find_map(|field| response.get(field).and_then(Value::as_str))
+        })
+        .or_else(|| {
+            ["code", "error_type"]
+                .into_iter()
+                .find_map(|field| value.get(field).and_then(Value::as_str))
+        })
+}
+
+fn classify_failure_code(code: &str) -> Option<u16> {
+    let code = code.trim().to_ascii_lowercase();
+    if let Ok(status) = code.parse::<u16>()
+        && (400..=599).contains(&status)
+    {
+        return Some(status);
+    }
+    match code.as_str() {
+        "rate_limit_error" | "rate_limit_exceeded" | "too_many_requests" => Some(429),
+        "overloaded_error" | "overloaded" | "server_overloaded" => Some(529),
+        "authentication_error" | "unauthorized" | "invalid_api_key" => Some(401),
+        "permission_error" | "forbidden" => Some(403),
+        "not_found_error" | "not_found" => Some(404),
+        "conflict_error" | "conflict" => Some(409),
+        "unprocessable_entity" => Some(422),
+        "invalid_request_error" | "bad_request" | "context_length_exceeded" => Some(400),
+        "gateway_timeout" | "timeout" => Some(504),
+        "service_unavailable" | "temporarily_unavailable" => Some(503),
+        "server_error" | "internal_server_error" | "internal_error" | "api_error" => Some(500),
+        _ => None,
+    }
+}
+
+fn classify_failure_message(message: &str) -> Option<u16> {
+    let message = message.to_ascii_lowercase();
+    if message.contains("rate limit") || message.contains("too many requests") {
+        Some(429)
+    } else if message.contains("overload") {
+        Some(529)
+    } else if message.contains("service unavailable")
+        || message.contains("temporarily unavailable")
+    {
+        Some(503)
+    } else if message.contains("gateway timeout")
+        || message.contains("timed out")
+        || message.contains("timeout")
+    {
+        Some(504)
+    } else if message.contains("internal server") || message.contains("server error") {
+        Some(500)
+    } else if message.contains("context window")
+        || message.contains("context length")
+        || message.contains("invalid request")
+    {
+        Some(400)
+    } else if message.contains("unauthorized") || message.contains("authentication") {
+        Some(401)
+    } else if message.contains("forbidden") || message.contains("permission denied") {
+        Some(403)
+    } else {
+        None
+    }
+}
+
+fn stringify_retry_after(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 pub(super) fn parse_function_arguments(arguments: &str) -> anyhow::Result<Value> {
@@ -1395,5 +1560,68 @@ mod tests {
             let error = reduce_upstream_bytes(input.as_bytes()).unwrap_err();
             assert!(error.to_string().contains("JSON object"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn upstream_failure_events_preserve_retry_semantics() {
+        let cases = [
+            (
+                concat!(r#"data: {"type":"response.failed","response":{"error":{"type":"overloaded_error","message":"capacity exhausted"},"retry_after":0.25,"usage":{"input_tokens":7}}}"#, "\n\n"),
+                "response.failed",
+                529,
+                true,
+                Some("0.25"),
+                "capacity exhausted",
+            ),
+            (
+                concat!(r#"data: {"type":"error","code":"rate_limit_exceeded","message":"slow down","retry_after":"1"}"#, "\n\n"),
+                "error",
+                429,
+                true,
+                Some("1"),
+                "slow down",
+            ),
+            (
+                concat!(r#"data: {"type":"response.error","response":{"error":{"status_code":400,"message":"invalid tool schema"}}}"#, "\n\n"),
+                "response.error",
+                400,
+                false,
+                None,
+                "invalid tool schema",
+            ),
+            (
+                concat!(r#"data: {"type":"response.failed","response":{"error":{"message":"model failed"}}}"#, "\n\n"),
+                "response.failed",
+                502,
+                false,
+                None,
+                "model failed",
+            ),
+        ];
+
+        for (wire, event_type, status, retryable, retry_after, message) in cases {
+            let error = reduce_upstream_bytes(wire.as_bytes()).unwrap_err();
+            let failure = error
+                .upstream_failure()
+                .expect("failure event must remain structured");
+            assert_eq!(failure.event_type, event_type);
+            assert_eq!(failure.status, status);
+            assert_eq!(failure.retryable, retryable);
+            assert_eq!(failure.retry_after.as_deref(), retry_after);
+            assert_eq!(failure.message, message);
+        }
+    }
+
+    #[test]
+    fn response_error_preserves_failure_usage() {
+        let error = reduce_upstream_bytes(
+            b"data: {\"type\":\"response.error\",\"response\":{\"error\":{\"code\":\"service_unavailable\",\"message\":\"try later\"},\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\n",
+        )
+        .unwrap_err();
+
+        let usage = error.usage().expect("failure usage must survive reduction");
+        assert_eq!(usage.input_tokens, Some(9));
+        assert_eq!(usage.output_tokens, Some(1));
+        assert_eq!(error.upstream_failure().unwrap().status, 503);
     }
 }

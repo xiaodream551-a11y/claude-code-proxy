@@ -98,6 +98,12 @@ struct CodexConfig {
     #[serde(rename = "model")]
     pub model: Option<String>,
     pub transport: Option<String>,
+    #[serde(rename = "connectTimeoutMs")]
+    pub connect_timeout_ms: Option<u64>,
+    #[serde(rename = "headerTimeoutMs")]
+    pub header_timeout_ms: Option<u64>,
+    #[serde(rename = "bodyIdleTimeoutMs")]
+    pub body_idle_timeout_ms: Option<u64>,
     #[serde(rename = "totalTimeoutMs")]
     pub total_timeout_ms: Option<u64>,
     #[serde(rename = "websocketResponseStartTimeoutMs")]
@@ -343,6 +349,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_RESPONSES_LITE") {
         out.push("CCP_CODEX_RESPONSES_LITE (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_CONNECT_TIMEOUT_MS") {
+        out.push("CCP_CODEX_CONNECT_TIMEOUT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_HEADER_TIMEOUT_MS") {
+        out.push("CCP_CODEX_HEADER_TIMEOUT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_BODY_IDLE_TIMEOUT_MS") {
+        out.push("CCP_CODEX_BODY_IDLE_TIMEOUT_MS (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_TOTAL_TIMEOUT_MS") {
         out.push("CCP_CODEX_TOTAL_TIMEOUT_MS (env)".to_string());
     }
@@ -386,6 +401,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 .is_some_and(|summary| !summary.is_empty())
             {
                 out.push("codex.reasoningSummary (config)".to_string());
+            }
+            if let Some(timeout_ms) = codex.connect_timeout_ms {
+                out.push(format!("codex.connectTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(timeout_ms) = codex.header_timeout_ms {
+                out.push(format!("codex.headerTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(timeout_ms) = codex.body_idle_timeout_ms {
+                out.push(format!("codex.bodyIdleTimeoutMs: {timeout_ms}"));
             }
             if let Some(timeout_ms) = codex.total_timeout_ms {
                 out.push(format!("codex.totalTimeoutMs: {timeout_ms}"));
@@ -856,6 +880,30 @@ pub fn codex_websocket_response_start_timeout_ms(default: u64) -> u64 {
     )
 }
 
+pub fn codex_connect_timeout_ms(default: u64) -> u64 {
+    codex_positive_u64(
+        "CCP_CODEX_CONNECT_TIMEOUT_MS",
+        |codex| codex.connect_timeout_ms,
+        default,
+    )
+}
+
+pub fn codex_header_timeout_ms(default: u64) -> u64 {
+    codex_positive_u64(
+        "CCP_CODEX_HEADER_TIMEOUT_MS",
+        |codex| codex.header_timeout_ms,
+        default,
+    )
+}
+
+pub fn codex_body_idle_timeout_ms(default: u64) -> u64 {
+    codex_positive_u64(
+        "CCP_CODEX_BODY_IDLE_TIMEOUT_MS",
+        |codex| codex.body_idle_timeout_ms,
+        default,
+    )
+}
+
 pub fn codex_total_timeout_ms(default: u64) -> u64 {
     codex_positive_u64(
         "CCP_CODEX_TOTAL_TIMEOUT_MS",
@@ -933,7 +981,7 @@ fn default_codex_transport(system_proxy_intercepts_upstream: bool) -> CodexTrans
     if system_proxy_intercepts_upstream {
         CodexTransport::Http
     } else {
-        CodexTransport::WebSocket
+        CodexTransport::Auto
     }
 }
 
@@ -1087,6 +1135,9 @@ mod tests {
         "CCP_LOG_STDERR",
         "CCP_CODEX_REASONING_SUMMARY",
         "CCP_CODEX_RESPONSES_LITE",
+        "CCP_CODEX_CONNECT_TIMEOUT_MS",
+        "CCP_CODEX_HEADER_TIMEOUT_MS",
+        "CCP_CODEX_BODY_IDLE_TIMEOUT_MS",
         "CCP_CODEX_TOTAL_TIMEOUT_MS",
         "CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS",
         "CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS",
@@ -1208,14 +1259,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_defaults_to_websocket() {
+    fn codex_transport_defaults_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         let _no_proxy = EnvGuard::set("NO_PROXY", "*");
         let result = codex_transport();
-        assert_eq!(result, CodexTransport::WebSocket);
+        assert_eq!(result, CodexTransport::Auto);
     }
 
     #[test]
@@ -1286,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_invalid_env_falls_back_to_websocket() {
+    fn codex_transport_invalid_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
@@ -1295,11 +1346,11 @@ mod tests {
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
         }
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
-    fn codex_transport_empty_env_falls_back_to_websocket() {
+    fn codex_transport_empty_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
@@ -1308,7 +1359,7 @@ mod tests {
         unsafe {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
@@ -1424,22 +1475,31 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"totalTimeoutMs":150000,"websocketResponseStartTimeoutMs":45000,"websocketIdleTimeoutMs":180000,"maxIdleWebSockets":64,"idleWebSocketTtlMs":240000}}"#,
+            r#"{"codex":{"connectTimeoutMs":11000,"headerTimeoutMs":22000,"bodyIdleTimeoutMs":130000,"totalTimeoutMs":150000,"websocketResponseStartTimeoutMs":45000,"websocketIdleTimeoutMs":180000,"maxIdleWebSockets":64,"idleWebSocketTtlMs":240000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
+        assert_eq!(codex_connect_timeout_ms(1), 11_000);
+        assert_eq!(codex_header_timeout_ms(1), 22_000);
+        assert_eq!(codex_body_idle_timeout_ms(1), 130_000);
         assert_eq!(codex_total_timeout_ms(1), 150_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(1), 45_000);
         assert_eq!(codex_websocket_idle_timeout_ms(1), 180_000);
         assert_eq!(codex_max_idle_websockets(1), 64);
         assert_eq!(codex_idle_websocket_ttl_ms(1), 240_000);
 
+        let _connect_env = EnvGuard::set("CCP_CODEX_CONNECT_TIMEOUT_MS", "9000");
+        let _header_env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "18000");
+        let _body_idle_env = EnvGuard::set("CCP_CODEX_BODY_IDLE_TIMEOUT_MS", "100000");
         let _total_env = EnvGuard::set("CCP_CODEX_TOTAL_TIMEOUT_MS", "120000");
         let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "12000");
         let _idle_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS", "90000");
         let _pool_cap_env = EnvGuard::set("CCP_CODEX_MAX_IDLE_WEBSOCKETS", "32");
         let _pool_ttl_env = EnvGuard::set("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS", "120000");
+        assert_eq!(codex_connect_timeout_ms(1), 9_000);
+        assert_eq!(codex_header_timeout_ms(1), 18_000);
+        assert_eq!(codex_body_idle_timeout_ms(1), 100_000);
         assert_eq!(codex_total_timeout_ms(1), 120_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(1), 12_000);
         assert_eq!(codex_websocket_idle_timeout_ms(1), 90_000);
@@ -1454,20 +1514,64 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"totalTimeoutMs":0,"websocketResponseStartTimeoutMs":0,"websocketIdleTimeoutMs":0,"maxIdleWebSockets":0,"idleWebSocketTtlMs":0}}"#,
+            r#"{"codex":{"connectTimeoutMs":0,"headerTimeoutMs":0,"bodyIdleTimeoutMs":0,"totalTimeoutMs":0,"websocketResponseStartTimeoutMs":0,"websocketIdleTimeoutMs":0,"maxIdleWebSockets":0,"idleWebSocketTtlMs":0}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _connect_env = EnvGuard::set("CCP_CODEX_CONNECT_TIMEOUT_MS", "invalid");
+        let _header_env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "invalid");
+        let _body_idle_env = EnvGuard::set("CCP_CODEX_BODY_IDLE_TIMEOUT_MS", "invalid");
         let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "invalid");
         let _total_env = EnvGuard::set("CCP_CODEX_TOTAL_TIMEOUT_MS", "invalid");
         let _pool_cap_env = EnvGuard::set("CCP_CODEX_MAX_IDLE_WEBSOCKETS", "invalid");
         let _pool_ttl_env = EnvGuard::set("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS", "invalid");
 
+        assert_eq!(codex_connect_timeout_ms(15_000), 15_000);
+        assert_eq!(codex_header_timeout_ms(60_000), 60_000);
+        assert_eq!(codex_body_idle_timeout_ms(300_000), 300_000);
         assert_eq!(codex_total_timeout_ms(540_000), 540_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(45_000), 45_000);
         assert_eq!(codex_websocket_idle_timeout_ms(180_000), 180_000);
         assert_eq!(codex_max_idle_websockets(128), 128);
         assert_eq!(codex_idle_websocket_ttl_ms(300_000), 300_000);
+    }
+
+    #[test]
+    fn codex_http_timeouts_appear_in_override_summary() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"connectTimeoutMs":15000,"headerTimeoutMs":60000,"bodyIdleTimeoutMs":300000}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let loaded = load_config();
+        let summary = config_override_summary_lines(&loaded);
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("codex.connectTimeoutMs"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("codex.headerTimeoutMs"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("codex.bodyIdleTimeoutMs"))
+        );
+
+        let _connect_env = EnvGuard::set("CCP_CODEX_CONNECT_TIMEOUT_MS", "12000");
+        let summary = config_override_summary_lines(&loaded);
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("CCP_CODEX_CONNECT_TIMEOUT_MS (env)"))
+        );
     }
 
     #[test]

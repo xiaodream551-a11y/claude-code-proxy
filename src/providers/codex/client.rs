@@ -218,6 +218,8 @@ pub struct CodexResponse {
 // ---------------------------------------------------------------------------
 
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_CODEX_MODEL_DISPATCHES;
+const HTTP_CONNECT_TIMEOUT_MS: u64 = 15_000;
+const HTTP_RESPONSE_HEADER_TIMEOUT_MS: u64 = 60_000;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const LIVE_HTTP_ERROR_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LIVE_HTTP_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -334,11 +336,11 @@ impl Default for CodexHttpClient {
     }
 }
 
-fn build_codex_http_client(base_url: &str) -> reqwest::Client {
+fn build_codex_http_client(base_url: &str, connect_timeout_ms: u64) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
-        .connect_timeout(Duration::from_secs(15));
+        .connect_timeout(Duration::from_millis(connect_timeout_ms));
     if crate::oauth_http::is_loopback_url(base_url) {
         builder = builder.no_proxy();
     }
@@ -347,15 +349,17 @@ fn build_codex_http_client(base_url: &str) -> reqwest::Client {
 
 impl CodexHttpClient {
     pub fn new() -> Self {
-        let timeout_ms = 60_000;
         let base_url = config::codex_base_url(CODEX_API_ENDPOINT);
+        let connect_timeout_ms = config::codex_connect_timeout_ms(HTTP_CONNECT_TIMEOUT_MS);
         Self {
-            client: build_codex_http_client(&base_url),
+            client: build_codex_http_client(&base_url, connect_timeout_ms),
             auth_manager: CodexAuthManager::new(file_store()),
             websocket_circuit_key: websocket_circuit_key_for_url(&base_url),
             base_url,
-            header_timeout_ms: timeout_ms,
-            body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
+            header_timeout_ms: config::codex_header_timeout_ms(HTTP_RESPONSE_HEADER_TIMEOUT_MS),
+            body_idle_timeout_ms: config::codex_body_idle_timeout_ms(
+                HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
+            ),
             total_timeout_ms: config::codex_total_timeout_ms(DEFAULT_CODEX_TOTAL_TIMEOUT_MS),
             header_timeout_retries: 1,
         }
@@ -373,7 +377,7 @@ impl CodexHttpClient {
             auth_manager,
             base_url,
             websocket_circuit_key,
-            header_timeout_ms: 60_000,
+            header_timeout_ms: HTTP_RESPONSE_HEADER_TIMEOUT_MS,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             total_timeout_ms: config::codex_total_timeout_ms(DEFAULT_CODEX_TOTAL_TIMEOUT_MS),
             header_timeout_retries: 1,
@@ -390,7 +394,7 @@ impl CodexHttpClient {
     ) -> Self {
         let websocket_circuit_key = websocket_circuit_key_for_url(&base_url);
         Self {
-            client: build_codex_http_client(&base_url),
+            client: build_codex_http_client(&base_url, HTTP_CONNECT_TIMEOUT_MS),
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
             websocket_circuit_key,
@@ -2233,6 +2237,13 @@ mod tests {
         CodexHttpClient::new_for_test(base_url, 100, body_idle_timeout_ms, 10_000, 0)
     }
 
+    #[test]
+    fn codex_http_timeout_defaults_remain_backward_compatible() {
+        assert_eq!(HTTP_CONNECT_TIMEOUT_MS, 15_000);
+        assert_eq!(HTTP_RESPONSE_HEADER_TIMEOUT_MS, 60_000);
+        assert_eq!(HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS, 300_000);
+    }
+
     fn buffered_test_request() -> ResponsesRequest {
         ResponsesRequest {
             model: "gpt-5.6-sol".into(),
@@ -2285,7 +2296,7 @@ mod tests {
         store.save_auth(auth).unwrap();
         let manager = CodexAuthManager::new_with_token_endpoint(store, token_endpoint);
         CodexHttpClient::new_with_client(
-            build_codex_http_client(&model_endpoint),
+            build_codex_http_client(&model_endpoint, HTTP_CONNECT_TIMEOUT_MS),
             manager,
             model_endpoint,
         )

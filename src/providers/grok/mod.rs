@@ -260,9 +260,11 @@ fn finish_non_streaming_message(
             (StatusCode::OK, Json(value)).into_response()
         }
         Err(error) => {
-            let usage = error
-                .downcast_ref::<translate::reducer::GrokReductionError>()
-                .and_then(translate::reducer::GrokReductionError::usage);
+            let reduction_error =
+                error.downcast_ref::<translate::reducer::GrokReductionError>();
+            let usage = reduction_error.and_then(translate::reducer::GrokReductionError::usage);
+            let upstream_failure = reduction_error
+                .and_then(translate::reducer::GrokReductionError::upstream_failure);
             if let (Some(monitor), Some(usage)) = (ctx.monitor.as_ref(), usage) {
                 monitor.usage_updated(
                     &ctx.req_id,
@@ -277,11 +279,22 @@ fn finish_non_streaming_message(
                 usage,
                 estimated_input_tokens,
             );
-            json_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Grok response is invalid",
-            )
+            if let Some(failure) = upstream_failure {
+                let status = StatusCode::from_u16(failure.status)
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let response = json_error(status, grok_error_type(status), failure.message.clone());
+                if let Some(retry_after) = failure.retry_after.clone() {
+                    ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+                } else {
+                    response
+                }
+            } else {
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "Grok response is invalid",
+                )
+            }
         }
     }
 }
@@ -670,7 +683,31 @@ impl GrokStreamState {
             // staged completion (or any earlier staged delta) before the protocol error.
             let reduced = match self.reducer.push_batch_in_place(values) {
                 Ok(events) => events,
-                Err(_) => return Some(self.fail_at("reducer", "invalid_event")),
+                Err(error) => {
+                    let Some(failure) = error
+                        .downcast_ref::<translate::reducer::GrokUpstreamFailure>()
+                        .cloned()
+                    else {
+                        return Some(self.fail_at("reducer", "invalid_event"));
+                    };
+                    let status = StatusCode::from_u16(failure.status)
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    let error = GrokError::upstream_event(
+                        status,
+                        failure.retry_after,
+                        failure.message,
+                        failure.retryable,
+                    );
+                    let kind = match failure.event_type.as_str() {
+                        "response.failed" => "response_failed",
+                        "response.error" => "response_error",
+                        _ => "error_event",
+                    };
+                    match self.begin_rebuild(error, "upstream", kind) {
+                        Ok(()) => continue,
+                        Err(bytes) => return Some(bytes),
+                    }
+                }
             };
             let usage = reduced.iter().find_map(|event| match event {
                 translate::reducer::ReducerEvent::Usage(usage) => Some(usage.clone()),
@@ -891,13 +928,13 @@ impl GrokStreamState {
                 );
             }
         }
-        let stream_message = match error {
-            Some(error) if error.origin == client::GrokErrorOrigin::Deadline => {
-                error.message.as_str()
-            }
-            _ => "Grok stream is invalid",
+        let (error_type, stream_message) = match error {
+            Some(error) => (grok_error_type(error.status), error.message.as_str()),
+            None => ("api_error", "Grok stream is invalid"),
         };
-        let bytes = self.translator.render_error(stream_message);
+        let bytes = self
+            .translator
+            .render_typed_error(error_type, stream_message);
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
         }
@@ -925,6 +962,9 @@ impl GrokStreamState {
                     serde_json::json!(client::stage_name(error.stage)),
                 );
                 fields.insert("message".into(), serde_json::json!(error.message));
+                if let Some(retry_after) = error.retry_after.as_ref() {
+                    fields.insert("retry_after".into(), serde_json::json!(retry_after));
+                }
             }
             traffic.write_json("060-grok-stream-error", &serde_json::Value::Object(fields));
         }
@@ -1140,7 +1180,17 @@ fn map_error(error: client::GrokError) -> Response {
     } else {
         StatusCode::BAD_GATEWAY
     };
-    let kind = match status {
+    let kind = grok_error_type(status);
+    let response = json_error(mapped_status, kind, error.message);
+    if let Some(retry_after) = error.retry_after {
+        ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+    } else {
+        response
+    }
+}
+
+fn grok_error_type(status: StatusCode) -> &'static str {
+    match status {
         StatusCode::UNAUTHORIZED => "authentication_error",
         StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN => "permission_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
@@ -1151,12 +1201,6 @@ fn map_error(error: client::GrokError) -> Response {
         status if status.as_u16() == 529 => "overloaded_error",
         status if status.is_client_error() => "invalid_request_error",
         _ => "api_error",
-    };
-    let response = json_error(mapped_status, kind, error.message);
-    if let Some(retry_after) = error.retry_after {
-        ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
-    } else {
-        response
     }
 }
 
@@ -1786,6 +1830,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_failure_after_visible_text_is_not_replayed() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial once\"}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.error\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"capacity is temporarily limited\"}}}\n\n",
+            )),
+        ]);
+        let response = stream_body(
+            upstream,
+            "msg_typed_failure".into(),
+            "grok-4.5".into(),
+            None,
+            "req_typed_failure".into(),
+            None,
+            None,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(body.matches("partial once").count(), 1, "{body}");
+        assert!(body.contains("\"type\":\"rate_limit_error\""), "{body}");
+        assert!(body.contains("capacity is temporarily limited"), "{body}");
+        assert!(body.rfind("event: content_block_stop").unwrap() < body.find("event: error").unwrap());
+        assert!(!body.contains("event: message_stop"), "{body}");
+    }
+
+    #[tokio::test]
     async fn invalid_semantic_tail_rolls_back_every_event_from_the_same_chunk() {
         let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
             b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"STAGED_ONLY\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"UNSAFE_TAIL\"}\n\n",
@@ -2002,7 +2075,7 @@ mod tests {
             (b"data: {bad json}\n\n".as_slice(), "json"),
             (
                 b"data: {\"type\":\"response.failed\",\"response\":{}}\n\n".as_slice(),
-                "reducer",
+                "upstream",
             ),
         ] {
             let temp = TempDir::new().unwrap();
@@ -2069,7 +2142,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "api_error");
-        assert_eq!(body["error"]["message"], "Grok response is invalid");
+        assert_eq!(body["error"]["message"], "model failed");
 
         // The server owns the final failed lifecycle event. Usage observed by the provider before
         // returning the 502 must survive that transition into the completed-request history.
@@ -2219,6 +2292,90 @@ mod tests {
         }
         assert!(captured.contains("[redacted len=6]"));
         assert!(!captured.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn pre_emit_overload_event_rebuilds_with_shared_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            let body = b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"capacity exhausted\"},\"retry_after\":0}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered once\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let client = Arc::new(client);
+        let deadline = GrokRequestDeadline::after(Duration::from_secs(5));
+        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+        let response = client
+            .post_with_retry(&sample_request(), None, retry.clone())
+            .await
+            .unwrap();
+        let reconnect = Some(GrokReconnectContext {
+            client: client.clone(),
+            request: Arc::new(sample_request()),
+            traffic: None,
+            retry,
+            estimated_input_tokens: 1,
+        });
+        let body = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream_body_with_policy(
+                response.into_stream(),
+                "msg_overload_rebuild".into(),
+                "grok-4.5".into(),
+                None,
+                "req_overload_rebuild".into(),
+                None,
+                reconnect,
+                deadline,
+                Duration::from_millis(10),
+            )
+            .into_body()
+            .collect(),
+        )
+        .await
+        .expect("the transient SSE failure must rebuild before the deadline")
+        .unwrap()
+        .to_bytes();
+        server.await.unwrap();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(body.matches("recovered once").count(), 1, "{body}");
+        assert_eq!(body.matches("event: message_start").count(), 1, "{body}");
+        assert!(!body.contains("capacity exhausted"), "{body}");
+        assert!(body.contains("event: message_stop"), "{body}");
     }
 
     #[tokio::test]

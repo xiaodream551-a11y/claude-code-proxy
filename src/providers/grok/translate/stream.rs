@@ -204,12 +204,17 @@ impl StreamTranslator {
 
     /// Finish an in-band failed stream without leaving a started Anthropic content block open.
     pub fn render_error(&mut self, message: &str) -> Vec<u8> {
+        self.render_typed_error("api_error", message)
+    }
+
+    /// Finish an in-band failed stream while preserving the upstream error category.
+    pub fn render_typed_error(&mut self, error_type: &str, message: &str) -> Vec<u8> {
         if self.finished {
             return Vec::new();
         }
         let mut out = Vec::new();
         self.close_open_content(&mut out);
-        out.extend(stream_error_with_message(message));
+        out.extend(stream_error_with_type(error_type, message));
         self.finished = true;
         out
     }
@@ -254,7 +259,11 @@ pub fn stream_error() -> Vec<u8> {
 }
 
 pub fn stream_error_with_message(message: &str) -> Vec<u8> {
-    let data = serde_json::json!({"type":"error","error":{"type":"api_error","message":message}});
+    stream_error_with_type("api_error", message)
+}
+
+pub fn stream_error_with_type(error_type: &str, message: &str) -> Vec<u8> {
+    let data = serde_json::json!({"type":"error","error":{"type":error_type,"message":message}});
     encode_sse_event(Some("error"), &data.to_string())
 }
 
