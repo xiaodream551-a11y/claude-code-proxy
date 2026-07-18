@@ -168,14 +168,10 @@ pub fn translate_request(
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "x_search"));
     let x_search_intent = !internal_text_request && requests_x_search(req);
-    let force_x_search = dedicated_x_search || x_search_intent;
+    let force_x_search = x_search_intent;
     let force_web_search =
         !force_x_search && !internal_text_request && hosted_web_search && requests_web_search(req);
     if force_x_search {
-        tools = Some(vec![GrokTool::hosted("x_search")]);
-    } else if force_web_search {
-        tools = Some(vec![GrokTool::hosted("web_search")]);
-    } else if !internal_text_request {
         let tools = tools.get_or_insert_default();
         if !tools.iter().any(|tool| tool.kind == "x_search") {
             tools.push(GrokTool::hosted("x_search"));
@@ -187,7 +183,7 @@ pub fn translate_request(
             "For general web searches, use the hosted web_search tool. Do not use shell commands, HTTP clients, or local tools to search the web.",
         );
     }
-    if !internal_text_request {
+    if !internal_text_request && (dedicated_x_search || force_x_search) {
         append_guidance(
             &mut instructions,
             "For requests to search X or Twitter, use the hosted x_search tool. XSearch accepts a query and supports allowed_x_handles, excluded_x_handles, from_date, and to_date filters. Do not use Bash, curl, HTTP clients, or general web_search for X searches.",
@@ -200,16 +196,31 @@ pub fn translate_request(
     } else {
         parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?
     };
-    let parallel_tool_calls = if compaction {
+    let has_tools = tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    let parallel_tool_calls = if compaction || !has_tools {
         None
     } else {
-        req.extra
+        let disabled = req
+            .extra
             .get("tool_choice")
             .and_then(Value::as_object)
             .and_then(|choice| choice.get("disable_parallel_tool_use"))
             .and_then(Value::as_bool)
-            .map(|disabled| !disabled)
+            .unwrap_or(false);
+        Some(!disabled)
     };
+    let function_tool_count = tools
+        .as_ref()
+        .map(|tools| tools.iter().filter(|tool| tool.kind == "function").count())
+        .unwrap_or(0);
+    if parallel_tool_calls == Some(true) && function_tool_count >= 2 {
+        append_guidance(
+            &mut instructions,
+            "When multiple independent function tools are needed, call them together in one response. Serialize only calls that have data dependencies.",
+        );
+    }
     let mut call_ids = HashSet::new();
     let mut input = Vec::new();
     for message in &req.messages {
@@ -823,6 +834,43 @@ mod tests {
     }
 
     #[test]
+    fn grok_translation_enables_parallel_custom_tools_by_default() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[
+                {"name":"read_first","input_schema":{"type":"object"}},
+                {"name":"read_second","input_schema":{"type":"object"}}
+            ],
+            "messages":[{"role":"user","content":"inspect both files"}]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["parallel_tool_calls"], true);
+        assert!(
+            translated["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("call them together in one response")
+        );
+    }
+
+    #[test]
+    fn grok_translation_omits_parallel_flag_without_tools() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(translated.get("tools").is_none());
+        assert!(translated.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
     fn grok_translation_maps_typed_anthropic_web_search() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
@@ -1039,6 +1087,7 @@ mod tests {
         assert_eq!(translated["reasoning"]["effort"], "high");
         assert!(translated.get("tools").is_none());
         assert!(translated.get("tool_choice").is_none());
+        assert!(translated.get("parallel_tool_calls").is_none());
         assert!(!translated.to_string().contains("x_search"));
     }
 
@@ -1081,6 +1130,7 @@ mod tests {
                 .contains("use the hosted web_search tool")
         );
         assert_eq!(translated["tool_choice"], "required");
+        assert_eq!(translated["parallel_tool_calls"], true);
     }
 
     #[test]
@@ -1096,43 +1146,46 @@ mod tests {
         .unwrap();
         let translated =
             serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
-        assert_eq!(
-            translated["tools"],
-            serde_json::json!([{"type":"x_search"}])
-        );
+        let tools = translated["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["name"] == "Bash"));
+        assert!(tools.iter().any(|tool| tool["type"] == "web_search"));
+        assert!(tools.iter().any(|tool| tool["type"] == "x_search"));
         assert_eq!(translated["tool_choice"], "required");
-        assert!(!translated.to_string().contains("\"name\":\"Bash\""));
+        assert_eq!(translated["parallel_tool_calls"], true);
     }
 
     #[test]
-    fn grok_translation_maps_dedicated_xsearch_with_domain_schema() {
+    fn grok_translation_keeps_dedicated_xsearch_without_forcing_unrelated_turn() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
-            "messages":[{"role":"user","content":"find relevant posts"}],
-            "tools":[{
-                "name":"XSearch",
-                "description":"Search X posts",
-                "input_schema":{
-                    "type":"object",
-                    "properties":{
-                        "query":{"type":"string"},
-                        "allowed_x_handles":{"type":"array","items":{"type":"string"}},
-                        "excluded_x_handles":{"type":"array","items":{"type":"string"}},
-                        "from_date":{"type":"string","format":"date"},
-                        "to_date":{"type":"string","format":"date"}
+            "messages":[{"role":"user","content":"inspect the local project"}],
+            "tools":[
+                {
+                    "name":"XSearch",
+                    "description":"Search X posts",
+                    "input_schema":{
+                        "type":"object",
+                        "properties":{
+                            "query":{"type":"string"},
+                            "allowed_x_handles":{"type":"array","items":{"type":"string"}},
+                            "excluded_x_handles":{"type":"array","items":{"type":"string"}},
+                            "from_date":{"type":"string","format":"date"},
+                            "to_date":{"type":"string","format":"date"}
+                        },
+                        "required":["query"]
                     },
-                    "required":["query"]
-                }
-            }]
+                },
+                {"name":"Bash","description":"Run a command","input_schema":{"type":"object"}}
+            ]
         }))
         .unwrap();
         let translated =
             serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
-        assert_eq!(
-            translated["tools"],
-            serde_json::json!([{"type":"x_search"}])
-        );
-        assert_eq!(translated["tool_choice"], "required");
+        let tools = translated["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["type"] == "x_search"));
+        assert!(tools.iter().any(|tool| tool["name"] == "Bash"));
+        assert!(translated.get("tool_choice").is_none());
+        assert_eq!(translated["parallel_tool_calls"], true);
     }
 
     #[test]

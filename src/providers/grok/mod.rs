@@ -115,6 +115,21 @@ impl Provider for GrokProvider {
                 effort: effort.into(),
             });
         }
+        let (function_tool_count, hosted_tool_count) = translated
+            .tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .fold((0_usize, 0_usize), |(functions, hosted), tool| {
+                        if tool.kind == "function" {
+                            (functions + 1, hosted)
+                        } else {
+                            (functions, hosted + 1)
+                        }
+                    })
+            })
+            .unwrap_or_default();
         let estimated_input_tokens = count_tokens::count_tokens(&translated);
         crate::logging::create_logger("grok").info(
             "request_configuration",
@@ -131,6 +146,18 @@ impl Provider for GrokProvider {
                     ),
                 ),
                 ("transport".into(), serde_json::json!("http")),
+                (
+                    "parallelToolCalls".into(),
+                    serde_json::json!(translated.parallel_tool_calls),
+                ),
+                (
+                    "functionToolCount".into(),
+                    serde_json::json!(function_tool_count),
+                ),
+                (
+                    "hostedToolCount".into(),
+                    serde_json::json!(hosted_tool_count),
+                ),
                 (
                     "estimatedInputTokens".into(),
                     serde_json::json!(estimated_input_tokens),

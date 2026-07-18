@@ -22,6 +22,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::config;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
+use crate::providers::translate_shared::is_claude_code_compaction_request;
 use crate::registry;
 use crate::retry::{compute_backoff_delay, sleep};
 
@@ -283,19 +284,97 @@ impl Provider for CodexProvider {
 /// uses the full Responses API and upgrades Luna for account compatibility.
 /// Other GPT-5.6 requests use Lite by default but may opt into the full shape.
 fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> bool {
-    apply_model_lane_for_request_with_lite(model, body, config::codex_responses_lite())
+    apply_model_lane_for_request_with_options(
+        model,
+        body,
+        config::codex_responses_lite(),
+        config::codex_parallel_tools(),
+    )
 }
 
-fn apply_model_lane_for_request_with_lite(
+fn apply_model_lane_for_request_with_options(
     model: &mut String,
     body: &MessagesRequest,
     responses_lite: bool,
+    parallel_tools: bool,
 ) -> bool {
     if has_hosted_web_search(body) {
         *model = full_lane_web_search_model(model).to_string();
         return false;
     }
+    if responses_lite && parallel_tools && parallel_tool_lane_eligible(model, body) {
+        return false;
+    }
     responses_lite && uses_responses_lite(model)
+}
+
+fn parallel_tool_lane_eligible(model: &str, body: &MessagesRequest) -> bool {
+    if !matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra")
+        || is_claude_code_compaction_request(body)
+        || has_structured_output(body)
+        || !tool_choice_allows_parallel(body)
+    {
+        return false;
+    }
+
+    body.extra
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| is_ordinary_function_tool(tool))
+                .count()
+        })
+        .is_some_and(|count| count >= 2)
+}
+
+fn has_structured_output(body: &MessagesRequest) -> bool {
+    body.extra
+        .get("output_config")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|output| output.contains_key("format"))
+}
+
+fn is_ordinary_function_tool(tool: &serde_json::Value) -> bool {
+    let Some(tool) = tool.as_object() else {
+        return false;
+    };
+    let ordinary_type = tool
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|kind| matches!(kind, "function" | "custom"));
+    ordinary_type
+        && tool
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| !name.is_empty())
+}
+
+fn tool_choice_allows_parallel(body: &MessagesRequest) -> bool {
+    let Some(choice) = body.extra.get("tool_choice") else {
+        return true;
+    };
+    match choice {
+        serde_json::Value::String(mode) => matches!(mode.as_str(), "auto" | "any" | "required"),
+        serde_json::Value::Object(choice) => {
+            if choice
+                .get("disable_parallel_tool_use")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            matches!(
+                choice
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("auto"),
+                "auto" | "any" | "required"
+            )
+        }
+        _ => false,
+    }
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -1620,7 +1699,8 @@ mod tests {
             ("gpt-5.4", "gpt-5.4"),
         ] {
             let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request_with_lite(&mut model, &body, true);
+            let lite =
+                apply_model_lane_for_request_with_options(&mut model, &body, true, false);
             assert!(!lite, "{resolved} with web_search must use the full lane");
             assert_eq!(model, expected);
         }
@@ -1637,10 +1717,117 @@ mod tests {
             ("gpt-5.4", false),
         ] {
             let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request_with_lite(&mut model, &body, true);
+            let lite =
+                apply_model_lane_for_request_with_options(&mut model, &body, true, false);
             assert_eq!(model, resolved, "model must not change without web_search");
             assert_eq!(lite, lite_expected);
         }
+    }
+
+    #[test]
+    fn parallel_tools_use_full_lane_for_eligible_sol_and_terra_requests() {
+        let body = request_with_tools(serde_json::json!([
+            {"type":"custom", "name":"Read", "input_schema":{}},
+            {"type":"function", "name":"Grep", "input_schema":{}}
+        ]));
+
+        for resolved in ["gpt-5.6-sol", "gpt-5.6-terra"] {
+            let mut model = resolved.to_string();
+            let lite = apply_model_lane_for_request_with_options(&mut model, &body, true, true);
+            assert!(!lite, "{resolved} should use the full parallel-tool lane");
+            assert_eq!(model, resolved);
+
+            let translated = translate_request_with_overrides(
+                &body,
+                TranslateOptions {
+                    session_id: None,
+                    service_tier: None,
+                    model,
+                    use_responses_lite: lite,
+                },
+                TranslationOverrides::default(),
+            )
+            .unwrap();
+            assert!(translated.parallel_tool_calls);
+            assert_eq!(translated.tools.as_ref().map(Vec::len), Some(2));
+            assert!(translated.client_metadata.is_none());
+        }
+    }
+
+    #[test]
+    fn parallel_tools_keep_luna_and_ineligible_requests_on_lite() {
+        let two_tools = serde_json::json!([
+            {"name":"Read", "input_schema":{}},
+            {"name":"Grep", "input_schema":{}}
+        ]);
+        let cases = [
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"inspect"}],
+                "tools":[{"name":"Read", "input_schema":{}}]
+            }),
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"inspect"}],
+                "tools":two_tools,
+                "output_config":{"format":{"type":"json_object"}}
+            }),
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"inspect"}],
+                "tools":two_tools,
+                "tool_choice":{"type":"none"}
+            }),
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"inspect"}],
+                "tools":two_tools,
+                "tool_choice":{"type":"tool", "name":"Read"}
+            }),
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"inspect"}],
+                "tools":two_tools,
+                "tool_choice":{"type":"auto", "disable_parallel_tool_use":true}
+            }),
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{
+                    "role":"user",
+                    "content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools. Your entire response must be plain text: an <analysis> block followed by a <summary> block. Your task is to create a detailed summary"
+                }],
+                "tools":two_tools
+            }),
+        ];
+
+        let luna_body = request_with_tools(two_tools.clone());
+        let mut luna = "gpt-5.6-luna".to_string();
+        assert!(apply_model_lane_for_request_with_options(
+            &mut luna, &luna_body, true, true
+        ));
+
+        for body in cases {
+            let body: MessagesRequest = serde_json::from_value(body).unwrap();
+            let mut model = "gpt-5.6-sol".to_string();
+            assert!(
+                apply_model_lane_for_request_with_options(&mut model, &body, true, true),
+                "ineligible request unexpectedly left Responses Lite: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_tools_disabled_preserves_responses_lite_behavior() {
+        let body = request_with_tools(serde_json::json!([
+            {"name":"Read", "input_schema":{}},
+            {"name":"Grep", "input_schema":{}}
+        ]));
+        let mut model = "gpt-5.6-sol".to_string();
+
+        assert!(apply_model_lane_for_request_with_options(
+            &mut model, &body, true, false
+        ));
+        assert_eq!(model, "gpt-5.6-sol");
     }
 
     #[test]
@@ -1648,12 +1835,18 @@ mod tests {
         let body = request_with_tools(serde_json::json!([
             {"name":"Bash", "input_schema":{}}
         ]));
-        let mut model = "gpt-5.6-luna".to_string();
+        for parallel_tools in [false, true] {
+            let mut model = "gpt-5.6-luna".to_string();
+            let lite = apply_model_lane_for_request_with_options(
+                &mut model,
+                &body,
+                false,
+                parallel_tools,
+            );
 
-        let lite = apply_model_lane_for_request_with_lite(&mut model, &body, false);
-
-        assert!(!lite);
-        assert_eq!(model, "gpt-5.6-luna");
+            assert!(!lite);
+            assert_eq!(model, "gpt-5.6-luna");
+        }
     }
 
     #[test]

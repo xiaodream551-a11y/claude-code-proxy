@@ -91,6 +91,8 @@ struct CodexConfig {
     pub service_tier: Option<String>,
     #[serde(rename = "responsesLite")]
     pub responses_lite: Option<bool>,
+    #[serde(rename = "parallelTools")]
+    pub parallel_tools: Option<bool>,
     #[serde(rename = "reasoningSummary")]
     pub reasoning_summary: Option<String>,
     #[serde(rename = "effort")]
@@ -349,6 +351,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_RESPONSES_LITE") {
         out.push("CCP_CODEX_RESPONSES_LITE (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_PARALLEL_TOOLS") {
+        out.push("CCP_CODEX_PARALLEL_TOOLS (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_CONNECT_TIMEOUT_MS") {
         out.push("CCP_CODEX_CONNECT_TIMEOUT_MS (env)".to_string());
     }
@@ -394,6 +399,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         if let Some(codex) = file_cfg.codex {
             if let Some(responses_lite) = codex.responses_lite {
                 out.push(format!("codex.responsesLite: {responses_lite}"));
+            }
+            if let Some(parallel_tools) = codex.parallel_tools {
+                out.push(format!("codex.parallelTools: {parallel_tools}"));
             }
             if codex
                 .reasoning_summary
@@ -806,6 +814,22 @@ pub fn codex_responses_lite() -> bool {
     true
 }
 
+pub fn codex_parallel_tools() -> bool {
+    if let Ok(raw) = std::env::var("CCP_CODEX_PARALLEL_TOOLS") {
+        match raw.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    if let Some(codex) = read_file_config(&paths::config_dir()).and_then(|file| file.codex)
+        && let Some(value) = codex.parallel_tools
+    {
+        return value;
+    }
+    false
+}
+
 pub fn codex_effort() -> Option<String> {
     let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_EFFORT") {
@@ -1135,6 +1159,7 @@ mod tests {
         "CCP_LOG_STDERR",
         "CCP_CODEX_REASONING_SUMMARY",
         "CCP_CODEX_RESPONSES_LITE",
+        "CCP_CODEX_PARALLEL_TOOLS",
         "CCP_CODEX_CONNECT_TIMEOUT_MS",
         "CCP_CODEX_HEADER_TIMEOUT_MS",
         "CCP_CODEX_BODY_IDLE_TIMEOUT_MS",
@@ -1445,6 +1470,25 @@ mod tests {
 
         let _lite_env = EnvGuard::set("CCP_CODEX_RESPONSES_LITE", "true");
         assert!(codex_responses_lite());
+    }
+
+    #[test]
+    fn codex_parallel_tools_defaults_false_and_reads_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(!codex_parallel_tools());
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"parallelTools":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_parallel_tools());
+
+        let _parallel_env = EnvGuard::set("CCP_CODEX_PARALLEL_TOOLS", "false");
+        assert!(!codex_parallel_tools());
     }
 
     #[test]

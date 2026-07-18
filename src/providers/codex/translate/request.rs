@@ -13,6 +13,9 @@ use crate::providers::translate_shared::{
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
 
+const PARALLEL_TOOL_GUIDANCE: &str =
+    "When multiple independent function tools are needed, call them together in one response. Serialize only calls that have data dependencies.";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -433,6 +436,15 @@ pub fn translate_request_with_overrides(
     } else if let Some(tools) = tools
         && !tools.is_empty()
     {
+        if out.parallel_tool_calls
+            && tools
+                .iter()
+                .filter(|tool| matches!(tool, ResponsesTool::Function(_)))
+                .count()
+                >= 2
+        {
+            append_instruction(&mut out.instructions, PARALLEL_TOOL_GUIDANCE);
+        }
         out.tools = Some(tools);
     }
 
@@ -489,6 +501,13 @@ pub fn translate_request_with_overrides(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn append_instruction(instructions: &mut Option<String>, guidance: &str) {
+    *instructions = Some(match instructions.take() {
+        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{guidance}"),
+        _ => guidance.to_string(),
+    });
+}
 
 fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
     let output_config = req.extra.get("output_config")?.as_object()?;
@@ -1181,6 +1200,27 @@ mod tests {
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
         assert!(!out.parallel_tool_calls);
+        assert!(out.instructions.is_none());
+    }
+
+    #[test]
+    fn full_lane_guides_independent_parallel_function_calls() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "system": "Follow repository rules.",
+            "messages": [{"role":"user", "content":"inspect both"}],
+            "tools": [
+                {"name":"read_first", "input_schema":{"type":"object"}},
+                {"name":"read_second", "input_schema":{"type":"object"}}
+            ]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(out.parallel_tool_calls);
+        let instructions = out.instructions.unwrap();
+        assert!(instructions.starts_with("Follow repository rules."));
+        assert!(instructions.contains("call them together in one response"));
     }
 
     #[test]

@@ -410,7 +410,9 @@ Claude Code reasoning effort is forwarded as Responses `reasoning.effort` for
 Grok 4.5; `xhigh` and `max` are capped at Grok's supported `high` level.
 Claude Code's `WebSearch` uses Grok's hosted general web search. Requests to
 search X use Grok's hosted `x_search` tool, with citations and search usage
-reported in Claude Code.
+reported in Claude Code. Function tools explicitly enable parallel calls unless
+Claude disables them; Web/X search intent keeps the other Read, Bash, MCP, and
+function tools available so independent work can be emitted in the same turn.
 
 Authentication uses browser OAuth with S256 PKCE through `auth.x.ai` and an
 ephemeral loopback callback. Headless hosts can use the OAuth device-code flow
@@ -763,6 +765,7 @@ Windows, and at
     "reasoningSummary": "auto",
     "serviceTier": "fast",
     "responsesLite": true,
+    "parallelTools": false,
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
     "transport": "auto",
     "connectTimeoutMs": 15000,
@@ -826,6 +829,7 @@ Windows, and at
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it                     |
+| `CCP_CODEX_PARALLEL_TOOLS`       | `codex.parallelTools`      | `false`                                           | While Responses Lite is enabled, opt eligible GPT-5.6 Sol/Terra requests with at least two ordinary function tools into the full Responses shape; Luna and internal or constrained requests stay on Lite |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
 | `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `auto` (resolves to `http` when a system proxy intercepts the upstream) | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or WebSocket-first fallback plus an origin-wide breaker in `auto`                                         |
 | `CCP_CODEX_CONNECT_TIMEOUT_MS`   | `codex.connectTimeoutMs`   | `15000`                                           | Maximum time to establish the Codex HTTP TCP/TLS connection, including an HTTP fallback selected by `auto`                                                                       |
@@ -1242,9 +1246,13 @@ supported shape.
   thinking signature and replayed on later turns; the proxy never decrypts it.
 - **Codex — Responses Lite parallel tools:** GPT-5.6 Lite models follow the native
   Codex behavior and disable parallel tool emission. Existing parallel tool history
-  still replays correctly. Set `codex.responsesLite` to `false` to use the full
-  Responses shape and permit parallel tool calls; full-lane GPT-5.6 availability is
-  account-dependent, so restore the default if the upstream reports model not found.
+  still replays correctly. Set `codex.parallelTools` to `true` to move only eligible
+  GPT-5.6 Sol/Terra requests with at least two ordinary function tools to the full
+  Responses shape. Compaction, structured-output, single-tool, parallel-disabled,
+  and Luna requests remain on Lite. Set `codex.responsesLite` to `false` to retain
+  the existing behavior of forcing the full Responses shape for all GPT-5.6
+  requests. Full-lane GPT-5.6 availability is account-dependent, so restore the
+  default if the upstream reports model not found.
 - **Codex — HTTP transport:** live requests are translated incrementally and
   support prompt cancellation. Non-streaming Anthropic requests still accumulate
   the upstream SSE response before returning one JSON document.
