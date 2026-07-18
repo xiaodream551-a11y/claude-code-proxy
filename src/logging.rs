@@ -55,8 +55,8 @@ fn stderr_suppressed() -> bool {
     STDERR_SUPPRESSION_DEPTH.load(Ordering::Relaxed) > 0
 }
 
-fn should_mirror_to_stderr(level: &str) -> bool {
-    !stderr_suppressed() && (matches!(level, "warn" | "error") || config::log_stderr())
+fn should_mirror_to_stderr(level: &str, log_stderr: bool) -> bool {
+    !stderr_suppressed() && (matches!(level, "warn" | "error") || log_stderr)
 }
 
 #[derive(Clone)]
@@ -92,23 +92,34 @@ impl Logger {
     }
 
     fn emit(&self, level: &str, msg: &str, fields: Option<serde_json::Map<String, Value>>) {
+        // Keep one coherent logging configuration snapshot for the whole
+        // record. Loading it separately while recursively redacting fields can
+        // otherwise turn every string value into a synchronous config read.
+        let log_config = config::load_log_config();
         let mut body = serde_json::Map::new();
         body.insert("t".into(), Value::String(now_iso8601()));
         body.insert("level".into(), Value::String(level.to_string()));
         body.insert("service".into(), Value::String(self.service.clone()));
         body.insert("msg".into(), Value::String(msg.to_string()));
+        body.insert(
+            "configGeneration".into(),
+            Value::Number(log_config.generation.into()),
+        );
 
         let mut merged = self.base.clone();
         if let Some(fields) = fields {
             merged.extend(fields);
         }
         if !merged.is_empty() {
-            body.insert("fields".into(), redact_value(Value::Object(merged)));
+            body.insert(
+                "fields".into(),
+                redact_with_depth(Value::Object(merged), 0, log_config.verbose),
+            );
         }
 
         let line = Value::Object(body).to_string();
 
-        let mirror_to_stderr = should_mirror_to_stderr(level);
+        let mirror_to_stderr = should_mirror_to_stderr(level, log_config.stderr);
         if mirror_to_stderr {
             let _ = writeln!(io::stderr(), "{line}");
         }
@@ -351,17 +362,18 @@ fn now_iso8601() -> String {
 }
 
 pub fn redact_value(value: Value) -> Value {
-    redact_with_depth(value, 0)
+    let verbose = config::log_verbose();
+    redact_with_depth(value, 0, verbose)
 }
 
-fn redact_with_depth(value: Value, depth: u8) -> Value {
+fn redact_with_depth(value: Value, depth: u8, verbose: bool) -> Value {
     if depth > 6 {
         return Value::String("[depth-limit]".into());
     }
 
     match value {
         Value::String(s) => {
-            if config::log_verbose() {
+            if verbose {
                 Value::String(s)
             } else {
                 Value::String(truncate_log_string(s))
@@ -370,7 +382,7 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
         Value::Array(values) => Value::Array(
             values
                 .into_iter()
-                .map(|v| redact_with_depth(v, depth + 1))
+                .map(|v| redact_with_depth(v, depth + 1, verbose))
                 .collect(),
         ),
         Value::Object(fields) => {
@@ -379,7 +391,7 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
                 if REDACT_KEYS.contains(&key.to_lowercase().as_str()) {
                     out.insert(key, redact_key_redaction(value));
                 } else {
-                    out.insert(key, redact_with_depth(value, depth + 1));
+                    out.insert(key, redact_with_depth(value, depth + 1, verbose));
                 }
             }
             Value::Object(out)
@@ -427,15 +439,15 @@ mod tests {
     #[test]
     fn stderr_suppression_disables_level_mirroring() {
         let _lock = STDERR_TEST_LOCK.lock().unwrap();
-        assert!(should_mirror_to_stderr("warn"));
+        assert!(should_mirror_to_stderr("warn", false));
 
         {
             let _guard = suppress_stderr();
-            assert!(!should_mirror_to_stderr("warn"));
-            assert!(!should_mirror_to_stderr("error"));
+            assert!(!should_mirror_to_stderr("warn", false));
+            assert!(!should_mirror_to_stderr("error", true));
         }
 
-        assert!(should_mirror_to_stderr("warn"));
+        assert!(should_mirror_to_stderr("warn", false));
     }
 
     #[test]
@@ -443,13 +455,40 @@ mod tests {
         let _lock = STDERR_TEST_LOCK.lock().unwrap();
         let outer = suppress_stderr();
         let inner = suppress_stderr();
-        assert!(!should_mirror_to_stderr("warn"));
+        assert!(!should_mirror_to_stderr("warn", false));
 
         drop(inner);
-        assert!(!should_mirror_to_stderr("warn"));
+        assert!(!should_mirror_to_stderr("warn", false));
 
         drop(outer);
-        assert!(should_mirror_to_stderr("warn"));
+        assert!(should_mirror_to_stderr("warn", false));
+    }
+
+    #[test]
+    fn stderr_snapshot_controls_non_warning_mirroring() {
+        let _lock = STDERR_TEST_LOCK.lock().unwrap();
+        assert!(!should_mirror_to_stderr("info", false));
+        assert!(should_mirror_to_stderr("info", true));
+    }
+
+    #[test]
+    fn verbose_snapshot_applies_to_all_nested_strings() {
+        let long = "x".repeat(4_001);
+        let value = serde_json::json!({
+            "outer": [{
+                "payload": long,
+                "authorization": "secret",
+            }],
+        });
+
+        let concise = redact_with_depth(value.clone(), 0, false);
+        let concise_payload = concise["outer"][0]["payload"].as_str().unwrap();
+        assert!(concise_payload.ends_with("…[1 more]"));
+        assert_eq!(concise["outer"][0]["authorization"], "[redacted len=6]");
+
+        let verbose = redact_with_depth(value, 0, true);
+        assert_eq!(verbose["outer"][0]["payload"], long);
+        assert_eq!(verbose["outer"][0]["authorization"], "[redacted len=6]");
     }
 
     #[test]

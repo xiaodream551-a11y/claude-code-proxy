@@ -1596,6 +1596,94 @@ mod tests {
     }
 
     #[test]
+    fn preserves_two_interleaved_parallel_tool_calls_with_out_of_order_completion() {
+        let out = render(vec![
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 3,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Lookup"}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 7,
+                "item": {"type": "function_call", "call_id": "call_2", "name": "Lookup"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 3,
+                "delta": "{\"q\":\"a"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 7,
+                "delta": "{\"q\":\"b\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 7,
+                "item": {"type": "function_call", "call_id": "call_2", "name": "Lookup", "arguments": "{\"q\":\"b\"}"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 3,
+                "delta": "\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 3,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Lookup", "arguments": "{\"q\":\"a\"}"}
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "usage": {}}
+            }),
+        ]);
+
+        let values: Vec<serde_json::Value> =
+            crate::anthropic::sse::try_parse_sse_events(out.as_bytes())
+                .unwrap()
+                .into_iter()
+                .map(|event| serde_json::from_str(&event.data).unwrap())
+                .collect();
+        let starts: Vec<_> = values
+            .iter()
+            .filter(|value| value["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0]["index"], 0);
+        assert_eq!(starts[0]["content_block"]["id"], "call_1");
+        assert_eq!(starts[0]["content_block"]["name"], "Lookup");
+        assert_eq!(starts[1]["index"], 1);
+        assert_eq!(starts[1]["content_block"]["id"], "call_2");
+        assert_eq!(starts[1]["content_block"]["name"], "Lookup");
+
+        let mut arguments = [String::new(), String::new()];
+        let mut stop_order = Vec::new();
+        for value in &values {
+            if value["type"] == "content_block_delta"
+                && value["delta"]["type"] == "input_json_delta"
+            {
+                let index = value["index"].as_u64().unwrap() as usize;
+                arguments[index].push_str(value["delta"]["partial_json"].as_str().unwrap());
+            }
+            if value["type"] == "content_block_stop" {
+                stop_order.push(value["index"].as_u64().unwrap());
+            }
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments[0]).unwrap(),
+            json!({"q":"a"})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments[1]).unwrap(),
+            json!({"q":"b"})
+        );
+        assert_eq!(stop_order, vec![1, 0]);
+        assert!(out.contains(r#""stop_reason":"tool_use""#));
+        assert_eq!(out.matches("event: message_stop").count(), 1);
+    }
+
+    #[test]
     fn repairs_whitespace_stalled_read_args_as_tool_use_finish() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
         let mut out = Vec::new();

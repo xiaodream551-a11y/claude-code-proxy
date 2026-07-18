@@ -196,9 +196,7 @@ pub fn translate_request(
     } else {
         parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?
     };
-    let has_tools = tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty());
+    let has_tools = tools.as_ref().is_some_and(|tools| !tools.is_empty());
     let parallel_tool_calls = if compaction || !has_tools {
         None
     } else {

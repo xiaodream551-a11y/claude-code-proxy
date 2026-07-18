@@ -1,4 +1,3 @@
-use crate::anthropic::sse::parse_sse_events;
 use crate::providers::translate_shared::{JsonObjectError, parse_json_object};
 
 use super::read_rewrite::sanitize_read_args;
@@ -246,7 +245,14 @@ pub fn finish_metadata_from_upstream(
 }
 
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
-    let sse_events = parse_sse_events(input);
+    let sse_events = super::super::events::parse_codex_sse_events(input).map_err(|message| {
+        UpstreamStreamError {
+            kind: UpstreamErrorKind::Failed,
+            message,
+            retry_after_seconds: None,
+            diagnostics: None,
+        }
+    })?;
     let mut out = Vec::new();
 
     let mut blocks_by_output_index: std::collections::HashMap<usize, BlockState> =
@@ -1242,6 +1248,27 @@ mod tests {
         } else {
             panic!("expected Finish");
         }
+    }
+
+    #[test]
+    fn buffered_reducer_accepts_stream_start_bom_and_rejects_invalid_utf8() {
+        let with_bom = b"\xef\xbb\xbfdata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\n";
+        let reduced = reduce_upstream_bytes(with_bom).unwrap();
+        assert!(matches!(reduced.last(), Some(ReducerEvent::Finish { .. })));
+
+        let invalid = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"\xff\"}\n\n";
+        let error = reduce_upstream_bytes(invalid).unwrap_err();
+        assert_eq!(error.kind, UpstreamErrorKind::Failed);
+        assert!(error.message.contains("invalid UTF-8"));
+    }
+
+    #[test]
+    fn buffered_reducer_rejects_bom_after_stream_start_instead_of_dropping_event() {
+        let input = b"data: {\"type\":\"response.created\"}\n\n\xef\xbb\xbfdata: {\"type\":\"response.output_text.delta\",\"delta\":\"missing\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\n";
+
+        let error = reduce_upstream_bytes(input).unwrap_err();
+        assert_eq!(error.kind, UpstreamErrorKind::Failed);
+        assert!(error.message.contains("BOM after stream start"));
     }
 
     #[test]

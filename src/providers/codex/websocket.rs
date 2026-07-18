@@ -37,6 +37,7 @@ pub const WEBSOCKET_POOL_HEALTHCHECK_DETAIL: &str = "websocket_pool_healthcheck"
 pub const WEBSOCKET_POOL_BUSY_DETAIL: &str = "websocket_pool_busy";
 pub const WEBSOCKET_CONNECTION_ERROR_DETAIL: &str = "websocket_connection_error";
 pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal";
+pub const WEBSOCKET_MALFORMED_EVENT_DETAIL: &str = "websocket_malformed_event";
 
 pub(super) fn is_retryable_transport_detail(detail: Option<&str>) -> bool {
     matches!(
@@ -883,6 +884,16 @@ fn missing_terminal_error() -> CodexError {
     }
 }
 
+fn malformed_event_error(error: &serde_json::Error) -> CodexError {
+    CodexError {
+        status: 0,
+        message: format!("Codex WebSocket event contained malformed JSON: {error}"),
+        detail: Some(WEBSOCKET_MALFORMED_EVENT_DETAIL.to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
 fn response_start_timeout_error(timeout_ms: u64) -> CodexError {
     CodexError {
         status: 0,
@@ -1409,7 +1420,7 @@ async fn collect_ws_events(
                 // Parse JSON
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(error) => {
                         if let Some(tc) = traffic {
                             tc.write_json_event(
                                 "040-upstream-event",
@@ -1419,11 +1430,8 @@ async fn collect_ws_events(
                                 }),
                             );
                         }
-                        // Write invalid JSON as-is
-                        append_buffered_sse(&mut sse_body, &text).inspect_err(|_| {
-                            invalidate_pool_owner(pool_key, pool_entry);
-                        })?;
-                        continue;
+                        invalidate_pool_owner(pool_key, pool_entry);
+                        return Err(malformed_event_error(&error));
                     }
                 };
 
@@ -1539,7 +1547,7 @@ async fn stream_ws_events(
                 }
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(error) => {
                         if let Some(tc) = traffic.as_deref() {
                             tc.write_json_event(
                                 "040-upstream-event",
@@ -1550,7 +1558,9 @@ async fn stream_ws_events(
                             );
                         }
                         append_live_capture_sse(&mut sse_body, &text);
-                        continue;
+                        invalidate_pool_owner(pool_key, pool_entry);
+                        let _ = tx.send(Err(malformed_event_error(&error))).await;
+                        break;
                     }
                 };
 
@@ -2339,6 +2349,168 @@ mod tests {
 
         assert!(err.message.contains("binary frames"));
         assert!(!WS_POOL.lock().unwrap().contains_key("binary-session"));
+    }
+
+    #[tokio::test]
+    async fn malformed_live_json_fails_closed_and_invalidates_pool() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.output_text.delta","delta":"truncated""#.into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp_1"}}"#.into(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let entry = Arc::new(PoolEntry {
+            ws: Arc::new(AsyncMutex::new(ws)),
+        });
+        WS_POOL.lock().unwrap().insert(
+            "malformed-session".to_string(),
+            IdlePoolEntry {
+                connection: entry.clone(),
+                idle_since_ms: now_ms(),
+            },
+        );
+
+        let (tx, mut rx) = mpsc::channel(super::super::LIVE_EVENT_CHANNEL_CAPACITY);
+        let reusable = {
+            let mut ws = entry.ws.lock().await;
+            stream_ws_events(
+                &mut ws,
+                test_timeouts(1_000, 1_000),
+                Some("malformed-session"),
+                Some(&entry),
+                None,
+                tx,
+            )
+            .await
+        };
+
+        assert!(!reusable);
+        let first = rx
+            .recv()
+            .await
+            .expect("the valid event should be forwarded before the protocol error")
+            .expect("the first event should remain valid");
+        assert_eq!(
+            first.get("type").and_then(serde_json::Value::as_str),
+            Some("response.output_item.added")
+        );
+
+        let error = rx
+            .recv()
+            .await
+            .expect("malformed JSON must become a terminal stream error")
+            .expect_err("a later success event must not replace the protocol error");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_MALFORMED_EVENT_DETAIL)
+        );
+        assert_eq!(error.origin, CodexErrorOrigin::WebSocket);
+        assert!(!is_retryable_transport_detail(error.detail.as_deref()));
+        assert!(!super::super::client::is_retryable_transport_error(&error));
+        assert!(!super::super::client::should_fallback_to_http(&error));
+        assert!(
+            rx.recv().await.is_none(),
+            "response.completed after malformed JSON must not be forwarded"
+        );
+        assert!(!codex_websocket_pool_contains_for_tests(
+            "malformed-session"
+        ));
+
+        server.await.unwrap();
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn malformed_buffered_json_fails_closed_and_invalidates_pool() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.output_text.delta","delta":"truncated""#.into(),
+            ))
+            .await
+            .unwrap();
+            let _ = ws
+                .send(Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp_1"}}"#.into(),
+                ))
+                .await;
+        });
+
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let entry = Arc::new(PoolEntry {
+            ws: Arc::new(AsyncMutex::new(ws)),
+        });
+        WS_POOL.lock().unwrap().insert(
+            "malformed-buffered-session".to_string(),
+            IdlePoolEntry {
+                connection: entry.clone(),
+                idle_since_ms: now_ms(),
+            },
+        );
+
+        let error = {
+            let mut ws = entry.ws.lock().await;
+            collect_ws_events(
+                &mut ws,
+                test_timeouts(1_000, 1_000),
+                Some("malformed-buffered-session"),
+                Some(&entry),
+                None,
+            )
+            .await
+            .expect_err("malformed buffered JSON must fail before a success terminal")
+        };
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_MALFORMED_EVENT_DETAIL)
+        );
+        assert!(!is_retryable_transport_detail(error.detail.as_deref()));
+        assert!(!super::super::client::is_retryable_transport_error(&error));
+        assert!(!super::super::client::should_fallback_to_http(&error));
+        assert!(!codex_websocket_pool_contains_for_tests(
+            "malformed-buffered-session"
+        ));
+
+        server.await.unwrap();
+        clear_codex_websocket_pool_for_tests();
     }
 
     #[tokio::test]

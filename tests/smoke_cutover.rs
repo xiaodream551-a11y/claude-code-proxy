@@ -173,6 +173,36 @@ where
     addr_str
 }
 
+/// Return SSE headers but never a first body byte, then keep accepting long
+/// enough to detect whether the proxy unsafely replays the completed POST.
+async fn spawn_http_first_byte_stall_upstream() -> (String, tokio::task::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 16 * 1024];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut dispatches = 1;
+        if let Ok(Ok((_stream, _))) =
+            tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+        {
+            dispatches += 1;
+        }
+        dispatches
+    });
+
+    (addr_str, task)
+}
+
 /// Spawn a mock WebSocket server that accepts one connection, captures the
 /// first text message, and responds with Codex WebSocket events that
 /// accumulate to `"codex websocket ok"`.
@@ -209,6 +239,49 @@ async fn spawn_websocket_upstream(captured: Arc<Mutex<Option<Value>>>) -> String
     });
 
     addr_str
+}
+
+/// Emit one semantic text delta, then a malformed JSON frame and a nominal
+/// success terminal. Keep listening long enough to detect an unsafe replay.
+async fn spawn_websocket_malformed_after_text_upstream() -> (String, tokio::task::JoinHandle<usize>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _ = ws.next().await;
+        for event in [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"partial before malformed"}"#,
+        ] {
+            ws.send(Message::Text(event.to_string())).await.unwrap();
+        }
+        ws.send(Message::Text(
+            r#"{"type":"response.output_text.delta","delta":"unterminated""#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let _ = ws
+            .send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"must_not_complete","usage":{}}}"#
+                    .to_string(),
+            ))
+            .await;
+        drop(ws);
+
+        let mut dispatches = 1;
+        if let Ok(Ok((_stream, _))) =
+            tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+        {
+            dispatches += 1;
+        }
+        dispatches
+    });
+
+    (addr_str, task)
 }
 
 async fn spawn_websocket_delayed_terminal_upstream() -> String {
@@ -495,14 +568,16 @@ async fn spawn_websocket_previous_missing_then_retry_upstream(
     addr_str
 }
 
-async fn spawn_websocket_close_then_retry_upstream(captured: Arc<Mutex<Vec<Value>>>) -> String {
+async fn spawn_websocket_close_after_second_request_upstream(
+    captured: Arc<Mutex<Vec<Value>>>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let addr_str = format!("http://{addr}");
 
     tokio::spawn(async move {
         let mut handled = 0usize;
-        while handled < 3 {
+        while handled < 2 {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
@@ -511,7 +586,7 @@ async fn spawn_websocket_close_then_retry_upstream(captured: Arc<Mutex<Vec<Value
             };
             let (mut sender, mut receiver) = ws.split();
 
-            while handled < 3 {
+            while handled < 2 {
                 let Some(text) = (loop {
                     match receiver.next().await {
                         Some(Ok(Message::Text(text))) => break Some(text),
@@ -970,6 +1045,86 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_malformed_json_fails_in_band_without_replay() {
+    let _guard = env_lock().await;
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    clear_codex_websocket_pool_for_tests();
+
+    let (upstream, server) = spawn_websocket_malformed_after_text_upstream().await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("malformed upstream JSON should terminate the downstream stream")
+    .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(body.contains("partial before malformed"), "{body}");
+    assert!(body.contains("event: error"), "{body}");
+    assert!(body.contains("api_error"), "{body}");
+    assert!(body.contains("websocket_malformed_event"), "{body}");
+    assert!(body.contains("event: content_block_stop"), "{body}");
+    assert!(
+        body.rfind("event: content_block_stop").unwrap() < body.find("event: error").unwrap(),
+        "{body}"
+    );
+    assert!(!body.contains("event: message_stop"), "{body}");
+    assert_eq!(server.await.unwrap(), 1, "malformed JSON must not replay");
+
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_http_first_byte_timeout_does_not_replay_post() {
+    let _guard = env_lock().await;
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let (upstream, server) = spawn_http_first_byte_stall_upstream().await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _first_byte_env = EnvGuard::set("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS", "50");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+    let status = response.status();
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("first-byte timeout should terminate the downstream stream")
+    .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(body.contains("api_error"), "{body}");
+    assert!(body.contains("http_response_first_byte"), "{body}");
+    assert!(!body.contains("event: message_stop"), "{body}");
+    assert_eq!(server.await.unwrap(), 1, "a timed-out POST must not replay");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_and_auto_stream_return_delta_before_terminal() {
     let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
@@ -1250,7 +1405,7 @@ async fn smoke_codex_websocket_stream_retries_missing_previous_response_id() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
+async fn smoke_codex_websocket_stream_does_not_replay_post_dispatch_close() {
     let _guard = env_lock().await;
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
@@ -1258,7 +1413,7 @@ async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
     clear_all_continuations_for_tests();
 
     let captured = Arc::new(Mutex::new(Vec::new()));
-    let upstream = spawn_websocket_close_then_retry_upstream(captured.clone()).await;
+    let upstream = spawn_websocket_close_after_second_request_upstream(captured.clone()).await;
 
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
@@ -1288,26 +1443,16 @@ async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
         ]
     }))
     .await;
-    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
     let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert!(
-        String::from_utf8_lossy(&second_body).contains("retry"),
-        "second response body: {}",
-        String::from_utf8_lossy(&second_body)
-    );
+    assert!(String::from_utf8_lossy(&second_body).contains("terminal"));
 
     let guard = captured.lock().unwrap();
-    assert_eq!(guard.len(), 3, "expected full-context retry request");
+    assert_eq!(guard.len(), 2, "the uncertain request must not be replayed");
     assert!(guard[0].get("previous_response_id").is_none());
     assert_eq!(guard[1]["previous_response_id"], "resp_1");
-    assert!(guard[2].get("previous_response_id").is_none());
-    assert_eq!(
-        guard[2]["input"].as_array().map(Vec::len),
-        Some(3),
-        "retry request should send the full input"
-    );
 
     clear_all_continuations_for_tests();
     clear_codex_websocket_pool_for_tests();

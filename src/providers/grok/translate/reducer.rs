@@ -968,8 +968,7 @@ fn classify_failure_message(message: &str) -> Option<u16> {
         Some(429)
     } else if message.contains("overload") {
         Some(529)
-    } else if message.contains("service unavailable")
-        || message.contains("temporarily unavailable")
+    } else if message.contains("service unavailable") || message.contains("temporarily unavailable")
     {
         Some(503)
     } else if message.contains("gateway timeout")
@@ -1566,7 +1565,10 @@ mod tests {
     fn upstream_failure_events_preserve_retry_semantics() {
         let cases = [
             (
-                concat!(r#"data: {"type":"response.failed","response":{"error":{"type":"overloaded_error","message":"capacity exhausted"},"retry_after":0.25,"usage":{"input_tokens":7}}}"#, "\n\n"),
+                concat!(
+                    r#"data: {"type":"response.failed","response":{"error":{"type":"overloaded_error","message":"capacity exhausted"},"retry_after":0.25,"usage":{"input_tokens":7}}}"#,
+                    "\n\n"
+                ),
                 "response.failed",
                 529,
                 true,
@@ -1574,7 +1576,10 @@ mod tests {
                 "capacity exhausted",
             ),
             (
-                concat!(r#"data: {"type":"error","code":"rate_limit_exceeded","message":"slow down","retry_after":"1"}"#, "\n\n"),
+                concat!(
+                    r#"data: {"type":"error","code":"rate_limit_exceeded","message":"slow down","retry_after":"1"}"#,
+                    "\n\n"
+                ),
                 "error",
                 429,
                 true,
@@ -1582,7 +1587,10 @@ mod tests {
                 "slow down",
             ),
             (
-                concat!(r#"data: {"type":"response.error","response":{"error":{"status_code":400,"message":"invalid tool schema"}}}"#, "\n\n"),
+                concat!(
+                    r#"data: {"type":"response.error","response":{"error":{"status_code":400,"message":"invalid tool schema"}}}"#,
+                    "\n\n"
+                ),
                 "response.error",
                 400,
                 false,
@@ -1590,7 +1598,10 @@ mod tests {
                 "invalid tool schema",
             ),
             (
-                concat!(r#"data: {"type":"response.failed","response":{"error":{"message":"model failed"}}}"#, "\n\n"),
+                concat!(
+                    r#"data: {"type":"response.failed","response":{"error":{"message":"model failed"}}}"#,
+                    "\n\n"
+                ),
                 "response.failed",
                 502,
                 false,

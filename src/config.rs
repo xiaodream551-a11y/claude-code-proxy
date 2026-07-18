@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::paths;
 
@@ -42,9 +42,14 @@ pub struct LoadedConfig {
     pub log_verbose: bool,
     pub log_stderr: bool,
     pub config_dir: PathBuf,
+    /// Monotonic generation of the process-local file-config snapshot.
+    ///
+    /// Environment overrides are intentionally not part of this generation:
+    /// process environment is expected to be immutable outside tests.
+    pub config_generation: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct FileConfig {
     #[serde(rename = "bindAddress")]
     pub bind_address: Option<String>,
@@ -104,6 +109,8 @@ struct CodexConfig {
     pub connect_timeout_ms: Option<u64>,
     #[serde(rename = "headerTimeoutMs")]
     pub header_timeout_ms: Option<u64>,
+    #[serde(rename = "httpFirstByteTimeoutMs")]
+    pub http_first_byte_timeout_ms: Option<u64>,
     #[serde(rename = "bodyIdleTimeoutMs")]
     pub body_idle_timeout_ms: Option<u64>,
     #[serde(rename = "totalTimeoutMs")]
@@ -158,7 +165,7 @@ struct GrokConfig {
     pub stream_heartbeat_ms: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct FileLog {
     pub verbose: Option<bool>,
     pub stderr: Option<bool>,
@@ -172,15 +179,116 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     }
 }
 
-fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileConfigFingerprint {
+    Missing,
+    Present {
+        len: u64,
+        modified: Option<SystemTime>,
+    },
+}
+
+#[derive(Clone)]
+struct CachedFileConfig {
+    path: PathBuf,
+    fingerprint: FileConfigFingerprint,
+    value: Option<FileConfig>,
+    checked_at: Instant,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct FileConfigCache {
+    current: Option<CachedFileConfig>,
+    #[cfg(test)]
+    filesystem_checks: u64,
+    #[cfg(test)]
+    parse_attempts: u64,
+}
+
+impl FileConfigCache {
+    fn load(&mut self, path: &Path, now: Instant, recheck_interval: Duration) -> CachedFileConfig {
+        if let Some(cached) = self.current.as_ref()
+            && cached.path == path
+            && now.saturating_duration_since(cached.checked_at) < recheck_interval
+        {
+            return cached.clone();
+        }
+
+        #[cfg(test)]
+        {
+            self.filesystem_checks += 1;
+        }
+        let fingerprint = file_config_fingerprint(path);
+        if let Some(cached) = self.current.as_mut()
+            && cached.path == path
+            && cached.fingerprint == fingerprint
+        {
+            cached.checked_at = now;
+            return cached.clone();
+        }
+
+        #[cfg(test)]
+        {
+            self.parse_attempts += 1;
+        }
+        let value = fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        let generation = self
+            .current
+            .as_ref()
+            .map_or(1, |cached| cached.generation.saturating_add(1));
+        let loaded = CachedFileConfig {
+            path: path.to_path_buf(),
+            fingerprint,
+            value,
+            checked_at: now,
+            generation,
+        };
+        self.current = Some(loaded.clone());
+        loaded
+    }
+}
+
+// File edits remain hot-reloadable, but request and logging hot paths only
+// perform a metadata check at this cadence. Every lookup inside the interval
+// observes one coherent generation. Unit tests use an immediate recheck so
+// their existing write-then-resolve behaviour remains deterministic.
+#[cfg(not(test))]
+const FILE_CONFIG_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const FILE_CONFIG_RECHECK_INTERVAL: Duration = Duration::ZERO;
+
+static FILE_CONFIG_CACHE: OnceLock<Mutex<FileConfigCache>> = OnceLock::new();
+
+fn file_config_fingerprint(path: &Path) -> FileConfigFingerprint {
+    match fs::metadata(path) {
+        Ok(metadata) => FileConfigFingerprint::Present {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        },
+        Err(_) => FileConfigFingerprint::Missing,
+    }
+}
+
+fn read_file_config_snapshot(config_dir: &Path) -> CachedFileConfig {
     let path = config_dir.join("config.json");
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    FILE_CONFIG_CACHE
+        .get_or_init(|| Mutex::new(FileConfigCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .load(&path, Instant::now(), FILE_CONFIG_RECHECK_INTERVAL)
+}
+
+fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
+    read_file_config_snapshot(config_dir).value
 }
 
 pub fn load_config() -> LoadedConfig {
     let config_dir = paths::config_dir();
-    let file = read_file_config(&config_dir);
+    let snapshot = read_file_config_snapshot(&config_dir);
+    let file = snapshot.value;
     let env = environment();
 
     let mut out = LoadedConfig {
@@ -190,6 +298,7 @@ pub fn load_config() -> LoadedConfig {
         log_verbose: false,
         log_stderr: false,
         config_dir: config_dir.clone(),
+        config_generation: snapshot.generation,
     };
 
     if let Some(raw) = env.get("CCP_BIND_ADDRESS") {
@@ -255,12 +364,43 @@ pub fn alias_provider() -> AliasProvider {
     load_config().alias_provider
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogConfigSnapshot {
+    pub verbose: bool,
+    pub stderr: bool,
+    pub generation: u64,
+}
+
+/// Load the two logging flags from one file-config generation.
+///
+/// This deliberately avoids collecting the entire process environment on the
+/// log emission path. As with the legacy behaviour, presence of either env var
+/// enables its flag regardless of the variable's value.
+pub fn load_log_config() -> LogConfigSnapshot {
+    let config_dir = paths::config_dir();
+    let snapshot = read_file_config_snapshot(&config_dir);
+    let file_log = snapshot.value.as_ref().and_then(|file| file.log.as_ref());
+    LogConfigSnapshot {
+        verbose: if std::env::var_os("CCP_LOG_VERBOSE").is_some() {
+            true
+        } else {
+            file_log.and_then(|log| log.verbose).unwrap_or(false)
+        },
+        stderr: if std::env::var_os("CCP_LOG_STDERR").is_some() {
+            true
+        } else {
+            file_log.and_then(|log| log.stderr).unwrap_or(false)
+        },
+        generation: snapshot.generation,
+    }
+}
+
 pub fn log_verbose() -> bool {
-    load_config().log_verbose
+    load_log_config().verbose
 }
 
 pub fn log_stderr() -> bool {
-    load_config().log_stderr
+    load_log_config().stderr
 }
 
 pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
@@ -360,6 +500,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_HEADER_TIMEOUT_MS") {
         out.push("CCP_CODEX_HEADER_TIMEOUT_MS (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS") {
+        out.push("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_BODY_IDLE_TIMEOUT_MS") {
         out.push("CCP_CODEX_BODY_IDLE_TIMEOUT_MS (env)".to_string());
     }
@@ -415,6 +558,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(timeout_ms) = codex.header_timeout_ms {
                 out.push(format!("codex.headerTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(timeout_ms) = codex.http_first_byte_timeout_ms {
+                out.push(format!("codex.httpFirstByteTimeoutMs: {timeout_ms}"));
             }
             if let Some(timeout_ms) = codex.body_idle_timeout_ms {
                 out.push(format!("codex.bodyIdleTimeoutMs: {timeout_ms}"));
@@ -920,6 +1066,14 @@ pub fn codex_header_timeout_ms(default: u64) -> u64 {
     )
 }
 
+pub fn codex_http_first_byte_timeout_ms(default: u64) -> u64 {
+    codex_positive_u64(
+        "CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS",
+        |codex| codex.http_first_byte_timeout_ms,
+        default,
+    )
+}
+
 pub fn codex_body_idle_timeout_ms(default: u64) -> u64 {
     codex_positive_u64(
         "CCP_CODEX_BODY_IDLE_TIMEOUT_MS",
@@ -1162,6 +1316,7 @@ mod tests {
         "CCP_CODEX_PARALLEL_TOOLS",
         "CCP_CODEX_CONNECT_TIMEOUT_MS",
         "CCP_CODEX_HEADER_TIMEOUT_MS",
+        "CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS",
         "CCP_CODEX_BODY_IDLE_TIMEOUT_MS",
         "CCP_CODEX_TOTAL_TIMEOUT_MS",
         "CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS",
@@ -1264,6 +1419,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn file_config_cache_avoids_hot_path_io_and_refreshes_as_one_generation() {
+        let config = tempfile::TempDir::new().unwrap();
+        let path = config.path().join("config.json");
+        std::fs::write(&path, r#"{"port":18765}"#).unwrap();
+
+        let mut cache = FileConfigCache::default();
+        let start = Instant::now();
+        let refresh_interval = Duration::from_secs(1);
+        let first = cache.load(&path, start, refresh_interval);
+        assert_eq!(first.value.as_ref().and_then(|file| file.port), Some(18765));
+        assert_eq!(first.generation, 1);
+        assert_eq!(cache.filesystem_checks, 1);
+        assert_eq!(cache.parse_attempts, 1);
+
+        // A resolver burst observes the same immutable generation without
+        // metadata calls or JSON parsing, even if an editor writes meanwhile.
+        std::fs::write(&path, r#"{"port":2876}"#).unwrap();
+        for elapsed_ms in [1, 10, 100, 999] {
+            let cached = cache.load(
+                &path,
+                start + Duration::from_millis(elapsed_ms),
+                refresh_interval,
+            );
+            assert_eq!(
+                cached.value.as_ref().and_then(|file| file.port),
+                Some(18765)
+            );
+            assert_eq!(cached.generation, first.generation);
+        }
+        assert_eq!(cache.filesystem_checks, 1);
+        assert_eq!(cache.parse_attempts, 1);
+
+        let refreshed = cache.load(&path, start + refresh_interval, refresh_interval);
+        assert_eq!(
+            refreshed.value.as_ref().and_then(|file| file.port),
+            Some(2876)
+        );
+        assert_eq!(refreshed.generation, first.generation + 1);
+        assert_eq!(cache.filesystem_checks, 2);
+        assert_eq!(cache.parse_attempts, 2);
+    }
+
+    #[test]
+    fn logging_config_uses_one_file_generation() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"log":{"verbose":true,"stderr":false}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let loaded = load_log_config();
+        assert!(loaded.verbose);
+        assert!(!loaded.stderr);
+        assert!(loaded.generation > 0);
     }
 
     #[test]
@@ -1519,13 +1735,14 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"connectTimeoutMs":11000,"headerTimeoutMs":22000,"bodyIdleTimeoutMs":130000,"totalTimeoutMs":150000,"websocketResponseStartTimeoutMs":45000,"websocketIdleTimeoutMs":180000,"maxIdleWebSockets":64,"idleWebSocketTtlMs":240000}}"#,
+            r#"{"codex":{"connectTimeoutMs":11000,"headerTimeoutMs":22000,"httpFirstByteTimeoutMs":33000,"bodyIdleTimeoutMs":130000,"totalTimeoutMs":150000,"websocketResponseStartTimeoutMs":45000,"websocketIdleTimeoutMs":180000,"maxIdleWebSockets":64,"idleWebSocketTtlMs":240000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
         assert_eq!(codex_connect_timeout_ms(1), 11_000);
         assert_eq!(codex_header_timeout_ms(1), 22_000);
+        assert_eq!(codex_http_first_byte_timeout_ms(1), 33_000);
         assert_eq!(codex_body_idle_timeout_ms(1), 130_000);
         assert_eq!(codex_total_timeout_ms(1), 150_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(1), 45_000);
@@ -1535,6 +1752,7 @@ mod tests {
 
         let _connect_env = EnvGuard::set("CCP_CODEX_CONNECT_TIMEOUT_MS", "9000");
         let _header_env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "18000");
+        let _first_byte_env = EnvGuard::set("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS", "27000");
         let _body_idle_env = EnvGuard::set("CCP_CODEX_BODY_IDLE_TIMEOUT_MS", "100000");
         let _total_env = EnvGuard::set("CCP_CODEX_TOTAL_TIMEOUT_MS", "120000");
         let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "12000");
@@ -1543,6 +1761,7 @@ mod tests {
         let _pool_ttl_env = EnvGuard::set("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS", "120000");
         assert_eq!(codex_connect_timeout_ms(1), 9_000);
         assert_eq!(codex_header_timeout_ms(1), 18_000);
+        assert_eq!(codex_http_first_byte_timeout_ms(1), 27_000);
         assert_eq!(codex_body_idle_timeout_ms(1), 100_000);
         assert_eq!(codex_total_timeout_ms(1), 120_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(1), 12_000);
@@ -1552,18 +1771,39 @@ mod tests {
     }
 
     #[test]
+    fn codex_http_first_byte_timeout_can_inherit_body_idle_timeout() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"bodyIdleTimeoutMs":130000}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let body_idle_timeout_ms = codex_body_idle_timeout_ms(300_000);
+        assert_eq!(body_idle_timeout_ms, 130_000);
+        assert_eq!(
+            codex_http_first_byte_timeout_ms(body_idle_timeout_ms),
+            body_idle_timeout_ms
+        );
+    }
+
+    #[test]
     fn codex_timeouts_ignore_zero_and_invalid_values() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"connectTimeoutMs":0,"headerTimeoutMs":0,"bodyIdleTimeoutMs":0,"totalTimeoutMs":0,"websocketResponseStartTimeoutMs":0,"websocketIdleTimeoutMs":0,"maxIdleWebSockets":0,"idleWebSocketTtlMs":0}}"#,
+            r#"{"codex":{"connectTimeoutMs":0,"headerTimeoutMs":0,"httpFirstByteTimeoutMs":0,"bodyIdleTimeoutMs":0,"totalTimeoutMs":0,"websocketResponseStartTimeoutMs":0,"websocketIdleTimeoutMs":0,"maxIdleWebSockets":0,"idleWebSocketTtlMs":0}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
         let _connect_env = EnvGuard::set("CCP_CODEX_CONNECT_TIMEOUT_MS", "invalid");
         let _header_env = EnvGuard::set("CCP_CODEX_HEADER_TIMEOUT_MS", "invalid");
+        let _first_byte_env = EnvGuard::set("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS", "invalid");
         let _body_idle_env = EnvGuard::set("CCP_CODEX_BODY_IDLE_TIMEOUT_MS", "invalid");
         let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "invalid");
         let _total_env = EnvGuard::set("CCP_CODEX_TOTAL_TIMEOUT_MS", "invalid");
@@ -1572,6 +1812,7 @@ mod tests {
 
         assert_eq!(codex_connect_timeout_ms(15_000), 15_000);
         assert_eq!(codex_header_timeout_ms(60_000), 60_000);
+        assert_eq!(codex_http_first_byte_timeout_ms(60_000), 60_000);
         assert_eq!(codex_body_idle_timeout_ms(300_000), 300_000);
         assert_eq!(codex_total_timeout_ms(540_000), 540_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(45_000), 45_000);
@@ -1587,7 +1828,7 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"connectTimeoutMs":15000,"headerTimeoutMs":60000,"bodyIdleTimeoutMs":300000}}"#,
+            r#"{"codex":{"connectTimeoutMs":15000,"headerTimeoutMs":60000,"httpFirstByteTimeoutMs":60000,"bodyIdleTimeoutMs":300000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -1606,15 +1847,26 @@ mod tests {
         assert!(
             summary
                 .iter()
+                .any(|line| line.contains("codex.httpFirstByteTimeoutMs"))
+        );
+        assert!(
+            summary
+                .iter()
                 .any(|line| line.contains("codex.bodyIdleTimeoutMs"))
         );
 
         let _connect_env = EnvGuard::set("CCP_CODEX_CONNECT_TIMEOUT_MS", "12000");
+        let _first_byte_env = EnvGuard::set("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS", "30000");
         let summary = config_override_summary_lines(&loaded);
         assert!(
             summary
                 .iter()
                 .any(|line| line.contains("CCP_CODEX_CONNECT_TIMEOUT_MS (env)"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS (env)"))
         );
     }
 

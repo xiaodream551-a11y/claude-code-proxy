@@ -8,6 +8,84 @@ pub const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 const RETRY_AFTER_MIN_DELAY_MS: u64 = 100;
 const RETRY_JITTER_MIN_PERCENT: u64 = 80;
 const RETRY_JITTER_MAX_PERCENT: u64 = 120;
+const FAST_PRE_DISPATCH_MIN_DELAY_MS: u64 = 100;
+const FAST_PRE_DISPATCH_MAX_DELAY_MS: u64 = 300;
+
+/// Whether replaying a model request can be justified from the observed
+/// transport outcome.
+///
+/// This is deliberately separate from an error being transient. A header or
+/// response-body reset can be transient while still leaving the result of the
+/// original POST unknown, in which case replaying it may duplicate generation
+/// or hosted-tool work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaySafety {
+    /// The model request was not dispatched to the upstream application.
+    DefinitelyNotDispatched,
+    /// The upstream explicitly returned a response that permits retry.
+    ExplicitlyRetryableResponse,
+    /// The request may have been accepted or partially processed upstream.
+    OutcomeUnknown,
+}
+
+impl ReplaySafety {
+    pub fn permits_model_replay(self) -> bool {
+        !matches!(self, Self::OutcomeUnknown)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DefinitelyNotDispatched => "definitely_not_dispatched",
+            Self::ExplicitlyRetryableResponse => "explicitly_retryable_response",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+}
+
+/// Backoff state for physical attempts of one logical model request.
+///
+/// One proven pre-dispatch transport failure may recover quickly. All other
+/// replay-safe failures retain the existing service-overload backoff, while an
+/// unknown POST outcome never receives a replay delay at all.
+#[derive(Debug, Default)]
+pub struct ModelRetryBackoff {
+    saw_definitely_not_dispatched: bool,
+    standard_attempt: u32,
+}
+
+impl ModelRetryBackoff {
+    pub fn next_delay(
+        &mut self,
+        replay_safety: ReplaySafety,
+        retry_after: Option<&str>,
+    ) -> Option<BackoffOutcome> {
+        match replay_safety {
+            ReplaySafety::OutcomeUnknown => None,
+            ReplaySafety::DefinitelyNotDispatched => {
+                let first_predispatch = !self.saw_definitely_not_dispatched;
+                self.saw_definitely_not_dispatched = true;
+                if first_predispatch && retry_after.is_none() {
+                    return Some(BackoffOutcome {
+                        wait_ms: rand::thread_rng().gen_range(
+                            FAST_PRE_DISPATCH_MIN_DELAY_MS..=FAST_PRE_DISPATCH_MAX_DELAY_MS,
+                        ),
+                        exceeds_budget: false,
+                    });
+                }
+                Some(self.next_standard_delay(retry_after))
+            }
+            ReplaySafety::ExplicitlyRetryableResponse => {
+                Some(self.next_standard_delay(retry_after))
+            }
+        }
+    }
+
+    fn next_standard_delay(&mut self, retry_after: Option<&str>) -> BackoffOutcome {
+        let delay = compute_backoff_delay(self.standard_attempt, retry_after);
+        self.standard_attempt = self.standard_attempt.saturating_add(1);
+        delay
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackoffOutcome {
@@ -147,5 +225,56 @@ mod tests {
         assert_eq!(invalid.wait_ms, RETRY_INITIAL_DELAY_MS);
         assert!(too_long.exceeds_budget);
         assert_eq!(too_long.wait_ms, RETRY_MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn first_proven_pre_dispatch_failure_uses_one_fast_jitter_window() {
+        let mut backoff = ModelRetryBackoff::default();
+        let fast = backoff
+            .next_delay(ReplaySafety::DefinitelyNotDispatched, None)
+            .unwrap();
+        assert!(
+            (FAST_PRE_DISPATCH_MIN_DELAY_MS..=FAST_PRE_DISPATCH_MAX_DELAY_MS)
+                .contains(&fast.wait_ms)
+        );
+        assert!(!fast.exceeds_budget);
+
+        let standard = backoff
+            .next_delay(ReplaySafety::DefinitelyNotDispatched, None)
+            .unwrap();
+        assert!((1_600..=2_400).contains(&standard.wait_ms));
+    }
+
+    #[test]
+    fn explicit_responses_keep_standard_backoff_and_retry_after() {
+        let mut backoff = ModelRetryBackoff::default();
+        let overload = backoff
+            .next_delay(ReplaySafety::ExplicitlyRetryableResponse, None)
+            .unwrap();
+        assert!((1_600..=2_400).contains(&overload.wait_ms));
+
+        let retry_after = backoff
+            .next_delay(ReplaySafety::ExplicitlyRetryableResponse, Some("0.25"))
+            .unwrap();
+        assert_eq!(retry_after.wait_ms, 250);
+    }
+
+    #[test]
+    fn retry_after_supersedes_fast_predispatch_delay_and_unknown_never_replays() {
+        let mut backoff = ModelRetryBackoff::default();
+        let retry_after = backoff
+            .next_delay(ReplaySafety::DefinitelyNotDispatched, Some("0.4"))
+            .unwrap();
+        assert_eq!(retry_after.wait_ms, 400);
+
+        let next = backoff
+            .next_delay(ReplaySafety::DefinitelyNotDispatched, None)
+            .unwrap();
+        assert!((3_200..=4_800).contains(&next.wait_ms));
+        assert!(
+            backoff
+                .next_delay(ReplaySafety::OutcomeUnknown, None)
+                .is_none()
+        );
     }
 }

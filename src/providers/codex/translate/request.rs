@@ -13,8 +13,7 @@ use crate::providers::translate_shared::{
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
 
-const PARALLEL_TOOL_GUIDANCE: &str =
-    "When multiple independent function tools are needed, call them together in one response. Serialize only calls that have data dependencies.";
+const PARALLEL_TOOL_GUIDANCE: &str = "When multiple independent function tools are needed, call them together in one response. Serialize only calls that have data dependencies.";
 
 // ---------------------------------------------------------------------------
 // Types

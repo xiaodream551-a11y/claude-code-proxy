@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexTerminalKind {
     Completed,
@@ -152,7 +154,9 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
 
 pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> {
     let mut first_failure = None;
-    for event in crate::anthropic::sse::parse_sse_events(body) {
+    // Malformed protocol bytes must never become the reason to replay a model
+    // request. The reducer will surface the decode failure to the caller.
+    for event in parse_codex_sse_events(body).ok()? {
         if event.data == "[DONE]" {
             continue;
         }
@@ -180,6 +184,27 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
         }
     }
     first_failure
+}
+
+/// Strict Codex SSE parsing with the protocol's one allowed stream-start BOM.
+/// A later BOM could prefix `data:` and otherwise be treated as an unknown SSE
+/// field, silently dropping a model event.
+pub(crate) fn parse_codex_sse_events(
+    body: &[u8],
+) -> Result<Vec<crate::anthropic::sse::SseEvent>, String> {
+    let body = body.strip_prefix(UTF8_BOM).unwrap_or(body);
+    if body
+        .windows(UTF8_BOM.len())
+        .any(|window| window == UTF8_BOM)
+    {
+        return Err("Codex SSE response contained a UTF-8 BOM after stream start".to_string());
+    }
+    crate::anthropic::sse::try_parse_sse_events(body).map_err(|error| {
+        format!(
+            "Codex SSE response contained invalid UTF-8 at byte {}",
+            error.valid_up_to()
+        )
+    })
 }
 
 pub(crate) fn numeric_status(payload: &Value) -> Option<u64> {
@@ -332,5 +357,14 @@ mod tests {
             first_retryable_failure(body).map(|failure| failure.status),
             Some(429)
         );
+    }
+
+    #[test]
+    fn malformed_protocol_bytes_never_trigger_retry_prescan() {
+        let invalid_utf8 = b"data: {\"type\":\"response.failed\",\"error\":{\"status\":503,\"message\":\"busy\xff\"}}\n\n";
+        assert!(first_retryable_failure(invalid_utf8).is_none());
+
+        let later_bom = b"data: {\"type\":\"response.created\"}\n\n\xef\xbb\xbfdata: {\"type\":\"response.failed\",\"error\":{\"status\":503,\"message\":\"busy\"}}\n\n";
+        assert!(first_retryable_failure(later_bom).is_none());
     }
 }

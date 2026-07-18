@@ -12,14 +12,27 @@
 - Preserve encrypted Codex reasoning by default and distinguish filtered
   incomplete responses from output-token limits.
 - Detect half-open Codex WebSockets with Ping/Pong probes, refresh stale pooled
-  connections, and retry transport stalls only before streaming output begins.
+  connections, and fail closed on malformed upstream events.
 - Keep Codex `auto` transport on live WebSockets while healthy, then temporarily
-  route a session through HTTP after repeated retryable transport failures.
-- Fall back to buffered HTTP immediately when Codex `auto` encounters a
-  retryable WebSocket transport fault before Anthropic output begins.
-- Recover Grok requests from transient connection, timeout, rate-limit, and 5xx
-  failures before downstream output while preserving the no-replay boundary
-  after text or tool events have been emitted.
+  route later requests through HTTP after repeated transport health failures.
+- Add an independent Codex HTTP first-byte timeout while preserving the existing
+  body-idle timeout as the fallback when the new setting is not configured.
+- Preserve the Codex recovery window across `response.created`, allowing a safe
+  OAuth refresh before semantic output is committed.
+- Classify model-request replay safety explicitly: retry pre-dispatch failures
+  and upstream 429/500/502/503/504/529 responses, but never replay a POST or
+  WebSocket request whose outcome is unknown.
+- Recover Grok requests from definite pre-dispatch failures and explicit
+  429/500/502/503/504/529 responses while preserving the no-replay boundary for
+  ambiguous transport failures and emitted text or tools.
+- Parse Codex protocol SSE as strict UTF-8 and avoid repeated buffer compaction
+  in its incremental decoder.
+- Serialize Codex HTTP and Grok model request bodies once per logical request,
+  reusing reference-counted bytes across safe retries and rebuilds.
+- Cache parsed file configuration and use one coherent logging snapshot per
+  record instead of rereading configuration for every redacted string.
+- Release Grok replay payloads as soon as semantic output makes rebuilding
+  ineligible.
 - Honor numeric and HTTP-date `Retry-After` values and add bounded jitter to
   exponential retry delays.
 - Forward Claude Code reasoning effort to Grok 4.5 instead of relying on the

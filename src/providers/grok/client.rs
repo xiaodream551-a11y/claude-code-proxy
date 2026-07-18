@@ -3,8 +3,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::time::Instant as TokioInstant;
@@ -12,7 +14,9 @@ use tokio::time::Instant as TokioInstant;
 use super::auth::manager::{GrokAuthError, GrokAuthErrorKind, GrokAuthManager};
 use super::auth::token_store::{StoredAuth, file_store};
 use super::translate::request::GrokResponsesRequest;
-use crate::retry::{MAX_RATE_LIMIT_RETRIES, should_retry_status, sleep};
+use crate::retry::{
+    MAX_RATE_LIMIT_RETRIES, ModelRetryBackoff, ReplaySafety, should_retry_status, sleep,
+};
 use crate::traffic::TrafficCapture;
 
 const DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
@@ -34,6 +38,7 @@ pub type GrokByteStream =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrokErrorOrigin {
     Auth,
+    Serialization,
     Http,
     RequestTransport,
     StreamTransport,
@@ -44,6 +49,7 @@ pub enum GrokErrorOrigin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrokErrorStage {
     Auth,
+    Serialize,
     Connect,
     Header,
     Status,
@@ -59,6 +65,7 @@ pub struct GrokError {
     pub origin: GrokErrorOrigin,
     pub stage: GrokErrorStage,
     pub retryable: bool,
+    pub replay_safety: ReplaySafety,
 }
 
 impl GrokError {
@@ -70,6 +77,7 @@ impl GrokError {
             origin: GrokErrorOrigin::Auth,
             stage: GrokErrorStage::Auth,
             retryable: false,
+            replay_safety: ReplaySafety::OutcomeUnknown,
         }
     }
 
@@ -85,6 +93,19 @@ impl GrokError {
             origin: GrokErrorOrigin::Http,
             stage: GrokErrorStage::Status,
             retryable: is_transient_http_status(status),
+            replay_safety: ReplaySafety::ExplicitlyRetryableResponse,
+        }
+    }
+
+    fn serialization(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            retry_after: None,
+            message: message.into(),
+            origin: GrokErrorOrigin::Serialization,
+            stage: GrokErrorStage::Serialize,
+            retryable: false,
+            replay_safety: ReplaySafety::DefinitelyNotDispatched,
         }
     }
 
@@ -101,6 +122,7 @@ impl GrokError {
             origin: GrokErrorOrigin::Http,
             stage: GrokErrorStage::Stream,
             retryable,
+            replay_safety: ReplaySafety::ExplicitlyRetryableResponse,
         }
     }
 
@@ -112,6 +134,7 @@ impl GrokError {
             origin: GrokErrorOrigin::Auth,
             stage: GrokErrorStage::Auth,
             retryable: true,
+            replay_safety: ReplaySafety::OutcomeUnknown,
         }
     }
 
@@ -123,10 +146,15 @@ impl GrokError {
             origin: GrokErrorOrigin::Auth,
             stage: GrokErrorStage::Auth,
             retryable: true,
+            replay_safety: ReplaySafety::ExplicitlyRetryableResponse,
         }
     }
 
-    pub fn request_transport(stage: GrokErrorStage, message: impl Into<String>) -> Self {
+    pub fn request_transport(
+        stage: GrokErrorStage,
+        message: impl Into<String>,
+        replay_safety: ReplaySafety,
+    ) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
             retry_after: None,
@@ -134,6 +162,7 @@ impl GrokError {
             origin: GrokErrorOrigin::RequestTransport,
             stage,
             retryable: true,
+            replay_safety,
         }
     }
 
@@ -145,6 +174,7 @@ impl GrokError {
             origin: GrokErrorOrigin::StreamTransport,
             stage,
             retryable: true,
+            replay_safety: ReplaySafety::OutcomeUnknown,
         }
     }
 
@@ -156,6 +186,7 @@ impl GrokError {
             origin: GrokErrorOrigin::ResponseLimit,
             stage,
             retryable: false,
+            replay_safety: ReplaySafety::OutcomeUnknown,
         }
     }
 
@@ -167,11 +198,16 @@ impl GrokError {
             origin: GrokErrorOrigin::Deadline,
             stage,
             retryable: false,
+            replay_safety: ReplaySafety::OutcomeUnknown,
         }
     }
 
     pub fn is_retryable(&self) -> bool {
         self.retryable
+    }
+
+    pub fn permits_model_replay(&self) -> bool {
+        self.retryable && self.replay_safety.permits_model_replay()
     }
 
     pub fn into_terminal(mut self, reason: &str) -> Self {
@@ -184,8 +220,52 @@ impl GrokError {
         Self::request_transport(
             GrokErrorStage::Header,
             "Grok retry budget was already exhausted",
+            ReplaySafety::OutcomeUnknown,
         )
         .into_terminal("retry exhausted")
+    }
+}
+
+/// Immutable JSON payload shared by every physical attempt for one logical Grok request.
+///
+/// The serialized bytes are cheap to clone and `capture_value` is populated only when full
+/// traffic capture is enabled, keeping the normal request path free of an extra JSON parse/value.
+#[derive(Debug)]
+pub struct PreparedGrokRequest {
+    body: Bytes,
+    capture_value: Option<Value>,
+}
+
+impl PreparedGrokRequest {
+    pub fn new(body: &GrokResponsesRequest, capture_body: bool) -> Result<Self, GrokError> {
+        Self::from_serializable(body, capture_body)
+    }
+
+    fn from_serializable<T: Serialize>(body: &T, capture_body: bool) -> Result<Self, GrokError> {
+        let body = serde_json::to_vec(body).map(Bytes::from).map_err(|error| {
+            GrokError::serialization(format!("Failed to serialize Grok request: {error}"))
+        })?;
+        let capture_value = capture_body
+            .then(|| {
+                serde_json::from_slice(&body).map_err(|error| {
+                    GrokError::serialization(format!(
+                        "Failed to prepare Grok traffic capture: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            body,
+            capture_value,
+        })
+    }
+
+    fn clone_body(&self) -> Bytes {
+        self.body.clone()
+    }
+
+    fn len(&self) -> usize {
+        self.body.len()
     }
 }
 
@@ -221,6 +301,14 @@ impl GrokRequestDeadline {
 
     pub fn permits_wait_ms(self, wait_ms: u64) -> bool {
         Duration::from_millis(wait_ms) < self.at.saturating_duration_since(TokioInstant::now())
+    }
+
+    pub fn remaining_ms(self) -> u64 {
+        self.at
+            .saturating_duration_since(TokioInstant::now())
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -262,6 +350,8 @@ pub struct GrokRetryState {
     terminal: bool,
     request_gate: Arc<Mutex<()>>,
     deadline: GrokRequestDeadline,
+    req_id: Option<String>,
+    model_retry_backoff: ModelRetryBackoff,
 }
 
 impl Default for GrokRetryState {
@@ -282,6 +372,14 @@ impl GrokRetryState {
     }
 
     pub fn with_deadline(deadline: GrokRequestDeadline) -> Self {
+        Self::with_optional_req_id(deadline, None)
+    }
+
+    pub fn with_deadline_and_req_id(deadline: GrokRequestDeadline, req_id: String) -> Self {
+        Self::with_optional_req_id(deadline, Some(req_id))
+    }
+
+    fn with_optional_req_id(deadline: GrokRequestDeadline, req_id: Option<String>) -> Self {
         Self {
             wire_attempt: 0,
             transient_failures: 0,
@@ -289,6 +387,8 @@ impl GrokRetryState {
             terminal: false,
             request_gate: Arc::new(Mutex::new(())),
             deadline,
+            req_id,
+            model_retry_backoff: ModelRetryBackoff::default(),
         }
     }
 
@@ -298,6 +398,17 @@ impl GrokRetryState {
 
     pub fn transient_failures(&self) -> u32 {
         self.transient_failures
+    }
+
+    pub fn wire_attempt(&self) -> u8 {
+        self.wire_attempt.min(u8::MAX as u32) as u8
+    }
+
+    pub(super) fn log_context(&self) -> GrokRetryLogContext {
+        GrokRetryLogContext {
+            req_id: self.req_id.clone(),
+            deadline_remaining_ms: self.deadline.remaining_ms(),
+        }
     }
 
     /// Reserve one transient retry and decide whether its delay fits both retry policy and the
@@ -312,6 +423,39 @@ impl GrokRetryState {
             return Err(GrokRetryStop::RETRY_EXHAUSTED);
         }
         let delay = crate::retry::compute_backoff_delay(self.transient_failures, retry_after);
+        self.note_transient_failure();
+        if delay.exceeds_budget {
+            self.mark_terminal();
+            return Err(GrokRetryStop::DELAY_EXCEEDS_BUDGET);
+        }
+        if !deadline.permits_wait_ms(delay.wait_ms) {
+            self.mark_terminal();
+            return Err(GrokRetryStop::DELAY_EXCEEDS_DEADLINE);
+        }
+        Ok(delay.wait_ms)
+    }
+
+    /// Schedule a model replay using its proven dispatch outcome. Unlike auth
+    /// retries, an unknown POST outcome is terminal and the first proven
+    /// pre-dispatch transport failure gets one short recovery delay.
+    pub fn schedule_model_retry(
+        &mut self,
+        replay_safety: ReplaySafety,
+        retry_after: Option<&str>,
+        deadline: GrokRequestDeadline,
+    ) -> Result<u64, GrokRetryStop> {
+        if !replay_safety.permits_model_replay() {
+            self.mark_terminal();
+            return Err(GrokRetryStop::OUTCOME_UNKNOWN);
+        }
+        if !self.can_retry_transient() {
+            self.mark_terminal();
+            return Err(GrokRetryStop::RETRY_EXHAUSTED);
+        }
+        let delay = self
+            .model_retry_backoff
+            .next_delay(replay_safety, retry_after)
+            .expect("replay-safe model failure must have a retry delay");
         self.note_transient_failure();
         if delay.exceeds_budget {
             self.mark_terminal();
@@ -363,6 +507,10 @@ pub struct GrokRetryStop {
 }
 
 impl GrokRetryStop {
+    const OUTCOME_UNKNOWN: Self = Self {
+        failure_kind: "outcome_unknown",
+        terminal_reason: "model request outcome is unknown",
+    };
     const RETRY_EXHAUSTED: Self = Self {
         failure_kind: "retry_exhausted",
         terminal_reason: "retry exhausted",
@@ -375,6 +523,12 @@ impl GrokRetryStop {
         failure_kind: "retry_delay_exceeds_deadline",
         terminal_reason: "retry delay exceeds remaining request deadline",
     };
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GrokRetryLogContext {
+    req_id: Option<String>,
+    deadline_remaining_ms: u64,
 }
 
 pub struct GrokClient {
@@ -546,6 +700,7 @@ impl GrokClient {
                 Err(stop) => {
                     let exhausted = stop.failure_kind == "retry_exhausted";
                     let error = error.into_terminal(stop.terminal_reason);
+                    let log_context = state.log_context();
                     drop(state);
                     capture_terminal_failure(
                         traffic,
@@ -556,12 +711,13 @@ impl GrokClient {
                         Some(&error.message),
                     );
                     if exhausted {
-                        log_retry_exhausted(auth_attempt, &error);
+                        log_retry_exhausted(auth_attempt, &error, &log_context);
                     }
                     return Err(error);
                 }
             };
             let transient = state.transient_failures;
+            let log_context = state.log_context();
             drop(state);
 
             if let Some(capture) = traffic {
@@ -578,7 +734,7 @@ impl GrokClient {
                     }),
                 );
             }
-            log_retry(auth_attempt, transient, wait_ms, &error);
+            log_retry(auth_attempt, transient, wait_ms, &error, &log_context);
             run_before_deadline(
                 deadline,
                 retry.clone(),
@@ -592,6 +748,17 @@ impl GrokClient {
     pub async fn post_with_retry(
         &self,
         body: &GrokResponsesRequest,
+        traffic: Option<Arc<TrafficCapture>>,
+        retry: Arc<Mutex<GrokRetryState>>,
+    ) -> Result<GrokResponse, GrokError> {
+        let prepared = PreparedGrokRequest::new(body, traffic.is_some())?;
+        self.post_prepared_with_retry(&prepared, traffic, retry)
+            .await
+    }
+
+    pub async fn post_prepared_with_retry(
+        &self,
+        body: &PreparedGrokRequest,
         traffic: Option<Arc<TrafficCapture>>,
         retry: Arc<Mutex<GrokRetryState>>,
     ) -> Result<GrokResponse, GrokError> {
@@ -610,8 +777,18 @@ impl GrokClient {
             return Err(GrokError::retry_budget_exhausted());
         }
         if let Some(capture) = traffic.as_ref() {
-            let body_value = serde_json::to_value(body).unwrap_or(serde_json::Value::Null);
-            capture.write_json("020-upstream-request", &body_value);
+            let parsed_body;
+            let body_value = if let Some(value) = body.capture_value.as_ref() {
+                value
+            } else {
+                parsed_body = serde_json::from_slice(&body.body).map_err(|error| {
+                    GrokError::serialization(format!(
+                        "Failed to prepare Grok traffic capture: {error}"
+                    ))
+                })?;
+                &parsed_body
+            };
+            capture.write_json("020-upstream-request", body_value);
             capture.write_json(
                 "021-upstream-request-metadata",
                 &serde_json::json!({
@@ -625,7 +802,7 @@ impl GrokClient {
                         "authorization":"[redacted]",
                         "x-xai-token-auth":"[redacted]"
                     },
-                    "body_bytes": serde_json::to_vec(body).map(|v| v.len()).unwrap_or(0),
+                    "body_bytes": body.len(),
                 }),
             );
         }
@@ -729,14 +906,18 @@ impl GrokClient {
                     );
                     return Err(error);
                 }
-                Err(error) if error.is_retryable() => {
+                Err(error) if error.permits_model_replay() => {
                     let mut state = retry.lock().await;
-                    let wait_ms = match state.schedule_retry(error.retry_after.as_deref(), deadline)
-                    {
+                    let wait_ms = match state.schedule_model_retry(
+                        error.replay_safety,
+                        error.retry_after.as_deref(),
+                        deadline,
+                    ) {
                         Ok(wait_ms) => wait_ms,
                         Err(stop) => {
                             let exhausted = stop.failure_kind == "retry_exhausted";
                             let error = error.into_terminal(stop.terminal_reason);
+                            let log_context = state.log_context();
                             drop(state);
                             capture_terminal_failure(
                                 traffic.as_deref(),
@@ -747,12 +928,13 @@ impl GrokClient {
                                 Some(&error.message),
                             );
                             if exhausted {
-                                log_retry_exhausted(attempt, &error);
+                                log_retry_exhausted(attempt, &error, &log_context);
                             }
                             return Err(error);
                         }
                     };
                     let transient = state.transient_failures;
+                    let log_context = state.log_context();
                     drop(state);
                     if let Some(capture) = traffic.as_ref() {
                         capture.write_json(
@@ -764,16 +946,19 @@ impl GrokClient {
                                 "status": error.status.as_u16(),
                                 "origin": origin_name(error.origin),
                                 "stage": stage_name(error.stage),
+                                "replay_safety": error.replay_safety.as_str(),
+                                "deadline_remaining_ms": log_context.deadline_remaining_ms,
                                 "message": error.message,
                             }),
                         );
                     }
-                    log_retry(attempt, transient, wait_ms, &error);
+                    log_retry(attempt, transient, wait_ms, &error, &log_context);
                     run_before_deadline(deadline, retry.clone(), error.stage, sleep(wait_ms))
                         .await?;
                     continue;
                 }
                 Err(error) => {
+                    retry.lock().await.mark_terminal();
                     capture_terminal_failure(
                         traffic.as_deref(),
                         stage_name(error.stage),
@@ -791,7 +976,7 @@ impl GrokClient {
     async fn attempt(
         &self,
         access: &str,
-        body: &GrokResponsesRequest,
+        body: &PreparedGrokRequest,
         attempt: u8,
         traffic: Option<&TrafficCapture>,
         deadline: GrokRequestDeadline,
@@ -807,7 +992,7 @@ impl GrokClient {
             .header("x-xai-token-auth", "xai-grok-cli")
             .header("x-grok-client-identifier", "grok-shell")
             .header("x-grok-client-version", &self.client_version)
-            .json(body)
+            .body(body.clone_body())
             .send();
 
         let response = match run_before_deadline(
@@ -834,7 +1019,12 @@ impl GrokClient {
                     stage_name(stage),
                     Some(&message),
                 );
-                return Err(GrokError::request_transport(stage, message));
+                let replay_safety = if error.is_connect() {
+                    ReplaySafety::DefinitelyNotDispatched
+                } else {
+                    ReplaySafety::OutcomeUnknown
+                };
+                return Err(GrokError::request_transport(stage, message, replay_safety));
             }
             Err(_) => {
                 let message = format!(
@@ -852,6 +1042,7 @@ impl GrokClient {
                 return Err(GrokError::request_transport(
                     GrokErrorStage::Header,
                     message,
+                    ReplaySafety::OutcomeUnknown,
                 ));
             }
         };
@@ -921,6 +1112,7 @@ impl GrokClient {
             return Err(GrokError::request_transport(
                 GrokErrorStage::Header,
                 message,
+                ReplaySafety::OutcomeUnknown,
             ));
         }
 
@@ -928,9 +1120,8 @@ impl GrokClient {
             && !is_event_stream_content_type(content_type)
         {
             let content_type = content_type.to_str().unwrap_or("<invalid>");
-            let message = format!(
-                "Grok upstream returned a non-SSE success response ({content_type})"
-            );
+            let message =
+                format!("Grok upstream returned a non-SSE success response ({content_type})");
             capture_attempt(
                 traffic,
                 attempt,
@@ -942,6 +1133,7 @@ impl GrokClient {
             return Err(GrokError::request_transport(
                 GrokErrorStage::Header,
                 message,
+                ReplaySafety::OutcomeUnknown,
             ));
         }
 
@@ -1226,16 +1418,31 @@ fn capture_attempt(
     }
 }
 
-fn log_retry(attempt: u8, transient_failures: u32, wait_ms: u64, error: &GrokError) {
+pub(super) fn log_retry(
+    attempt: u8,
+    transient_failures: u32,
+    wait_ms: u64,
+    error: &GrokError,
+    context: &GrokRetryLogContext,
+) {
     crate::logging::create_logger("grok").info(
         "upstream_retry",
         Some(serde_json::Map::from_iter([
+            ("reqId".into(), serde_json::json!(context.req_id)),
             ("attempt".into(), serde_json::json!(attempt)),
             (
                 "transientFailures".into(),
                 serde_json::json!(transient_failures),
             ),
             ("waitMs".into(), serde_json::json!(wait_ms)),
+            (
+                "replaySafety".into(),
+                serde_json::json!(error.replay_safety.as_str()),
+            ),
+            (
+                "deadlineRemainingMs".into(),
+                serde_json::json!(context.deadline_remaining_ms),
+            ),
             ("status".into(), serde_json::json!(error.status.as_u16())),
             (
                 "origin".into(),
@@ -1247,11 +1454,20 @@ fn log_retry(attempt: u8, transient_failures: u32, wait_ms: u64, error: &GrokErr
     );
 }
 
-fn log_retry_exhausted(attempt: u8, error: &GrokError) {
+fn log_retry_exhausted(attempt: u8, error: &GrokError, context: &GrokRetryLogContext) {
     crate::logging::create_logger("grok").info(
         "upstream_retry_exhausted",
         Some(serde_json::Map::from_iter([
+            ("reqId".into(), serde_json::json!(context.req_id)),
             ("attempt".into(), serde_json::json!(attempt)),
+            (
+                "replaySafety".into(),
+                serde_json::json!(error.replay_safety.as_str()),
+            ),
+            (
+                "deadlineRemainingMs".into(),
+                serde_json::json!(context.deadline_remaining_ms),
+            ),
             ("status".into(), serde_json::json!(error.status.as_u16())),
             (
                 "origin".into(),
@@ -1266,6 +1482,7 @@ fn log_retry_exhausted(attempt: u8, error: &GrokError) {
 pub(super) fn origin_name(origin: GrokErrorOrigin) -> &'static str {
     match origin {
         GrokErrorOrigin::Auth => "auth",
+        GrokErrorOrigin::Serialization => "serialization",
         GrokErrorOrigin::Http => "http",
         GrokErrorOrigin::RequestTransport => "request_transport",
         GrokErrorOrigin::StreamTransport => "stream_transport",
@@ -1277,6 +1494,7 @@ pub(super) fn origin_name(origin: GrokErrorOrigin) -> &'static str {
 pub(super) fn stage_name(stage: GrokErrorStage) -> &'static str {
     match stage {
         GrokErrorStage::Auth => "auth",
+        GrokErrorStage::Serialize => "serialize",
         GrokErrorStage::Connect => "connect",
         GrokErrorStage::Header => "header",
         GrokErrorStage::Status => "status",
@@ -1382,6 +1600,43 @@ mod tests {
         assert!(out_of_time.is_terminal());
         assert_eq!(out_of_time.transient_failures(), 1);
     }
+
+    #[test]
+    fn model_retry_schedule_is_fast_once_and_rejects_unknown_outcomes() {
+        let deadline = GrokRequestDeadline::after(Duration::from_secs(60));
+        let mut retry = GrokRetryState::with_deadline(deadline);
+        assert!(
+            retry.req_id.is_none(),
+            "test/default retry state has no reqId"
+        );
+
+        let fast = retry
+            .schedule_model_retry(ReplaySafety::DefinitelyNotDispatched, None, deadline)
+            .unwrap();
+        assert!((100..=300).contains(&fast));
+
+        let overload = retry
+            .schedule_model_retry(ReplaySafety::ExplicitlyRetryableResponse, None, deadline)
+            .unwrap();
+        assert!((1_600..=2_400).contains(&overload));
+
+        let stop = retry
+            .schedule_model_retry(ReplaySafety::OutcomeUnknown, None, deadline)
+            .unwrap_err();
+        assert_eq!(stop.failure_kind, "outcome_unknown");
+        assert!(retry.is_terminal());
+    }
+
+    #[test]
+    fn production_retry_state_carries_request_id_for_logs() {
+        let retry = GrokRetryState::with_deadline_and_req_id(
+            GrokRequestDeadline::after(Duration::from_secs(60)),
+            "req-observed".into(),
+        );
+        let context = retry.log_context();
+        assert_eq!(context.req_id.as_deref(), Some("req-observed"));
+        assert!(context.deadline_remaining_ms <= 60_000);
+    }
     use crate::traffic::test_capture;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1469,6 +1724,31 @@ mod tests {
         (client, temp)
     }
 
+    #[test]
+    fn prepared_request_maps_serialization_failure_without_dispatch() {
+        let error = PreparedGrokRequest::from_serializable(&FailingPayload, false).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.origin, GrokErrorOrigin::Serialization);
+        assert_eq!(error.stage, GrokErrorStage::Serialize);
+        assert!(!error.is_retryable());
+        assert_eq!(error.replay_safety, ReplaySafety::DefinitelyNotDispatched);
+        assert!(!error.permits_model_replay());
+        assert!(error.message.contains("intentional serialization failure"));
+    }
+
+    #[test]
+    fn prepared_request_only_retains_capture_value_when_requested() {
+        let normal = PreparedGrokRequest::new(&sample_body(), false).unwrap();
+        let captured = PreparedGrokRequest::new(&sample_body(), true).unwrap();
+
+        assert!(normal.capture_value.is_none());
+        assert_eq!(
+            captured.capture_value.as_ref().unwrap()["model"],
+            "grok-4.5"
+        );
+    }
+
     fn sample_body() -> GrokResponsesRequest {
         GrokResponsesRequest {
             model: "grok-4.5".into(),
@@ -1482,6 +1762,39 @@ mod tests {
             max_output_tokens: None,
             reasoning: None,
             text: None,
+        }
+    }
+
+    struct CountingPayload<'a> {
+        serializations: &'a AtomicUsize,
+    }
+
+    impl Serialize for CountingPayload<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            self.serializations.fetch_add(1, Ordering::SeqCst);
+            serde_json::json!({
+                "model": "grok-4.5",
+                "input": [],
+                "store": false,
+                "stream": true
+            })
+            .serialize(serializer)
+        }
+    }
+
+    struct FailingPayload;
+
+    impl Serialize for FailingPayload {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(<S::Error as serde::ser::Error>::custom(
+                "intentional serialization failure",
+            ))
         }
     }
 
@@ -1501,6 +1814,35 @@ mod tests {
         }
         buf.truncate(total);
         buf
+    }
+
+    async fn read_http_request_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = read_http_request(stream).await;
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("HTTP headers must terminate");
+        let content_length = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .expect("prepared request must have content-length");
+        let mut body_bytes_read = request.len().saturating_sub(header_end).min(content_length);
+        request.resize(header_end + content_length, 0);
+        while body_bytes_read < content_length {
+            let read = stream
+                .read(&mut request[header_end + body_bytes_read..])
+                .await
+                .unwrap();
+            assert!(read > 0, "expected complete HTTP request body");
+            body_bytes_read += read;
+        }
+        request[header_end..header_end + content_length].to_vec()
     }
 
     async fn write_http_response(
@@ -1600,7 +1942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_non_sse_success_is_retryable_protocol_failure() {
+    async fn explicit_non_sse_success_is_retryable_but_not_replayable() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1625,9 +1967,10 @@ mod tests {
         .await;
         let deadline = GrokRequestDeadline::after(Duration::from_secs(2));
         let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+        let prepared = PreparedGrokRequest::new(&sample_body(), false).unwrap();
 
         let error = client
-            .attempt("test-access", &sample_body(), 1, None, deadline, retry)
+            .attempt("test-access", &prepared, 1, None, deadline, retry)
             .await
             .unwrap_err();
         server.await.unwrap();
@@ -1635,6 +1978,8 @@ mod tests {
         assert_eq!(error.origin, GrokErrorOrigin::RequestTransport);
         assert_eq!(error.stage, GrokErrorStage::Header);
         assert!(error.is_retryable());
+        assert_eq!(error.replay_safety, ReplaySafety::OutcomeUnknown);
+        assert!(!error.permits_model_replay());
         assert!(error.message.contains("text/html"));
     }
 
@@ -2296,6 +2641,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_payload_is_serialized_once_and_shared_across_wire_attempts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                bodies.push(read_http_request_body(&mut stream).await);
+                if attempt == 0 {
+                    write_http_response(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        "retry-after: 0\r\n",
+                        b"busy",
+                    )
+                    .await;
+                } else {
+                    let response_body = b"data: ok\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        response_body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(response_body).await.unwrap();
+                }
+            }
+            bodies
+        });
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let serializations = AtomicUsize::new(0);
+        let prepared = PreparedGrokRequest::from_serializable(
+            &CountingPayload {
+                serializations: &serializations,
+            },
+            false,
+        )
+        .unwrap();
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+
+        let response = client
+            .post_prepared_with_retry(&prepared, None, retry)
+            .await
+            .unwrap();
+        assert_eq!(response.into_bytes().await.unwrap(), b"data: ok\n\n");
+        let bodies = server.await.unwrap();
+
+        assert_eq!(serializations.load(Ordering::SeqCst), 1);
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[0].as_slice(), prepared.body.as_ref());
+    }
+
+    #[tokio::test]
     async fn retries_503_then_succeeds() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2382,27 +2789,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_reset_retries_within_budget() {
+    async fn post_dispatch_transport_reset_is_not_replayed() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_server = hits.clone();
         let server = tokio::spawn(async move {
-            // First connection is reset before headers.
-            let (stream, _) = listener.accept().await.unwrap();
-            hits_server.fetch_add(1, Ordering::SeqCst);
-            drop(stream);
-
+            // Consume the complete POST before resetting. The upstream may
+            // already have accepted it, so a second model dispatch is unsafe.
             let (mut stream, _) = listener.accept().await.unwrap();
             let _ = read_http_request(&mut stream).await;
             hits_server.fetch_add(1, Ordering::SeqCst);
-            let body = b"data: ok\n\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.write_all(body).await.unwrap();
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .is_ok()
         });
 
         let (client, _temp) = test_client(
@@ -2415,11 +2816,15 @@ mod tests {
             },
         )
         .await;
-        let response = client.post(&sample_body(), None).await.unwrap();
-        let body = response.into_bytes().await.unwrap();
-        server.await.unwrap();
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
-        assert_eq!(body, b"data: ok\n\n");
+        let error = match client.post(&sample_body(), None).await {
+            Ok(_) => panic!("a post-dispatch reset must fail without replay"),
+            Err(error) => error,
+        };
+        let replayed = server.await.unwrap();
+        assert_eq!(error.replay_safety, ReplaySafety::OutcomeUnknown);
+        assert!(!error.permits_model_replay());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(!replayed, "the uncertain POST must not be replayed");
     }
 
     #[tokio::test]
@@ -2670,23 +3075,27 @@ mod tests {
         assert_eq!(err.origin, GrokErrorOrigin::StreamTransport);
         assert_eq!(err.stage, GrokErrorStage::Body);
         assert!(err.is_retryable());
+        assert_eq!(err.replay_safety, ReplaySafety::OutcomeUnknown);
+        assert!(!err.permits_model_replay());
     }
 
     #[tokio::test]
     async fn header_timeout_exhaustion_is_terminal_request_transport() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
         let server = tokio::spawn(async move {
-            // Keep accepting and holding connections so every retry hits the
-            // header timeout rather than a later connection-refused path.
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let _ = read_http_request(&mut stream).await;
-                // Never send response headers.
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            // Keep the first request open without headers and watch long
+            // enough for an erroneous retry to arrive.
+            let replayed = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .is_ok();
+            drop(stream);
+            replayed
         });
 
         let (client, _temp) = test_client(
@@ -2699,21 +3108,19 @@ mod tests {
             },
         )
         .await;
-        // Single attempt path: exhaust budget is slow due to backoff; assert the
-        // classification from a direct timed-out attempt by using a shared retry
-        // state already at the limit after one failure via post() retries.
-        // Force one-shot classification by using post_with_retry with a pre-exhausted
-        // budget after capturing the first error through a custom loop is heavy;
-        // instead assert the final exhausted error still retains request transport shape.
         let err = match client.post(&sample_body(), None).await {
             Ok(_) => panic!("header timeout should fail"),
             Err(error) => error,
         };
-        server.abort();
+        let replayed = server.await.unwrap();
         assert_eq!(err.origin, GrokErrorOrigin::RequestTransport);
         assert_eq!(err.stage, GrokErrorStage::Header);
-        assert!(!err.is_retryable());
+        assert!(err.is_retryable());
+        assert_eq!(err.replay_safety, ReplaySafety::OutcomeUnknown);
+        assert!(!err.permits_model_replay());
         assert!(err.message.contains("headers"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(!replayed, "a timed-out POST must not be replayed");
     }
 
     #[tokio::test]
@@ -2750,6 +3157,8 @@ mod tests {
         assert_eq!(err.origin, GrokErrorOrigin::StreamTransport);
         assert_eq!(err.stage, GrokErrorStage::Stream);
         assert!(err.is_retryable());
+        assert_eq!(err.replay_safety, ReplaySafety::OutcomeUnknown);
+        assert!(!err.permits_model_replay());
         assert!(err.message.contains("next Grok response body chunk"));
     }
 

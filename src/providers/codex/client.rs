@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::anthropic::sse::parse_sse_events;
+use bytes::{Bytes, BytesMut};
+
+use crate::anthropic::sse::{parse_sse_events, try_parse_sse_events};
 use crate::config;
 use crate::logging::create_logger;
 use crate::provider::RequestContext;
-use crate::retry::{compute_backoff_delay, should_retry_status, sleep};
+use crate::retry::{ModelRetryBackoff, ReplaySafety, should_retry_status, sleep};
 use crate::traffic::TrafficCapture;
 
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
@@ -33,6 +35,7 @@ pub struct CodexError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexErrorOrigin {
     Http,
+    UpstreamHttp,
     WebSocket,
     WebSocketHandshake,
     Auth,
@@ -49,6 +52,48 @@ impl CodexError {
             retry_after: None,
             origin: CodexErrorOrigin::Http,
         }
+    }
+
+    /// Classify model replay safety from structured error provenance.
+    ///
+    /// Keep this conservative: only constructors that prove the model request
+    /// was not dispatched, or an explicit upstream retry response, may opt in.
+    pub fn replay_safety(&self) -> ReplaySafety {
+        if self.origin == CodexErrorOrigin::WebSocketHandshake
+            || matches!(
+                self.detail.as_deref(),
+                Some(
+                    CODEX_HTTP_CONNECT_ERROR_DETAIL
+                        | "websocket_pre_request"
+                        | super::websocket::WEBSOCKET_POOL_HEALTHCHECK_DETAIL
+                        | super::websocket::WEBSOCKET_POOL_BUSY_DETAIL
+                )
+            )
+        {
+            return ReplaySafety::DefinitelyNotDispatched;
+        }
+
+        if self.detail.as_deref() == Some("previous_response_not_found") {
+            return ReplaySafety::ExplicitlyRetryableResponse;
+        }
+
+        let explicit_retry_status = matches!(self.status, 401 | 429 | 500 | 502 | 503 | 504 | 529);
+        let explicit_upstream_origin = matches!(
+            self.origin,
+            CodexErrorOrigin::UpstreamHttp
+                | CodexErrorOrigin::BufferedHttp
+                | CodexErrorOrigin::BufferedWebSocket
+                | CodexErrorOrigin::WebSocket
+        );
+        let local_failure = matches!(
+            self.detail.as_deref(),
+            Some(CODEX_TOTAL_TIMEOUT_DETAIL | CODEX_DISPATCH_BUDGET_DETAIL)
+        );
+        if explicit_retry_status && explicit_upstream_origin && !local_failure {
+            return ReplaySafety::ExplicitlyRetryableResponse;
+        }
+
+        ReplaySafety::OutcomeUnknown
     }
 }
 
@@ -218,6 +263,7 @@ pub struct CodexResponse {
 // ---------------------------------------------------------------------------
 
 const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_CODEX_MODEL_DISPATCHES;
+const CODEX_HTTP_CONNECT_ERROR_DETAIL: &str = "http_connect_error";
 const HTTP_CONNECT_TIMEOUT_MS: u64 = 15_000;
 const HTTP_RESPONSE_HEADER_TIMEOUT_MS: u64 = 60_000;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
@@ -324,10 +370,9 @@ pub struct CodexHttpClient {
     base_url: String,
     websocket_circuit_key: String,
     header_timeout_ms: u64,
+    http_first_byte_timeout_ms: u64,
     body_idle_timeout_ms: u64,
     total_timeout_ms: u64,
-    #[allow(dead_code)]
-    header_timeout_retries: u32,
 }
 
 impl Default for CodexHttpClient {
@@ -351,17 +396,22 @@ impl CodexHttpClient {
     pub fn new() -> Self {
         let base_url = config::codex_base_url(CODEX_API_ENDPOINT);
         let connect_timeout_ms = config::codex_connect_timeout_ms(HTTP_CONNECT_TIMEOUT_MS);
+        let body_idle_timeout_ms =
+            config::codex_body_idle_timeout_ms(HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS);
+        // Preserve the historical behavior unless an independent first-byte
+        // timeout is configured: the resolved body-idle timeout remains the
+        // first-chunk limit as well.
+        let http_first_byte_timeout_ms =
+            config::codex_http_first_byte_timeout_ms(body_idle_timeout_ms);
         Self {
             client: build_codex_http_client(&base_url, connect_timeout_ms),
             auth_manager: CodexAuthManager::new(file_store()),
             websocket_circuit_key: websocket_circuit_key_for_url(&base_url),
             base_url,
             header_timeout_ms: config::codex_header_timeout_ms(HTTP_RESPONSE_HEADER_TIMEOUT_MS),
-            body_idle_timeout_ms: config::codex_body_idle_timeout_ms(
-                HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
-            ),
+            http_first_byte_timeout_ms,
+            body_idle_timeout_ms,
             total_timeout_ms: config::codex_total_timeout_ms(DEFAULT_CODEX_TOTAL_TIMEOUT_MS),
-            header_timeout_retries: 1,
         }
     }
 
@@ -378,9 +428,9 @@ impl CodexHttpClient {
             base_url,
             websocket_circuit_key,
             header_timeout_ms: HTTP_RESPONSE_HEADER_TIMEOUT_MS,
+            http_first_byte_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             total_timeout_ms: config::codex_total_timeout_ms(DEFAULT_CODEX_TOTAL_TIMEOUT_MS),
-            header_timeout_retries: 1,
         }
     }
 
@@ -390,7 +440,6 @@ impl CodexHttpClient {
         header_timeout_ms: u64,
         body_idle_timeout_ms: u64,
         total_timeout_ms: u64,
-        header_timeout_retries: u32,
     ) -> Self {
         let websocket_circuit_key = websocket_circuit_key_for_url(&base_url);
         Self {
@@ -399,9 +448,9 @@ impl CodexHttpClient {
             base_url,
             websocket_circuit_key,
             header_timeout_ms,
+            http_first_byte_timeout_ms: body_idle_timeout_ms,
             body_idle_timeout_ms,
             total_timeout_ms,
-            header_timeout_retries,
         }
     }
 
@@ -520,6 +569,8 @@ impl CodexHttpClient {
         let mut active_transport = transport;
         let mut auth_refresh_attempted = false;
         let mut reserved_model_replay: Option<CodexModelDispatchReservation> = None;
+        let mut model_retry_backoff = ModelRetryBackoff::default();
+        let mut serialized_http_body = None;
         let websocket_timeouts = super::websocket::CodexWebSocketTimeouts::configured();
         loop {
             let reservation = match reserved_model_replay.take() {
@@ -532,7 +583,7 @@ impl CodexHttpClient {
             let pool_key = websocket_pool_key(ctx, active_continuation.as_ref());
             let (result, result_transport) = match active_transport {
                 CodexTransport::Http => {
-                    let body_json = serialize_request(body)?;
+                    let body_json = cached_serialized_request(&mut serialized_http_body, body)?;
                     (
                         self.attempt_post_http(
                             &auth,
@@ -570,7 +621,7 @@ impl CodexHttpClient {
                     if super::websocket::codex_websocket_circuit_open(circuit_key) {
                         log_websocket_circuit_fallback(ctx);
                         active_transport = CodexTransport::Http;
-                        let body_json = serialize_request(body)?;
+                        let body_json = cached_serialized_request(&mut serialized_http_body, body)?;
                         (
                             self.attempt_post_http(
                                 &auth,
@@ -609,6 +660,15 @@ impl CodexHttpClient {
                                 record_auto_websocket_failure(ctx, circuit_key, &err);
                                 if dispatch_budget.can_reserve_model() {
                                     log_auto_http_fallback(ctx, &err);
+                                    let Some(delay) = model_retry_backoff.next_delay(
+                                        err.replay_safety(),
+                                        err.retry_after.as_deref(),
+                                    ) else {
+                                        return Err(err);
+                                    };
+                                    if delay.exceeds_budget {
+                                        return Err(err);
+                                    }
                                     if let Some(key) = pool_key {
                                         super::websocket::invalidate_codex_websocket_pool_turn(
                                             key, turn_id,
@@ -617,8 +677,11 @@ impl CodexHttpClient {
                                     active_continuation =
                                         full_context_continuation(active_continuation.as_ref());
                                     active_transport = CodexTransport::Http;
-                                    // Immediate buffered HTTP for retryable pre-output WS transport faults.
-                                    let body_json = serialize_request(body)?;
+                                    // A replay-safe pre-dispatch WS fault gets
+                                    // one short jitter window before HTTP.
+                                    sleep(delay.wait_ms).await;
+                                    let body_json =
+                                        cached_serialized_request(&mut serialized_http_body, body)?;
                                     let fallback =
                                         dispatch_budget.reserve_model().map_err(|error| {
                                             model_dispatch_budget_error(error, CodexTransport::Http)
@@ -675,10 +738,12 @@ impl CodexHttpClient {
                 && let Some(failure) = super::events::first_retryable_failure(&response.body)
             {
                 if dispatch_budget.can_reserve_model() {
-                    let delay = compute_backoff_delay(
-                        physical_attempts.saturating_sub(1),
-                        failure.retry_after.as_deref(),
-                    );
+                    let delay = model_retry_backoff
+                        .next_delay(
+                            ReplaySafety::ExplicitlyRetryableResponse,
+                            failure.retry_after.as_deref(),
+                        )
+                        .expect("explicit retry response must permit model replay");
                     if delay.exceeds_budget {
                         return Err(CodexError {
                             status: failure.status,
@@ -746,10 +811,12 @@ impl CodexHttpClient {
                         .find(|(k, _)| k.to_lowercase() == "retry-after")
                         .map(|(_, v)| v.clone());
                     if dispatch_budget.can_reserve_model() {
-                        let delay = compute_backoff_delay(
-                            physical_attempts.saturating_sub(1),
-                            retry_after.as_deref(),
-                        );
+                        let delay = model_retry_backoff
+                            .next_delay(
+                                ReplaySafety::ExplicitlyRetryableResponse,
+                                retry_after.as_deref(),
+                            )
+                            .expect("explicit retry response must permit model replay");
                         if delay.exceeds_budget {
                             let detail = String::from_utf8_lossy(&response.body).to_string();
                             return Err(CodexError {
@@ -795,8 +862,9 @@ impl CodexHttpClient {
                             .iter()
                             .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
                             .map(|(_, value)| value.as_str());
-                        let delay =
-                            compute_backoff_delay(physical_attempts.saturating_sub(1), retry_after);
+                        let delay = model_retry_backoff
+                            .next_delay(ReplaySafety::ExplicitlyRetryableResponse, retry_after)
+                            .expect("explicit retry response must permit model replay");
                         if delay.exceeds_budget {
                             return Err(codex_status_error(response, result_transport));
                         }
@@ -836,16 +904,25 @@ impl CodexHttpClient {
                         super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                     }
                     active_continuation = full_context_continuation(active_continuation.as_ref());
+                    if err.detail.as_deref() != Some("previous_response_not_found") {
+                        let delay = model_retry_backoff
+                            .next_delay(err.replay_safety(), err.retry_after.as_deref())
+                            .expect("replay-safe continuation recovery must have a retry delay");
+                        if delay.exceeds_budget {
+                            return Err(err);
+                        }
+                        sleep(delay.wait_ms).await;
+                    }
                     continue;
                 }
                 Err(err) => {
                     // Determine if retryable
                     let retryable = is_retryable_transport_error(&err);
-                    if retryable && dispatch_budget.can_reserve_model() {
-                        let delay = compute_backoff_delay(
-                            physical_attempts.saturating_sub(1),
-                            err.retry_after.as_deref(),
-                        );
+                    let replayable = retryable && err.replay_safety().permits_model_replay();
+                    if replayable && dispatch_budget.can_reserve_model() {
+                        let delay = model_retry_backoff
+                            .next_delay(err.replay_safety(), err.retry_after.as_deref())
+                            .expect("replayable transport error must have a model retry delay");
                         if delay.exceeds_budget {
                             return Err(err);
                         }
@@ -861,7 +938,7 @@ impl CodexHttpClient {
                         sleep(delay.wait_ms).await;
                         continue;
                     }
-                    if retryable {
+                    if replayable {
                         log_buffered_retry_exhausted(
                             ctx,
                             result_transport,
@@ -938,8 +1015,9 @@ impl CodexHttpClient {
             .as_ref()
             .and_then(|candidate| candidate.previous_response_id.as_deref())
             .is_some();
-        let mut forwarded_any = false;
+        let mut replay_window_closed = false;
         let mut reserved_model_replay: Option<CodexModelDispatchReservation> = None;
+        let mut model_retry_backoff = ModelRetryBackoff::default();
         let websocket_timeouts = super::websocket::CodexWebSocketTimeouts::configured();
 
         'attempt: loop {
@@ -988,7 +1066,11 @@ impl CodexHttpClient {
                 }
                 result = start => match result {
                     Ok(stream) => stream,
-                    Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
+                    Err(err)
+                        if err.status == 401
+                            && !auth_refresh_attempted
+                            && !replay_window_closed =>
+                    {
                         let replay = match dispatch_budget.reserve_model() {
                             Ok(replay) => replay,
                             Err(_) => {
@@ -1030,6 +1112,25 @@ impl CodexHttpClient {
                             super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                         }
                         continuation = full_context_continuation(continuation.as_ref());
+                        if err.detail.as_deref() != Some("previous_response_not_found") {
+                            let delay = model_retry_backoff
+                                .next_delay(err.replay_safety(), err.retry_after.as_deref())
+                                .expect("replay-safe continuation recovery must have a retry delay");
+                            if delay.exceeds_budget {
+                                let _ = tx.send(Err(err)).await;
+                                return;
+                            }
+                            tokio::select! {
+                                _ = tx.closed() => {
+                                    super::continuation::abort_continuation(
+                                        ctx.session_id.as_deref(),
+                                        turn_id,
+                                    );
+                                    return;
+                                }
+                                _ = sleep(delay.wait_ms) => {}
+                            }
+                        }
                         continue 'attempt;
                     }
                     Err(err) => {
@@ -1061,7 +1162,7 @@ impl CodexHttpClient {
                     Err(err) => err.status == 401,
                     Ok(payload) => super::websocket::event_error_status(payload) == Some(401),
                 };
-                if unauthorized && !auth_refresh_attempted && !forwarded_any {
+                if unauthorized && !auth_refresh_attempted && !replay_window_closed {
                     let replay = match dispatch_budget.reserve_model() {
                         Ok(replay) => replay,
                         Err(_) => {
@@ -1101,18 +1202,42 @@ impl CodexHttpClient {
                 if let Err(err) = &item
                     && continuation_retry_available
                     && is_continuation_retry_error(err)
-                    && !forwarded_any
+                    && !replay_window_closed
                 {
+                    let delay = if err.detail.as_deref() == Some("previous_response_not_found") {
+                        None
+                    } else {
+                        let delay = model_retry_backoff
+                            .next_delay(err.replay_safety(), err.retry_after.as_deref())
+                            .expect("replay-safe continuation recovery must have a retry delay");
+                        if delay.exceeds_budget {
+                            let _ = tx.send(item).await;
+                            return;
+                        }
+                        Some(delay.wait_ms)
+                    };
                     continuation_retry_available = false;
                     if let Some(key) = pool_key.as_deref() {
                         super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                     }
                     continuation = full_context_continuation(continuation.as_ref());
+                    if let Some(wait_ms) = delay {
+                        tokio::select! {
+                            _ = tx.closed() => {
+                                super::continuation::abort_continuation(
+                                    ctx.session_id.as_deref(),
+                                    turn_id,
+                                );
+                                return;
+                            }
+                            _ = sleep(wait_ms) => {}
+                        }
+                    }
                     continue 'attempt;
                 }
 
                 if item.as_ref().is_ok_and(event_closes_live_retry_window) {
-                    forwarded_any = true;
+                    replay_window_closed = true;
                 }
                 if tx.send(item).await.is_err() {
                     if let Some(key) = pool_key.as_deref() {
@@ -1185,10 +1310,15 @@ impl CodexHttpClient {
                         });
                     }
                     Ok(Err(error)) => {
+                        let detail = if error.is_connect() {
+                            CODEX_HTTP_CONNECT_ERROR_DETAIL
+                        } else {
+                            "http_response_headers"
+                        };
                         return Err(CodexError {
                             status: 0,
                             message: format!("Transport error waiting for Codex response headers: {error}"),
-                            detail: Some("http_response_headers".to_string()),
+                            detail: Some(detail.to_string()),
                             retry_after: None,
                             origin: CodexErrorOrigin::Http,
                         });
@@ -1213,6 +1343,9 @@ impl CodexHttpClient {
                 .get(http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
+            validate_codex_http_success(status, response.headers())?;
+            let first_byte_timeout = Duration::from_millis(self.http_first_byte_timeout_ms);
+            let body_idle_timeout = Duration::from_millis(self.body_idle_timeout_ms);
 
             if status == 401
                 && !auth_refresh_attempted
@@ -1228,7 +1361,13 @@ impl CodexHttpClient {
                 continue;
             }
             if !(200..300).contains(&status) {
-                let error_body = read_live_http_error_body(response, deadline).await?;
+                let error_body = read_live_http_error_body(
+                    response,
+                    first_byte_timeout,
+                    body_idle_timeout,
+                    deadline,
+                )
+                .await?;
                 if let Some(traffic) = ctx.traffic.as_deref() {
                     write_upstream_response_capture(
                         traffic,
@@ -1250,13 +1389,12 @@ impl CodexHttpClient {
                     detail: Some(message.clone()),
                     message,
                     retry_after,
-                    origin: CodexErrorOrigin::Http,
+                    origin: CodexErrorOrigin::UpstreamHttp,
                 });
             }
 
             let (tx, rx) = tokio::sync::mpsc::channel(super::LIVE_EVENT_CHANNEL_CAPACITY);
             let ctx = ctx.clone();
-            let body_idle_timeout = Duration::from_millis(self.body_idle_timeout_ms);
             tokio::spawn(async move {
                 forward_live_http_response(
                     response,
@@ -1264,6 +1402,7 @@ impl CodexHttpClient {
                     response_headers,
                     started_at,
                     ctx,
+                    first_byte_timeout,
                     body_idle_timeout,
                     deadline,
                     tx,
@@ -1277,7 +1416,7 @@ impl CodexHttpClient {
     async fn attempt_post_http(
         &self,
         auth: &StoredAuth,
-        body_json: &str,
+        body_json: &Bytes,
         ctx: &RequestContext,
         use_responses_lite: bool,
     ) -> Result<CodexResponse, CodexError> {
@@ -1296,7 +1435,7 @@ impl CodexHttpClient {
 
         // Apply header timeout
         let started_at = Instant::now();
-        let send_fut = req_builder.body(body_json.to_string()).send();
+        let send_fut = req_builder.body(body_json.clone()).send();
         let header_timeout_dur = Duration::from_millis(self.header_timeout_ms);
 
         let mut resp = tokio::time::timeout(header_timeout_dur, send_fut)
@@ -1307,16 +1446,24 @@ impl CodexHttpClient {
                     "Timed out waiting {}ms for Codex response headers",
                     self.header_timeout_ms
                 ),
-                detail: None,
+                detail: Some("http_response_headers".to_string()),
                 retry_after: None,
                 origin: CodexErrorOrigin::Http,
             })?
             .map_err(|e| {
-                if is_retryable_reqwest_error(&e) {
+                if e.is_connect() {
                     CodexError {
                         status: 0,
                         message: format!("Transport error: {e}"),
-                        detail: None,
+                        detail: Some(CODEX_HTTP_CONNECT_ERROR_DETAIL.to_string()),
+                        retry_after: None,
+                        origin: CodexErrorOrigin::Http,
+                    }
+                } else if is_retryable_reqwest_error(&e) {
+                    CodexError {
+                        status: 0,
+                        message: format!("Transport error: {e}"),
+                        detail: Some("http_response_headers".to_string()),
                         retry_after: None,
                         origin: CodexErrorOrigin::Http,
                     }
@@ -1324,7 +1471,7 @@ impl CodexHttpClient {
                     CodexError {
                         status: 0,
                         message: format!("Network error: {e}"),
-                        detail: None,
+                        detail: Some("http_response_headers".to_string()),
                         retry_after: None,
                         origin: CodexErrorOrigin::Http,
                     }
@@ -1332,11 +1479,41 @@ impl CodexHttpClient {
             })?;
 
         let status = resp.status().as_u16();
-        let body_limit = if (200..300).contains(&status) {
-            MAX_BUFFERED_HTTP_SUCCESS_BODY_BYTES
-        } else {
-            MAX_BUFFERED_HTTP_ERROR_BODY_BYTES
-        };
+        validate_codex_http_success(status, resp.headers())?;
+        let headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
+        if !(200..300).contains(&status) {
+            // The upstream status is authoritative even if its diagnostic body
+            // stalls or resets. Preserve that explicit retry signal and its
+            // Retry-After header instead of replacing it with a statusless,
+            // outcome-unknown transport error.
+            let body_bytes = read_buffered_http_error_body(
+                resp,
+                Duration::from_millis(self.http_first_byte_timeout_ms),
+                Duration::from_millis(self.body_idle_timeout_ms),
+            )
+            .await;
+            if let Some(traffic) = ctx.traffic.as_deref() {
+                write_upstream_response_capture(
+                    traffic,
+                    status,
+                    started_at.elapsed(),
+                    &headers,
+                    &body_bytes,
+                );
+            }
+            return Ok(CodexResponse {
+                body: body_bytes,
+                status,
+                headers,
+            });
+        }
+
+        let body_limit = MAX_BUFFERED_HTTP_SUCCESS_BODY_BYTES;
         if resp
             .content_length()
             .is_some_and(|length| length > body_limit as u64)
@@ -1349,37 +1526,48 @@ impl CodexHttpClient {
                 origin: CodexErrorOrigin::Http,
             });
         }
-        let headers: Vec<(String, String)> = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-
         let mut body_bytes = Vec::new();
         let mut response_started = false;
         loop {
-            let chunk = tokio::time::timeout(
-                Duration::from_millis(self.body_idle_timeout_ms),
-                resp.chunk(),
-            )
-            .await
-            .map_err(|_| CodexError {
-                status: 0,
-                message: format!(
-                    "Timed out waiting {}ms for the next Codex response body chunk",
-                    self.body_idle_timeout_ms
-                ),
-                detail: Some("http_response_body".to_string()),
-                retry_after: None,
-                origin: CodexErrorOrigin::Http,
-            })?
-            .map_err(|e| CodexError {
-                status: 0,
-                message: format!("Transport error reading Codex response body: {e}"),
-                detail: Some("http_response_body".to_string()),
-                retry_after: None,
-                origin: CodexErrorOrigin::Http,
-            })?;
+            let first_chunk = !response_started;
+            let chunk_timeout_ms = if first_chunk {
+                self.http_first_byte_timeout_ms
+            } else {
+                self.body_idle_timeout_ms
+            };
+            let chunk = tokio::time::timeout(Duration::from_millis(chunk_timeout_ms), resp.chunk())
+                .await
+                .map_err(|_| CodexError {
+                    status: 0,
+                    message: if first_chunk {
+                        format!(
+                            "Timed out waiting {}ms for the first Codex HTTP response body byte",
+                            self.http_first_byte_timeout_ms
+                        )
+                    } else {
+                        format!(
+                            "Timed out waiting {}ms for the next Codex response body chunk",
+                            self.body_idle_timeout_ms
+                        )
+                    },
+                    detail: Some(
+                        if first_chunk {
+                            "http_response_first_byte"
+                        } else {
+                            "http_response_body"
+                        }
+                        .to_string(),
+                    ),
+                    retry_after: None,
+                    origin: CodexErrorOrigin::Http,
+                })?
+                .map_err(|e| CodexError {
+                    status: 0,
+                    message: format!("Transport error reading Codex response body: {e}"),
+                    detail: Some("http_response_body".to_string()),
+                    retry_after: None,
+                    origin: CodexErrorOrigin::Http,
+                })?;
 
             let Some(chunk) = chunk else {
                 break;
@@ -1422,23 +1610,33 @@ impl CodexHttpClient {
 
 #[derive(Default)]
 struct CodexLiveSseDecoder {
-    pending: Vec<u8>,
+    pending: BytesMut,
+    records_seen: usize,
+    scan_from: usize,
 }
 
 impl CodexLiveSseDecoder {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<serde_json::Value>, String> {
         self.pending.extend_from_slice(bytes);
         let mut payloads = Vec::new();
-        while let Some(end) = next_sse_record_end(&self.pending) {
+        while let Some(end) = next_sse_record_end(&self.pending, self.scan_from) {
             if end > super::MAX_LIVE_EVENT_BYTES {
                 return Err("Codex SSE event exceeded the incremental decode limit".to_string());
             }
-            let record: Vec<u8> = self.pending.drain(..end).collect();
-            decode_codex_sse_record(&record, &mut payloads)?;
+            let record = self.pending.split_to(end);
+            self.scan_from = 0;
+            let stream_start = self.records_seen == 0;
+            self.records_seen = self.records_seen.saturating_add(1);
+            decode_codex_sse_record(&record, stream_start, &mut payloads)?;
         }
         if self.pending.len() > super::MAX_LIVE_EVENT_BYTES {
             return Err("Codex SSE event exceeded the incremental decode limit".to_string());
         }
+        // The longest record delimiter is CRLFCRLF (four bytes), so only its
+        // last three existing bytes can combine with the next network chunk.
+        // Retaining this cursor avoids rescanning a large partial event from
+        // byte zero for every small chunk.
+        self.scan_from = self.pending.len().saturating_sub(3);
         Ok(payloads)
     }
 
@@ -1448,18 +1646,21 @@ impl CodexLiveSseDecoder {
         }
         self.pending.extend_from_slice(b"\n\n");
         let mut payloads = Vec::new();
-        while let Some(end) = next_sse_record_end(&self.pending) {
+        while let Some(end) = next_sse_record_end(&self.pending, self.scan_from) {
             if end > super::MAX_LIVE_EVENT_BYTES {
                 return Err("Codex SSE event exceeded the incremental decode limit".to_string());
             }
-            let record: Vec<u8> = self.pending.drain(..end).collect();
-            decode_codex_sse_record(&record, &mut payloads)?;
+            let record = self.pending.split_to(end);
+            self.scan_from = 0;
+            let stream_start = self.records_seen == 0;
+            self.records_seen = self.records_seen.saturating_add(1);
+            decode_codex_sse_record(&record, stream_start, &mut payloads)?;
         }
         Ok(payloads)
     }
 }
 
-fn next_sse_record_end(bytes: &[u8]) -> Option<usize> {
+fn next_sse_record_end(bytes: &[u8], scan_from: usize) -> Option<usize> {
     fn line_ending_len(bytes: &[u8], index: usize) -> Option<usize> {
         match bytes.get(index) {
             Some(b'\r') if bytes.get(index + 1) == Some(&b'\n') => Some(2),
@@ -1468,7 +1669,7 @@ fn next_sse_record_end(bytes: &[u8]) -> Option<usize> {
         }
     }
 
-    for index in 0..bytes.len() {
+    for index in scan_from.min(bytes.len())..bytes.len() {
         let Some(first) = line_ending_len(bytes, index) else {
             continue;
         };
@@ -1482,9 +1683,25 @@ fn next_sse_record_end(bytes: &[u8]) -> Option<usize> {
 
 fn decode_codex_sse_record(
     record: &[u8],
+    stream_start: bool,
     payloads: &mut Vec<serde_json::Value>,
 ) -> Result<(), String> {
-    for event in parse_sse_events(record) {
+    const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+    let record = if stream_start {
+        record.strip_prefix(UTF8_BOM).unwrap_or(record)
+    } else {
+        if record.starts_with(UTF8_BOM) {
+            return Err("Codex SSE stream contained a UTF-8 BOM after stream start".to_string());
+        }
+        record
+    };
+    let events = try_parse_sse_events(record).map_err(|error| {
+        format!(
+            "Codex SSE event contained invalid UTF-8 at byte {}",
+            error.valid_up_to()
+        )
+    })?;
+    for event in events {
         if event.data == "[DONE]" {
             continue;
         }
@@ -1509,6 +1726,16 @@ fn live_http_body_error(message: String) -> CodexError {
     }
 }
 
+fn live_http_first_byte_error(message: String) -> CodexError {
+    CodexError {
+        status: 0,
+        message,
+        detail: Some("http_response_first_byte".to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::Http,
+    }
+}
+
 async fn send_live_http_item(
     tx: &tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
     item: Result<serde_json::Value, CodexError>,
@@ -1522,12 +1749,56 @@ async fn send_live_http_item(
     }
 }
 
+async fn read_buffered_http_error_body(
+    mut response: reqwest::Response,
+    first_byte_timeout: Duration,
+    body_idle_timeout: Duration,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut first_chunk = true;
+    loop {
+        let wait = if first_chunk {
+            first_byte_timeout
+        } else {
+            body_idle_timeout
+        }
+        .min(LIVE_HTTP_ERROR_BODY_IDLE_TIMEOUT);
+        let chunk = match tokio::time::timeout(wait, response.chunk()).await {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(_)) | Err(_) => break,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        first_chunk = false;
+        let remaining = MAX_BUFFERED_HTTP_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if chunk.len() >= remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    body
+}
+
 async fn read_live_http_error_body(
     mut response: reqwest::Response,
+    first_byte_timeout: Duration,
+    body_idle_timeout: Duration,
     deadline: CodexRequestDeadline,
 ) -> Result<Vec<u8>, CodexError> {
     let mut body = Vec::new();
+    let mut first_chunk = true;
     loop {
+        // Error bodies are diagnostic only, so retain the existing five-second
+        // cap while honoring any stricter configured first-byte/body-idle
+        // timeout.
+        let chunk_timeout = if first_chunk {
+            first_byte_timeout
+        } else {
+            body_idle_timeout
+        }
+        .min(LIVE_HTTP_ERROR_BODY_IDLE_TIMEOUT);
         let chunk = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(deadline.at()) => {
@@ -1536,7 +1807,7 @@ async fn read_live_http_error_body(
                     deadline.timeout_ms(),
                 ));
             }
-            result = tokio::time::timeout(LIVE_HTTP_ERROR_BODY_IDLE_TIMEOUT, response.chunk()) => {
+            result = tokio::time::timeout(chunk_timeout, response.chunk()) => {
                 match result {
                     Ok(Ok(chunk)) => chunk,
                     Ok(Err(_)) | Err(_) => return Ok(body),
@@ -1546,6 +1817,7 @@ async fn read_live_http_error_body(
         let Some(chunk) = chunk else {
             return Ok(body);
         };
+        first_chunk = false;
         let remaining = MAX_LIVE_HTTP_ERROR_BODY_BYTES.saturating_sub(body.len());
         if chunk.len() >= remaining {
             body.extend_from_slice(&chunk[..remaining]);
@@ -1562,6 +1834,7 @@ async fn forward_live_http_response(
     headers: Vec<(String, String)>,
     started_at: Instant,
     ctx: RequestContext,
+    first_byte_timeout: Duration,
     body_idle_timeout: Duration,
     deadline: CodexRequestDeadline,
     tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
@@ -1575,8 +1848,14 @@ async fn forward_live_http_response(
     let mut terminal = false;
     let mut final_error = None;
     let mut cancelled = false;
+    let mut first_chunk = true;
 
     'body: loop {
+        let chunk_timeout = if first_chunk {
+            first_byte_timeout
+        } else {
+            body_idle_timeout
+        };
         let chunk = tokio::select! {
             biased;
             _ = tx.closed() => {
@@ -1590,12 +1869,19 @@ async fn forward_live_http_response(
                 ));
                 break 'body;
             }
-            result = tokio::time::timeout(body_idle_timeout, response.chunk()) => match result {
+            result = tokio::time::timeout(chunk_timeout, response.chunk()) => match result {
                 Err(_) => {
-                    final_error = Some(live_http_body_error(format!(
-                        "Timed out waiting {}ms for the next Codex response body chunk",
-                        body_idle_timeout.as_millis()
-                    )));
+                    final_error = Some(if first_chunk {
+                        live_http_first_byte_error(format!(
+                            "Timed out waiting {}ms for the first Codex HTTP response body byte",
+                            first_byte_timeout.as_millis()
+                        ))
+                    } else {
+                        live_http_body_error(format!(
+                            "Timed out waiting {}ms for the next Codex response body chunk",
+                            body_idle_timeout.as_millis()
+                        ))
+                    });
                     break 'body;
                 }
                 Ok(Err(error)) => {
@@ -1628,6 +1914,7 @@ async fn forward_live_http_response(
             }
             break;
         };
+        first_chunk = false;
 
         if let Some(body) = captured_body.as_mut() {
             let remaining =
@@ -1691,9 +1978,9 @@ fn write_codex_http_request_capture(
     traffic: &TrafficCapture,
     url: &str,
     headers: &http::HeaderMap,
-    body_json: &str,
+    body_json: &[u8],
 ) {
-    let body = serde_json::from_str(body_json).unwrap_or_else(|_| {
+    let body = serde_json::from_slice(body_json).unwrap_or_else(|_| {
         serde_json::json!({
             "unparseable": true,
             "bytes": body_json.len(),
@@ -1708,7 +1995,7 @@ fn write_codex_http_request_capture(
             "url": url,
             "method": "POST",
             "headers": headers_to_json(headers),
-            "size": summarize_json_request_size(&body, body_json),
+            "size": summarize_json_request_size(&body, body_json.len()),
         }),
     );
 }
@@ -1791,9 +2078,9 @@ fn headers_to_json_from_pairs(headers: &[(String, String)]) -> serde_json::Value
     serde_json::Value::Object(out)
 }
 
-fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> serde_json::Value {
+fn summarize_json_request_size(body: &serde_json::Value, body_bytes: usize) -> serde_json::Value {
     serde_json::json!({
-        "bytes": body_json.len(),
+        "bytes": body_bytes,
         "inputCount": body
             .get("input")
             .and_then(|v| v.as_array())
@@ -1916,14 +2203,28 @@ fn buffered_origin(transport: crate::config::CodexTransport) -> CodexErrorOrigin
     }
 }
 
-fn serialize_request(body: &ResponsesRequest) -> Result<String, CodexError> {
-    serde_json::to_string(body).map_err(|error| CodexError {
-        status: 500,
-        message: "Failed to serialize request".to_string(),
-        detail: Some(error.to_string()),
-        retry_after: None,
-        origin: CodexErrorOrigin::Http,
-    })
+fn serialize_request(body: &ResponsesRequest) -> Result<Bytes, CodexError> {
+    serde_json::to_vec(body)
+        .map(Bytes::from)
+        .map_err(|error| CodexError {
+            status: 500,
+            message: "Failed to serialize request".to_string(),
+            detail: Some(error.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        })
+}
+
+fn cached_serialized_request(
+    cached: &mut Option<Bytes>,
+    body: &ResponsesRequest,
+) -> Result<Bytes, CodexError> {
+    if let Some(bytes) = cached.as_ref() {
+        return Ok(bytes.clone());
+    }
+    let bytes = serialize_request(body)?;
+    *cached = Some(bytes.clone());
+    Ok(bytes)
 }
 
 fn websocket_circuit_key_for_url(base_url: &str) -> String {
@@ -1939,6 +2240,7 @@ fn should_retry_codex_status(status: u16) -> bool {
 fn codex_error_origin_name(origin: CodexErrorOrigin) -> &'static str {
     match origin {
         CodexErrorOrigin::Http => "http",
+        CodexErrorOrigin::UpstreamHttp => "upstream_http",
         CodexErrorOrigin::WebSocket => "websocket",
         CodexErrorOrigin::WebSocketHandshake => "websocket_handshake",
         CodexErrorOrigin::Auth => "auth",
@@ -2038,7 +2340,7 @@ pub(super) fn record_auto_websocket_failure(
     circuit_key: &str,
     err: &CodexError,
 ) -> bool {
-    if !should_fallback_to_http(err) {
+    if !is_websocket_transport_health_failure(err) {
         // A non-transport response proves the WebSocket path is reachable and
         // breaks a run of consecutive transport failures.
         super::websocket::record_codex_websocket_success(circuit_key);
@@ -2063,6 +2365,14 @@ pub(super) fn record_auto_websocket_failure(
         );
     }
     opened
+}
+
+fn is_websocket_transport_health_failure(err: &CodexError) -> bool {
+    matches!(
+        err.origin,
+        CodexErrorOrigin::WebSocket | CodexErrorOrigin::WebSocketHandshake
+    ) && err.detail.as_deref() != Some("previous_response_not_found")
+        && is_retryable_transport_error(err)
 }
 
 pub(super) fn is_retryable_transport_error(err: &CodexError) -> bool {
@@ -2101,6 +2411,44 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
         || msg.contains("epipe")
 }
 
+fn validate_codex_http_success(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+) -> Result<(), CodexError> {
+    if !(200..300).contains(&status) {
+        return Ok(());
+    }
+    if status == 204 {
+        return Err(CodexError {
+            status: 502,
+            message: "Codex upstream returned an empty 204 response".to_string(),
+            detail: Some("http_invalid_success_response".to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::Http,
+        });
+    }
+    if let Some(content_type) = headers.get(reqwest::header::CONTENT_TYPE) {
+        let event_stream = content_type
+            .to_str()
+            .ok()
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
+        if !event_stream {
+            return Err(CodexError {
+                status: 502,
+                message: format!(
+                    "Codex upstream returned a non-SSE success response ({})",
+                    content_type.to_str().unwrap_or("<invalid content-type>")
+                ),
+                detail: Some("http_invalid_success_response".to_string()),
+                retry_after: None,
+                origin: CodexErrorOrigin::Http,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn should_refresh_after_unauthorized(
     result: &Result<CodexResponse, CodexError>,
     auth_refresh_attempted: bool,
@@ -2116,15 +2464,11 @@ fn should_refresh_after_unauthorized(
 
 /// Immediate Auto-mode fallback from WebSocket to buffered HTTP.
 ///
-/// Only pre-output, retryable WebSocket transport failures qualify. Business
-/// 4xx, continuation misses, and service 429/5xx event errors stay on the
+/// Only replay-safe, retryable WebSocket transport failures qualify. Business
+/// 4xx, continuation misses, and service 429/500/502/503/504/529 event errors stay on the
 /// original error path and must not be treated as transport fallback.
 pub(super) fn should_fallback_to_http(err: &CodexError) -> bool {
-    matches!(
-        err.origin,
-        CodexErrorOrigin::WebSocket | CodexErrorOrigin::WebSocketHandshake
-    ) && err.detail.as_deref() != Some("previous_response_not_found")
-        && is_retryable_transport_error(err)
+    is_websocket_transport_health_failure(err) && err.replay_safety().permits_model_replay()
 }
 
 pub(super) fn log_auto_http_fallback(ctx: &RequestContext, err: &CodexError) {
@@ -2171,9 +2515,12 @@ fn full_context_continuation(
 }
 
 fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
+    // `response.created` confirms that the upstream generation exists, but the
+    // live translator emits no Anthropic bytes for it. Keep the recovery window
+    // open until an event can commit semantic output such as text or tool use.
     !matches!(
         payload.get("type").and_then(|value| value.as_str()),
-        Some("codex.rate_limits" | "keepalive")
+        Some("codex.rate_limits" | "keepalive" | "response.created")
     )
 }
 
@@ -2181,9 +2528,10 @@ fn is_continuation_retry_error(err: &CodexError) -> bool {
     // store:false continuation state is tied to its WebSocket. Once that
     // connection is lost or detached, the retry must send full context.
     err.detail.as_deref() == Some("previous_response_not_found")
-        || super::websocket::is_retryable_transport_detail(err.detail.as_deref())
-        || (err.origin == CodexErrorOrigin::WebSocketHandshake
-            && (err.status == 0 || should_retry_codex_status(err.status)))
+        || (err.replay_safety().permits_model_replay()
+            && (super::websocket::is_retryable_transport_detail(err.detail.as_deref())
+                || (err.origin == CodexErrorOrigin::WebSocketHandshake
+                    && (err.status == 0 || should_retry_codex_status(err.status)))))
 }
 
 fn websocket_pool_key<'a>(
@@ -2234,7 +2582,17 @@ mod tests {
     }
 
     fn http_test_client(base_url: String, body_idle_timeout_ms: u64) -> CodexHttpClient {
-        CodexHttpClient::new_for_test(base_url, 100, body_idle_timeout_ms, 10_000, 0)
+        CodexHttpClient::new_for_test(base_url, 100, body_idle_timeout_ms, 10_000)
+    }
+
+    fn http_test_client_with_body_timeouts(
+        base_url: String,
+        first_byte_timeout_ms: u64,
+        body_idle_timeout_ms: u64,
+    ) -> CodexHttpClient {
+        let mut client = http_test_client(base_url, body_idle_timeout_ms);
+        client.http_first_byte_timeout_ms = first_byte_timeout_ms;
+        client
     }
 
     #[test]
@@ -2242,6 +2600,57 @@ mod tests {
         assert_eq!(HTTP_CONNECT_TIMEOUT_MS, 15_000);
         assert_eq!(HTTP_RESPONSE_HEADER_TIMEOUT_MS, 60_000);
         assert_eq!(HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS, 300_000);
+        let client = CodexHttpClient::new_for_test(
+            "http://127.0.0.1:1/responses".to_string(),
+            60_000,
+            300_000,
+            DEFAULT_CODEX_TOTAL_TIMEOUT_MS,
+        );
+        assert_eq!(
+            client.http_first_byte_timeout_ms,
+            client.body_idle_timeout_ms
+        );
+    }
+
+    #[test]
+    fn codex_http_success_requires_a_nonempty_sse_response() {
+        let mut sse = reqwest::header::HeaderMap::new();
+        sse.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        assert!(validate_codex_http_success(200, &sse).is_ok());
+
+        let no_content = validate_codex_http_success(204, &sse).unwrap_err();
+        assert_eq!(
+            no_content.detail.as_deref(),
+            Some("http_invalid_success_response")
+        );
+        assert_eq!(no_content.replay_safety(), ReplaySafety::OutcomeUnknown);
+
+        let mut json = reqwest::header::HeaderMap::new();
+        json.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        let non_sse = validate_codex_http_success(200, &json).unwrap_err();
+        assert!(non_sse.message.contains("non-SSE"));
+        assert_eq!(non_sse.replay_safety(), ReplaySafety::OutcomeUnknown);
+    }
+
+    #[test]
+    fn codex_http_retries_reuse_one_serialized_bytes_allocation() {
+        let request = buffered_test_request();
+        let mut cached = None;
+        let first = cached_serialized_request(&mut cached, &request).unwrap();
+        let second = cached_serialized_request(&mut cached, &request).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&first).unwrap()["model"],
+            request.model
+        );
     }
 
     fn buffered_test_request() -> ResponsesRequest {
@@ -2268,6 +2677,20 @@ mod tests {
 
     fn authenticated_http_test_client(base_url: String) -> CodexHttpClient {
         let client = http_test_client(base_url, 100);
+        client.auth_manager().set_test_auth(http_test_auth());
+        client
+    }
+
+    fn authenticated_http_test_client_with_body_timeouts(
+        base_url: String,
+        first_byte_timeout_ms: u64,
+        body_idle_timeout_ms: u64,
+    ) -> CodexHttpClient {
+        let client = http_test_client_with_body_timeouts(
+            base_url,
+            first_byte_timeout_ms,
+            body_idle_timeout_ms,
+        );
         client.auth_manager().set_test_auth(http_test_auth());
         client
     }
@@ -2389,7 +2812,6 @@ mod tests {
             500,
             500,
             2_000,
-            0,
         );
         client.auth_manager().set_test_auth(http_test_auth());
         let result = client
@@ -2487,6 +2909,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_http_preserves_retryable_status_when_error_body_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = read_complete_http_request(&mut first).await;
+            assert!(first_request.starts_with("POST /responses "));
+            first
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 100\r\nretry-after: 0\r\nconnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut second, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("the explicit 503 should remain retryable")
+                .unwrap();
+            let second_request = read_complete_http_request(&mut second).await;
+            assert!(second_request.starts_with("POST /responses "));
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 10\r\nconnection: close\r\n\r\ndata: ok\n\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"data: ok\n\n");
+    }
+
+    #[tokio::test]
+    async fn buffered_http_header_timeout_after_complete_post_is_not_replayed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_complete_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /responses "));
+            // Hold the first POST open without response headers. Three seconds
+            // covers the maximum 2.4-second first retry jitter.
+            let replayed = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .is_ok();
+            drop(stream);
+            replayed
+        });
+
+        let result = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("a header timeout after dispatch must fail without replay"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.detail.as_deref(), Some("http_response_headers"));
+        assert_eq!(error.replay_safety(), ReplaySafety::OutcomeUnknown);
+        assert!(
+            !server.await.unwrap(),
+            "the uncertain POST must not be replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_http_first_byte_timeout_after_complete_post_is_not_replayed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_complete_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /responses "));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let replayed = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .is_ok();
+            drop(stream);
+            replayed
+        });
+
+        let result = authenticated_http_test_client_with_body_timeouts(
+            format!("http://{addr}/responses"),
+            30,
+            500,
+        )
+        .post_codex_with_transport(
+            &buffered_test_request(),
+            &http_test_context(),
+            None,
+            crate::config::CodexTransport::Http,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a first-byte timeout after dispatch must fail without replay"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.detail.as_deref(), Some("http_response_first_byte"));
+        assert_eq!(error.replay_safety(), ReplaySafety::OutcomeUnknown);
+        assert!(
+            !server.await.unwrap(),
+            "the uncertain POST must not be replayed"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_falls_back_to_http_after_statusful_websocket_handshake_failure() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2533,42 +3080,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_falls_back_to_http_after_websocket_closes_before_terminal() {
+    async fn auto_does_not_replay_after_websocket_request_closes_before_terminal() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _ = futures_util::StreamExt::next(&mut websocket).await;
+            let request = futures_util::StreamExt::next(&mut websocket)
+                .await
+                .expect("the model request frame should arrive")
+                .expect("the model request frame should be valid");
+            assert!(request.is_text());
             drop(websocket);
-
-            let (mut http, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 16 * 1024];
-            let read = http.read(&mut request).await.unwrap();
-            assert!(read > 0);
-            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
-            let body = b"data: keep\n\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            http.write_all(response.as_bytes()).await.unwrap();
-            http.write_all(body).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .is_ok()
         });
 
-        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+        let result = authenticated_http_test_client(format!("http://{addr}/responses"))
             .post_codex_with_transport(
                 &buffered_test_request(),
                 &http_test_context(),
                 None,
                 crate::config::CodexTransport::Auto,
             )
-            .await
-            .unwrap();
-        server.await.unwrap();
+            .await;
+        let error = match result {
+            Ok(_) => panic!("a post-dispatch close must not fall back to HTTP"),
+            Err(error) => error,
+        };
+        let replayed = server.await.unwrap();
 
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"data: keep\n\n");
+        assert!(matches!(
+            error.detail.as_deref(),
+            Some(
+                super::super::websocket::WEBSOCKET_CONNECTION_ERROR_DETAIL
+                    | super::super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL
+            )
+        ));
+        assert_eq!(error.replay_safety(), ReplaySafety::OutcomeUnknown);
+        assert!(!should_fallback_to_http(&error));
+        assert!(
+            !replayed,
+            "the uncertain WebSocket request must not be replayed"
+        );
     }
 
     #[tokio::test]
@@ -2578,21 +3133,24 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let first = futures_util::StreamExt::next(&mut websocket)
+            let (mut websocket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; 16 * 1024];
+            let read = websocket.read(&mut handshake).await.unwrap();
+            assert!(String::from_utf8_lossy(&handshake[..read]).contains("Upgrade: websocket"));
+            websocket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
+                )
                 .await
-                .unwrap()
-                .unwrap()
-                .into_text()
                 .unwrap();
-            assert!(first.contains("\"previous_response_id\":\"resp_prev\""));
-            assert!(first.contains("delta only"));
             drop(websocket);
 
             let (mut http, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 16 * 1024];
-            assert!(http.read(&mut request).await.unwrap() > 0);
+            let request = read_complete_http_request(&mut http).await;
+            assert!(request.starts_with("POST "));
+            assert!(!request.contains("previous_response_id"));
+            assert!(request.contains("full context"));
+            assert!(!request.contains("delta only"));
             http.write_all(
                 b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 5\r\nretry-after: 0\r\nconnection: close\r\n\r\nretry",
             )
@@ -2601,9 +3159,7 @@ mod tests {
             drop(http);
 
             let (mut retried_http, _) = listener.accept().await.unwrap();
-            let mut retried_request = [0_u8; 16 * 1024];
-            let read = retried_http.read(&mut retried_request).await.unwrap();
-            let retried_request = String::from_utf8_lossy(&retried_request[..read]);
+            let retried_request = read_complete_http_request(&mut retried_http).await;
             assert!(retried_request.starts_with("POST "));
             assert!(!retried_request.contains("previous_response_id"));
             assert!(retried_request.contains("full context"));
@@ -2662,7 +3218,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            let mut model_hits = 0_usize;
+            let mut oauth_hits = 0_usize;
+
             let (stream, _) = listener.accept().await.unwrap();
+            model_hits += 1;
             let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let first = futures_util::StreamExt::next(&mut websocket)
                 .await
@@ -2676,6 +3236,15 @@ mod tests {
             futures_util::SinkExt::send(
                 &mut websocket,
                 Message::Text(
+                    r#"{"type":"response.created","response":{"id":"resp_started","status":"in_progress"}}"#
+                        .into(),
+                ),
+            )
+            .await
+            .unwrap();
+            futures_util::SinkExt::send(
+                &mut websocket,
+                Message::Text(
                     r#"{"type":"error","error":{"status":401,"message":"Unauthorized"}}"#.into(),
                 ),
             )
@@ -2684,6 +3253,7 @@ mod tests {
             drop(websocket);
 
             let (mut oauth, _) = listener.accept().await.unwrap();
+            oauth_hits += 1;
             let refresh_request = read_complete_http_request(&mut oauth).await;
             assert!(refresh_request.starts_with("POST /oauth/token "));
             assert!(refresh_request.contains("refresh_token=r0"));
@@ -2697,6 +3267,7 @@ mod tests {
             .await;
 
             let (stream, _) = listener.accept().await.unwrap();
+            model_hits += 1;
             let mut retried_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let retried = futures_util::StreamExt::next(&mut retried_websocket)
                 .await
@@ -2716,6 +3287,14 @@ mod tests {
             )
             .await
             .unwrap();
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err(),
+                "response.created followed by 401 must not trigger an extra replay"
+            );
+            (model_hits, oauth_hits)
         });
 
         let full_input = ResponsesInputItem::Message {
@@ -2761,14 +3340,21 @@ mod tests {
             )
             .await
             .unwrap();
+        let created = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("response.created should be forwarded while recovery remains available")
+            .unwrap()
+            .unwrap();
+        assert_eq!(created["type"], "response.created");
+
         let completed = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
-            .expect("the refreshed full-context replay should complete")
+            .expect("the refreshed full-context replay should complete without forwarding 401")
             .unwrap()
             .unwrap();
 
         assert_eq!(completed["type"], "response.completed");
-        server.await.unwrap();
+        assert_eq!(server.await.unwrap(), (2, 1));
     }
 
     #[tokio::test]
@@ -2889,9 +3475,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _ = futures_util::StreamExt::next(&mut websocket).await;
+            let (mut websocket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; 16 * 1024];
+            let read = websocket.read(&mut handshake).await.unwrap();
+            assert!(String::from_utf8_lossy(&handshake[..read]).contains("Upgrade: websocket"));
+            websocket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
             drop(websocket);
 
             for _ in 0..3 {
@@ -3379,7 +3972,7 @@ mod tests {
                 .write_all(b"data: {\"type\":\"response.created\"}\n\n")
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
             stream
                 .write_all(
                     b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"HTTP_ONCE\",\"output_index\":0}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
@@ -3387,9 +3980,11 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let client = Arc::new(authenticated_http_test_client(format!(
-            "http://{addr}/responses"
-        )));
+        let client = Arc::new(authenticated_http_test_client_with_body_timeouts(
+            format!("http://{addr}/responses"),
+            100,
+            300,
+        ));
         let mut events = client
             .stream_codex_http_events(
                 &buffered_test_request(),
@@ -3400,7 +3995,7 @@ mod tests {
             .await
             .unwrap();
 
-        let first = tokio::time::timeout(Duration::from_millis(50), events.recv())
+        let first = tokio::time::timeout(Duration::from_millis(200), events.recv())
             .await
             .expect("the first HTTP SSE record should not wait for response EOF")
             .unwrap()
@@ -3419,6 +4014,51 @@ mod tests {
                 "response.completed"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn live_http_stalled_first_byte_uses_independent_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        let client = Arc::new(authenticated_http_test_client_with_body_timeouts(
+            format!("http://{addr}/responses"),
+            50,
+            500,
+        ));
+        let mut events = client
+            .stream_codex_http_events(
+                &buffered_test_request(),
+                &http_test_context(),
+                CodexRequestDeadline::from_timeout_ms(1_000),
+                CodexDispatchBudget::new(),
+            )
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(Duration::from_millis(200), events.recv())
+            .await
+            .expect("the independent first-byte deadline should fire")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("first Codex HTTP response body byte")
+        );
+        assert_eq!(error.detail.as_deref(), Some("http_response_first_byte"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -3475,7 +4115,6 @@ mod tests {
             5_000,
             5_000,
             5_000,
-            0,
         ));
         client.auth_manager().set_test_auth(http_test_auth());
 
@@ -3524,7 +4163,6 @@ mod tests {
             1_000,
             1_000,
             5_000,
-            0,
         ));
         client.auth_manager().set_test_auth(http_test_auth());
         let mut events = client
@@ -3617,6 +4255,54 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "response.created");
         assert!(decoder.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn incremental_http_sse_decoder_accepts_split_stream_start_bom() {
+        let mut decoder = CodexLiveSseDecoder::default();
+        assert!(decoder.push(b"\xef").unwrap().is_empty());
+        assert!(decoder.push(b"\xbb").unwrap().is_empty());
+        let events = decoder
+            .push(b"\xbfdata: {\"type\":\"response.created\"}\n\n")
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "response.created");
+    }
+
+    #[test]
+    fn incremental_http_sse_decoder_rejects_invalid_utf8() {
+        let mut decoder = CodexLiveSseDecoder::default();
+        let error = decoder
+            .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"\xff\"}\n\n")
+            .unwrap_err();
+
+        assert!(error.contains("invalid UTF-8"));
+    }
+
+    #[test]
+    fn incremental_http_sse_decoder_rejects_bom_after_stream_start() {
+        let mut decoder = CodexLiveSseDecoder::default();
+        decoder
+            .push(b"data: {\"type\":\"response.created\"}\n\n")
+            .unwrap();
+        let error = decoder
+            .push(b"\xef\xbb\xbfdata: {\"type\":\"response.completed\"}\n\n")
+            .unwrap_err();
+
+        assert!(error.contains("BOM after stream start"));
+    }
+
+    #[test]
+    fn incremental_http_sse_decoder_retains_only_a_delimiter_overlap_cursor() {
+        let mut decoder = CodexLiveSseDecoder::default();
+        for _ in 0..100_000 {
+            assert!(decoder.push(b"x").unwrap().is_empty());
+            assert!(decoder.scan_from >= decoder.pending.len().saturating_sub(3));
+        }
+
+        assert_eq!(decoder.pending.len(), 100_000);
+        assert_eq!(decoder.scan_from, decoder.pending.len() - 3);
     }
 
     #[test]
@@ -3726,7 +4412,7 @@ mod tests {
             futures_util::future::pending::<()>().await;
         });
         let client =
-            CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 5_000, 5_000, 100, 0);
+            CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 5_000, 5_000, 100);
         client.auth_manager().set_test_auth(http_test_auth());
 
         let started_at = Instant::now();
@@ -3776,7 +4462,7 @@ mod tests {
             futures_util::future::pending::<()>().await;
         });
         let client =
-            CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 5_000, 5_000, 120, 0);
+            CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 5_000, 5_000, 120);
         client.auth_manager().set_test_auth(http_test_auth());
 
         let started_at = Instant::now();
@@ -3861,13 +4547,8 @@ mod tests {
         );
         let mut ctx = http_test_context();
         ctx.session_id = Some(session_id.to_string());
-        let client = CodexHttpClient::new_for_test(
-            format!("http://{addr}/responses"),
-            2_000,
-            2_000,
-            2_000,
-            0,
-        );
+        let client =
+            CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 2_000, 2_000, 2_000);
         client.auth_manager().set_test_auth(http_test_auth());
 
         let first_response = client
@@ -4011,7 +4692,12 @@ mod tests {
         });
 
         let response = http_test_client(format!("http://{addr}/responses"), 80)
-            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false)
+            .attempt_post_http(
+                &http_test_auth(),
+                &Bytes::from_static(b"{}"),
+                &http_test_context(),
+                false,
+            )
             .await
             .expect("active body should not hit a whole-request timeout");
         server.await.unwrap();
@@ -4020,7 +4706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_http_body_hits_idle_timeout() {
+    async fn stalled_buffered_http_first_byte_hits_independent_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -4034,11 +4720,87 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
 
-        let result = http_test_client(format!("http://{addr}/responses"), 30)
-            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false)
-            .await;
+        let result =
+            http_test_client_with_body_timeouts(format!("http://{addr}/responses"), 30, 500)
+                .attempt_post_http(
+                    &http_test_auth(),
+                    &Bytes::from_static(b"{}"),
+                    &http_test_context(),
+                    false,
+                )
+                .await;
         server.await.unwrap();
-        let error = result.err().expect("stalled body should time out");
+        let error = result.err().expect("stalled first byte should time out");
+
+        assert!(
+            error
+                .message
+                .contains("first Codex HTTP response body byte")
+        );
+        assert_eq!(error.detail.as_deref(), Some("http_response_first_byte"));
+    }
+
+    #[tokio::test]
+    async fn buffered_http_uses_body_idle_timeout_after_first_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n1\r\na\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            stream.write_all(b"1\r\nb\r\n0\r\n\r\n").await.unwrap();
+        });
+
+        let response =
+            http_test_client_with_body_timeouts(format!("http://{addr}/responses"), 20, 150)
+                .attempt_post_http(
+                    &http_test_auth(),
+                    &Bytes::from_static(b"{}"),
+                    &http_test_context(),
+                    false,
+                )
+                .await
+                .expect("the shorter first-byte timeout must not govern later chunks");
+        server.await.unwrap();
+
+        assert_eq!(response.body, b"ab");
+    }
+
+    #[tokio::test]
+    async fn stalled_buffered_http_after_first_chunk_hits_body_idle_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n1\r\na\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let result =
+            http_test_client_with_body_timeouts(format!("http://{addr}/responses"), 200, 30)
+                .attempt_post_http(
+                    &http_test_auth(),
+                    &Bytes::from_static(b"{}"),
+                    &http_test_context(),
+                    false,
+                )
+                .await;
+        server.await.unwrap();
+        let error = result.err().expect("a stalled later chunk should time out");
 
         assert!(error.message.contains("next Codex response body chunk"));
         assert_eq!(error.detail.as_deref(), Some("http_response_body"));
@@ -4059,7 +4821,12 @@ mod tests {
         });
 
         let result = http_test_client(format!("http://{addr}/responses"), 100)
-            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false)
+            .attempt_post_http(
+                &http_test_auth(),
+                &Bytes::from_static(b"{}"),
+                &http_test_context(),
+                false,
+            )
             .await;
         server.await.unwrap();
         let error = result.err().expect("truncated body should fail");
@@ -4538,7 +5305,9 @@ mod tests {
             origin: CodexErrorOrigin::WebSocket,
         };
 
-        assert!(should_fallback_to_http(&statusless_ws));
+        // A generic WebSocket reset may happen after the request frame was
+        // accepted, so transient does not imply replay-safe.
+        assert!(!should_fallback_to_http(&statusless_ws));
         assert!(should_fallback_to_http(&retryable_handshake));
         assert!(should_fallback_to_http(&statusless_handshake));
         assert!(!should_fallback_to_http(&http_reset));
@@ -4591,7 +5360,7 @@ mod tests {
     }
 
     #[test]
-    fn informational_events_keep_live_continuation_retry_available() {
+    fn non_semantic_events_keep_live_recovery_window_open() {
         assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "codex.rate_limits",
             "rate_limits": {"limit_reached": false}
@@ -4599,8 +5368,16 @@ mod tests {
         assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "keepalive"
         })));
-        assert!(event_closes_live_retry_window(&serde_json::json!({
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "response.created"
+        })));
+        assert!(event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "hello"
+        })));
+        assert!(event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {"type": "function_call", "call_id": "call_1"}
         })));
     }
 
@@ -4658,9 +5435,9 @@ mod tests {
             origin: CodexErrorOrigin::WebSocket,
         };
 
-        assert!(should_retry_without_continuation(&timeout, Some(&append)));
+        assert!(!should_retry_without_continuation(&timeout, Some(&append)));
         assert!(should_retry_without_continuation(&missing, Some(&append)));
-        assert!(should_retry_without_continuation(&idle, Some(&append)));
+        assert!(!should_retry_without_continuation(&idle, Some(&append)));
         assert!(should_retry_without_continuation(
             &pool_healthcheck,
             Some(&append)

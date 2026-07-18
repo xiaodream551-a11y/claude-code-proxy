@@ -402,10 +402,12 @@ not signed Anthropic thinking blocks and can contain draft answers; periodic
 Anthropic `ping` events preserve downstream liveness while Grok reasons.
 Failures delivered inside an HTTP 200 stream (`error`, `response.error`, or
 `response.failed`) retain their upstream status, message, and `Retry-After`.
-Retryable 429/5xx/529 failures rebuild the request only before semantic output;
+Retryable 429/500/502/503/504/529 failures rebuild the request only before semantic output;
 after text or tool output begins, the proxy emits a typed Anthropic in-band
-error instead of replaying a potentially duplicate tool call. Explicit 204 or
-non-SSE success responses are treated as retryable transport failures.
+error instead of replaying a potentially duplicate tool call. Header timeouts,
+body/stream failures, and explicit 204 or non-SSE success responses leave the
+POST outcome ambiguous and therefore terminate without replaying the model
+request.
 Claude Code reasoning effort is forwarded as Responses `reasoning.effort` for
 Grok 4.5; `xhigh` and `max` are capped at Grok's supported `high` level.
 Claude Code's `WebSearch` uses Grok's hosted general web search. Requests to
@@ -770,6 +772,7 @@ Windows, and at
     "transport": "auto",
     "connectTimeoutMs": 15000,
     "headerTimeoutMs": 60000,
+    "httpFirstByteTimeoutMs": 30000,
     "bodyIdleTimeoutMs": 300000,
     "totalTimeoutMs": 540000,
     "websocketResponseStartTimeoutMs": 60000,
@@ -834,9 +837,10 @@ Windows, and at
 | `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `auto` (resolves to `http` when a system proxy intercepts the upstream) | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or WebSocket-first fallback plus an origin-wide breaker in `auto`                                         |
 | `CCP_CODEX_CONNECT_TIMEOUT_MS`   | `codex.connectTimeoutMs`   | `15000`                                           | Maximum time to establish the Codex HTTP TCP/TLS connection, including an HTTP fallback selected by `auto`                                                                       |
 | `CCP_CODEX_HEADER_TIMEOUT_MS`    | `codex.headerTimeoutMs`    | `60000`                                           | Maximum time to receive Codex HTTP response headers                                                                                                                               |
+| `CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS` | `codex.httpFirstByteTimeoutMs` | inherits `codex.bodyIdleTimeoutMs` (`300000`) | Maximum time to receive the first Codex HTTP response body byte; configure it independently to fail a header-only stall sooner, while the total request deadline remains authoritative |
 | `CCP_CODEX_BODY_IDLE_TIMEOUT_MS` | `codex.bodyIdleTimeoutMs`  | `300000`                                          | Maximum gap between Codex HTTP response body chunks; this per-gap limit cannot extend the total request deadline                                                                 |
 | `CCP_CODEX_TOTAL_TIMEOUT_MS`     | `codex.totalTimeoutMs`     | `540000`                                          | Total wall-clock budget across WebSocket retries, Auto HTTP fallback, and the remaining live stream; caps stragglers while remaining configurable                                   |
-| `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event before refreshing the WebSocket and retrying safely                                                                                |
+| `CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS` | `codex.websocketResponseStartTimeoutMs` | `60000` | Maximum wait for the first Codex response event; a timeout invalidates the connection and contributes to the breaker, but does not replay an already-sent request                    |
 | `CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS` | `codex.websocketIdleTimeoutMs` | `300000` | Maximum gap between Codex response events; WebSocket control frames do not extend this business-event deadline                                                                    |
 | `CCP_CODEX_MAX_IDLE_WEBSOCKETS` | `codex.maxIdleWebSockets` | `128` | Maximum continuation WebSockets retained while idle; values above 4096 are clamped                                                                                                |
 | `CCP_CODEX_IDLE_WEBSOCKET_TTL_MS` | `codex.idleWebSocketTtlMs` | `300000` | Time an idle continuation WebSocket remains pooled; values above 30 minutes are clamped and a background reaper closes expired entries                                            |
@@ -847,8 +851,8 @@ Windows, and at
 | `CCP_GROK_BASE_URL`              | `grok.baseUrl`             | `https://cli-chat-proxy.grok.com/v1`              | Override the Grok Responses API base URL                                                                                                                                          |
 | `CCP_GROK_CLIENT_VERSION`        | `grok.clientVersion`       | `0.2.93`                                          | Override the Grok client version header                                                                                                                                           |
 | `CCP_GROK_CONNECT_TIMEOUT_MS`    | `grok.connectTimeoutMs`    | `10000`                                           | Maximum time to establish the Grok TCP/TLS connection                                                                                                                             |
-| `CCP_GROK_HEADER_TIMEOUT_MS`     | `grok.headerTimeoutMs`     | `60000`                                           | Maximum time to receive Grok response headers before a safe pre-output retry                                                                                                      |
-| `CCP_GROK_FIRST_BYTE_TIMEOUT_MS` | `grok.firstByteTimeoutMs`  | `60000`                                           | Maximum time to receive the first Grok response body byte before a safe pre-output retry                                                                                          |
+| `CCP_GROK_HEADER_TIMEOUT_MS`     | `grok.headerTimeoutMs`     | `60000`                                           | Maximum time to receive Grok response headers; a timeout has an ambiguous POST outcome and is not replayed                                                                         |
+| `CCP_GROK_FIRST_BYTE_TIMEOUT_MS` | `grok.firstByteTimeoutMs`  | `60000`                                           | Maximum time to receive the first Grok response body byte; a timeout terminates the request without replay                                                                         |
 | `CCP_GROK_BODY_IDLE_TIMEOUT_MS`  | `grok.bodyIdleTimeoutMs`   | `300000`                                          | Maximum gap between Grok response body chunks; this per-gap limit cannot extend the total request deadline                                                                         |
 | `CCP_GROK_TOTAL_TIMEOUT_MS`      | `grok.totalTimeoutMs`      | `540000`                                          | Total wall-clock budget across authentication, all physical attempts, backoff, stream rebuilds, and response-body streaming                                                        |
 | `CCP_GROK_STREAM_HEARTBEAT_MS`   | `grok.streamHeartbeatMs`   | `15000`                                           | Emit Anthropic `ping` events during downstream silence; configured values are clamped to 1 through 60 seconds and do not extend the total deadline                                 |
@@ -864,28 +868,31 @@ in its place. Invalid types for individual keys are warned and skipped without
 affecting other keys.
 
 Codex uses `auto` transport by default. Without a system proxy, `auto` starts
-with live WebSocket streaming while the connection is healthy and immediately
-falls back to incremental HTTP when a retryable WebSocket transport failure
-occurs before Anthropic output begins. When an HTTP(S) environment or
-operating-system proxy intercepts the upstream URL, `auto` starts directly on
+with live WebSocket streaming while the connection is healthy. It falls back
+to incremental HTTP only when the WebSocket attempt is known not to have
+dispatched the model request, such as a handshake or pre-request pool failure.
+When an HTTP(S) environment or operating-system proxy intercepts the upstream
+URL, `auto` starts directly on
 incremental HTTP SSE so Codex traffic follows that proxy instead of silently
 bypassing it. Explicit `CCP_CODEX_TRANSPORT=websocket` remains a strict direct
 connection because the WebSocket connector does not implement HTTP CONNECT.
-This covers handshake rejection, response-start or idle timeouts, failed
-heartbeat and pool probes, busy pooled connections, connection loss, and a
-close without a terminal event. Three consecutive retryable WebSocket transport
-failures for the same upstream origin open a 30-second circuit, temporarily
+Pool probes and busy pooled connections are also safe pre-request fallback
+cases. After a request frame is sent, response-start or idle timeouts, failed
+heartbeats, connection loss, malformed events, and a close without a terminal
+event have an ambiguous outcome and are reported without replay. These failures
+still count toward transport health. Three consecutive WebSocket transport
+health failures for the same upstream origin open a 30-second circuit, temporarily
 routing all sessions for that endpoint through HTTP. After the cooldown, one WebSocket request
 probes recovery while concurrent requests keep using HTTP; a successful response
 or any non-transport result resets the failure count.
 Pooled WebSockets must answer a matching Ping/Pong probe before reuse. Active
 connections are also probed after 30 seconds without a frame, so a half-open
 socket left behind by a VPN or proxy-node switch is detected without waiting for
-the business idle timeout. In strict `websocket` mode, statusless transport
-failures before Anthropic output are retried up to two times on a refreshed
-connection. In `auto` mode those failures use the HTTP fallback instead. Once
-output has begun, the proxy reports the connection error instead of replaying a
-request that could duplicate tool execution.
+the business idle timeout. Only failures proven to occur before model dispatch,
+plus explicit upstream retry responses 429/500/502/503/504/529, can consume the
+current request's retry budget. A timeout or reset after an HTTP POST or
+WebSocket request frame may mean the model already ran, so it is never replayed,
+even when no Anthropic semantic output was emitted.
 Both live transports emit a standard Anthropic `ping` after 15 seconds without
 visible output. HTTP SSE is decoded incrementally, so cancellation closes the
 upstream socket instead of waiting for a buffered response. WebSocket retries,
@@ -900,15 +907,20 @@ intermediary event channels hold two items each, and the final downstream queue
 has a 2 MiB byte budget. Buffered HTTP success bodies are capped at 8 MiB, and
 live translator input has the same cumulative ceiling. A downstream that remains
 backpressured for 60 seconds is terminated and its upstream request is cancelled.
-Unsignaled retries use jittered exponential backoff capped at 30 seconds. Numeric
-and HTTP-date `Retry-After` values are honored directly within that retry budget.
+The first failure proven to occur before model dispatch and carrying no
+`Retry-After` uses a 100–300ms full-jitter recovery delay. Explicit overload and
+rate-limit responses retain the jittered exponential backoff capped at 30
+seconds. Numeric and HTTP-date
+`Retry-After` values are honored directly within that retry budget.
 `CCP_CODEX_PREVIOUS_RESPONSE_ID=1` enables opt-in WebSocket continuation for
 append-only turns. Continuation keeps in-memory state keyed by Claude Code
 session id, reuses a session WebSocket while it remains open, and sends
 `previous_response_id` only when the translated request shape is unchanged and
 the new input strictly extends the previous transcript. On mismatch, missing
-state, missing upstream response, closed connections, or setup failure, the
-proxy clears unsafe continuation state and sends the full request instead.
+state, an explicit `previous_response_not_found`, or a replay-safe pre-request
+setup failure, the proxy clears unsafe continuation state and sends the full
+request instead. A connection failure after the request frame is sent has an
+ambiguous outcome and terminates without full-context replay.
 The idle continuation pool retains at most 128 sockets for five minutes by
 default. Checkout removes a socket from the idle set, successful completion
 returns it with a fresh idle timestamp, and a single background reaper closes
@@ -922,11 +934,13 @@ header waits, every physical attempt, retry backoff, stream rebuilds, and the
 remaining response body. This finishes before Claude Code's common 600-second
 client timeout and prevents active reasoning chunks from keeping a stuck request
 alive forever. During downstream silence the proxy emits an Anthropic `ping`
-every 15 seconds; pings do not reset the total deadline or close the safe
-pre-output rebuild window. Connection/header failures, HTTP 429/500/502/503/504,
-safe authentication failures, and a stream that dies before emitting Anthropic
-output share one budget of up to three transient retries with jittered backoff
-and `Retry-After` support. Authentication is replayed only for idempotent OIDC
+every 15 seconds; pings do not reset the total deadline or close the pre-output
+recovery window. Connect failures proven to occur before dispatch, explicit HTTP
+429/500/502/503/504/529 responses, retryable upstream error events, and safe
+authentication failures share one budget of up to three transient retries with
+jittered backoff and `Retry-After` support. Header timeouts and response-body or
+stream failures have an ambiguous POST outcome and terminate without rebuilding
+the model request. Authentication is replayed only for idempotent OIDC
 discovery, rate limits, or a token connection that failed before the refresh
 request was sent. An ambiguous token response blocks later use of that same
 credential generation across requests and process restarts. Refresh dispatches

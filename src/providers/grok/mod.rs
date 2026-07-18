@@ -31,11 +31,15 @@ use crate::retry::sleep;
 use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 
 use self::auth::token_store::file_store;
-use self::client::{GrokByteStream, GrokError, GrokRequestDeadline, GrokRetryState};
+use self::client::{
+    GrokByteStream, GrokError, GrokRequestDeadline, GrokRetryState, PreparedGrokRequest,
+};
+#[cfg(test)]
+use self::translate::request::GrokResponsesRequest;
 use self::translate::{
     accumulate::accumulate_response_with_traffic,
     model_allowlist::{assert_allowed_model, resolve_model_request},
-    request::{GrokReasoning, GrokResponsesRequest, translate_request},
+    request::{GrokReasoning, translate_request},
     stream::{SseDecoder, StreamTranslator, stream_ping},
 };
 
@@ -169,10 +173,17 @@ impl Provider for GrokProvider {
             monitor.upstream_started(&ctx.req_id);
         }
 
-        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline_and_req_id(
+            deadline,
+            ctx.req_id.clone(),
+        )));
+        let prepared = match PreparedGrokRequest::new(&translated, ctx.traffic.is_some()) {
+            Ok(prepared) => Arc::new(prepared),
+            Err(error) => return map_error(error),
+        };
         let upstream = match self
             .client
-            .post_with_retry(&translated, ctx.traffic.clone(), retry.clone())
+            .post_prepared_with_retry(&prepared, ctx.traffic.clone(), retry.clone())
             .await
         {
             Ok(response) => response,
@@ -181,13 +192,13 @@ impl Provider for GrokProvider {
 
         if body.stream {
             let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-            let reconnect = Some(GrokReconnectContext {
-                client: self.client.clone(),
-                request: Arc::new(translated),
-                traffic: ctx.traffic.clone(),
+            let reconnect = Some(GrokReconnectContext::new(
+                self.client.clone(),
+                prepared,
+                ctx.traffic.clone(),
                 retry,
                 estimated_input_tokens,
-            });
+            ));
             stream_body_with_policy(
                 upstream.into_stream(),
                 message_id,
@@ -202,7 +213,7 @@ impl Provider for GrokProvider {
         } else {
             match read_non_streaming_body(
                 self.client.clone(),
-                translated,
+                prepared,
                 upstream,
                 ctx.traffic.clone(),
                 retry,
@@ -287,11 +298,10 @@ fn finish_non_streaming_message(
             (StatusCode::OK, Json(value)).into_response()
         }
         Err(error) => {
-            let reduction_error =
-                error.downcast_ref::<translate::reducer::GrokReductionError>();
+            let reduction_error = error.downcast_ref::<translate::reducer::GrokReductionError>();
             let usage = reduction_error.and_then(translate::reducer::GrokReductionError::usage);
-            let upstream_failure = reduction_error
-                .and_then(translate::reducer::GrokReductionError::upstream_failure);
+            let upstream_failure =
+                reduction_error.and_then(translate::reducer::GrokReductionError::upstream_failure);
             if let (Some(monitor), Some(usage)) = (ctx.monitor.as_ref(), usage) {
                 monitor.usage_updated(
                     &ctx.req_id,
@@ -307,8 +317,8 @@ fn finish_non_streaming_message(
                 estimated_input_tokens,
             );
             if let Some(failure) = upstream_failure {
-                let status = StatusCode::from_u16(failure.status)
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let status =
+                    StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY);
                 let response = json_error(status, grok_error_type(status), failure.message.clone());
                 if let Some(retry_after) = failure.retry_after.clone() {
                     ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
@@ -328,7 +338,7 @@ fn finish_non_streaming_message(
 
 async fn read_non_streaming_body(
     client: Arc<client::GrokClient>,
-    request: GrokResponsesRequest,
+    request: Arc<PreparedGrokRequest>,
     mut response: client::GrokResponse,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
     retry: Arc<Mutex<GrokRetryState>>,
@@ -337,17 +347,21 @@ async fn read_non_streaming_body(
     loop {
         match response.into_bytes().await {
             Ok(bytes) => return Ok(bytes),
-            Err(error) if error.is_retryable() => {
+            Err(error) if error.permits_model_replay() => {
                 let wait_ms = {
                     let mut state = retry.lock().await;
                     state
-                        .schedule_retry(error.retry_after.as_deref(), deadline)
+                        .schedule_model_retry(
+                            error.replay_safety,
+                            error.retry_after.as_deref(),
+                            deadline,
+                        )
                         .map_err(|stop| error.clone().into_terminal(stop.terminal_reason))?
                 };
                 client::run_before_deadline(deadline, retry.clone(), error.stage, sleep(wait_ms))
                     .await?;
                 response = client
-                    .post_with_retry(&request, traffic.clone(), retry.clone())
+                    .post_prepared_with_retry(&request, traffic.clone(), retry.clone())
                     .await?;
             }
             Err(error) => return Err(error),
@@ -355,12 +369,36 @@ async fn read_non_streaming_body(
     }
 }
 
-struct GrokReconnectContext {
+struct GrokReplayMaterial {
     client: Arc<client::GrokClient>,
-    request: Arc<GrokResponsesRequest>,
+    request: Arc<PreparedGrokRequest>,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
+}
+
+struct GrokReconnectContext {
+    replay: Option<GrokReplayMaterial>,
     retry: Arc<Mutex<GrokRetryState>>,
     estimated_input_tokens: u64,
+}
+
+impl GrokReconnectContext {
+    fn new(
+        client: Arc<client::GrokClient>,
+        request: Arc<PreparedGrokRequest>,
+        traffic: Option<Arc<crate::traffic::TrafficCapture>>,
+        retry: Arc<Mutex<GrokRetryState>>,
+        estimated_input_tokens: u64,
+    ) -> Self {
+        Self {
+            replay: Some(GrokReplayMaterial {
+                client,
+                request,
+                traffic,
+            }),
+            retry,
+            estimated_input_tokens,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +466,7 @@ where
         terminal: false,
         error_sent: false,
         downstream_emitted: false,
+        semantic_output_pending_enqueue: false,
         attempt_bytes: 0,
         usage: None,
         terminal_status: None,
@@ -535,7 +574,7 @@ async fn run_grok_stream_producer(mut state: GrokStreamState, tx: mpsc::Sender<G
             return;
         }
         match send_grok_chunk(&tx, &budget, bytes, state.deadline.at()).await {
-            GrokChunkSendOutcome::Sent => {}
+            GrokChunkSendOutcome::Sent => state.output_enqueued(),
             GrokChunkSendOutcome::Closed => return,
             GrokChunkSendOutcome::Deadline => {
                 if let Some(retry) = state.retry_state() {
@@ -585,6 +624,7 @@ struct GrokStreamState {
     terminal: bool,
     error_sent: bool,
     downstream_emitted: bool,
+    semantic_output_pending_enqueue: bool,
     attempt_bytes: u64,
     usage: Option<translate::reducer::GrokUsage>,
     terminal_status: Option<translate::reducer::GrokTerminal>,
@@ -608,6 +648,18 @@ impl GrokStreamState {
         self.reconnect
             .as_ref()
             .map(|reconnect| reconnect.retry.clone())
+    }
+
+    /// Drop the large replay-only state as soon as the first semantic output has actually entered
+    /// the downstream queue. The retry state remains available for total-deadline and stalled
+    /// consumer accounting until the stream producer itself is dropped.
+    fn output_enqueued(&mut self) {
+        if !std::mem::take(&mut self.semantic_output_pending_enqueue) {
+            return;
+        }
+        if let Some(reconnect) = self.reconnect.as_mut() {
+            reconnect.replay.take();
+        }
     }
 
     async fn next_output(&mut self) -> Option<Vec<u8>> {
@@ -717,8 +769,8 @@ impl GrokStreamState {
                     else {
                         return Some(self.fail_at("reducer", "invalid_event"));
                     };
-                    let status = StatusCode::from_u16(failure.status)
-                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    let status =
+                        StatusCode::from_u16(failure.status).unwrap_or(StatusCode::BAD_GATEWAY);
                     let error = GrokError::upstream_event(
                         status,
                         failure.retry_after,
@@ -775,6 +827,7 @@ impl GrokStreamState {
                 self.terminal = true;
                 if semantic_output {
                     self.downstream_emitted = true;
+                    self.semantic_output_pending_enqueue = !out.is_empty();
                 }
                 let outcome = terminal_status
                     .map(translate::reducer::GrokTerminal::outcome)
@@ -787,6 +840,7 @@ impl GrokStreamState {
             if !out.is_empty() {
                 if semantic_output {
                     self.downstream_emitted = true;
+                    self.semantic_output_pending_enqueue = true;
                 }
                 self.capture_downstream(&out);
                 self.schedule_next_heartbeat();
@@ -829,15 +883,18 @@ impl GrokStreamState {
         fail_stage: &'static str,
         fail_kind: &'static str,
     ) -> Result<(), Vec<u8>> {
-        if self.downstream_emitted || !error.is_retryable() {
+        if self.downstream_emitted || !error.permits_model_replay() {
             return Err(self.fail_mapped(error, fail_stage, fail_kind));
         }
         let Some(reconnect) = self.reconnect.as_ref() else {
             return Err(self.fail_at(fail_stage, fail_kind));
         };
-        let client = reconnect.client.clone();
-        let request = reconnect.request.clone();
-        let traffic = reconnect.traffic.clone();
+        let Some(replay) = reconnect.replay.as_ref() else {
+            return Err(self.fail_at(fail_stage, fail_kind));
+        };
+        let client = replay.client.clone();
+        let request = replay.request.clone();
+        let traffic = replay.traffic.clone();
         let retry = reconnect.retry.clone();
         let deadline = self.deadline;
         let attempt_bytes = self.attempt_bytes;
@@ -845,8 +902,15 @@ impl GrokStreamState {
             let wait_ms = {
                 let mut state = retry.lock().await;
                 let wait_ms = state
-                    .schedule_retry(error.retry_after.as_deref(), deadline)
+                    .schedule_model_retry(
+                        error.replay_safety,
+                        error.retry_after.as_deref(),
+                        deadline,
+                    )
                     .map_err(|stop| error.clone().into_terminal(stop.terminal_reason))?;
+                let transient = state.transient_failures();
+                let wire_attempt = state.wire_attempt();
+                let log_context = state.log_context();
                 if let Some(traffic) = traffic.as_ref() {
                     traffic.write_json(
                         "024-upstream-stream-rebuild",
@@ -855,6 +919,8 @@ impl GrokStreamState {
                             "origin": client::origin_name(error.origin),
                             "error_stage": client::stage_name(error.stage),
                             "status": error.status.as_u16(),
+                            "replay_safety": error.replay_safety.as_str(),
+                            "deadline_remaining_ms": deadline.remaining_ms(),
                             "message": error.message,
                             "stage": fail_stage,
                             "kind": fail_kind,
@@ -862,12 +928,13 @@ impl GrokStreamState {
                         }),
                     );
                 }
+                client::log_retry(wire_attempt, transient, wait_ms, &error, &log_context);
                 wait_ms
             };
             client::run_before_deadline(deadline, retry.clone(), error.stage, sleep(wait_ms))
                 .await?;
             client
-                .post_with_retry(&request, traffic, retry)
+                .post_prepared_with_retry(&request, traffic, retry)
                 .await
                 .map(client::GrokResponse::into_stream)
         });
@@ -1482,16 +1549,22 @@ mod tests {
         .await;
         let deadline = GrokRequestDeadline::after(Duration::from_millis(180));
         let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
-        let reconnect = Some(GrokReconnectContext {
-            client: Arc::new(client),
-            request: Arc::new(sample_request()),
-            traffic: None,
-            retry: retry.clone(),
-            estimated_input_tokens: 1,
-        });
-        let mut reset =
-            client::GrokError::stream_transport(GrokErrorStage::Stream, "synthetic stream reset");
-        reset.retry_after = Some("0".into());
+        let reconnect = Some(GrokReconnectContext::new(
+            Arc::new(client),
+            prepared_request(false),
+            None,
+            retry.clone(),
+            1,
+        ));
+        // This test is specifically about a permitted rebuild waiting on a
+        // socket. Use an explicit upstream retry response rather than an
+        // outcome-unknown transport reset.
+        let reset = client::GrokError::upstream_event(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("0".into()),
+            "synthetic retryable upstream event",
+            true,
+        );
 
         let response = stream_body_with_policy(
             futures_util::stream::iter(vec![Err(reset)]),
@@ -1544,16 +1617,19 @@ mod tests {
         .await;
         let deadline = GrokRequestDeadline::after(Duration::from_secs(5));
         let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
-        let reconnect = Some(GrokReconnectContext {
-            client: Arc::new(client),
-            request: Arc::new(sample_request()),
-            traffic: None,
+        let reconnect = Some(GrokReconnectContext::new(
+            Arc::new(client),
+            prepared_request(false),
+            None,
             retry,
-            estimated_input_tokens: 1,
-        });
-        let mut reset =
-            client::GrokError::stream_transport(GrokErrorStage::Stream, "synthetic stream reset");
-        reset.retry_after = Some("0".into());
+            1,
+        ));
+        let reset = client::GrokError::upstream_event(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("0".into()),
+            "synthetic retryable upstream event",
+            true,
+        );
         let response = stream_body_with_policy(
             futures_util::stream::iter(vec![Err(reset)]),
             "msg_cancel_rebuild".into(),
@@ -1618,6 +1694,10 @@ mod tests {
             reasoning: None,
             text: None,
         }
+    }
+
+    fn prepared_request(capture_body: bool) -> Arc<PreparedGrokRequest> {
+        Arc::new(PreparedGrokRequest::new(&sample_request(), capture_body).unwrap())
     }
 
     async fn test_client(base_url: &str, timeouts: GrokTimeouts) -> (client::GrokClient, TempDir) {
@@ -1707,6 +1787,15 @@ mod tests {
         request
     }
 
+    fn http_request_body(request: &[u8]) -> &[u8] {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("HTTP request must contain complete headers");
+        &request[header_end..]
+    }
+
     #[tokio::test]
     async fn map_error_preserves_transient_gateway_statuses() {
         for status in [
@@ -1722,6 +1811,7 @@ mod tests {
                 origin: client::GrokErrorOrigin::Auth,
                 stage: client::GrokErrorStage::Auth,
                 retryable: true,
+                replay_safety: crate::retry::ReplaySafety::OutcomeUnknown,
             });
             assert_eq!(response.status(), status);
             let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -1881,7 +1971,9 @@ mod tests {
         assert_eq!(body.matches("partial once").count(), 1, "{body}");
         assert!(body.contains("\"type\":\"rate_limit_error\""), "{body}");
         assert!(body.contains("capacity is temporarily limited"), "{body}");
-        assert!(body.rfind("event: content_block_stop").unwrap() < body.find("event: error").unwrap());
+        assert!(
+            body.rfind("event: content_block_stop").unwrap() < body.find("event: error").unwrap()
+        );
         assert!(!body.contains("event: message_stop"), "{body}");
     }
 
@@ -1962,6 +2054,85 @@ mod tests {
                 .expect("downstream EOF waited for upstream EOF")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn semantic_enqueue_releases_replay_material_but_keeps_retry_state() {
+        let (client, _temp) = test_client(
+            "http://127.0.0.1:1/v1",
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let client = Arc::new(client);
+        let request = prepared_request(false);
+        let capture_temp = TempDir::new().unwrap();
+        let replay_traffic = Arc::new(test_capture(capture_temp.path().join("traffic")));
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let client_weak = Arc::downgrade(&client);
+        let request_weak = Arc::downgrade(&request);
+        let traffic_weak = Arc::downgrade(&replay_traffic);
+        let retry_weak = Arc::downgrade(&retry);
+        let reconnect = Some(GrokReconnectContext::new(
+            client,
+            request,
+            Some(replay_traffic),
+            retry,
+            1,
+        ));
+
+        let (tx, rx) = mpsc::channel(1);
+        let response = stream_body_with_policy(
+            ChannelStream(rx),
+            "msg_release_replay".into(),
+            "grok-4.5".into(),
+            None,
+            "req_release_replay".into(),
+            None,
+            reconnect,
+            GrokRequestDeadline::after(Duration::from_secs(5)),
+            Duration::from_secs(1),
+        );
+        let mut body = response.into_body();
+        tx.send(Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first semantic output\"}\n\n",
+        )))
+        .await
+        .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_millis(250), body.frame())
+            .await
+            .expect("semantic output must enter the downstream queue")
+            .expect("stream must remain open after its first semantic output")
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(first.data_ref().unwrap()).contains("first semantic output")
+        );
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while request_weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the queued semantic output must release replay-only state promptly");
+
+        assert_eq!(client_weak.strong_count(), 0);
+        assert_eq!(request_weak.strong_count(), 0);
+        assert_eq!(traffic_weak.strong_count(), 0);
+        let retry = retry_weak
+            .upgrade()
+            .expect("retry state must outlive replay material while the stream is active");
+        assert!(!retry.lock().await.is_terminal());
+
+        drop(retry);
+        drop(body);
+        tokio::time::timeout(Duration::from_millis(250), tx.closed())
+            .await
+            .expect("dropping downstream must still cancel the upstream producer");
     }
 
     #[tokio::test]
@@ -2329,7 +2500,7 @@ mod tests {
         let hits_server = hits.clone();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_http_request(&mut stream).await;
+            let first_request = read_complete_http_request(&mut stream).await;
             hits_server.fetch_add(1, Ordering::SeqCst);
             let body = b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"capacity exhausted\"},\"retry_after\":0}}\n\n";
             let response = format!(
@@ -2340,7 +2511,7 @@ mod tests {
             stream.write_all(body).await.unwrap();
 
             let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_http_request(&mut stream).await;
+            let rebuilt_request = read_complete_http_request(&mut stream).await;
             hits_server.fetch_add(1, Ordering::SeqCst);
             let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered once\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
             let response = format!(
@@ -2349,6 +2520,7 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).await.unwrap();
             stream.write_all(body).await.unwrap();
+            (first_request, rebuilt_request)
         });
 
         let (client, _temp) = test_client(
@@ -2364,17 +2536,18 @@ mod tests {
         let client = Arc::new(client);
         let deadline = GrokRequestDeadline::after(Duration::from_secs(5));
         let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+        let prepared = prepared_request(false);
         let response = client
-            .post_with_retry(&sample_request(), None, retry.clone())
+            .post_prepared_with_retry(&prepared, None, retry.clone())
             .await
             .unwrap();
-        let reconnect = Some(GrokReconnectContext {
-            client: client.clone(),
-            request: Arc::new(sample_request()),
-            traffic: None,
+        let reconnect = Some(GrokReconnectContext::new(
+            client.clone(),
+            prepared,
+            None,
             retry,
-            estimated_input_tokens: 1,
-        });
+            1,
+        ));
         let body = tokio::time::timeout(
             Duration::from_secs(3),
             stream_body_with_policy(
@@ -2395,9 +2568,14 @@ mod tests {
         .expect("the transient SSE failure must rebuild before the deadline")
         .unwrap()
         .to_bytes();
-        server.await.unwrap();
+        let (first_request, rebuilt_request) = server.await.unwrap();
 
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            http_request_body(&first_request),
+            http_request_body(&rebuilt_request),
+            "stream rebuild must reuse the prepared JSON bytes"
+        );
         let body = String::from_utf8_lossy(&body);
         assert_eq!(body.matches("recovered once").count(), 1, "{body}");
         assert_eq!(body.matches("event: message_start").count(), 1, "{body}");
@@ -2406,7 +2584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_emit_stream_reset_rebuilds_with_shared_budget() {
+    async fn pre_emit_stream_reset_does_not_replay_unknown_outcome() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -2425,17 +2603,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(30)).await;
             drop(stream);
 
-            // Second attempt succeeds.
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_http_request(&mut stream).await;
-            hits_server.fetch_add(1, Ordering::SeqCst);
-            let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.write_all(body).await.unwrap();
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+            {
+                let _ = read_http_request(&mut stream).await;
+                hits_server.fetch_add(1, Ordering::SeqCst);
+            }
         });
 
         let (client, _temp) = test_client(
@@ -2451,17 +2624,18 @@ mod tests {
         let client = Arc::new(client);
         let deadline = GrokRequestDeadline::after(Duration::from_secs(5));
         let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+        let prepared = prepared_request(false);
         let response = client
-            .post_with_retry(&sample_request(), None, retry.clone())
+            .post_prepared_with_retry(&prepared, None, retry.clone())
             .await
             .unwrap();
-        let reconnect = Some(GrokReconnectContext {
-            client: client.clone(),
-            request: Arc::new(sample_request()),
-            traffic: None,
+        let reconnect = Some(GrokReconnectContext::new(
+            client.clone(),
+            prepared,
+            None,
             retry,
-            estimated_input_tokens: 1,
-        });
+            1,
+        ));
         let body = tokio::time::timeout(
             Duration::from_secs(3),
             stream_body_with_policy(
@@ -2479,23 +2653,18 @@ mod tests {
             .collect(),
         )
         .await
-        .expect("rebuild must remain bounded by the request deadline")
+        .expect("the unknown-outcome failure must terminate promptly")
         .unwrap()
         .to_bytes();
-        tokio::time::timeout(Duration::from_secs(3), server)
-            .await
-            .expect("rebuild should issue the second request")
-            .unwrap();
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("message_start"));
-        assert!(body.contains("ok"));
-        assert!(body.contains("event: ping"));
-        assert!(body.contains("message_stop"));
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("\"delta\":\"ok\""), "{body}");
     }
 
     #[tokio::test]
-    async fn reasoning_only_reset_rebuilds_without_replaying_visible_content() {
+    async fn reasoning_only_reset_does_not_replay_unknown_outcome() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -2517,16 +2686,12 @@ mod tests {
             stream.write_all(b"\r\n").await.unwrap();
             drop(stream);
 
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_http_request(&mut stream).await;
-            hits_server.fetch_add(1, Ordering::SeqCst);
-            let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"final once\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.write_all(body).await.unwrap();
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+            {
+                let _ = read_http_request(&mut stream).await;
+                hits_server.fetch_add(1, Ordering::SeqCst);
+            }
         });
 
         let (client, _temp) = test_client(
@@ -2541,17 +2706,12 @@ mod tests {
         .await;
         let client = Arc::new(client);
         let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let prepared = prepared_request(false);
         let response = client
-            .post_with_retry(&sample_request(), None, retry.clone())
+            .post_prepared_with_retry(&prepared, None, retry.clone())
             .await
             .unwrap();
-        let reconnect = Some(GrokReconnectContext {
-            client,
-            request: Arc::new(sample_request()),
-            traffic: None,
-            retry,
-            estimated_input_tokens: 1,
-        });
+        let reconnect = Some(GrokReconnectContext::new(client, prepared, None, retry, 1));
         let body = stream_body(
             response.into_stream(),
             "msg_reasoning_rebuild".into(),
@@ -2568,12 +2728,12 @@ mod tests {
         .to_bytes();
         server.await.unwrap();
 
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         let body = String::from_utf8_lossy(&body);
         assert!(!body.contains("draft"));
         assert!(!body.contains('😊'));
-        assert_eq!(body.matches("final once").count(), 1);
-        assert!(!body.contains("event: error"));
+        assert!(!body.contains("final once"));
+        assert!(body.contains("event: error"), "{body}");
     }
 
     #[tokio::test]
@@ -2602,7 +2762,7 @@ mod tests {
             drop(stream);
             // If a second request arrives, count it (should not happen).
             if let Ok(Ok((mut stream, _))) =
-                tokio::time::timeout(Duration::from_millis(150), listener.accept()).await
+                tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
             {
                 let _ = read_http_request(&mut stream).await;
                 hits_server.fetch_add(1, Ordering::SeqCst);
@@ -2623,17 +2783,18 @@ mod tests {
         .await;
         let client = Arc::new(client);
         let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let prepared = prepared_request(true);
         let response = client
-            .post_with_retry(&sample_request(), Some(traffic.clone()), retry.clone())
+            .post_prepared_with_retry(&prepared, Some(traffic.clone()), retry.clone())
             .await
             .unwrap();
-        let reconnect = Some(GrokReconnectContext {
+        let reconnect = Some(GrokReconnectContext::new(
             client,
-            request: Arc::new(sample_request()),
-            traffic: Some(traffic.clone()),
+            prepared,
+            Some(traffic.clone()),
             retry,
-            estimated_input_tokens: 1,
-        });
+            1,
+        ));
         let body = stream_body(
             response.into_stream(),
             "msg_post".into(),
@@ -2719,17 +2880,12 @@ mod tests {
         .await;
         let client = Arc::new(client);
         let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let prepared = prepared_request(false);
         let response = client
-            .post_with_retry(&sample_request(), None, retry.clone())
+            .post_prepared_with_retry(&prepared, None, retry.clone())
             .await
             .unwrap();
-        let reconnect = Some(GrokReconnectContext {
-            client,
-            request: Arc::new(sample_request()),
-            traffic: None,
-            retry,
-            estimated_input_tokens: 1,
-        });
+        let reconnect = Some(GrokReconnectContext::new(client, prepared, None, retry, 1));
         let body = stream_body(
             response.into_stream(),
             "msg_bad".into(),
@@ -2753,6 +2909,11 @@ mod tests {
     fn stream_error_classifier_marks_transport_retryable() {
         let err = client::GrokError::stream_transport(GrokErrorStage::Stream, "reset");
         assert!(err.is_retryable());
+        assert_eq!(
+            err.replay_safety,
+            crate::retry::ReplaySafety::OutcomeUnknown
+        );
+        assert!(!err.permits_model_replay());
         assert_eq!(err.origin, client::GrokErrorOrigin::StreamTransport);
         let bad = client::GrokError::http(StatusCode::BAD_REQUEST, None, "nope");
         assert!(!bad.is_retryable());

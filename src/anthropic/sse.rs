@@ -19,7 +19,26 @@ pub fn parse_sse_events(input: &[u8]) -> Vec<SseEvent> {
 
 pub fn parse_sse_events_with_stats(input: &[u8]) -> (Vec<SseEvent>, SseParseStats) {
     let text = String::from_utf8_lossy(input);
-    let normalized = normalize_lines(&text);
+    parse_sse_text(&text)
+}
+
+/// Parses protocol SSE bytes without replacing malformed UTF-8.
+///
+/// Keep the lossy helpers above for diagnostics and legacy providers. Network
+/// protocol paths that must fail closed should use this API instead.
+pub fn try_parse_sse_events(input: &[u8]) -> Result<Vec<SseEvent>, std::str::Utf8Error> {
+    Ok(try_parse_sse_events_with_stats(input)?.0)
+}
+
+pub fn try_parse_sse_events_with_stats(
+    input: &[u8],
+) -> Result<(Vec<SseEvent>, SseParseStats), std::str::Utf8Error> {
+    let text = std::str::from_utf8(input)?;
+    Ok(parse_sse_text(text))
+}
+
+fn parse_sse_text(text: &str) -> (Vec<SseEvent>, SseParseStats) {
+    let normalized = normalize_lines(text);
     let mut events = Vec::new();
     let mut block = String::new();
     let mut bytes_read = 0usize;
@@ -127,4 +146,17 @@ fn parse_block(block: &str) -> Vec<SseEvent> {
     push_if_relevant(event.take(), &mut data_lines);
 
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_sse_events, try_parse_sse_events};
+
+    #[test]
+    fn strict_parser_rejects_invalid_utf8_without_changing_legacy_parser() {
+        let input = b"data: {\"text\":\"\xff\"}\n\n";
+
+        assert!(try_parse_sse_events(input).is_err());
+        assert_eq!(parse_sse_events(input).len(), 1);
+    }
 }
