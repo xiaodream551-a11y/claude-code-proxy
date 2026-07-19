@@ -178,7 +178,6 @@ pub enum GrokToolChoice {
     Required(String),
     None(String),
     Function { r#type: String, name: String },
-    Hosted { r#type: String },
 }
 
 pub fn translate_request(
@@ -192,15 +191,15 @@ pub fn translate_request(
     let internal_text_request = compaction || text.is_some();
     let mut instructions = parse_system(req.extra.get("system"))?;
     let selected_deferred = selected_deferred_tools(req);
-    let tools = if compaction {
+    let mut tools = if compaction {
         None
     } else {
         parse_tools(req.extra.get("tools"), &selected_deferred)?
     };
-    let hosted_web_search = tools
+    let declared_web_search = tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "web_search"));
-    let dedicated_x_search = tools
+    let declared_x_search = tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "x_search"));
     // Prompt text may select a hosted capability that the client actually
@@ -209,13 +208,37 @@ pub fn translate_request(
     let has_explicit_tool_choice = req.extra.contains_key("tool_choice");
     let force_x_search = !internal_text_request
         && !has_explicit_tool_choice
-        && dedicated_x_search
+        && declared_x_search
         && requests_x_search(req);
     let force_web_search = !internal_text_request
         && !has_explicit_tool_choice
         && !force_x_search
-        && hosted_web_search
+        && declared_web_search
         && requests_web_search(req);
+    let (tool_choice, forced_hosted_kind) = if compaction {
+        (None, None)
+    } else if force_x_search {
+        (
+            Some(GrokToolChoice::Required("required".into())),
+            Some("x_search"),
+        )
+    } else if force_web_search {
+        (
+            Some(GrokToolChoice::Required("required".into())),
+            Some("web_search"),
+        )
+    } else {
+        parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?
+    };
+    if let (Some(kind), Some(tools)) = (forced_hosted_kind, tools.as_mut()) {
+        tools.retain(|tool| tool.kind == kind);
+    }
+    let hosted_web_search = tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "web_search"));
+    let dedicated_x_search = tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "x_search"));
     if !internal_text_request && hosted_web_search {
         append_guidance(
             &mut instructions,
@@ -260,13 +283,6 @@ pub fn translate_request(
             }
         }
     }
-    let tool_choice = if compaction {
-        None
-    } else if force_x_search || force_web_search {
-        Some(GrokToolChoice::Required("required".into()))
-    } else {
-        parse_tool_choice(req.extra.get("tool_choice"), tools.as_ref())?
-    };
     let has_tools = tools.as_ref().is_some_and(|tools| !tools.is_empty());
     let parallel_tool_calls = if compaction || !has_tools {
         None
@@ -1047,8 +1063,10 @@ fn validate_response_inclusion(
 fn parse_tool_choice(
     value: Option<&Value>,
     tools: Option<&Vec<GrokTool>>,
-) -> anyhow::Result<Option<GrokToolChoice>> {
-    let Some(value) = value else { return Ok(None) };
+) -> anyhow::Result<(Option<GrokToolChoice>, Option<&'static str>)> {
+    let Some(value) = value else {
+        return Ok((None, None));
+    };
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("tool_choice must be an object"))?;
@@ -1071,14 +1089,17 @@ fn parse_tool_choice(
                 anyhow::bail!("tool_choice {kind} requires at least one tool");
             }
             if kind == "auto" && tools.is_none_or(|items| items.is_empty()) {
-                return Ok(None);
+                return Ok((None, None));
             }
-            Ok(Some(match kind {
-                "auto" => GrokToolChoice::Auto("auto".into()),
-                "any" => GrokToolChoice::Required("required".into()),
-                "none" => GrokToolChoice::None("none".into()),
-                _ => unreachable!(),
-            }))
+            Ok((
+                Some(match kind {
+                    "auto" => GrokToolChoice::Auto("auto".into()),
+                    "any" => GrokToolChoice::Required("required".into()),
+                    "none" => GrokToolChoice::None("none".into()),
+                    _ => unreachable!(),
+                }),
+                None,
+            ))
         }
         "tool"
             if obj.keys().all(|key| {
@@ -1102,16 +1123,25 @@ fn parse_tool_choice(
             let Some(tool) = matched else {
                 anyhow::bail!("tool_choice references an unknown tool");
             };
-            Ok(Some(if tool.kind == "function" {
-                GrokToolChoice::Function {
-                    r#type: "function".into(),
-                    name: name.into(),
-                }
+            if tool.kind == "function" {
+                Ok((
+                    Some(GrokToolChoice::Function {
+                        r#type: "function".into(),
+                        name: name.into(),
+                    }),
+                    None,
+                ))
             } else {
-                GrokToolChoice::Hosted {
-                    r#type: tool.kind.clone(),
-                }
-            }))
+                let kind = match tool.kind.as_str() {
+                    "web_search" => "web_search",
+                    "x_search" => "x_search",
+                    _ => unreachable!("parse_tools only emits supported hosted tool kinds"),
+                };
+                Ok((
+                    Some(GrokToolChoice::Required("required".into())),
+                    Some(kind),
+                ))
+            }
         }
         _ => anyhow::bail!("unsupported tool_choice"),
     }
@@ -2128,6 +2158,10 @@ mod tests {
                 "name":"WebSearch",
                 "description":"Search the web",
                 "input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+            },{
+                "name":"Bash",
+                "description":"Run a command",
+                "input_schema":{"type":"object"}
             }]
         }))
         .unwrap();
@@ -2142,6 +2176,27 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("use the hosted web_search tool")
+        );
+        assert_eq!(translated["tool_choice"], "required");
+        assert_eq!(translated["parallel_tool_calls"], true);
+    }
+
+    #[test]
+    fn grok_translation_forces_only_declared_xsearch_for_x_prompt() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"Search X for recent Rust posts"}],
+            "tools":[
+                {"name":"XSearch","description":"Search X posts","input_schema":{"type":"object"}},
+                {"name":"Bash","description":"Run a command","input_schema":{"type":"object"}}
+            ]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(
+            translated["tools"],
+            serde_json::json!([{"type":"x_search"}])
         );
         assert_eq!(translated["tool_choice"], "required");
         assert_eq!(translated["parallel_tool_calls"], true);
@@ -2613,6 +2668,9 @@ mod tests {
                 "user_location":{"type":"approximate","city":"Nanjing","region":"Jiangsu","country":"CN","timezone":"Asia/Shanghai"},
                 "allowed_callers":["direct"],
                 "response_inclusion":"full"
+            },{
+                "name":"Bash",
+                "input_schema":{"type":"object"}
             }],
             "tool_choice":{"type":"tool","name":"web_search"},
             "messages":[{"role":"user","content":"search the web"}]
@@ -2628,10 +2686,7 @@ mod tests {
                 "filters":{"allowed_domains":["docs.rs","rust-lang.org"]}
             }])
         );
-        assert_eq!(
-            translated["tool_choice"],
-            serde_json::json!({"type":"web_search"})
-        );
+        assert_eq!(translated["tool_choice"], "required");
         assert!(
             translated["instructions"]
                 .as_str()
@@ -2659,6 +2714,26 @@ mod tests {
         let translated =
             serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
         assert_eq!(translated["tool_choice"], "none");
+        assert_eq!(translated["tools"][0]["type"], "x_search");
+    }
+
+    #[test]
+    fn grok_translation_forces_declared_x_search_with_required_choice() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[
+                {"name":"XSearch","input_schema":{"type":"object"}},
+                {"name":"Bash","input_schema":{"type":"object"}}
+            ],
+            "tool_choice":{"type":"tool","name":"XSearch"},
+            "messages":[{"role":"user","content":"Search X for recent posts"}]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["tool_choice"], "required");
+        assert_eq!(translated["tools"].as_array().unwrap().len(), 1);
         assert_eq!(translated["tools"][0]["type"], "x_search");
     }
 
