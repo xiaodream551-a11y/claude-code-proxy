@@ -6,8 +6,8 @@ use super::translate::request::{ResponsesInputItem, ResponsesRequest};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_STATES: usize = 10_000;
-const MAX_SESSION_TRANSCRIPT_BYTES: u64 = 2_000_000;
-const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
+pub(super) const MAX_SESSION_TRANSCRIPT_BYTES: u64 = 2_000_000;
+pub(super) const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
 
 #[derive(Clone)]
 struct ContinuationState {

@@ -1,6 +1,6 @@
-use std::io::{Cursor, Read as _};
+use std::io::Cursor;
 
-use base64::read::DecoderReader;
+use base64::Engine as _;
 
 use super::translate::request::{GrokContentPart, GrokInputItem, GrokResponsesRequest};
 
@@ -9,13 +9,16 @@ const TOOL_OVERHEAD_TOKENS: u64 = 4;
 const IMAGE_OVERHEAD_TOKENS: u64 = 256;
 const IMAGE_TILE_EDGE: u64 = 512;
 const IMAGE_TILE_TOKENS: u64 = 256;
-const IMAGE_FALLBACK_BYTES_PER_TILE: u64 = 256 * 1024;
 const MAX_IMAGE_ESTIMATE_TOKENS: u64 = 65_536;
-/// Enough for PNG's IHDR and for the usual JPEG APP/EXIF preamble. If a JPEG
-/// pushes its SOF marker farther into the file, use decoded byte count instead
-/// of retaining the entire image just to estimate tokens.
-const IMAGE_METADATA_PREFIX_BYTES: usize = 64 * 1024;
-const IMAGE_DECODE_BUFFER_BYTES: usize = 8 * 1024;
+const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+const JPEG_SIGNATURE: &[u8; 2] = b"\xff\xd8";
+/// Bound both decode work and dimensions independently of the compressed file size. The input
+/// limit alone does not protect against a highly-compressible image with attacker-chosen geometry.
+const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+const MAX_PNG_DECODER_BYTES: usize = 64 * 1024 * 1024;
+/// JPEG validation decodes to one luminance byte per pixel, so the pixel cap is also a hard output
+/// buffer cap. This avoids allocating RGB/CMYK output that is immediately discarded.
+const MAX_JPEG_VALIDATION_BYTES: usize = MAX_IMAGE_PIXELS as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Base64ImageError {
@@ -81,59 +84,44 @@ fn estimate_image_tokens(image_url: &str) -> u64 {
     let Some((metadata, encoded)) = image_url.split_once(',') else {
         return IMAGE_OVERHEAD_TOKENS + approx_token_count(image_url);
     };
-    if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") {
+    let Some(media_type) = metadata
+        .strip_prefix("data:")
+        .and_then(|metadata| metadata.strip_suffix(";base64"))
+    else {
         return IMAGE_OVERHEAD_TOKENS + approx_token_count(image_url);
-    }
-    validate_and_estimate_base64_image(encoded, usize::MAX).unwrap_or(IMAGE_OVERHEAD_TOKENS)
+    };
+    validate_and_estimate_base64_image(encoded, usize::MAX, media_type)
+        .unwrap_or(IMAGE_OVERHEAD_TOKENS)
 }
 
 /// Validate an embedded image in one streaming decode pass and cache the
-/// estimate at translation time. Memory is bounded by the decoder buffers and
-/// [`IMAGE_METADATA_PREFIX_BYTES`], independent of the image's decoded size.
+/// estimate at translation time. Base64 input and decoded geometry are bounded before a mature
+/// format decoder consumes the complete image. PNG is decoded row-by-row; JPEG is decoded in
+/// strict mode to a bounded luminance buffer after its marker framing is checked.
 pub(super) fn validate_and_estimate_base64_image(
     encoded: &str,
     max_decoded_bytes: usize,
+    expected_media_type: &str,
 ) -> Result<u64, Base64ImageError> {
     if encoded.len() > max_base64_len(max_decoded_bytes) {
         return Err(Base64ImageError::TooLarge);
     }
 
-    let mut decoder = DecoderReader::new(
-        Cursor::new(encoded.as_bytes()),
-        &base64::engine::general_purpose::STANDARD,
-    );
-    let mut buffer = [0_u8; IMAGE_DECODE_BUFFER_BYTES];
-    let mut prefix = Vec::with_capacity(IMAGE_METADATA_PREFIX_BYTES.min(max_decoded_bytes));
-    let mut decoded_len = 0_usize;
-
-    loop {
-        let read = decoder
-            .read(&mut buffer)
-            .map_err(|_| Base64ImageError::Invalid)?;
-        if read == 0 {
-            break;
-        }
-        decoded_len = decoded_len
-            .checked_add(read)
-            .ok_or(Base64ImageError::TooLarge)?;
-        if decoded_len > max_decoded_bytes {
-            return Err(Base64ImageError::TooLarge);
-        }
-
-        let prefix_remaining = IMAGE_METADATA_PREFIX_BYTES.saturating_sub(prefix.len());
-        prefix.extend_from_slice(&buffer[..read.min(prefix_remaining)]);
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| Base64ImageError::Invalid)?;
+    if decoded.len() > max_decoded_bytes {
+        return Err(Base64ImageError::TooLarge);
     }
 
-    if image_dimensions(&prefix).is_some_and(|(width, height)| {
-        width < 8 || height < 8 || width.saturating_mul(height) < 512
-    }) {
-        return Err(Base64ImageError::TooSmall);
-    }
+    let (width, height) = match expected_media_type {
+        "image/png" if decoded.starts_with(PNG_SIGNATURE) => decode_png(&decoded)?,
+        "image/jpeg" if decoded.starts_with(JPEG_SIGNATURE) => decode_jpeg(&decoded)?,
+        _ => return Err(Base64ImageError::Invalid),
+    };
+    validate_image_dimensions(width, height)?;
 
-    Ok(estimate_image_tokens_from_summary(
-        &prefix,
-        decoded_len as u64,
-    ))
+    Ok(estimate_image_tokens_from_dimensions(width, height))
 }
 
 fn max_base64_len(max_decoded_bytes: usize) -> usize {
@@ -144,83 +132,171 @@ fn max_base64_len(max_decoded_bytes: usize) -> usize {
         .saturating_mul(4)
 }
 
-fn estimate_image_tokens_from_summary(prefix: &[u8], decoded_len: u64) -> u64 {
-    let estimate = image_dimensions(prefix)
-        .map(|(width, height)| {
-            width
-                .div_ceil(IMAGE_TILE_EDGE)
-                .saturating_mul(height.div_ceil(IMAGE_TILE_EDGE))
-                .saturating_mul(IMAGE_TILE_TOKENS)
-        })
-        .unwrap_or_else(|| {
-            decoded_len
-                .div_ceil(IMAGE_FALLBACK_BYTES_PER_TILE)
-                .saturating_mul(IMAGE_TILE_TOKENS)
-        });
+fn estimate_image_tokens_from_dimensions(width: u64, height: u64) -> u64 {
+    let estimate = width
+        .div_ceil(IMAGE_TILE_EDGE)
+        .saturating_mul(height.div_ceil(IMAGE_TILE_EDGE))
+        .saturating_mul(IMAGE_TILE_TOKENS);
     estimate.clamp(IMAGE_OVERHEAD_TOKENS, MAX_IMAGE_ESTIMATE_TOKENS)
 }
 
-fn image_dimensions(bytes: &[u8]) -> Option<(u64, u64)> {
-    png_dimensions(bytes)
-        .or_else(|| jpeg_dimensions(bytes))
-        .filter(|(width, height)| *width > 0 && *height > 0)
+fn validate_image_dimensions(width: u64, height: u64) -> Result<(), Base64ImageError> {
+    if width < 8 || height < 8 || width.saturating_mul(height) < 512 {
+        return Err(Base64ImageError::TooSmall);
+    }
+    if width.saturating_mul(height) > MAX_IMAGE_PIXELS {
+        return Err(Base64ImageError::TooLarge);
+    }
+    Ok(())
 }
 
-fn png_dimensions(bytes: &[u8]) -> Option<(u64, u64)> {
-    if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return None;
+fn decode_png(bytes: &[u8]) -> Result<(u64, u64), Base64ImageError> {
+    let mut cursor = Cursor::new(bytes);
+    let decoder = png::Decoder::new_with_limits(
+        &mut cursor,
+        png::Limits {
+            bytes: MAX_PNG_DECODER_BYTES,
+        },
+    );
+    let mut reader = decoder.read_info().map_err(map_png_error)?;
+    let width = u64::from(reader.info().width);
+    let height = u64::from(reader.info().height);
+    validate_image_dimensions(width, height)?;
+    if reader
+        .output_buffer_size()
+        .filter(|size| *size <= MAX_PNG_DECODER_BYTES)
+        .is_none()
+    {
+        return Err(Base64ImageError::TooLarge);
     }
-    Some((
-        u32::from_be_bytes(bytes[16..20].try_into().ok()?) as u64,
-        u32::from_be_bytes(bytes[20..24].try_into().ok()?) as u64,
-    ))
+
+    while reader.next_row().map_err(map_png_error)?.is_some() {}
+    reader.finish().map_err(map_png_error)?;
+    drop(reader);
+    if cursor.position() != bytes.len() as u64 {
+        return Err(Base64ImageError::Invalid);
+    }
+    Ok((width, height))
 }
 
-fn jpeg_dimensions(bytes: &[u8]) -> Option<(u64, u64)> {
-    if !bytes.starts_with(&[0xff, 0xd8]) {
-        return None;
+fn map_png_error(error: png::DecodingError) -> Base64ImageError {
+    match error {
+        png::DecodingError::LimitsExceeded => Base64ImageError::TooLarge,
+        _ => Base64ImageError::Invalid,
     }
-    let mut offset = 2_usize;
-    while offset + 3 < bytes.len() {
+}
+
+fn decode_jpeg(bytes: &[u8]) -> Result<(u64, u64), Base64ImageError> {
+    // Some image decoders deliberately conceal premature EOI markers so browsers can display a
+    // partial image. Reject empty scans and trailing data before asking the decoder to validate
+    // the actual Huffman/arithmetic stream.
+    validate_jpeg_framing(bytes)?;
+
+    let options = zune_core::options::DecoderOptions::new_safe()
+        .set_strict_mode(true)
+        .set_max_width(usize::from(u16::MAX))
+        .set_max_height(usize::from(u16::MAX))
+        .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::Luma);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(bytes), options);
+    decoder
+        .decode_headers()
+        .map_err(|_| Base64ImageError::Invalid)?;
+    let info = decoder.info().ok_or(Base64ImageError::Invalid)?;
+    let width = u64::from(info.width);
+    let height = u64::from(info.height);
+    validate_image_dimensions(width, height)?;
+
+    let output_size = decoder
+        .output_buffer_size()
+        .filter(|size| *size <= MAX_JPEG_VALIDATION_BYTES)
+        .ok_or(Base64ImageError::TooLarge)?;
+    let mut output = vec![0; output_size];
+    decoder
+        .decode_into(&mut output)
+        .map_err(|_| Base64ImageError::Invalid)?;
+    Ok((width, height))
+}
+
+fn validate_jpeg_framing(bytes: &[u8]) -> Result<(), Base64ImageError> {
+    if !bytes.starts_with(JPEG_SIGNATURE) {
+        return Err(Base64ImageError::Invalid);
+    }
+
+    let mut offset = JPEG_SIGNATURE.len();
+    let mut saw_scan = false;
+    while offset < bytes.len() {
         if bytes[offset] != 0xff {
-            offset += 1;
-            continue;
+            return Err(Base64ImageError::Invalid);
         }
         while offset < bytes.len() && bytes[offset] == 0xff {
             offset += 1;
         }
-        let marker = *bytes.get(offset)?;
+        let marker = *bytes.get(offset).ok_or(Base64ImageError::Invalid)?;
         offset += 1;
-        if matches!(marker, 0xd8 | 0xd9) {
+
+        match marker {
+            0xd9 => {
+                return if saw_scan && offset == bytes.len() {
+                    Ok(())
+                } else {
+                    Err(Base64ImageError::Invalid)
+                };
+            }
+            0xd8 | 0x00 | 0xd0..=0xd7 => return Err(Base64ImageError::Invalid),
+            // TEM is the only standalone marker that may occur outside entropy-coded data.
+            0x01 => continue,
+            _ => {}
+        }
+
+        let length_bytes = bytes
+            .get(offset..offset.saturating_add(2))
+            .ok_or(Base64ImageError::Invalid)?;
+        let segment_length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+        if segment_length < 2 {
+            return Err(Base64ImageError::Invalid);
+        }
+        offset = offset
+            .checked_add(segment_length)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(Base64ImageError::Invalid)?;
+
+        if marker != 0xda {
             continue;
         }
-        let length = u16::from_be_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as usize;
-        if length < 2 || offset + length > bytes.len() {
-            return None;
+
+        saw_scan = true;
+        let mut entropy_bytes = 0_usize;
+        while offset < bytes.len() {
+            if bytes[offset] != 0xff {
+                entropy_bytes += 1;
+                offset += 1;
+                continue;
+            }
+
+            let marker_start = offset;
+            while offset < bytes.len() && bytes[offset] == 0xff {
+                offset += 1;
+            }
+            let next = *bytes.get(offset).ok_or(Base64ImageError::Invalid)?;
+            match next {
+                // Byte-stuffed 0xff is entropy data; restart markers remain inside the scan.
+                0x00 => {
+                    entropy_bytes += 1;
+                    offset += 1;
+                }
+                0xd0..=0xd7 => offset += 1,
+                _ => {
+                    offset = marker_start;
+                    break;
+                }
+            }
         }
-        if matches!(
-            marker,
-            0xc0 | 0xc1
-                | 0xc2
-                | 0xc3
-                | 0xc5
-                | 0xc6
-                | 0xc7
-                | 0xc9
-                | 0xca
-                | 0xcb
-                | 0xcd
-                | 0xce
-                | 0xcf
-        ) && length >= 7
-        {
-            let height = u16::from_be_bytes(bytes[offset + 3..offset + 5].try_into().ok()?);
-            let width = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?);
-            return Some((u64::from(width), u64::from(height)));
+        if entropy_bytes == 0 {
+            return Err(Base64ImageError::Invalid);
         }
-        offset += length;
     }
-    None
+
+    Err(Base64ImageError::Invalid)
 }
 
 fn approx_token_count(text: &str) -> u64 {
@@ -250,14 +326,111 @@ mod tests {
     use super::*;
     use crate::anthropic::schema::MessagesRequest;
     use crate::providers::grok::translate::request::translate_request;
-    use base64::Engine as _;
     use serde_json::json;
 
+    fn png_bytes(width: u32, height: u32, ancillary_bytes: usize) -> Vec<u8> {
+        let pixel_count = usize::try_from(u64::from(width) * u64::from(height)).unwrap();
+        let mut image = Vec::new();
+        let mut encoder = png::Encoder::new(&mut image, width, height);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        if ancillary_bytes > 0 {
+            encoder
+                .add_text_chunk("Comment".into(), "x".repeat(ancillary_bytes))
+                .unwrap();
+        }
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&vec![0; pixel_count])
+            .unwrap();
+        image
+    }
+
     fn png_base64(width: u32, height: u32) -> String {
-        let mut header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        base64::engine::general_purpose::STANDARD.encode(png_bytes(width, height, 0))
+    }
+
+    fn jpeg_bytes(width: u16, height: u16, app_payload_bytes: usize) -> Vec<u8> {
+        assert!(app_payload_bytes <= usize::from(u16::MAX) - 2);
+        let mut image = Vec::new();
+        jpeg_encoder::Encoder::new(&mut image, 90)
+            .encode(
+                &vec![0; usize::from(width) * usize::from(height)],
+                width,
+                height,
+                jpeg_encoder::ColorType::Luma,
+            )
+            .unwrap();
+        if app_payload_bytes > 0 {
+            let mut app = Vec::with_capacity(app_payload_bytes + 4);
+            app.extend_from_slice(&[0xff, 0xef]);
+            app.extend_from_slice(&((app_payload_bytes + 2) as u16).to_be_bytes());
+            app.resize(app.len() + app_payload_bytes, 0);
+            image.splice(2..2, app);
+        }
+        image
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (0_u32.wrapping_sub(crc & 1)));
+            }
+        }
+        !crc
+    }
+
+    fn append_raw_png_chunk(output: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+        output.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        output.extend_from_slice(chunk_type);
+        output.extend_from_slice(data);
+        let mut crc_input = Vec::with_capacity(chunk_type.len() + data.len());
+        crc_input.extend_from_slice(chunk_type);
+        crc_input.extend_from_slice(data);
+        output.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    }
+
+    fn png_with_empty_pixel_stream(width: u32, height: u32) -> Vec<u8> {
+        png_with_empty_pixel_stream_and_color(width, height, 0)
+    }
+
+    fn png_with_empty_pixel_stream_and_color(width: u32, height: u32, color_type: u8) -> Vec<u8> {
+        let mut image = PNG_SIGNATURE.to_vec();
+        let mut header = Vec::with_capacity(13);
         header.extend_from_slice(&width.to_be_bytes());
         header.extend_from_slice(&height.to_be_bytes());
-        base64::engine::general_purpose::STANDARD.encode(header)
+        header.extend_from_slice(&[8, color_type, 0, 0, 0]);
+        append_raw_png_chunk(&mut image, b"IHDR", &header);
+        // This is a valid zlib stream that expands to zero bytes. The PNG container and every CRC
+        // are valid, but it cannot contain the declared scanlines.
+        append_raw_png_chunk(
+            &mut image,
+            b"IDAT",
+            &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+        );
+        append_raw_png_chunk(&mut image, b"IEND", &[]);
+        image
+    }
+
+    fn jpeg_with_truncated_entropy(width: u16, height: u16) -> Vec<u8> {
+        let image = jpeg_bytes(width, height, 0);
+        let mut offset = 2;
+        while offset + 4 <= image.len() {
+            assert_eq!(image[offset], 0xff);
+            let marker = image[offset + 1];
+            let length = usize::from(u16::from_be_bytes([image[offset + 2], image[offset + 3]]));
+            if marker == 0xda {
+                let scan_start = offset + 2 + length;
+                let mut truncated = image[..scan_start].to_vec();
+                truncated.extend_from_slice(&[0xff, 0xd9]);
+                return truncated;
+            }
+            offset += 2 + length;
+        }
+        panic!("encoded JPEG lacks an SOS marker")
     }
 
     fn translated_request(value: serde_json::Value) -> GrokResponsesRequest {
@@ -303,18 +476,21 @@ mod tests {
 
     #[test]
     fn count_tokens_handles_images_without_counting_base64_bytes_as_text() {
+        let small_image = base64::engine::general_purpose::STANDARD.encode(png_bytes(32, 32, 0));
+        let larger_payload_image =
+            base64::engine::general_purpose::STANDARD.encode(png_bytes(32, 32, 1024));
         let small = translated_request(json!({
             "model": "grok-4.5",
             "messages": [{"role": "user", "content": [{
                 "type":"image",
-                "source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}
+                "source":{"type":"base64","media_type":"image/png","data":small_image}
             }]}]
         }));
         let larger_payload = translated_request(json!({
             "model": "grok-4.5",
             "messages": [{"role": "user", "content": [{
                 "type":"image",
-                "source":{"type":"base64","media_type":"image/png","data":"aGVsbG8gd29ybGQ="}
+                "source":{"type":"base64","media_type":"image/png","data":larger_payload_image}
             }]}]
         }));
 
@@ -324,45 +500,64 @@ mod tests {
 
     #[test]
     fn streaming_base64_validation_enforces_the_decoded_byte_boundary() {
-        let at_limit = base64::engine::general_purpose::STANDARD.encode([0_u8; 8]);
-        let over_limit = base64::engine::general_purpose::STANDARD.encode([0_u8; 9]);
+        let image = png_bytes(32, 32, 0);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&image);
 
-        assert!(validate_and_estimate_base64_image(&at_limit, 8).is_ok());
+        assert!(validate_and_estimate_base64_image(&encoded, image.len(), "image/png").is_ok());
         assert_eq!(
-            validate_and_estimate_base64_image(&over_limit, 8),
+            validate_and_estimate_base64_image(&encoded, image.len() - 1, "image/png"),
             Err(Base64ImageError::TooLarge)
         );
     }
 
     #[test]
     fn streaming_base64_validation_reads_and_validates_the_entire_payload() {
-        let mut invalid_tail = base64::engine::general_purpose::STANDARD.encode([0_u8; 16 * 1024]);
+        let mut invalid_tail =
+            base64::engine::general_purpose::STANDARD.encode(png_bytes(32, 32, 16 * 1024));
         invalid_tail.pop();
         invalid_tail.push('%');
 
         assert_eq!(
-            validate_and_estimate_base64_image(&invalid_tail, 20 * 1024),
+            validate_and_estimate_base64_image(&invalid_tail, 20 * 1024, "image/png"),
+            Err(Base64ImageError::Invalid)
+        );
+
+        let mut trailing_bytes = png_bytes(32, 32, 0);
+        trailing_bytes.push(0);
+        let trailing_bytes = base64::engine::general_purpose::STANDARD.encode(trailing_bytes);
+        assert_eq!(
+            validate_and_estimate_base64_image(&trailing_bytes, 20 * 1024, "image/png"),
+            Err(Base64ImageError::Invalid)
+        );
+
+        let mut trailing_jpeg = jpeg_bytes(32, 32, 0);
+        trailing_jpeg.push(0);
+        let trailing_jpeg = base64::engine::general_purpose::STANDARD.encode(trailing_jpeg);
+        assert_eq!(
+            validate_and_estimate_base64_image(&trailing_jpeg, 20 * 1024, "image/jpeg"),
+            Err(Base64ImageError::Invalid)
+        );
+
+        let mut trailing_base64 = png_base64(32, 32);
+        trailing_base64.push('%');
+        assert_eq!(
+            validate_and_estimate_base64_image(&trailing_base64, 20 * 1024, "image/png"),
             Err(Base64ImageError::Invalid)
         );
     }
 
     #[test]
     fn streaming_image_estimate_reads_png_and_jpeg_dimensions() {
-        let png = png_base64(4096, 2048);
+        let png = png_base64(1024, 512);
         assert_eq!(
-            validate_and_estimate_base64_image(&png, 1024).unwrap(),
-            8 * 4 * IMAGE_TILE_TOKENS
+            validate_and_estimate_base64_image(&png, 1024 * 1024, "image/png").unwrap(),
+            2 * IMAGE_TILE_TOKENS
         );
 
-        let jpeg = base64::engine::general_purpose::STANDARD.encode([
-            0xff, 0xd8, // SOI
-            0xff, 0xc0, 0x00, 0x07, 0x08, // SOF + length + precision
-            0x08, 0x00, // height = 2048
-            0x10, 0x00, // width = 4096
-        ]);
+        let jpeg = base64::engine::general_purpose::STANDARD.encode(jpeg_bytes(1024, 512, 0));
         assert_eq!(
-            validate_and_estimate_base64_image(&jpeg, 1024).unwrap(),
-            8 * 4 * IMAGE_TILE_TOKENS
+            validate_and_estimate_base64_image(&jpeg, 1024 * 1024, "image/jpeg").unwrap(),
+            2 * IMAGE_TILE_TOKENS
         );
     }
 
@@ -376,30 +571,112 @@ mod tests {
             png_base64(8, 63),
         ] {
             assert_eq!(
-                validate_and_estimate_base64_image(&image, 1024),
+                validate_and_estimate_base64_image(&image, 1024, "image/png"),
                 Err(Base64ImageError::TooSmall)
             );
         }
         for image in [png_base64(8, 64), png_base64(16, 32), png_base64(512, 8)] {
-            assert!(validate_and_estimate_base64_image(&image, 1024).is_ok());
+            assert!(validate_and_estimate_base64_image(&image, 1024, "image/png").is_ok());
         }
     }
 
     #[test]
-    fn jpeg_metadata_beyond_the_bounded_prefix_uses_decoded_size_fallback() {
-        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0xff, 0xff];
-        jpeg.resize(2 + 2 + usize::from(u16::MAX), 0);
-        jpeg.extend_from_slice(&[
-            0xff, 0xc0, 0x00, 0x07, 0x08, // SOF + length + precision
-            0x10, 0x00, // height = 4096
-            0x10, 0x00, // width = 4096
-        ]);
-        assert!(jpeg.len() > IMAGE_METADATA_PREFIX_BYTES);
+    fn image_dimensions_are_bounded_independently_of_compressed_size() {
+        assert!(validate_image_dimensions(8192, 8192).is_ok());
+        assert_eq!(
+            validate_image_dimensions(8192, 8193),
+            Err(Base64ImageError::TooLarge)
+        );
+        assert_eq!(
+            validate_image_dimensions(u64::MAX, u64::MAX),
+            Err(Base64ImageError::TooLarge)
+        );
+
+        // The geometry is below the pixel cap, but RGBA output would exceed the decoder budget.
+        let oversized_output = base64::engine::general_purpose::STANDARD
+            .encode(png_with_empty_pixel_stream_and_color(4096, 4097, 6));
+        assert_eq!(
+            validate_and_estimate_base64_image(&oversized_output, 1024 * 1024, "image/png"),
+            Err(Base64ImageError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn jpeg_dimensions_beyond_64_kib_are_still_validated() {
+        let jpeg = jpeg_bytes(8, 8, usize::from(u16::MAX) - 2);
+        assert!(jpeg.len() > 64 * 1024);
         let encoded = base64::engine::general_purpose::STANDARD.encode(&jpeg);
 
         assert_eq!(
-            validate_and_estimate_base64_image(&encoded, jpeg.len()).unwrap(),
-            IMAGE_OVERHEAD_TOKENS
+            validate_and_estimate_base64_image(&encoded, jpeg.len(), "image/jpeg"),
+            Err(Base64ImageError::TooSmall)
+        );
+    }
+
+    #[test]
+    fn streaming_image_validation_rejects_fake_truncated_and_corrupt_images() {
+        let fake_png = base64::engine::general_purpose::STANDARD.encode(b"hello");
+        let fake_jpeg = base64::engine::general_purpose::STANDARD
+            .encode([0xff, 0xd8, b'h', b'e', b'l', b'l', b'o']);
+        let mut truncated_png = png_bytes(32, 32, 0);
+        truncated_png.truncate(truncated_png.len() - 5);
+        let mut truncated_jpeg = jpeg_bytes(32, 32, 0);
+        truncated_jpeg.truncate(truncated_jpeg.len() - 1);
+        let mut corrupt_png = png_bytes(32, 32, 0);
+        corrupt_png[29] ^= 1;
+
+        for (invalid, media_type) in [
+            (fake_png, "image/png"),
+            (fake_jpeg, "image/jpeg"),
+            (
+                base64::engine::general_purpose::STANDARD.encode(truncated_png),
+                "image/png",
+            ),
+            (
+                base64::engine::general_purpose::STANDARD.encode(truncated_jpeg),
+                "image/jpeg",
+            ),
+            (
+                base64::engine::general_purpose::STANDARD.encode(corrupt_png),
+                "image/png",
+            ),
+        ] {
+            assert_eq!(
+                validate_and_estimate_base64_image(&invalid, 1024 * 1024, media_type),
+                Err(Base64ImageError::Invalid)
+            );
+        }
+    }
+
+    #[test]
+    fn complete_decoders_reject_invalid_idat_and_entropy_streams() {
+        let invalid_png =
+            base64::engine::general_purpose::STANDARD.encode(png_with_empty_pixel_stream(32, 32));
+        let invalid_jpeg =
+            base64::engine::general_purpose::STANDARD.encode(jpeg_with_truncated_entropy(32, 32));
+
+        assert_eq!(
+            validate_and_estimate_base64_image(&invalid_png, 1024 * 1024, "image/png"),
+            Err(Base64ImageError::Invalid)
+        );
+        assert_eq!(
+            validate_and_estimate_base64_image(&invalid_jpeg, 1024 * 1024, "image/jpeg"),
+            Err(Base64ImageError::Invalid)
+        );
+    }
+
+    #[test]
+    fn streaming_image_validation_rejects_declared_media_type_mismatches() {
+        let png = png_base64(32, 32);
+        let jpeg = base64::engine::general_purpose::STANDARD.encode(jpeg_bytes(32, 32, 0));
+
+        assert_eq!(
+            validate_and_estimate_base64_image(&png, 1024, "image/jpeg"),
+            Err(Base64ImageError::Invalid)
+        );
+        assert_eq!(
+            validate_and_estimate_base64_image(&jpeg, 1024, "image/png"),
+            Err(Base64ImageError::Invalid)
         );
     }
 
@@ -449,7 +726,7 @@ mod tests {
             "model": "grok-4.5",
             "messages": [{"role": "user", "content": [{
                 "type":"image",
-                "source":{"type":"base64","media_type":"image/png","data":png_base64(4096, 4096)}
+                "source":{"type":"base64","media_type":"image/png","data":png_base64(1024, 1024)}
             }]}]
         }));
 
@@ -462,9 +739,8 @@ mod tests {
 
     #[test]
     fn image_estimate_is_bounded_for_untrusted_dimensions() {
-        let encoded = png_base64(u32::MAX, u32::MAX);
         assert_eq!(
-            estimate_image_tokens(&format!("data:image/png;base64,{encoded}")),
+            estimate_image_tokens_from_dimensions(u64::MAX, u64::MAX),
             MAX_IMAGE_ESTIMATE_TOKENS
         );
     }

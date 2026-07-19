@@ -50,6 +50,9 @@ enum Commands {
         port: Option<u16>,
         #[arg(long = "no-monitor", action = ArgAction::SetTrue)]
         no_monitor: bool,
+        /// Acknowledge that remote clients are not authenticated; require a firewall or authenticating reverse proxy
+        #[arg(long = "allow-remote-unauthenticated", action = ArgAction::SetTrue)]
+        allow_remote_unauthenticated: bool,
     },
     /// Open the monitor TUI with mock data and no proxy server
     Demo,
@@ -183,6 +186,7 @@ fn run() -> Result<()> {
     let commands = cli.command.unwrap_or(Commands::Serve {
         port: None,
         no_monitor: false,
+        allow_remote_unauthenticated: false,
     });
 
     match commands {
@@ -194,11 +198,17 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Serve { port, no_monitor } => {
+        Commands::Serve {
+            port,
+            no_monitor,
+            allow_remote_unauthenticated,
+        } => {
             // Cache the running inode before a deployment can atomically replace
             // the Cellar path while this process is still serving.
             server::initialize_process_identity();
             let bind_address = config::bind_address();
+            let allow_remote_unauthenticated =
+                allow_remote_unauthenticated || config::allow_remote_unauthenticated();
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Registry::with_default_alias();
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -213,18 +223,24 @@ fn run() -> Result<()> {
                                 bind_address,
                                 port: effective_port,
                                 monitor: None,
+                                allow_remote_unauthenticated,
                             },
                             shutdown_signal(),
                         ))
                         .map_err(|err| anyhow::anyhow!(err))
                 }
                 ServeMode::Monitor => {
-                    let _stderr_guard = logging::suppress_stderr();
                     let monitor = MonitorHandle::default();
                     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                     let (shutdown_complete_tx, shutdown_complete_rx) = std::sync::mpsc::channel();
-                    let listener = runtime
-                        .block_on(server::bind_proxy_listener(&bind_address, effective_port))?;
+                    let listener = runtime.block_on(server::bind_proxy_listener_with_ack(
+                        &bind_address,
+                        effective_port,
+                        allow_remote_unauthenticated,
+                    ))?;
+                    // Keep bind-time security warnings visible before the TUI
+                    // takes ownership of the terminal.
+                    let _stderr_guard = logging::suppress_stderr();
                     let local_addr = listener.local_addr()?;
                     let monitor_listen_url =
                         listen_url(&local_addr.ip().to_string(), local_addr.port());

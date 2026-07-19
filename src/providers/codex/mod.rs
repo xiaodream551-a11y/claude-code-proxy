@@ -21,8 +21,11 @@ use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::config;
 use crate::monitor::usage_from_anthropic_sse;
-use crate::provider::{CliHandlers, Provider, RequestContext};
-use crate::providers::translate_shared::is_claude_code_compaction_request;
+use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
+use crate::providers::translate_shared::{
+    ImageDecodeAdmissionError, acquire_image_decode_slot, is_claude_code_compaction_request,
+    messages_request_contains_base64_image,
+};
 use crate::registry;
 use crate::retry::{ModelRetryBackoff, sleep};
 
@@ -55,6 +58,12 @@ const MAX_DOWNSTREAM_QUEUE_BYTES: usize = 2 * 1024 * 1024;
 const DOWNSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const DOWNSTREAM_PING: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+static LIVE_CONTINUATION_CAPTURE_BYTES: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            continuation::MAX_TOTAL_TRANSCRIPT_BYTES as usize,
+        ))
+    });
 
 fn translation_overrides() -> TranslationOverrides {
     TranslationOverrides::configured()
@@ -113,7 +122,11 @@ impl Provider for CodexProvider {
         let provider_started_at = Instant::now();
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
-        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
+        let requested_model = body
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-5.6-sol".to_string());
+        let model = requested_model.as_str();
 
         let mut resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
@@ -132,8 +145,8 @@ impl Provider for CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let translated = match translate_request_with_overrides(
-            &body,
+        let translated = match translate_codex_request_for_provider(
+            body,
             TranslateOptions {
                 session_id: ctx.session_id.clone(),
                 service_tier: resolved.service_tier.clone(),
@@ -141,17 +154,19 @@ impl Provider for CodexProvider {
                 use_responses_lite,
             },
             translation_overrides(),
-        ) {
+        )
+        .await
+        {
             Ok(t) => t,
-            Err(e) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    e.to_string(),
-                );
-            }
+            Err(response) => return response,
         };
-        log_codex_request_configuration(&ctx, &translated, use_responses_lite, native_web_search);
+        log_codex_request_configuration(
+            &ctx,
+            &translated,
+            use_responses_lite,
+            native_web_search,
+            self.client.transport_decision(),
+        );
 
         // Check continuation
         let previous_response_id_enabled = config::codex_previous_response_id();
@@ -228,7 +243,11 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
+        let requested_model = body
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-5.6-sol".to_string());
+        let model = requested_model.as_str();
         let mut resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
@@ -245,8 +264,8 @@ impl Provider for CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
-        let translated = match translate_request_with_overrides(
-            &body,
+        let translated = match translate_codex_request_for_provider(
+            body,
             TranslateOptions {
                 session_id: None,
                 service_tier: resolved.service_tier.clone(),
@@ -254,15 +273,11 @@ impl Provider for CodexProvider {
                 use_responses_lite,
             },
             translation_overrides(),
-        ) {
+        )
+        .await
+        {
             Ok(t) => t,
-            Err(e) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    e.to_string(),
-                );
-            }
+            Err(response) => return response,
         };
 
         let tokens = count_translated_tokens(&translated);
@@ -277,6 +292,60 @@ impl Provider for CodexProvider {
         )
             .into_response()
     }
+}
+
+async fn translate_codex_request_for_provider(
+    body: MessagesRequest,
+    options: TranslateOptions,
+    overrides: TranslationOverrides,
+) -> Result<translate::request::ResponsesRequest, Response> {
+    if !messages_request_contains_base64_image(&body) {
+        return translate_request_with_overrides(&body, options, overrides).map_err(|error| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            )
+        });
+    }
+
+    let permit = match acquire_image_decode_slot().await {
+        Ok(permit) => permit,
+        Err(ImageDecodeAdmissionError::Closed) => {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "Codex image validation is unavailable",
+            ));
+        }
+        Err(ImageDecodeAdmissionError::Timeout) => {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "Codex image validation queue was saturated for 30 seconds",
+            ));
+        }
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        translate_request_with_overrides(&body, options, overrides)
+    })
+    .await
+    .map_err(|error| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            format!("Codex image validation worker failed: {error}"),
+        )
+    })?
+    .map_err(|error| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            error.to_string(),
+        )
+    })
 }
 
 /// Picks the upstream model and lane for a request. Hosted web_search always
@@ -433,21 +502,67 @@ enum LiveStreamStart {
 struct LiveContinuationCapture {
     request_body: translate::request::ResponsesRequest,
     upstream_sse_body: Vec<u8>,
+    captured_bytes: usize,
+    capture_byte_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl LiveContinuationCapture {
     fn for_turn(
         turn_id: Option<u64>,
         request_body: &translate::request::ResponsesRequest,
+        request_byte_lease: Option<&RequestByteLease>,
     ) -> Option<Self> {
-        turn_id.map(|_| Self {
+        turn_id?;
+        let translated_bytes =
+            serde_json::to_vec(request_body).map_or(usize::MAX, |encoded| encoded.len());
+        let request_bytes = request_byte_lease
+            .map(RequestByteLease::buffered_bytes)
+            .unwrap_or_default()
+            .max(translated_bytes);
+        if request_bytes > continuation::MAX_SESSION_TRANSCRIPT_BYTES as usize {
+            return None;
+        }
+        let capture_byte_permit = LIVE_CONTINUATION_CAPTURE_BYTES
+            .clone()
+            .try_acquire_many_owned(request_bytes as u32)
+            .ok()?;
+        Some(Self {
             request_body: request_body.clone(),
             upstream_sse_body: Vec::new(),
+            captured_bytes: request_bytes,
+            capture_byte_permit,
         })
     }
 
-    fn append(&mut self, payload: &serde_json::Value) {
-        append_upstream_sse_payload(&mut self.upstream_sse_body, payload);
+    fn append(&mut self, payload: &serde_json::Value) -> bool {
+        let text = payload.to_string();
+        let encoded_len = text
+            .lines()
+            .map(|line| b"data: ".len() + line.len() + 1)
+            .sum::<usize>()
+            .saturating_add(1);
+        if self.captured_bytes.saturating_add(encoded_len)
+            > continuation::MAX_SESSION_TRANSCRIPT_BYTES as usize
+            || self.upstream_sse_body.len().saturating_add(encoded_len)
+                > MAX_LIVE_UPSTREAM_SSE_BYTES
+        {
+            return false;
+        }
+        let Ok(extra_permit) = LIVE_CONTINUATION_CAPTURE_BYTES
+            .clone()
+            .try_acquire_many_owned(encoded_len as u32)
+        else {
+            return false;
+        };
+        self.capture_byte_permit.merge(extra_permit);
+        self.captured_bytes += encoded_len;
+        for line in text.lines() {
+            self.upstream_sse_body.extend_from_slice(b"data: ");
+            self.upstream_sse_body.extend_from_slice(line.as_bytes());
+            self.upstream_sse_body.push(b'\n');
+        }
+        self.upstream_sse_body.push(b'\n');
+        true
     }
 }
 
@@ -457,7 +572,7 @@ fn update_live_continuation_from_capture(
     capture: Option<&LiveContinuationCapture>,
 ) {
     let Some(capture) = capture else {
-        debug_assert!(turn_id.is_none());
+        abort_continuation(session_id, turn_id);
         return;
     };
     update_continuation_from_upstream(
@@ -480,6 +595,7 @@ async fn live_stream_response(
     deadline: client::CodexRequestDeadline,
 ) -> Response {
     let turn_id = continuation.turn_id;
+    let transport = client.transport();
     match tokio::time::timeout_at(
         deadline.at(),
         live_stream_response_inner(
@@ -499,7 +615,7 @@ async fn live_stream_response(
         Err(_) => {
             abort_continuation(ctx.session_id.as_deref(), turn_id);
             map_codex_error_to_response(&client::codex_total_timeout_error(
-                config::codex_transport(),
+                transport,
                 deadline.timeout_ms(),
             ))
         }
@@ -511,7 +627,7 @@ async fn live_stream_response_inner(
     client: Arc<CodexHttpClient>,
     message_id: String,
     model: &str,
-    ctx: RequestContext,
+    mut ctx: RequestContext,
     request_body: translate::request::ResponsesRequest,
     continuation: ContinuationCandidate,
     provider_started_at: Instant,
@@ -519,11 +635,12 @@ async fn live_stream_response_inner(
 ) -> Response {
     let model = model.to_string();
     let turn_id = continuation.turn_id;
+    let request_byte_lease = ctx.request_byte_lease.take();
     let mut attempt = 0_u32;
     let mut model_retry_backoff = ModelRetryBackoff::default();
     let mut continuation = Some(continuation);
     let circuit_key = client.websocket_circuit_key().to_string();
-    let transport = config::codex_transport();
+    let transport = client.transport();
     let dispatch_budget = dispatch_budget::CodexDispatchBudget::new();
     // Auto may fall back once, but it never switches back to WebSocket within
     // the same logical request. This prevents retry multiplication.
@@ -631,7 +748,7 @@ async fn live_stream_response_inner(
             &model,
             ctx.clone(),
             turn_id,
-            LiveContinuationCapture::for_turn(turn_id, &request_body),
+            LiveContinuationCapture::for_turn(turn_id, &request_body, request_byte_lease.as_ref()),
             provider_started_at,
             deadline,
             active_transport == config::CodexTransport::Http,
@@ -770,8 +887,12 @@ async fn live_stream_response_once(
             generation_started = true;
             keepalive_at = Some(tokio::time::Instant::now() + keepalive_delay);
         }
-        if let Some(capture) = continuation_capture.as_mut() {
-            capture.append(&payload);
+        if continuation_capture
+            .as_mut()
+            .is_some_and(|capture| !capture.append(&payload))
+        {
+            continuation_capture = None;
+            abort_continuation(ctx.session_id.as_deref(), turn_id);
         }
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, &ctx)
         {
@@ -868,6 +989,7 @@ fn log_codex_request_configuration(
     request: &translate::request::ResponsesRequest,
     use_responses_lite: bool,
     native_web_search: bool,
+    transport: config::CodexTransportDecision,
 ) {
     let service_tier = request.service_tier.as_ref().map(|tier| match tier {
         ServiceTier::Priority => "priority",
@@ -890,7 +1012,15 @@ fn log_codex_request_configuration(
             ),
             (
                 "transport".to_string(),
-                serde_json::json!(config::codex_transport().as_str()),
+                serde_json::json!(transport.effective().as_str()),
+            ),
+            (
+                "transportRequested".to_string(),
+                serde_json::json!(transport.requested().as_str()),
+            ),
+            (
+                "transportReason".to_string(),
+                serde_json::json!(transport.reason()),
             ),
             (
                 "responsesLite".to_string(),
@@ -1257,8 +1387,12 @@ fn remaining_live_stream_response_with_heartbeat(
             match item {
                 Ok(payload) => {
                     log_native_web_search_phase(&ctx, &payload, provider_started_at);
-                    if let Some(capture) = continuation_capture.as_mut() {
-                        capture.append(&payload);
+                    if continuation_capture
+                        .as_mut()
+                        .is_some_and(|capture| !capture.append(&payload))
+                    {
+                        continuation_capture = None;
+                        abort_continuation(ctx.session_id.as_deref(), turn_id);
                     }
                     let (chunk, terminal) =
                         match translate_live_stream_payload(&mut translator, &payload, &ctx) {
@@ -1341,24 +1475,6 @@ fn remaining_live_stream_response_with_heartbeat(
     event_stream_response(stream)
 }
 
-fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
-    let text = payload.to_string();
-    let encoded_len = text
-        .lines()
-        .map(|line| b"data: ".len() + line.len() + 1)
-        .sum::<usize>()
-        .saturating_add(1);
-    if buffer.len().saturating_add(encoded_len) > MAX_LIVE_UPSTREAM_SSE_BYTES {
-        return;
-    }
-    for line in text.lines() {
-        buffer.extend_from_slice(b"data: ");
-        buffer.extend_from_slice(line.as_bytes());
-        buffer.push(b'\n');
-    }
-    buffer.push(b'\n');
-}
-
 fn event_stream_response<S>(stream: S) -> Response
 where
     S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
@@ -1378,7 +1494,11 @@ fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
     if matches!(
         err.detail.as_deref(),
-        Some(client::CODEX_TOTAL_TIMEOUT_DETAIL | dispatch_budget::CODEX_DISPATCH_BUDGET_DETAIL)
+        Some(
+            client::CODEX_TOTAL_TIMEOUT_DETAIL
+                | dispatch_budget::CODEX_DISPATCH_BUDGET_DETAIL
+                | websocket::WEBSOCKET_TERMINAL_BARRIER_DETAIL
+        )
     ) {
         return false;
     }
@@ -1686,6 +1806,7 @@ mod tests {
             provider: "codex".to_string(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         }
     }
 
@@ -1715,19 +1836,46 @@ mod tests {
         let disabled = continuation_candidate(Some("disabled-session"), &request, false);
 
         assert!(disabled.turn_id.is_none());
-        assert!(LiveContinuationCapture::for_turn(disabled.turn_id, &request).is_none());
+        assert!(LiveContinuationCapture::for_turn(disabled.turn_id, &request, None).is_none());
 
-        let mut capture = LiveContinuationCapture::for_turn(Some(7), &request)
+        let mut capture = LiveContinuationCapture::for_turn(Some(7), &request, None)
             .expect("a registered continuation turn must retain replay metadata");
         assert_eq!(capture.request_body.model, request.model);
         assert!(capture.upstream_sse_body.is_empty());
 
-        capture.append(&serde_json::json!({
+        assert!(capture.append(&serde_json::json!({
             "type": "response.created",
             "response": {"id": "resp_1"}
-        }));
+        })));
         assert!(!capture.upstream_sse_body.is_empty());
         assert!(String::from_utf8_lossy(&capture.upstream_sse_body).contains("response.created"));
+    }
+
+    #[test]
+    fn live_continuation_capture_uses_an_independent_byte_budget() {
+        let request = live_test_request();
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = RequestByteLease::new(budget.clone().try_acquire_owned().unwrap(), 1);
+        let capture = LiveContinuationCapture::for_turn(Some(7), &request, Some(&lease))
+            .expect("registered turn");
+        drop(lease);
+
+        assert!(budget.clone().try_acquire_owned().is_ok());
+        drop(capture);
+    }
+
+    #[test]
+    fn oversized_request_skips_live_continuation_capture_and_releases_its_lease() {
+        let request = live_test_request();
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let lease = RequestByteLease::new(
+            budget.clone().try_acquire_owned().unwrap(),
+            continuation::MAX_SESSION_TRANSCRIPT_BYTES as usize + 1,
+        );
+
+        assert!(LiveContinuationCapture::for_turn(Some(7), &request, Some(&lease)).is_none());
+        drop(lease);
+        assert!(budget.try_acquire_owned().is_ok());
     }
 
     fn heartbeat_test_error() -> client::CodexError {
@@ -1742,16 +1890,28 @@ mod tests {
 
     fn started_live_translator(message_id: &str) -> (LiveStreamTranslator, Vec<u8>) {
         let mut translator = LiveStreamTranslator::new(message_id, "gpt-5.6-sol");
-        let first_chunk = translator
+        let mut first_chunk = translator
             .accept(
                 &serde_json::json!({
-                    "type": "response.output_text.delta",
+                    "type": "response.output_item.added",
                     "output_index": 0,
-                    "delta": "hello"
+                    "item": {"type":"message", "id":"msg_up"}
                 }),
                 None,
             )
             .unwrap();
+        first_chunk.extend(
+            translator
+                .accept(
+                    &serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "delta": "hello"
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
         assert!(!first_chunk.is_empty());
         (translator, first_chunk)
     }
@@ -1985,6 +2145,7 @@ mod tests {
             provider: "codex".to_string(),
             traffic: None,
             monitor: Some(monitor.clone()),
+            request_byte_lease: None,
         };
         let chunk = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":48}}\n\n";
 
@@ -2019,7 +2180,14 @@ mod tests {
             LiveStreamStart::Retry { .. }
         ));
 
-        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let (tx, rx) = tokio::sync::mpsc::channel(3);
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type":"message", "id":"msg_up"}
+        })))
+        .await
+        .unwrap();
         tx.send(Ok(serde_json::json!({
             "type": "response.output_text.delta",
             "output_index": 0,
@@ -2260,6 +2428,14 @@ mod tests {
                 "type": "response.output_text.delta",
                 "output_index": 0,
                 "delta": " world"
+            })))
+            .await
+            .unwrap();
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type":"message", "id":"msg_up"}
             })))
             .await
             .unwrap();
@@ -2570,6 +2746,21 @@ mod tests {
 
         assert!(retryable_live_start_codex_error(&err));
         assert_eq!(max_live_retries(&err), MAX_LIVE_TRANSPORT_RETRIES);
+    }
+
+    #[test]
+    fn live_start_terminal_barrier_error_is_never_replayed() {
+        let err = client::CodexError {
+            status: 0,
+            message: "WebSocket terminal ordering barrier failed: connection closed".to_string(),
+            detail: Some(websocket::WEBSOCKET_TERMINAL_BARRIER_DETAIL.to_string()),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::WebSocket,
+        };
+
+        assert!(!retryable_live_start_codex_error(&err));
+        assert!(!replayable_live_start_codex_error(&err));
+        assert!(!client::should_fallback_to_http(&err));
     }
 
     #[test]

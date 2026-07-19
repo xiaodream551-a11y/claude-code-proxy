@@ -26,7 +26,7 @@ use crate::anthropic::{
     schema::{CountTokensResponse, MessagesRequest},
 };
 use crate::monitor::MonitorHandle;
-use crate::provider::{CliHandlers, Provider, RequestContext};
+use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
 use crate::retry::sleep;
 use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 
@@ -47,7 +47,6 @@ const GROK_DOWNSTREAM_CHANNEL_CAPACITY: usize = 3;
 const GROK_DOWNSTREAM_QUEUE_BYTES: usize = 2 * 1024 * 1024;
 const GROK_DOWNSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const GROK_MAX_CUMULATIVE_STREAM_BYTES: u64 = 8 * 1024 * 1024;
-
 const MIN_STREAM_HEARTBEAT: Duration = Duration::from_secs(1);
 const MAX_STREAM_HEARTBEAT: Duration = Duration::from_secs(60);
 
@@ -96,6 +95,7 @@ impl Provider for GrokProvider {
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let deadline = GrokRequestDeadline::configured();
         let requested = body.model.clone().unwrap_or_else(|| "grok-4.5".into());
+        let stream = body.stream;
         let resolved = resolve_model_request(&requested);
         if let Err(error) = assert_allowed_model(&resolved.model) {
             return json_error(
@@ -104,16 +104,11 @@ impl Provider for GrokProvider {
                 error.to_string(),
             );
         }
-        let mut translated = match translate_request(&body, resolved.model.clone()) {
-            Ok(value) => value,
-            Err(error) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    error.to_string(),
-                );
-            }
-        };
+        let mut translated =
+            match translate_request_for_provider(body, resolved.model.clone()).await {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
         if let Some(effort) = resolved.reasoning_effort {
             translated.reasoning = Some(GrokReasoning {
                 effort: effort.into(),
@@ -190,15 +185,18 @@ impl Provider for GrokProvider {
             Err(error) => return map_error(error),
         };
 
-        if body.stream {
+        if stream {
             let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-            let reconnect = Some(GrokReconnectContext::new(
-                self.client.clone(),
-                prepared,
-                ctx.traffic.clone(),
-                retry,
-                estimated_input_tokens,
-            ));
+            let reconnect = Some(
+                GrokReconnectContext::new(
+                    self.client.clone(),
+                    prepared,
+                    ctx.traffic.clone(),
+                    retry,
+                    estimated_input_tokens,
+                )
+                .with_request_byte_lease(ctx.request_byte_lease.clone()),
+            );
             stream_body_with_policy(
                 upstream.into_stream(),
                 message_id,
@@ -244,15 +242,9 @@ impl Provider for GrokProvider {
                 error.to_string(),
             );
         }
-        let translated = match translate_request(&body, resolved.model) {
+        let translated = match translate_request_for_provider(body, resolved.model).await {
             Ok(value) => value,
-            Err(error) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    error.to_string(),
-                );
-            }
+            Err(response) => return response,
         };
         let tokens = count_tokens::count_tokens(&translated);
         if let Some(monitor) = ctx.monitor.as_ref() {
@@ -266,6 +258,59 @@ impl Provider for GrokProvider {
         )
             .into_response()
     }
+}
+
+async fn translate_request_for_provider(
+    body: MessagesRequest,
+    model: String,
+) -> Result<self::translate::request::GrokResponsesRequest, Response> {
+    if !crate::providers::translate_shared::messages_request_contains_base64_image(&body) {
+        return translate_request(&body, model).map_err(|error| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            )
+        });
+    }
+
+    let permit = match crate::providers::translate_shared::acquire_image_decode_slot().await {
+        Ok(permit) => permit,
+        Err(crate::providers::translate_shared::ImageDecodeAdmissionError::Closed) => {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "Grok image validation is unavailable",
+            ));
+        }
+        Err(crate::providers::translate_shared::ImageDecodeAdmissionError::Timeout) => {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "Grok image validation queue was saturated for 30 seconds",
+            ));
+        }
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        translate_request(&body, model)
+    })
+    .await
+    .map_err(|error| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            format!("Grok image validation worker failed: {error}"),
+        )
+    })?
+    .map_err(|error| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            error.to_string(),
+        )
+    })
 }
 
 fn finish_non_streaming_message(
@@ -379,6 +424,7 @@ struct GrokReconnectContext {
     replay: Option<GrokReplayMaterial>,
     retry: Arc<Mutex<GrokRetryState>>,
     estimated_input_tokens: u64,
+    request_byte_lease: Option<RequestByteLease>,
 }
 
 impl GrokReconnectContext {
@@ -397,7 +443,13 @@ impl GrokReconnectContext {
             }),
             retry,
             estimated_input_tokens,
+            request_byte_lease: None,
         }
+    }
+
+    fn with_request_byte_lease(mut self, lease: Option<RequestByteLease>) -> Self {
+        self.request_byte_lease = lease;
+        self
     }
 }
 
@@ -471,6 +523,7 @@ where
         usage: None,
         terminal_status: None,
         upstream_incomplete_reason: None,
+        pending_terminal: None,
         estimated_input_tokens,
         monitor,
         req_id,
@@ -629,6 +682,7 @@ struct GrokStreamState {
     usage: Option<translate::reducer::GrokUsage>,
     terminal_status: Option<translate::reducer::GrokTerminal>,
     upstream_incomplete_reason: Option<String>,
+    pending_terminal: Option<GrokPendingTerminal>,
     estimated_input_tokens: Option<u64>,
     monitor: Option<MonitorHandle>,
     req_id: String,
@@ -641,6 +695,14 @@ struct GrokStreamState {
     deadline: GrokRequestDeadline,
     heartbeat_interval: Duration,
     next_heartbeat: tokio::time::Instant,
+}
+
+struct GrokPendingTerminal {
+    translator: StreamTranslator,
+    bytes: Vec<u8>,
+    semantic_output: bool,
+    terminal_status: Option<translate::reducer::GrokTerminal>,
+    stop_reason: Option<String>,
 }
 
 impl GrokStreamState {
@@ -659,6 +721,7 @@ impl GrokStreamState {
         }
         if let Some(reconnect) = self.reconnect.as_mut() {
             reconnect.replay.take();
+            reconnect.request_byte_lease.take();
         }
     }
 
@@ -699,7 +762,26 @@ impl GrokStreamState {
                     return Some(ping);
                 }
                 Ok(GrokStreamPoll::End) => {
-                    if self.decoder.finish().is_err() || !self.reducer.finished() {
+                    if self.decoder.finish().is_err() {
+                        if self.pending_terminal.is_some() {
+                            return Some(self.fail_at("decoder", "incomplete_stream"));
+                        }
+                        match self.begin_rebuild(
+                            client::GrokError::stream_transport(
+                                client::GrokErrorStage::Stream,
+                                "Grok stream closed with an incomplete SSE frame",
+                            ),
+                            "decoder",
+                            "incomplete_stream",
+                        ) {
+                            Ok(()) => continue,
+                            Err(bytes) => return Some(bytes),
+                        }
+                    }
+                    if self.pending_terminal.is_some() {
+                        return self.commit_pending_terminal();
+                    }
+                    if !self.reducer.finished() {
                         match self.begin_rebuild(
                             client::GrokError::stream_transport(
                                 client::GrokErrorStage::Stream,
@@ -716,10 +798,15 @@ impl GrokStreamState {
                     self.finish_capture(true);
                     return None;
                 }
-                Err(error) => match self.begin_rebuild(error, "transport", "upstream_stream") {
-                    Ok(()) => continue,
-                    Err(bytes) => return Some(bytes),
-                },
+                Err(error) => {
+                    if self.pending_terminal.is_some() {
+                        return Some(self.fail_mapped(error, "transport", "terminal_drain"));
+                    }
+                    match self.begin_rebuild(error, "transport", "upstream_stream") {
+                        Ok(()) => continue,
+                        Err(bytes) => return Some(bytes),
+                    }
+                }
             };
 
             if cumulative_stream_size_exceeded(self.bytes, chunk.len()) {
@@ -788,6 +875,12 @@ impl GrokStreamState {
                     }
                 }
             };
+            if self.pending_terminal.is_some() {
+                if reduced.is_empty() {
+                    continue;
+                }
+                return Some(self.fail_at("reducer", "post_terminal_output"));
+            }
             let usage = reduced.iter().find_map(|event| match event {
                 translate::reducer::ReducerEvent::Usage(usage) => Some(usage.clone()),
                 _ => None,
@@ -803,11 +896,22 @@ impl GrokStreamState {
                 _ => None,
             });
             let semantic_output = reduced.iter().any(|event| event.is_semantic());
-            let out = match self.translator.render(reduced) {
-                Ok(bytes) => bytes,
-                Err(_) => return Some(self.fail_at("render", "invalid_event")),
-            };
             let finished = self.reducer.finished();
+            let mut terminal_translator = None;
+            let out = if finished {
+                let mut translator = self.translator.clone();
+                let bytes = match translator.render(reduced) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return Some(self.fail_at("render", "invalid_event")),
+                };
+                terminal_translator = Some(translator);
+                bytes
+            } else {
+                match self.translator.render(reduced) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return Some(self.fail_at("render", "invalid_event")),
+                }
+            };
             let upstream_incomplete_reason = self.reducer.incomplete_reason().map(str::to_owned);
             if let Some(usage) = usage {
                 if let Some(monitor) = self.monitor.as_ref() {
@@ -824,18 +928,15 @@ impl GrokStreamState {
                 self.upstream_incomplete_reason = upstream_incomplete_reason;
             }
             if finished {
-                self.terminal = true;
-                if semantic_output {
-                    self.downstream_emitted = true;
-                    self.semantic_output_pending_enqueue = !out.is_empty();
-                }
-                let outcome = terminal_status
-                    .map(translate::reducer::GrokTerminal::outcome)
-                    .unwrap_or("completed");
-                self.log_stream_terminal(outcome, stop_reason.as_deref(), None, None);
-                self.capture_downstream(&out);
-                self.finish_capture(true);
-                return if out.is_empty() { None } else { Some(out) };
+                self.pending_terminal = Some(GrokPendingTerminal {
+                    translator: terminal_translator.expect("terminal renderer must be staged"),
+                    bytes: out,
+                    semantic_output,
+                    terminal_status,
+                    stop_reason,
+                });
+                self.schedule_next_heartbeat();
+                continue;
             }
             if !out.is_empty() {
                 if semantic_output {
@@ -847,6 +948,27 @@ impl GrokStreamState {
                 return Some(out);
             }
         }
+    }
+
+    fn commit_pending_terminal(&mut self) -> Option<Vec<u8>> {
+        let pending = self
+            .pending_terminal
+            .take()
+            .expect("pending terminal must exist");
+        self.translator = pending.translator;
+        self.terminal = true;
+        if pending.semantic_output {
+            self.downstream_emitted = true;
+            self.semantic_output_pending_enqueue = !pending.bytes.is_empty();
+        }
+        let outcome = pending
+            .terminal_status
+            .map(translate::reducer::GrokTerminal::outcome)
+            .unwrap_or("completed");
+        self.log_stream_terminal(outcome, pending.stop_reason.as_deref(), None, None);
+        self.capture_downstream(&pending.bytes);
+        self.finish_capture(true);
+        (!pending.bytes.is_empty()).then_some(pending.bytes)
     }
 
     async fn next_upstream_chunk(&mut self) -> Result<GrokStreamPoll, GrokError> {
@@ -998,6 +1120,7 @@ impl GrokStreamState {
         self.usage = None;
         self.terminal_status = None;
         self.upstream_incomplete_reason = None;
+        self.pending_terminal = None;
         self.error_sent = false;
         self.terminal = false;
     }
@@ -1011,6 +1134,7 @@ impl GrokStreamState {
     }
 
     fn fail(&mut self, stage: &str, kind: &str, error: Option<&GrokError>) -> Vec<u8> {
+        self.pending_terminal = None;
         self.error_sent = true;
         if self.usage.is_none() {
             self.usage = self.reducer.usage().cloned();
@@ -1370,6 +1494,45 @@ mod tests {
             GROK_MAX_CUMULATIVE_STREAM_BYTES,
             1
         ));
+    }
+
+    #[test]
+    fn base64_image_detection_finds_direct_and_nested_tool_result_images() {
+        for content in [
+            serde_json::json!([{
+                "type":"image",
+                "source":{"type":"base64","media_type":"image/png","data":"AA=="}
+            }]),
+            serde_json::json!([{
+                "type":"tool_result",
+                "tool_use_id":"call_1",
+                "content":[{
+                    "type":"image",
+                    "source":{"type":"base64","media_type":"image/jpeg","data":"AA=="}
+                }]
+            }]),
+        ] {
+            let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"user","content":content}]
+            }))
+            .unwrap();
+            assert!(
+                crate::providers::translate_shared::messages_request_contains_base64_image(&body)
+            );
+        }
+
+        let url_image: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":[{
+                "type":"image",
+                "source":{"type":"url","url":"https://example.com/image.png"}
+            }]}]
+        }))
+        .unwrap();
+        assert!(
+            !crate::providers::translate_shared::messages_request_contains_base64_image(&url_image)
+        );
     }
 
     struct ChannelStream(mpsc::Receiver<Result<Bytes, client::GrokError>>);
@@ -2001,7 +2164,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn downstream_event_arrives_before_upstream_completion() {
+    async fn semantic_tail_in_a_later_chunk_rejects_the_staged_terminal() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"UNSAFE_TAIL\"}\n\n",
+            )),
+        ]);
+        let response = stream_body(
+            upstream,
+            "msg_cross_chunk_tail".into(),
+            "grok-4.5".into(),
+            None,
+            "req_cross_chunk_tail".into(),
+            None,
+            None,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("UNSAFE_TAIL"), "{body}");
+        assert!(!body.contains("event: message_stop"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn incomplete_sse_tail_after_terminal_is_not_reported_as_success() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"truncated",
+            )),
+        ]);
+        let response = stream_body(
+            upstream,
+            "msg_incomplete_tail".into(),
+            "grok-4.5".into(),
+            None,
+            "req_incomplete_tail".into(),
+            None,
+            None,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("event: message_stop"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn post_terminal_rate_limit_telemetry_drains_before_one_terminal_render() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"rate_limits.updated\",\"remaining\":42}\n\n",
+            )),
+        ]);
+        let response = stream_body(
+            upstream,
+            "msg_terminal_telemetry".into(),
+            "grok-4.5".into(),
+            None,
+            "req_terminal_telemetry".into(),
+            None,
+            None,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(!body.contains("event: error"), "{body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+    }
+
+    #[tokio::test]
+    async fn semantic_output_streams_early_but_terminal_waits_for_upstream_eof() {
         let (tx, rx) = mpsc::channel(2);
         let response = stream_body(
             ChannelStream(rx),
@@ -2036,6 +2278,13 @@ mod tests {
         )))
         .await
         .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), body.frame())
+                .await
+                .is_err(),
+            "terminal must remain staged until upstream EOF"
+        );
+        drop(tx);
         let terminal = tokio::time::timeout(Duration::from_millis(250), body.frame())
             .await
             .expect("downstream completion timed out")
@@ -2051,7 +2300,7 @@ mod tests {
         assert!(
             tokio::time::timeout(Duration::from_millis(250), body.frame())
                 .await
-                .expect("downstream EOF waited for upstream EOF")
+                .expect("downstream EOF was not delivered after upstream EOF")
                 .is_none()
         );
     }
@@ -2077,13 +2326,14 @@ mod tests {
         let request_weak = Arc::downgrade(&request);
         let traffic_weak = Arc::downgrade(&replay_traffic);
         let retry_weak = Arc::downgrade(&retry);
-        let reconnect = Some(GrokReconnectContext::new(
-            client,
-            request,
-            Some(replay_traffic),
-            retry,
-            1,
-        ));
+        let request_byte_budget = Arc::new(Semaphore::new(1));
+        let request_byte_lease =
+            RequestByteLease::new(request_byte_budget.clone().try_acquire_owned().unwrap(), 1);
+        let reconnect = Some(
+            GrokReconnectContext::new(client, request, Some(replay_traffic), retry, 1)
+                .with_request_byte_lease(Some(request_byte_lease)),
+        );
+        assert!(request_byte_budget.clone().try_acquire_owned().is_err());
 
         let (tx, rx) = mpsc::channel(1);
         let response = stream_body_with_policy(
@@ -2123,6 +2373,7 @@ mod tests {
         assert_eq!(client_weak.strong_count(), 0);
         assert_eq!(request_weak.strong_count(), 0);
         assert_eq!(traffic_weak.strong_count(), 0);
+        assert!(request_byte_budget.try_acquire_owned().is_ok());
         let retry = retry_weak
             .upgrade()
             .expect("retry state must outlive replay material while the stream is active");
@@ -2332,6 +2583,7 @@ mod tests {
             provider: "grok".into(),
             traffic: Some(traffic),
             monitor: Some(monitor.clone()),
+            request_byte_lease: None,
         };
         let upstream = b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"model failed\"},\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":2,\"total_tokens\":14}}}\n\n";
 

@@ -97,6 +97,33 @@ async fn call_messages_body(body: Value) -> Response {
         .unwrap()
 }
 
+async fn answer_terminal_barrier<S, R>(sender: &mut S, receiver: &mut R)
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match receiver.next().await {
+                Some(Ok(Message::Ping(payload))) => {
+                    sender.send(Message::Pong(payload)).await.unwrap();
+                    return;
+                }
+                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Ok(other)) => {
+                    panic!("expected terminal ordering-barrier Ping, got {other:?}")
+                }
+                Some(Err(error)) => {
+                    panic!("terminal ordering-barrier receive failed: {error}")
+                }
+                None => panic!("connection closed before terminal ordering-barrier Ping"),
+            }
+        }
+    })
+    .await
+    .expect("terminal ordering-barrier Ping should arrive");
+}
+
 fn collect_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -227,14 +254,16 @@ async fn spawn_websocket_upstream(captured: Arc<Mutex<Option<Value>>>) -> String
             // Send Codex Responses events as WebSocket text messages
             let events = [
                 r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
-                r#"{"type":"response.output_text.delta","output_index":0,"delta":"codex websocket ok"}"#,
-                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+                r#"{"type":"response.output_text.delta","output_index":0,"item_id":"msg_up","delta":"codex websocket ok"}"#,
+                r#"{"type":"response.output_text.done","output_index":0,"item_id":"msg_up","text":"codex websocket ok"}"#,
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
                 r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#,
             ];
 
             for event in &events {
                 let _ = sender.send(Message::Text(event.to_string())).await;
             }
+            answer_terminal_barrier(&mut sender, &mut receiver).await;
         }
     });
 
@@ -255,7 +284,7 @@ async fn spawn_websocket_malformed_after_text_upstream() -> (String, tokio::task
         let _ = ws.next().await;
         for event in [
             r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
-            r#"{"type":"response.output_text.delta","output_index":0,"delta":"partial before malformed"}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"item_id":"msg_up","delta":"partial before malformed"}"#,
         ] {
             ws.send(Message::Text(event.to_string())).await.unwrap();
         }
@@ -296,7 +325,7 @@ async fn spawn_websocket_delayed_terminal_upstream() -> String {
             let _ = ws.next().await;
             let early_events = [
                 r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
-                r#"{"type":"response.output_text.delta","output_index":0,"delta":"early chunk"}"#,
+                r#"{"type":"response.output_text.delta","output_index":0,"item_id":"msg_up","delta":"early chunk"}"#,
             ];
             for event in &early_events {
                 let _ = ws.send(Message::Text(event.to_string())).await;
@@ -305,12 +334,15 @@ async fn spawn_websocket_delayed_terminal_upstream() -> String {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             let terminal_events = [
-                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+                r#"{"type":"response.output_text.done","output_index":0,"item_id":"msg_up","text":"early chunk"}"#,
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
                 r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#,
             ];
             for event in &terminal_events {
                 let _ = ws.send(Message::Text(event.to_string())).await;
             }
+            let (mut sender, mut receiver) = ws.split();
+            answer_terminal_barrier(&mut sender, &mut receiver).await;
         }
     });
 
@@ -346,8 +378,9 @@ async fn spawn_websocket_rejection_then_http_upstream() -> String {
         assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
         let body = concat!(
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"auto http fallback\"}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"auto http fallback\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"auto http fallback\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
         );
         let response = format!(
@@ -388,9 +421,10 @@ async fn spawn_websocket_error_upstream(message: &'static str) -> String {
 
     tokio::spawn(async move {
         if let Ok((stream, _)) = listener.accept().await
-            && let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await
+            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
         {
-            let _ = ws.next().await;
+            let (mut sender, mut receiver) = ws.split();
+            let _ = receiver.next().await;
             let event = json!({
                 "type": "error",
                 "status": 400,
@@ -400,7 +434,8 @@ async fn spawn_websocket_error_upstream(message: &'static str) -> String {
                     "message": message
                 }
             });
-            let _ = ws.send(Message::Text(event.to_string())).await;
+            let _ = sender.send(Message::Text(event.to_string())).await;
+            answer_terminal_barrier(&mut sender, &mut receiver).await;
         }
     });
 
@@ -445,21 +480,29 @@ async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> 
                 let idx = handled;
                 let response_text = texts[idx];
                 let response_id = format!("resp_{}", idx + 1);
+                let message_id = format!("msg_up_{idx}");
                 let events = [
                     json!({
                         "type":"response.output_item.added",
                         "output_index":0,
-                        "item":{"type":"message","id":format!("msg_up_{idx}")}
+                        "item":{"type":"message","id":message_id}
                     }),
                     json!({
                         "type":"response.output_text.delta",
                         "output_index":0,
+                        "item_id":message_id,
                         "delta":response_text
+                    }),
+                    json!({
+                        "type":"response.output_text.done",
+                        "output_index":0,
+                        "item_id":message_id,
+                        "text":response_text
                     }),
                     json!({
                         "type":"response.output_item.done",
                         "output_index":0,
-                        "item":{"type":"message"}
+                        "item":{"type":"message","id":message_id}
                     }),
                     json!({
                         "type":"response.completed",
@@ -470,6 +513,7 @@ async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> 
                 for event in &events {
                     let _ = sender.send(Message::Text(event.to_string())).await;
                 }
+                answer_terminal_barrier(&mut sender, &mut receiver).await;
                 handled += 1;
             }
         }
@@ -529,27 +573,37 @@ async fn spawn_websocket_previous_missing_then_retry_upstream(
                         }
                     });
                     let _ = sender.send(Message::Text(event.to_string())).await;
+                    // `previous_response_not_found` is intercepted before the generic
+                    // terminal barrier so the request can be retried with full input.
                     handled += 1;
                     break;
                 }
 
                 let response_text = if handled == 0 { "first" } else { "retry" };
                 let response_id = if handled == 0 { "resp_1" } else { "resp_retry" };
+                let message_id = format!("msg_up_{handled}");
                 let events = [
                     json!({
                         "type":"response.output_item.added",
                         "output_index":0,
-                        "item":{"type":"message","id":format!("msg_up_{handled}")}
+                        "item":{"type":"message","id":message_id}
                     }),
                     json!({
                         "type":"response.output_text.delta",
                         "output_index":0,
+                        "item_id":message_id,
                         "delta":response_text
+                    }),
+                    json!({
+                        "type":"response.output_text.done",
+                        "output_index":0,
+                        "item_id":message_id,
+                        "text":response_text
                     }),
                     json!({
                         "type":"response.output_item.done",
                         "output_index":0,
-                        "item":{"type":"message"}
+                        "item":{"type":"message","id":message_id}
                     }),
                     json!({
                         "type":"response.completed",
@@ -560,6 +614,7 @@ async fn spawn_websocket_previous_missing_then_retry_upstream(
                 for event in &events {
                     let _ = sender.send(Message::Text(event.to_string())).await;
                 }
+                answer_terminal_barrier(&mut sender, &mut receiver).await;
                 handled += 1;
             }
         }
@@ -612,21 +667,29 @@ async fn spawn_websocket_close_after_second_request_upstream(
 
                 let response_text = if handled == 0 { "first" } else { "retry" };
                 let response_id = if handled == 0 { "resp_1" } else { "resp_retry" };
+                let message_id = format!("msg_close_{handled}");
                 let events = [
                     json!({
                         "type":"response.output_item.added",
                         "output_index":0,
-                        "item":{"type":"message","id":format!("msg_close_{handled}")}
+                        "item":{"type":"message","id":message_id}
                     }),
                     json!({
                         "type":"response.output_text.delta",
                         "output_index":0,
+                        "item_id":message_id,
                         "delta":response_text
+                    }),
+                    json!({
+                        "type":"response.output_text.done",
+                        "output_index":0,
+                        "item_id":message_id,
+                        "text":response_text
                     }),
                     json!({
                         "type":"response.output_item.done",
                         "output_index":0,
-                        "item":{"type":"message"}
+                        "item":{"type":"message","id":message_id}
                     }),
                     json!({
                         "type":"response.completed",
@@ -637,6 +700,7 @@ async fn spawn_websocket_close_after_second_request_upstream(
                 for event in &events {
                     let _ = sender.send(Message::Text(event.to_string())).await;
                 }
+                answer_terminal_barrier(&mut sender, &mut receiver).await;
                 handled += 1;
             }
         }
@@ -765,8 +829,9 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
             let _ = captured.lock().map(|mut g| *g = Some(body));
             concat!(
                 "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"codex http ok\"}\n\n",
-                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"codex http ok\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"codex http ok\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
             )
             .as_bytes()
@@ -807,8 +872,9 @@ async fn smoke_co_marker_promotes_codex_xhigh_to_wire_max() {
             let _ = captured.lock().map(|mut guard| *guard = Some(body));
             concat!(
                 "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"wire max ok\"}\n\n",
-                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"wire max ok\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"wire max ok\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
             )
             .as_bytes()
@@ -864,8 +930,9 @@ async fn smoke_codex_http_nonstream_keeps_completed_response_after_rate_limit_te
     let upstream = spawn_http_upstream(|_body: Value| {
         concat!(
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"completed answer\"}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"completed answer\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"completed answer\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n",
             "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":60}}}\n\n"
         )
@@ -937,8 +1004,9 @@ async fn smoke_codex_http_traffic_capture_writes_upstream_artifacts() {
     let upstream = spawn_http_upstream(|_body: Value| {
         concat!(
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"codex http ok\"}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"codex http ok\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"codex http ok\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
         )
         .as_bytes()
@@ -984,8 +1052,9 @@ async fn smoke_codex_http_stream_traffic_captures_downstream_events() {
     let upstream = spawn_http_upstream(|_body: Value| {
         concat!(
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"codex stream ok\"}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"codex stream ok\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"codex stream ok\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
         )
         .as_bytes()
@@ -1029,8 +1098,9 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
     let upstream = spawn_http_upstream(|_body: Value| {
         concat!(
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial\"}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n"
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_up\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"item_id\":\"msg_up\",\"text\":\"partial\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n"
         )
         .as_bytes()
         .to_vec()

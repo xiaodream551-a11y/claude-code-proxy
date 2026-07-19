@@ -115,7 +115,7 @@ claude-code-proxy cursor auth status
 ```sh
 claude-code-proxy serve                # listens on 127.0.0.1:18765
 PORT=11435 claude-code-proxy serve     # change the listen port
-CCP_BIND_ADDRESS=0.0.0.0 claude-code-proxy serve  # change the bind address
+CCP_BIND_ADDRESS=0.0.0.0 claude-code-proxy serve --allow-remote-unauthenticated
 claude-code-proxy serve --no-monitor   # plain logs instead of the monitor TUI
 ```
 
@@ -123,8 +123,10 @@ Binds to `127.0.0.1` by default. One `serve` process handles all providers —
 the upstream for each request is chosen from `ANTHROPIC_MODEL`. When stdout is
 a terminal, `serve` opens a monitor TUI with sessions, active requests, recent
 requests, and error events. Use `--no-monitor` for plain terminal output.
-The proxy does not authenticate incoming clients, so protect any non-loopback
-binding with a firewall or an authenticating reverse proxy.
+The proxy does not authenticate incoming clients. Non-loopback binds are rejected
+unless you explicitly pass `--allow-remote-unauthenticated` (or set the matching
+config acknowledgement), and must be protected with a firewall or an
+authenticating reverse proxy.
 
 To explore every monitor pane and interaction without starting the proxy, launch
 its deterministic simulated traffic:
@@ -417,6 +419,14 @@ are emitted back to Claude Code as Anthropic `server_tool_use` and
 `usage.server_tool_use.web_search_requests` so Claude Code can account for
 completed searches.
 
+Deferred `tool_reference` loading for Codex and Grok is intentionally bound to
+Claude Code's built-in, non-deferred custom tool named `ToolSearch`. The generic
+Anthropic wire does not mark arbitrary custom tools as search-capable, so a
+differently named search tool is rejected rather than trusted as a
+capability-control source. Source and referenced tools must permit the caller
+represented by history, and failed tool results cannot activate deferred
+schemas.
+
 Confirmed working on **Plus**:
 
 - `gpt-5.4`
@@ -611,6 +621,10 @@ sequenceDiagram
 
 Starts the HTTP proxy and blocks. Binds to `127.0.0.1` by default. Set
 `CCP_BIND_ADDRESS` or the `bindAddress` config key to choose another IP address.
+Non-loopback addresses also require `--allow-remote-unauthenticated`,
+`CCP_ALLOW_REMOTE_UNAUTHENTICATED=1`, or
+`server.allowRemoteUnauthenticated: true`; the proxy emits a security warning
+because incoming requests are not authenticated.
 When stdout is a terminal, `serve` opens a monitor TUI showing sessions, active
 requests, recent requests, output throughput, and error events. Token throughput
 uses the change in cumulative output usage over the matching observed generation
@@ -833,6 +847,7 @@ Windows, and at
   "port": 18765,
   "aliasProvider": "codex",
   "server": {
+    "allowRemoteUnauthenticated": false,
     "maxRequestBodyBytes": 33554432,
     "maxBufferedRequestBytes": 268435456,
     "maxConcurrentRequests": 64,
@@ -893,6 +908,7 @@ Windows, and at
 | Variable                         | Config key                 | Default                                           | Purpose                                                                                                                                                                           |
 | -------------------------------- | -------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CCP_BIND_ADDRESS`               | `bindAddress`              | `127.0.0.1`                                       | Proxy listen IP address; use `0.0.0.0` only when remote access is required and protected                                                                                          |
+| `CCP_ALLOW_REMOTE_UNAUTHENTICATED` | `server.allowRemoteUnauthenticated` | `false`                                | Explicit acknowledgement required for non-loopback binds; accepts `1`, `true`, or `yes`, and does not add authentication                                                          |
 | `PORT`                           | `port`                     | `18765`                                           | Proxy listen port                                                                                                                                                                 |
 | `CCP_CONFIG_DIR`                 | unset                      | platform config dir                               | Per-process config directory; Cursor auth uses it for file storage                                                                                                                |
 | `XDG_STATE_HOME`                 | —                          | `~/.local/state`                                  | Linux/macOS base dir for `proxy.log`                                                                                                                                              |
@@ -901,7 +917,7 @@ Windows, and at
 | `CCP_TRAFFIC_LOG`                | —                          | unset                                             | Write full per-request traffic captures under `traffic/` for session debugging (`1`, `true`, or `yes`)                                                                            |
 | `CCP_ALIAS_PROVIDER`             | `aliasProvider`            | `codex`                                           | Route Anthropic-style aliases (`haiku`, `sonnet`, `opus`, `claude-*`) through `codex` or `kimi`                                                                                   |
 | `CCP_MAX_REQUEST_BODY_BYTES`     | `server.maxRequestBodyBytes` | `33554432`                                      | Hard cap for both Anthropic request endpoints; declared and streamed overflows return 413                                                                                         |
-| `CCP_MAX_BUFFERED_REQUEST_BYTES` | `server.maxBufferedRequestBytes` | `268435456`                                  | Process-wide byte budget for request bodies retained by active requests; saturation returns retryable 429                                                                         |
+| `CCP_MAX_BUFFERED_REQUEST_BYTES` | `server.maxBufferedRequestBytes` | `268435456`                                  | Process-wide budget for buffered request bodies and initial replay material; long-lived Codex continuation capture has a separate bounded pool; saturation returns retryable 429   |
 | `CCP_MAX_CONCURRENT_REQUESTS`    | `server.maxConcurrentRequests` | `64`                                            | Global in-flight request limit; saturated requests are shed immediately instead of entering an unbounded wait queue                                                               |
 | `CCP_MAX_CONCURRENT_PER_PROVIDER` | `server.maxConcurrentPerProvider` | `48`                                         | Per-provider in-flight limit, preventing one upstream from consuming the entire process                                                                                           |
 | `CCP_MAX_CONCURRENT_PER_SESSION` | `server.maxConcurrentPerSession` | `24`                                            | Per-session in-flight limit; checked before the global limit so one child-agent wave cannot occupy every global slot                                                              |
@@ -958,6 +974,9 @@ URL, `auto` starts directly on
 incremental HTTP SSE so Codex traffic follows that proxy instead of silently
 bypassing it. Explicit `CCP_CODEX_TRANSPORT=websocket` remains a strict direct
 connection because the WebSocket connector does not implement HTTP CONNECT.
+The proxy decision is captured together with the Codex HTTP client at process
+startup; restart the service after changing environment or operating-system
+proxy settings.
 Pool probes and busy pooled connections are also safe pre-request fallback
 cases. After a request frame is sent, response-start or idle timeouts, failed
 heartbeats, connection loss, malformed events, and a close without a terminal
@@ -1047,6 +1066,11 @@ Grok streaming also uses a two-item/2 MiB downstream queue; a consumer stalled
 for 60 seconds cancels the producer instead of pinning a connection until the
 full model deadline. Raw stream bytes across rebuilds are capped at 8 MiB, which
 also bounds reducer text and tool state.
+Base64 image validation for Codex and Grok runs on blocking workers behind one
+shared two-slot gate, so bounded full-image decoding cannot stall Tokio
+heartbeats or multiply its peak decode memory across every admitted request. A
+saturated gate fails after 30 seconds instead of building an unbounded decode
+queue.
 
 Claude Code retries API failures independently of the proxy. Its default retry
 count can multiply a slow terminal failure, so the example configuration sets
@@ -1055,11 +1079,16 @@ bounded user-visible wait.
 
 The server aggregates at most 32 MiB per incoming request and 256 MiB across
 active requests. Request bodies have five-second idle and 30-second total read
-budgets. Rejected response bodies are capped at 64 KiB with five-second idle and
-10-second total budgets. Global, provider, and session bulkheads shed excess work
-with 429 instead of allowing a child-agent wave to exhaust the process. Successful
-streaming permits and bounded provider error responses remain held through response
-EOF or body drop, not merely until response headers arrive.
+budgets. The byte budget is released after initial dispatch/replay material is
+dropped and is not held for the duration of a downstream stream. Codex live
+continuation capture uses a separate 20 MB process-wide budget and a 2 MB
+per-session cap; when either cap is unavailable, continuation is disabled for
+that turn without delaying the response. Rejected
+response bodies are capped at 64 KiB with five-second idle and 10-second total
+budgets. Global, provider, and session bulkheads shed excess work with 429 instead
+of allowing a child-agent wave to exhaust the process. Concurrency permits and
+bounded provider error responses remain held through response EOF or body drop,
+not merely until response headers arrive.
 
 Request lifecycle logs distinguish response headers from a finished stream:
 `response_started` records the status returned by the provider,

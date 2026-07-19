@@ -31,6 +31,11 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 tiktoken-rs = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots", "system-proxy", "blocking", "http2"] }
 base64 = "0.22"
+gif = { version = "0.14.2", default-features = false, features = ["std"] }
+image-webp = "0.2.4"
+png = "0.18.1"
+zune-core = { version = "0.5.1", default-features = false, features = ["std"] }
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 rand = "0.8"
 sha2 = "0.10"
 hex = "0.4"
@@ -50,3 +55,4 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 tempfile = "3.14"
 assert_cmd = "2"
 predicates = "3"
+jpeg-encoder = "0.7.0"

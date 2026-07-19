@@ -310,7 +310,7 @@ mod tests {
             sse_event(
                 "response.output_item.done",
                 json!({
-                    "output_index":0,"item":{"type":"message"}
+                    "output_index":0,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse_event(
@@ -381,7 +381,7 @@ mod tests {
             sse_event(
                 "response.output_item.done",
                 json!({
-                    "output_index":0,"item":{"type":"message"}
+                    "output_index":0,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse_event(
@@ -496,7 +496,7 @@ mod tests {
             sse_event(
                 "response.output_item.done",
                 json!({
-                    "output_index":1,"item":{"type":"message"}
+                    "output_index":1,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse_event(
@@ -527,7 +527,14 @@ mod tests {
     #[test]
     fn accumulate_reasoning_summary_as_thinking_before_text() {
         let upstream = format!(
-            "{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                })
+            ),
             sse_event(
                 "response.reasoning_summary_text.delta",
                 json!({
@@ -571,7 +578,7 @@ mod tests {
             sse_event(
                 "response.output_item.done",
                 json!({
-                    "output_index":1,"item":{"type":"message"}
+                    "output_index":1,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse_event(
@@ -624,7 +631,7 @@ mod tests {
             sse_event(
                 "response.output_item.done",
                 json!({
-                    "output_index":1,"item":{"type":"message"}
+                    "output_index":1,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse_event(

@@ -1,6 +1,5 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -66,6 +65,8 @@ struct FileConfig {
 
 #[derive(Deserialize, Clone)]
 struct ServerResourceConfig {
+    #[serde(rename = "allowRemoteUnauthenticated")]
+    pub allow_remote_unauthenticated: Option<bool>,
     #[serde(rename = "maxRequestBodyBytes")]
     pub max_request_body_bytes: Option<u64>,
     #[serde(rename = "maxBufferedRequestBytes")]
@@ -482,6 +483,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS") {
         out.push("CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS (env)".to_string());
     }
+    if env.contains_key("CCP_ALLOW_REMOTE_UNAUTHENTICATED") {
+        out.push("CCP_ALLOW_REMOTE_UNAUTHENTICATED (env)".to_string());
+    }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .is_some_and(|raw| !raw.is_empty())
@@ -604,6 +608,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
         }
         if let Some(server) = file_cfg.server {
+            if let Some(value) = server.allow_remote_unauthenticated {
+                out.push(format!("server.allowRemoteUnauthenticated: {value}"));
+            }
             if let Some(value) = server.max_request_body_bytes {
                 out.push(format!("server.maxRequestBodyBytes: {value}"));
             }
@@ -628,6 +635,19 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         }
     }
     out
+}
+
+pub fn allow_remote_unauthenticated() -> bool {
+    if let Ok(raw) = std::env::var("CCP_ALLOW_REMOTE_UNAUTHENTICATED") {
+        return matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        );
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.server)
+        .and_then(|server| server.allow_remote_unauthenticated)
+        .unwrap_or(false)
 }
 
 fn server_positive_u64(
@@ -1135,6 +1155,47 @@ impl CodexTransport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexTransportDecision {
+    requested: CodexTransport,
+    effective: CodexTransport,
+    reason: &'static str,
+}
+
+impl CodexTransportDecision {
+    fn resolve(requested: CodexTransport, system_proxy_intercepts_upstream: bool) -> Self {
+        if requested == CodexTransport::Auto && system_proxy_intercepts_upstream {
+            Self {
+                requested,
+                effective: CodexTransport::Http,
+                reason: "system_proxy",
+            }
+        } else {
+            Self {
+                requested,
+                effective: requested,
+                reason: if requested == CodexTransport::Auto {
+                    "automatic"
+                } else {
+                    "explicit"
+                },
+            }
+        }
+    }
+
+    pub fn requested(self) -> CodexTransport {
+        self.requested
+    }
+
+    pub fn effective(self) -> CodexTransport {
+        self.effective
+    }
+
+    pub fn reason(self) -> &'static str {
+        self.reason
+    }
+}
+
 fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
     match raw {
         "http" => Some(CodexTransport::Http),
@@ -1144,108 +1205,55 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
     }
 }
 
-fn resolve_codex_transport(
-    requested: CodexTransport,
-    system_proxy_intercepts_upstream: bool,
-) -> CodexTransport {
-    if requested == CodexTransport::Auto && system_proxy_intercepts_upstream {
-        CodexTransport::Http
-    } else {
-        requested
-    }
-}
-
-fn default_codex_transport(system_proxy_intercepts_upstream: bool) -> CodexTransport {
-    if system_proxy_intercepts_upstream {
-        CodexTransport::Http
-    } else {
-        CodexTransport::Auto
-    }
-}
-
-const CODEX_PROXY_PROBE_TTL: Duration = Duration::from_secs(5);
-const PROXY_ENV_KEYS: [&str; 8] = [
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "no_proxy",
-];
-
-struct CodexProxyProbe {
-    upstream: String,
-    environment: [Option<OsString>; PROXY_ENV_KEYS.len()],
-    checked_at: Instant,
-    intercepts: bool,
-}
-
-impl CodexProxyProbe {
-    fn is_fresh_for(
-        &self,
-        upstream: &str,
-        environment: &[Option<OsString>; PROXY_ENV_KEYS.len()],
-        now: Instant,
-    ) -> bool {
-        self.upstream == upstream
-            && &self.environment == environment
-            && now.saturating_duration_since(self.checked_at) < CODEX_PROXY_PROBE_TTL
-    }
-}
-
-static CODEX_PROXY_PROBE: OnceLock<Mutex<Option<CodexProxyProbe>>> = OnceLock::new();
-
-fn codex_system_proxy_intercepts_upstream() -> bool {
-    const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-
-    let upstream = codex_base_url(DEFAULT_CODEX_BASE_URL);
-    if crate::oauth_http::is_loopback_url(&upstream) {
+fn codex_system_proxy_intercepts_upstream(upstream: &str) -> bool {
+    if crate::oauth_http::is_loopback_url(upstream) {
         return false;
     }
     let Ok(uri) = upstream.parse::<http::Uri>() else {
         return false;
     };
-    let environment = PROXY_ENV_KEYS.map(std::env::var_os);
-    let now = Instant::now();
-    let cache = CODEX_PROXY_PROBE.get_or_init(|| Mutex::new(None));
-    let mut cached = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(probe) = cached.as_ref()
-        && probe.is_fresh_for(&upstream, &environment, now)
-    {
-        return probe.intercepts;
-    }
-
-    let intercepts = hyper_util::client::proxy::matcher::Matcher::from_system()
+    hyper_util::client::proxy::matcher::Matcher::from_system()
         .intercept(&uri)
-        .is_some();
-    *cached = Some(CodexProxyProbe {
-        upstream,
-        environment,
-        checked_at: now,
-        intercepts,
-    });
-    intercepts
+        .is_some()
 }
 
-pub fn codex_transport() -> CodexTransport {
+fn requested_codex_transport() -> CodexTransport {
     let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
         && let Some(transport) = parse_codex_transport(raw)
     {
-        return resolve_codex_transport(transport, codex_system_proxy_intercepts_upstream());
+        return transport;
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(transport) = codex.transport.as_deref().and_then(parse_codex_transport)
     {
-        return resolve_codex_transport(transport, codex_system_proxy_intercepts_upstream());
+        return transport;
     }
-    default_codex_transport(codex_system_proxy_intercepts_upstream())
+    CodexTransport::Auto
+}
+
+/// Capture the Codex transport and system-proxy decision for one client lifetime.
+///
+/// Reqwest snapshots its system proxy matcher when a client is built, so callers
+/// should store this decision next to that client instead of probing again for
+/// every request.
+pub fn codex_transport_decision() -> CodexTransportDecision {
+    const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+    let upstream = codex_base_url(DEFAULT_CODEX_BASE_URL);
+    codex_transport_decision_for_url(&upstream)
+}
+
+pub(crate) fn codex_transport_decision_for_url(upstream: &str) -> CodexTransportDecision {
+    let requested = requested_codex_transport();
+    let system_proxy_intercepts_upstream =
+        requested == CodexTransport::Auto && codex_system_proxy_intercepts_upstream(upstream);
+    CodexTransportDecision::resolve(requested, system_proxy_intercepts_upstream)
+}
+
+pub fn codex_transport() -> CodexTransport {
+    codex_transport_decision().effective()
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,6 +1314,7 @@ mod tests {
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     const TEST_ENV_KEYS: &[&str] = &[
+        "CCP_ALLOW_REMOTE_UNAUTHENTICATED",
         "CCP_BIND_ADDRESS",
         "CCP_CODEX_TRANSPORT",
         "CCP_CONFIG_DIR",
@@ -1393,6 +1402,23 @@ mod tests {
         assert_eq!(load_config().bind_address, "192.0.2.10");
         let _bind_env = EnvGuard::set("CCP_BIND_ADDRESS", "0.0.0.0");
         assert_eq!(load_config().bind_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn remote_unauthenticated_ack_is_explicit_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"server":{"allowRemoteUnauthenticated":true}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(allow_remote_unauthenticated());
+        let _ack_env = EnvGuard::set("CCP_ALLOW_REMOTE_UNAUTHENTICATED", "false");
+        assert!(!allow_remote_unauthenticated());
     }
 
     struct EnvGuard {
@@ -1512,44 +1538,45 @@ mod tests {
 
     #[test]
     fn codex_transport_uses_http_when_system_proxy_intercepts() {
-        assert_eq!(
-            default_codex_transport(true),
-            CodexTransport::Http,
-            "the implicit default must not bypass an active system proxy"
-        );
-        assert_eq!(
-            resolve_codex_transport(CodexTransport::Auto, true),
-            CodexTransport::Http,
-            "Auto must start on the proxy-aware HTTP transport"
-        );
-        assert_eq!(
-            resolve_codex_transport(CodexTransport::WebSocket, true),
-            CodexTransport::WebSocket,
-            "an explicit strict WebSocket selection remains an opt-in direct connection"
-        );
+        let automatic = CodexTransportDecision::resolve(CodexTransport::Auto, true);
+        assert_eq!(automatic.requested(), CodexTransport::Auto);
+        assert_eq!(automatic.effective(), CodexTransport::Http);
+        assert_eq!(automatic.reason(), "system_proxy");
+
+        let explicit = CodexTransportDecision::resolve(CodexTransport::WebSocket, true);
+        assert_eq!(explicit.effective(), CodexTransport::WebSocket);
+        assert_eq!(explicit.reason(), "explicit");
     }
 
     #[test]
-    fn codex_system_proxy_probe_cache_is_keyed_and_short_lived() {
-        let now = Instant::now();
-        let environment: [Option<OsString>; PROXY_ENV_KEYS.len()] = std::array::from_fn(|_| None);
-        let probe = CodexProxyProbe {
-            upstream: "https://chatgpt.com/backend-api/codex/responses".into(),
-            environment: environment.clone(),
-            checked_at: now,
-            intercepts: true,
-        };
+    fn codex_auto_transport_honors_https_proxy_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+        let _proxy = EnvGuard::set("HTTPS_PROXY", "http://127.0.0.1:18080");
+        let _no_proxy = EnvGuard::set("NO_PROXY", "");
 
-        assert!(probe.is_fresh_for(&probe.upstream, &environment, now));
-        assert!(!probe.is_fresh_for("https://example.com/responses", &environment, now));
-        let mut changed_environment = environment;
-        changed_environment[0] = Some("http://127.0.0.1:8080".into());
-        assert!(!probe.is_fresh_for(&probe.upstream, &changed_environment, now));
-        assert!(!probe.is_fresh_for(
-            &probe.upstream,
-            &probe.environment,
-            now + CODEX_PROXY_PROBE_TTL
-        ));
+        let decision = codex_transport_decision();
+        assert_eq!(decision.requested(), CodexTransport::Auto);
+        assert_eq!(decision.effective(), CodexTransport::Http);
+        assert_eq!(decision.reason(), "system_proxy");
+    }
+
+    #[test]
+    fn codex_auto_transport_honors_no_proxy_exclusion() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+        let _proxy = EnvGuard::set("HTTPS_PROXY", "http://127.0.0.1:18080");
+        let _no_proxy = EnvGuard::set("NO_PROXY", "chatgpt.com");
+
+        let decision = codex_transport_decision();
+        assert_eq!(decision.effective(), CodexTransport::Auto);
+        assert_eq!(decision.reason(), "automatic");
     }
 
     #[test]

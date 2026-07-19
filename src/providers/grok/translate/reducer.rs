@@ -8,6 +8,7 @@ use crate::providers::translate_shared::{JsonObjectError, parse_json_object};
 
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_INCOMPLETE_TOOL_CALLS: usize = 128;
+const MAX_TOTAL_TOOL_ITEMS: usize = 256;
 const MAX_SEQUENCE_HISTORY: usize = 1024;
 const MAX_INCOMPLETE_REASON_BYTES: usize = 256;
 const MAX_UPSTREAM_FAILURE_MESSAGE_BYTES: usize = 2 * 1024;
@@ -307,12 +308,16 @@ pub struct Reducer {
     active: Option<(String, usize)>,
     active_text: String,
     saw_text_output: bool,
-    calls: HashMap<String, (usize, String)>,
+    calls: HashMap<String, ActiveFunctionCall>,
     item_calls: HashMap<String, String>,
+    completed_calls: HashMap<String, CompletedFunctionCall>,
     tool_args: HashMap<String, String>,
     completed_arguments: HashMap<String, bool>,
-    hosted_calls: HashMap<String, (String, String)>,
+    hosted_calls: HashMap<String, ActiveHostedCall>,
     completed_hosted_inputs: HashSet<String>,
+    completed_hosted_calls: HashMap<String, CompletedHostedCall>,
+    tool_item_ids: HashSet<String>,
+    total_tool_items: usize,
     pending_citations: Vec<Value>,
     web_search_requests: u64,
     x_search_requests: u64,
@@ -320,6 +325,64 @@ pub struct Reducer {
     completed: bool,
     incomplete_reason: Option<String>,
     usage: Option<GrokUsage>,
+}
+
+#[derive(Clone)]
+struct ActiveFunctionCall {
+    index: usize,
+    item_id: Option<String>,
+    name: String,
+}
+
+#[derive(Clone)]
+struct CompletedFunctionCall {
+    item_id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Clone)]
+struct ActiveHostedCall {
+    item_kind: HostedItemKind,
+    search_kind: HostedSearchKind,
+    phase: HostedPhase,
+    input: String,
+}
+
+#[derive(Clone)]
+struct CompletedHostedCall {
+    item_kind: HostedItemKind,
+    search_kind: HostedSearchKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostedItemKind {
+    Web,
+    X,
+    Custom,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostedSearchKind {
+    Web,
+    X,
+}
+
+impl HostedSearchKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Web => "web_search",
+            Self::X => "x_search",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostedPhase {
+    Added,
+    InProgress,
+    Searching,
+    Completed,
 }
 
 impl Reducer {
@@ -367,14 +430,17 @@ impl Reducer {
                 if self.completed_hosted_inputs.contains(id) {
                     anyhow::bail!("custom tool delta arrived after input completion");
                 }
-                let (_, input) = self
+                let call = self
                     .hosted_calls
                     .get_mut(id)
                     .ok_or_else(|| anyhow::anyhow!("custom tool delta is out of order"))?;
-                if input.len().saturating_add(delta.len()) > MAX_TOOL_ARGUMENT_BYTES {
+                if call.item_kind != HostedItemKind::Custom {
+                    anyhow::bail!("custom tool delta disagrees with output_item.added");
+                }
+                if call.input.len().saturating_add(delta.len()) > MAX_TOOL_ARGUMENT_BYTES {
                     anyhow::bail!("custom tool input exceeds the size limit");
                 }
-                input.push_str(delta);
+                call.input.push_str(delta);
                 Ok(vec![])
             }
             "response.custom_tool_call_input.done" => {
@@ -382,8 +448,12 @@ impl Reducer {
                     .get("item_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("custom tool completion lacks item id"))?;
-                if !self.hosted_calls.contains_key(id) {
-                    anyhow::bail!("custom tool completion is out of order");
+                let call = self
+                    .hosted_calls
+                    .get(id)
+                    .ok_or_else(|| anyhow::anyhow!("custom tool completion is out of order"))?;
+                if call.item_kind != HostedItemKind::Custom {
+                    anyhow::bail!("custom tool completion disagrees with output_item.added");
                 }
                 if !self.completed_hosted_inputs.insert(id.into()) {
                     anyhow::bail!("duplicate custom tool input completion");
@@ -395,7 +465,7 @@ impl Reducer {
             | "response.web_search_call.completed"
             | "response.x_search_call.in_progress"
             | "response.x_search_call.searching"
-            | "response.x_search_call.completed" => Ok(vec![]),
+            | "response.x_search_call.completed" => self.advance_hosted_search(typ, &value),
             "response.output_text.annotation.added" => {
                 let Some(annotation) = value.get("annotation") else {
                     return Ok(vec![]);
@@ -428,98 +498,113 @@ impl Reducer {
                     .get("item")
                     .and_then(Value::as_object)
                     .ok_or_else(|| anyhow::anyhow!("output item is invalid"))?;
-                let item_type = item.get("type").and_then(Value::as_str);
-                if matches!(
-                    item_type,
-                    Some("custom_tool_call" | "web_search_call" | "x_search_call")
-                ) {
-                    let id = item
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("custom tool call id is invalid"))?;
-                    if self.hosted_calls.contains_key(id) {
-                        anyhow::bail!("duplicate hosted tool call id");
+                let item_type = optional_non_empty_identity(item.get("type"), "output item type")?
+                    .ok_or_else(|| anyhow::anyhow!("output item lacks type"))?;
+                match item_type {
+                    "custom_tool_call" | "web_search_call" | "x_search_call" => {
+                        let id =
+                            optional_non_empty_identity(item.get("id"), "hosted tool call id")?
+                                .ok_or_else(|| anyhow::anyhow!("hosted tool call lacks id"))?;
+                        if self.hosted_calls.contains_key(id)
+                            || self.completed_hosted_calls.contains_key(id)
+                        {
+                            anyhow::bail!("duplicate hosted tool call id");
+                        }
+                        if self.tool_item_ids.contains(id) {
+                            anyhow::bail!("duplicate output tool item id");
+                        }
+                        if self.total_tool_items >= MAX_TOTAL_TOOL_ITEMS {
+                            anyhow::bail!("too many tool items in one Grok response");
+                        }
+                        if self.hosted_calls.len() >= MAX_INCOMPLETE_TOOL_CALLS {
+                            anyhow::bail!("too many incomplete hosted tool calls");
+                        }
+                        let (item_kind, search_kind) = hosted_search_identity(item, item_type)?;
+                        self.hosted_calls.insert(
+                            id.into(),
+                            ActiveHostedCall {
+                                item_kind,
+                                search_kind,
+                                phase: HostedPhase::Added,
+                                input: String::new(),
+                            },
+                        );
+                        self.tool_item_ids.insert(id.into());
+                        self.total_tool_items += 1;
+                        Ok(vec![])
                     }
-                    if self.hosted_calls.len() >= MAX_INCOMPLETE_TOOL_CALLS {
-                        anyhow::bail!("too many incomplete hosted tool calls");
-                    }
-                    let name = match item_type {
-                        Some("web_search_call") => "web_search",
-                        Some("x_search_call") => "x_search",
-                        _ => item
+                    "function_call" => {
+                        let id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .filter(|v| !v.is_empty())
+                            .ok_or_else(|| anyhow::anyhow!("function call id is invalid"))?;
+                        let name = item
                             .get("name")
                             .and_then(Value::as_str)
-                            .filter(|name| !name.is_empty())
-                            .unwrap_or("x_search"),
-                    };
-                    let name = if name.starts_with("x_") {
-                        "x_search"
-                    } else {
-                        name
-                    };
-                    self.hosted_calls
-                        .insert(id.into(), (name.into(), String::new()));
-                    Ok(vec![])
-                } else if item_type == Some("function_call") {
-                    let id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .filter(|v| !v.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("function call id is invalid"))?;
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|v| !v.is_empty())
-                        .ok_or_else(|| anyhow::anyhow!("function call name is invalid"))?;
-                    if self.calls.contains_key(id) {
-                        anyhow::bail!("duplicate function call id");
+                            .filter(|v| !v.is_empty())
+                            .ok_or_else(|| anyhow::anyhow!("function call name is invalid"))?;
+                        if self.calls.contains_key(id) || self.completed_calls.contains_key(id) {
+                            anyhow::bail!("duplicate function call id");
+                        }
+                        if self.total_tool_items >= MAX_TOTAL_TOOL_ITEMS {
+                            anyhow::bail!("too many tool items in one Grok response");
+                        }
+                        if self.calls.len() >= MAX_INCOMPLETE_TOOL_CALLS {
+                            anyhow::bail!("too many incomplete function calls");
+                        }
+                        let item_id =
+                            optional_non_empty_identity(item.get("id"), "function call item id")?
+                                .map(str::to_owned);
+                        if item_id
+                            .as_ref()
+                            .is_some_and(|item_id| self.tool_item_ids.contains(item_id))
+                        {
+                            anyhow::bail!("duplicate output tool item id");
+                        }
+                        let mut out = self.close_active()?;
+                        let index = self.next_index;
+                        self.next_index += 1;
+                        self.calls.insert(
+                            id.into(),
+                            ActiveFunctionCall {
+                                index,
+                                item_id: item_id.clone(),
+                                name: name.into(),
+                            },
+                        );
+                        if let Some(item_id) = item_id {
+                            self.item_calls.insert(item_id.clone(), id.into());
+                            self.tool_item_ids.insert(item_id);
+                        }
+                        self.total_tool_items += 1;
+                        self.tool_args.insert(id.into(), String::new());
+                        self.completed_arguments.insert(id.into(), false);
+                        self.saw_tool = true;
+                        out.push(ReducerEvent::ToolStart(index, id.into(), name.into()));
+                        Ok(out)
                     }
-                    if self.calls.len() >= MAX_INCOMPLETE_TOOL_CALLS {
-                        anyhow::bail!("too many incomplete function calls");
-                    }
-                    let mut out = self.close_active()?;
-                    let index = self.next_index;
-                    self.next_index += 1;
-                    self.calls.insert(id.into(), (index, name.into()));
-                    if let Some(item_id) = item.get("id").and_then(Value::as_str) {
-                        self.item_calls.insert(item_id.into(), id.into());
-                    }
-                    self.tool_args.insert(id.into(), String::new());
-                    self.completed_arguments.insert(id.into(), false);
-                    self.saw_tool = true;
-                    out.push(ReducerEvent::ToolStart(index, id.into(), name.into()));
-                    Ok(out)
-                } else {
-                    Ok(vec![])
+                    "message" | "reasoning" => Ok(vec![]),
+                    _ => anyhow::bail!("unsupported Grok output item type: {item_type}"),
                 }
             }
             "response.function_call_arguments.delta" => {
-                let id = value
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        value
-                            .get("item_id")
-                            .and_then(Value::as_str)
-                            .and_then(|item_id| self.item_calls.get(item_id).map(String::as_str))
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("function delta lacks call id"))?;
+                let id = self.resolve_function_event_call_id(&value, "function delta")?;
                 let delta = value
                     .get("delta")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("function delta is invalid"))?;
-                let (index, _) = self
+                let index = self
                     .calls
-                    .get(id)
-                    .ok_or_else(|| anyhow::anyhow!("function delta is out of order"))?
-                    .clone();
-                if self.completed_arguments.get(id) == Some(&true) {
+                    .get(&id)
+                    .map(|call| call.index)
+                    .ok_or_else(|| anyhow::anyhow!("function delta is out of order"))?;
+                if self.completed_arguments.get(&id) == Some(&true) {
                     anyhow::bail!("function delta arrived after arguments completion");
                 }
                 let args = self
                     .tool_args
-                    .get_mut(id)
+                    .get_mut(&id)
                     .ok_or_else(|| anyhow::anyhow!("function delta is out of order"))?;
                 if args.len().saturating_add(delta.len()) > MAX_TOOL_ARGUMENT_BYTES {
                     anyhow::bail!("function arguments exceed the size limit");
@@ -528,18 +613,10 @@ impl Reducer {
                 Ok(vec![ReducerEvent::ToolDelta(index, delta.into())])
             }
             "response.function_call_arguments.done" => {
-                let id = value
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        value
-                            .get("item_id")
-                            .and_then(Value::as_str)
-                            .and_then(|item_id| self.item_calls.get(item_id).map(String::as_str))
-                    })
-                    .ok_or_else(|| anyhow::anyhow!("function completion lacks call id"))?;
-                let args = value.get("arguments").and_then(Value::as_str);
-                if self.completed_arguments.get(id) == Some(&true) {
+                let id = self.resolve_function_event_call_id(&value, "function completion")?;
+                let args =
+                    optional_string_field(value.get("arguments"), "function completion arguments")?;
+                if self.completed_arguments.get(&id) == Some(&true) {
                     anyhow::bail!("duplicate function arguments completion");
                 }
                 if args.is_some_and(|args| args.len() > MAX_TOOL_ARGUMENT_BYTES) {
@@ -547,16 +624,16 @@ impl Reducer {
                 }
                 let accumulated = self
                     .tool_args
-                    .get(id)
+                    .get(&id)
                     .ok_or_else(|| anyhow::anyhow!("function completion is out of order"))?;
                 let index = self
                     .calls
-                    .get(id)
-                    .map(|(index, _)| *index)
+                    .get(&id)
+                    .map(|call| call.index)
                     .ok_or_else(|| anyhow::anyhow!("function completion is out of order"))?;
                 let output = match args {
                     Some(args) if accumulated.is_empty() && !args.is_empty() => {
-                        self.tool_args.get_mut(id).unwrap().push_str(args);
+                        self.tool_args.get_mut(&id).unwrap().push_str(args);
                         vec![ReducerEvent::ToolDelta(index, args.into())]
                     }
                     Some(args) if args != accumulated => {
@@ -564,7 +641,7 @@ impl Reducer {
                     }
                     _ => vec![],
                 };
-                self.completed_arguments.insert(id.into(), true);
+                self.completed_arguments.insert(id, true);
                 Ok(output)
             }
             "response.output_text.done" => {
@@ -586,21 +663,48 @@ impl Reducer {
                     .get("item")
                     .and_then(Value::as_object)
                     .ok_or_else(|| anyhow::anyhow!("completed output item is invalid"))?;
-                match item.get("type").and_then(Value::as_str) {
-                    Some(kind @ ("web_search_call" | "x_search_call" | "custom_tool_call")) => {
+                let item_type =
+                    optional_non_empty_identity(item.get("type"), "completed output item type")?
+                        .ok_or_else(|| anyhow::anyhow!("completed output item lacks type"))?;
+                match item_type {
+                    kind @ ("web_search_call" | "x_search_call" | "custom_tool_call") => {
                         self.complete_hosted_search(item, kind)
                     }
-                    Some("function_call") => {
-                        let id = item.get("call_id").and_then(Value::as_str).ok_or_else(|| {
-                            anyhow::anyhow!("completed function call lacks call id")
-                        })?;
-                        let index =
-                            self.calls.get(id).map(|(index, _)| *index).ok_or_else(|| {
+                    "function_call" => {
+                        let id = optional_non_empty_identity(
+                            item.get("call_id"),
+                            "completed function call id",
+                        )?
+                        .ok_or_else(|| anyhow::anyhow!("completed function call lacks call id"))?;
+                        let completed =
+                            self.calls.get(id).cloned().ok_or_else(|| {
                                 anyhow::anyhow!("completed function call is unknown")
                             })?;
+                        if let Some(actual_item_id) = optional_non_empty_identity(
+                            item.get("id"),
+                            "completed function call item id",
+                        )? && completed.item_id.as_deref() != Some(actual_item_id)
+                        {
+                            anyhow::bail!(
+                                "completed function call item id disagrees with output_item.added"
+                            );
+                        }
+                        if let Some(actual_name) = optional_non_empty_identity(
+                            item.get("name"),
+                            "completed function call name",
+                        )? && actual_name != completed.name
+                        {
+                            anyhow::bail!(
+                                "completed function call name disagrees with output_item.added"
+                            );
+                        }
+                        let index = completed.index;
                         let mut args = self.tool_args.get(id).cloned().unwrap_or_default();
                         let mut out = Vec::new();
-                        if let Some(snapshot) = item.get("arguments").and_then(Value::as_str) {
+                        if let Some(snapshot) = optional_string_field(
+                            item.get("arguments"),
+                            "completed function call arguments",
+                        )? {
                             if snapshot.len() > MAX_TOOL_ARGUMENT_BYTES {
                                 anyhow::bail!("function arguments exceed the size limit");
                             }
@@ -612,17 +716,47 @@ impl Reducer {
                             }
                         }
                         parse_function_arguments(&args)?;
-                        self.calls.remove(id);
+                        let completed = self.calls.remove(id).expect("validated function call");
+                        if let Some(item_id) = completed.item_id.as_ref() {
+                            self.item_calls.remove(item_id);
+                        }
                         self.tool_args.remove(id);
                         self.completed_arguments.remove(id);
+                        self.completed_calls.insert(
+                            id.into(),
+                            CompletedFunctionCall {
+                                item_id: completed.item_id,
+                                name: completed.name,
+                                arguments: args,
+                            },
+                        );
                         out.push(ReducerEvent::ToolStop(index));
                         Ok(out)
                     }
-                    _ => Ok(vec![]),
+                    "message" | "reasoning" => Ok(vec![]),
+                    _ => anyhow::bail!("unsupported completed Grok output item type: {item_type}"),
                 }
             }
             "response.completed" | "response.incomplete" => {
-                let response = value.get("response").unwrap_or(&value);
+                let response = value
+                    .get("response")
+                    .filter(|response| response.is_object())
+                    .ok_or_else(|| anyhow::anyhow!("terminal event response is not an object"))?;
+                let expected_status = if typ == "response.completed" {
+                    "completed"
+                } else {
+                    "incomplete"
+                };
+                if let Some(status) = response.get("status") {
+                    let status = status.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("terminal response status must be a string")
+                    })?;
+                    if status != expected_status {
+                        anyhow::bail!(
+                            "terminal response status disagrees with the terminal event type"
+                        );
+                    }
+                }
                 let usage = grok_usage(response);
                 self.usage = Some(usage.clone());
                 if !self.calls.is_empty() {
@@ -631,10 +765,11 @@ impl Reducer {
                 if !self.hosted_calls.is_empty() {
                     anyhow::bail!("hosted tool call is incomplete");
                 }
+                let snapshot_text = self.validate_terminal_snapshot(response)?;
                 let fallback_text = if self.saw_text_output {
                     Vec::new()
                 } else {
-                    response_output_text(response)
+                    snapshot_text
                 };
                 let mut out = self.close_active()?;
                 for text in fallback_text {
@@ -650,9 +785,16 @@ impl Reducer {
                     .get("incomplete_details")
                     .and_then(|details| details.get("reason"))
                     .and_then(Value::as_str);
-                let response_is_incomplete = typ == "response.incomplete"
-                    || response.get("status").and_then(Value::as_str) == Some("incomplete")
-                    || incomplete_reason.is_some();
+                if typ == "response.completed"
+                    && response
+                        .get("incomplete_details")
+                        .is_some_and(|details| !details.is_null())
+                {
+                    anyhow::bail!(
+                        "completed terminal response unexpectedly contains incomplete_details"
+                    );
+                }
+                let response_is_incomplete = typ == "response.incomplete";
                 let terminal = if response_is_incomplete {
                     match incomplete_reason {
                         Some("content_filter") => GrokTerminal::IncompleteContentFilter,
@@ -694,43 +836,251 @@ impl Reducer {
         }
     }
 
+    fn resolve_function_event_call_id(&self, value: &Value, event: &str) -> anyhow::Result<String> {
+        let call_id = optional_event_identity(value.get("call_id"), event, "call_id")?;
+        let item_id = optional_event_identity(value.get("item_id"), event, "item_id")?;
+        if call_id.is_none() && item_id.is_none() {
+            anyhow::bail!("{event} lacks call_id and item_id");
+        }
+
+        let resolved_item_call = item_id
+            .map(|item_id| {
+                self.item_calls
+                    .get(item_id)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("{event} references an unknown item_id"))
+            })
+            .transpose()?;
+        if let Some(call_id) = call_id
+            && !self.calls.contains_key(call_id)
+        {
+            anyhow::bail!("{event} references an unknown call_id");
+        }
+        if let (Some(call_id), Some(item_call_id)) = (call_id, resolved_item_call)
+            && call_id != item_call_id
+        {
+            anyhow::bail!("{event} call_id and item_id identify different function calls");
+        }
+
+        Ok(call_id
+            .or(resolved_item_call)
+            .expect("one identity is present")
+            .into())
+    }
+
+    fn validate_terminal_snapshot(&self, response: &Value) -> anyhow::Result<Vec<String>> {
+        let Some(output) = response.get("output") else {
+            return Ok(Vec::new());
+        };
+        let output = output
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("terminal response output is not an array"))?;
+        let mut text = Vec::new();
+        let mut function_ids = HashSet::new();
+        let mut hosted_ids = HashSet::new();
+
+        for item in output {
+            let item = item
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("terminal response output item is not an object"))?;
+            let item_type = optional_non_empty_identity(
+                item.get("type"),
+                "terminal response output item type",
+            )?
+            .ok_or_else(|| anyhow::anyhow!("terminal response output item lacks type"))?;
+            match item_type {
+                "message" => {
+                    if let Some(content) = item.get("content") {
+                        let content = content.as_array().ok_or_else(|| {
+                            anyhow::anyhow!("terminal response message content is not an array")
+                        })?;
+                        for part in content {
+                            if part.get("type").and_then(Value::as_str) == Some("output_text")
+                                && let Some(value) = part
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                            {
+                                text.push(value.to_owned());
+                            }
+                        }
+                    }
+                }
+                "reasoning" => {}
+                "function_call" => {
+                    let call_id = optional_non_empty_identity(
+                        item.get("call_id"),
+                        "terminal function call id",
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("terminal function call lacks call id"))?;
+                    if !function_ids.insert(call_id.to_owned()) {
+                        anyhow::bail!("terminal response repeats a function call");
+                    }
+                    let completed = self.completed_calls.get(call_id).ok_or_else(|| {
+                        anyhow::anyhow!("terminal response contains an unobserved function call")
+                    })?;
+                    let item_id = optional_non_empty_identity(
+                        item.get("id"),
+                        "terminal function call item id",
+                    )?;
+                    if item_id != completed.item_id.as_deref() {
+                        anyhow::bail!(
+                            "terminal function call item id disagrees with its lifecycle"
+                        );
+                    }
+                    let name = optional_non_empty_identity(
+                        item.get("name"),
+                        "terminal function call name",
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("terminal function call lacks name"))?;
+                    if name != completed.name {
+                        anyhow::bail!("terminal function call name disagrees with its lifecycle");
+                    }
+                    let arguments = optional_string_field(
+                        item.get("arguments"),
+                        "terminal function call arguments",
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("terminal function call lacks arguments"))?;
+                    if arguments != completed.arguments {
+                        anyhow::bail!(
+                            "terminal function call arguments disagree with its lifecycle"
+                        );
+                    }
+                }
+                kind @ ("web_search_call" | "x_search_call" | "custom_tool_call") => {
+                    let id = optional_non_empty_identity(
+                        item.get("id"),
+                        "terminal hosted tool call id",
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("terminal hosted tool call lacks id"))?;
+                    if !hosted_ids.insert(id.to_owned()) {
+                        anyhow::bail!("terminal response repeats a hosted tool call");
+                    }
+                    let completed = self.completed_hosted_calls.get(id).ok_or_else(|| {
+                        anyhow::anyhow!("terminal response contains an unobserved hosted tool call")
+                    })?;
+                    let (item_kind, search_kind) = hosted_search_identity(item, kind)?;
+                    if item_kind != completed.item_kind || search_kind != completed.search_kind {
+                        anyhow::bail!("terminal hosted tool call disagrees with its lifecycle");
+                    }
+                }
+                _ => anyhow::bail!("unsupported Grok terminal output item type: {item_type}"),
+            }
+        }
+
+        if function_ids.len() != self.completed_calls.len() {
+            anyhow::bail!("terminal response omits a completed function call");
+        }
+        if hosted_ids.len() != self.completed_hosted_calls.len() {
+            anyhow::bail!("terminal response omits a completed hosted tool call");
+        }
+        Ok(text)
+    }
+
+    fn advance_hosted_search(
+        &mut self,
+        event_type: &str,
+        value: &Value,
+    ) -> anyhow::Result<Vec<ReducerEvent>> {
+        let (item_kind, search_kind, expected_phase, next_phase) = match event_type {
+            "response.web_search_call.in_progress" => (
+                HostedItemKind::Web,
+                HostedSearchKind::Web,
+                HostedPhase::Added,
+                HostedPhase::InProgress,
+            ),
+            "response.web_search_call.searching" => (
+                HostedItemKind::Web,
+                HostedSearchKind::Web,
+                HostedPhase::InProgress,
+                HostedPhase::Searching,
+            ),
+            "response.web_search_call.completed" => (
+                HostedItemKind::Web,
+                HostedSearchKind::Web,
+                HostedPhase::Searching,
+                HostedPhase::Completed,
+            ),
+            "response.x_search_call.in_progress" => (
+                HostedItemKind::X,
+                HostedSearchKind::X,
+                HostedPhase::Added,
+                HostedPhase::InProgress,
+            ),
+            "response.x_search_call.searching" => (
+                HostedItemKind::X,
+                HostedSearchKind::X,
+                HostedPhase::InProgress,
+                HostedPhase::Searching,
+            ),
+            "response.x_search_call.completed" => (
+                HostedItemKind::X,
+                HostedSearchKind::X,
+                HostedPhase::Searching,
+                HostedPhase::Completed,
+            ),
+            _ => anyhow::bail!("unsupported hosted search lifecycle event: {event_type}"),
+        };
+        let id = optional_event_identity(value.get("item_id"), event_type, "item_id")?
+            .ok_or_else(|| anyhow::anyhow!("{event_type} lacks item_id"))?;
+        if self.completed_hosted_calls.contains_key(id) {
+            anyhow::bail!("hosted search lifecycle event arrived after output_item.done");
+        }
+        let call = self
+            .hosted_calls
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("hosted search lifecycle event is out of order"))?;
+        if call.item_kind != item_kind || call.search_kind != search_kind {
+            anyhow::bail!("hosted search lifecycle event disagrees with output_item.added");
+        }
+        if call.phase != expected_phase {
+            anyhow::bail!("hosted search lifecycle event is out of order");
+        }
+        call.phase = next_phase;
+        Ok(vec![])
+    }
+
     fn complete_hosted_search(
         &mut self,
         item: &serde_json::Map<String, Value>,
         item_type: &str,
     ) -> anyhow::Result<Vec<ReducerEvent>> {
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
+        let id = optional_non_empty_identity(item.get("id"), "completed hosted search id")?
             .ok_or_else(|| anyhow::anyhow!("completed hosted search lacks id"))?;
-        let fallback_name = match item_type {
-            "web_search_call" => "web_search",
-            "x_search_call" => "x_search",
-            _ => item
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("x_search"),
-        };
-        let (mut name, input) = self
+        let (item_kind, search_kind) = hosted_search_identity(item, item_type)?;
+        if self.completed_hosted_calls.contains_key(id) {
+            anyhow::bail!("duplicate hosted search completion");
+        }
+        let active = self
             .hosted_calls
-            .remove(id)
-            .unwrap_or_else(|| (fallback_name.into(), String::new()));
-        self.completed_hosted_inputs.remove(id);
-        if name.starts_with("x_") {
-            name = "x_search".into();
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("completed hosted search is unknown"))?;
+        if active.item_kind != item_kind || active.search_kind != search_kind {
+            anyhow::bail!("completed hosted search disagrees with output_item.added");
         }
-        if !matches!(name.as_str(), "web_search" | "x_search") {
-            return Ok(vec![]);
+        if active.item_kind != HostedItemKind::Custom && active.phase != HostedPhase::Completed {
+            anyhow::bail!("completed hosted search is out of order");
         }
+        let query = hosted_search_query(item, &active.input);
         let mut out = self.close_active()?;
+        self.hosted_calls
+            .remove(id)
+            .expect("validated hosted search call");
+        self.completed_hosted_inputs.remove(id);
+        self.completed_hosted_calls.insert(
+            id.into(),
+            CompletedHostedCall {
+                item_kind,
+                search_kind,
+            },
+        );
         // Anthropic's response ContentBlock union has no x_search server-tool variant. Keep the
         // model's subsequent text and citation events, but do not synthesize an invalid hosted
         // block or charge it as an Anthropic web-search request.
-        if name == "x_search" {
+        if search_kind == HostedSearchKind::X {
             return Ok(out);
         }
-        let query = hosted_search_query(item, &input);
         let index = self.next_index;
         let result_index = index + 1;
         self.next_index += 2;
@@ -739,7 +1089,7 @@ impl Reducer {
             index,
             result_index,
             id: format!("srvtoolu_{id}"),
-            name,
+            name: search_kind.name().into(),
             query,
         });
         Ok(out)
@@ -852,17 +1202,16 @@ impl Reducer {
         })
     }
     fn complete_text_snapshot(&mut self, snapshot: &str) -> anyhow::Result<Vec<ReducerEvent>> {
-        if snapshot.is_empty() {
-            return Ok(Vec::new());
-        }
         let suffix = match self.active.as_ref() {
             Some((kind, _)) if kind == "text" => snapshot.strip_prefix(&self.active_text),
-            None if !self.saw_text_output => Some(snapshot),
+            _ if !self.saw_text_output => Some(snapshot),
             _ => None,
-        };
-        match suffix {
-            Some(suffix) if !suffix.is_empty() => self.delta("text", suffix),
-            _ => Ok(Vec::new()),
+        }
+        .ok_or_else(|| anyhow::anyhow!("completed text snapshot disagrees with streamed deltas"))?;
+        if suffix.is_empty() {
+            Ok(Vec::new())
+        } else {
+            self.delta("text", suffix)
         }
     }
     fn close_kind(&mut self, kind: &str) -> anyhow::Result<Vec<ReducerEvent>> {
@@ -887,6 +1236,64 @@ impl Reducer {
     pub fn incomplete_reason(&self) -> Option<&str> {
         self.incomplete_reason.as_deref()
     }
+}
+
+fn optional_non_empty_identity<'a>(
+    value: Option<&'a Value>,
+    label: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+        Some(_) => anyhow::bail!("{label} must be a non-empty string"),
+    }
+}
+
+fn optional_event_identity<'a>(
+    value: Option<&'a Value>,
+    event: &str,
+    field: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+        Some(_) => anyhow::bail!("{event} {field} must be a non-empty string"),
+    }
+}
+
+fn optional_string_field<'a>(
+    value: Option<&'a Value>,
+    label: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => anyhow::bail!("{label} must be a string"),
+    }
+}
+
+fn hosted_search_identity(
+    item: &serde_json::Map<String, Value>,
+    item_type: &str,
+) -> anyhow::Result<(HostedItemKind, HostedSearchKind)> {
+    let supplied_name = optional_non_empty_identity(item.get("name"), "hosted tool call name")?;
+    let identity = match item_type {
+        "web_search_call" => (HostedItemKind::Web, HostedSearchKind::Web),
+        "x_search_call" => (HostedItemKind::X, HostedSearchKind::X),
+        "custom_tool_call" => match supplied_name {
+            Some("web_search") => (HostedItemKind::Custom, HostedSearchKind::Web),
+            Some("x_search") => (HostedItemKind::Custom, HostedSearchKind::X),
+            Some(_) => anyhow::bail!("unsupported custom hosted tool name"),
+            None => anyhow::bail!("custom hosted tool call lacks name"),
+        },
+        _ => anyhow::bail!("unsupported hosted tool call type: {item_type}"),
+    };
+    if let Some(supplied_name) = supplied_name
+        && supplied_name != identity.1.name()
+    {
+        anyhow::bail!("hosted tool call name disagrees with its type");
+    }
+    Ok(identity)
 }
 
 fn hosted_search_query(item: &serde_json::Map<String, Value>, buffered_input: &str) -> String {
@@ -1105,29 +1512,6 @@ pub(super) fn parse_function_arguments(arguments: &str) -> anyhow::Result<Value>
     }
 }
 
-fn response_output_text(response: &Value) -> Vec<String> {
-    let mut text = Vec::new();
-    let Some(output) = response.get("output").and_then(Value::as_array) else {
-        return text;
-    };
-    for item in output {
-        let Some(content) = item.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        for part in content {
-            if part.get("type").and_then(Value::as_str) == Some("output_text")
-                && let Some(value) = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-            {
-                text.push(value.to_string());
-            }
-        }
-    }
-    text
-}
-
 pub fn reduce_upstream_bytes(bytes: &[u8]) -> Result<Vec<ReducerEvent>, GrokReductionError> {
     let mut reducer = Reducer::default();
     let mut decoder = SseDecoder::default();
@@ -1337,6 +1721,244 @@ mod tests {
                 !reducer.finished(),
                 "a rejected same-batch tail must roll back the terminal"
             );
+        }
+    }
+
+    #[test]
+    fn terminal_events_require_a_response_object() {
+        for event in [
+            serde_json::json!({"type":"response.completed"}),
+            serde_json::json!({"type":"response.completed","response":null}),
+            serde_json::json!({"type":"response.incomplete","response":[]}),
+        ] {
+            let error = Reducer::default().push(event).unwrap_err();
+            assert!(error.to_string().contains("response is not an object"));
+        }
+    }
+
+    #[test]
+    fn terminal_status_must_match_the_event_type_when_present() {
+        for event in [
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"status":"incomplete","usage":{}}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"status":"failed","usage":{}}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"status":42,"usage":{}}
+            }),
+            serde_json::json!({
+                "type":"response.incomplete",
+                "response":{"status":"completed","usage":{}}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "incomplete_details":{"reason":"max_output_tokens"},
+                    "usage":{}
+                }
+            }),
+        ] {
+            assert!(Reducer::default().push(event).is_err());
+        }
+
+        for event in [
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"status":"completed","usage":{}}
+            }),
+            serde_json::json!({
+                "type":"response.incomplete",
+                "response":{"status":"incomplete","usage":{}}
+            }),
+        ] {
+            assert!(Reducer::default().push(event).is_ok());
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_rejects_unobserved_or_omitted_tool_items() {
+        for item in [
+            serde_json::json!({
+                "type":"function_call",
+                "id":"item_1",
+                "call_id":"call_1",
+                "name":"lookup",
+                "arguments":"{}"
+            }),
+            serde_json::json!({
+                "type":"web_search_call",
+                "id":"search_1"
+            }),
+        ] {
+            let error = Reducer::default()
+                .push(serde_json::json!({
+                    "type":"response.completed",
+                    "response":{"output":[item],"usage":{}}
+                }))
+                .unwrap_err();
+            assert!(error.to_string().contains("unobserved"), "{error:#}");
+        }
+
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"function_call",
+                    "id":"item_1",
+                    "call_id":"call_1",
+                    "name":"lookup"
+                }
+            }))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{
+                    "type":"function_call",
+                    "id":"item_1",
+                    "call_id":"call_1",
+                    "name":"lookup",
+                    "arguments":"{}"
+                }
+            }))
+            .unwrap();
+        let error = reducer
+            .push(serde_json::json!({
+                "type":"response.completed",
+                "response":{"output":[],"usage":{}}
+            }))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("omits a completed function call")
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_accepts_matching_function_lifecycle() {
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"function_call",
+                    "id":"item_1",
+                    "call_id":"call_1",
+                    "name":"lookup"
+                }
+            }))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{
+                    "type":"function_call",
+                    "id":"item_1",
+                    "call_id":"call_1",
+                    "name":"lookup",
+                    "arguments":"{\"q\":1}"
+                }
+            }))
+            .unwrap();
+        let events = reducer
+            .push(serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "output":[{
+                        "type":"function_call",
+                        "id":"item_1",
+                        "call_id":"call_1",
+                        "name":"lookup",
+                        "arguments":"{\"q\":1}"
+                    }],
+                    "usage":{}
+                }
+            }))
+            .unwrap();
+        assert!(matches!(events.last(), Some(ReducerEvent::Finish { .. })));
+    }
+
+    #[test]
+    fn terminal_snapshot_accepts_matching_hosted_lifecycle() {
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"custom_tool_call",
+                    "id":"search_1",
+                    "name":"web_search"
+                }
+            }))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.custom_tool_call_input.delta",
+                "item_id":"search_1",
+                "delta":"{\"query\":\"rust\"}"
+            }))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.custom_tool_call_input.done",
+                "item_id":"search_1"
+            }))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{
+                    "type":"custom_tool_call",
+                    "id":"search_1",
+                    "name":"web_search"
+                }
+            }))
+            .unwrap();
+        let events = reducer
+            .push(serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "output":[{
+                        "type":"custom_tool_call",
+                        "id":"search_1",
+                        "name":"web_search"
+                    }],
+                    "usage":{}
+                }
+            }))
+            .unwrap();
+        assert!(matches!(events.last(), Some(ReducerEvent::Finish { .. })));
+    }
+
+    #[test]
+    fn output_item_events_fail_closed_on_missing_or_unknown_types() {
+        for event in [
+            serde_json::json!({"type":"response.output_item.added","item":{}}),
+            serde_json::json!({"type":"response.output_item.added","item":{"type":"future"}}),
+            serde_json::json!({"type":"response.output_item.done","item":{}}),
+            serde_json::json!({"type":"response.output_item.done","item":{"type":"future"}}),
+        ] {
+            assert!(Reducer::default().push(event).is_err());
+        }
+
+        for event_type in ["response.output_item.added", "response.output_item.done"] {
+            for item_type in ["message", "reasoning"] {
+                let events = Reducer::default()
+                    .push(serde_json::json!({
+                        "type":event_type,
+                        "item":{"type":item_type}
+                    }))
+                    .unwrap();
+                assert!(events.is_empty());
+            }
         }
     }
 
@@ -1552,6 +2174,388 @@ mod tests {
         assert!(matches!(events.last(), Some(ReducerEvent::Finish { .. })));
     }
 
+    fn reducer_with_two_identified_function_calls() -> Reducer {
+        let mut reducer = Reducer::default();
+        for (item_id, call_id, name) in [
+            ("item_1", "call_1", "first"),
+            ("item_2", "call_2", "second"),
+        ] {
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.added",
+                    "item":{
+                        "type":"function_call",
+                        "id":item_id,
+                        "call_id":call_id,
+                        "name":name
+                    }
+                }))
+                .unwrap();
+        }
+        reducer
+    }
+
+    #[test]
+    fn function_argument_events_reject_unknown_or_mixed_identities() {
+        let base = reducer_with_two_identified_function_calls();
+
+        for event in [
+            serde_json::json!({
+                "type":"response.function_call_arguments.delta",
+                "call_id":"call_1",
+                "item_id":"item_2",
+                "delta":"{}"
+            }),
+            serde_json::json!({
+                "type":"response.function_call_arguments.delta",
+                "call_id":"call_1",
+                "item_id":"missing_item",
+                "delta":"{}"
+            }),
+            serde_json::json!({
+                "type":"response.function_call_arguments.delta",
+                "call_id":"missing_call",
+                "item_id":"item_1",
+                "delta":"{}"
+            }),
+            serde_json::json!({
+                "type":"response.function_call_arguments.done",
+                "call_id":"call_1",
+                "item_id":"item_2",
+                "arguments":"{}"
+            }),
+            serde_json::json!({
+                "type":"response.function_call_arguments.done",
+                "call_id":"call_1",
+                "item_id":"missing_item",
+                "arguments":"{}"
+            }),
+            serde_json::json!({
+                "type":"response.function_call_arguments.done",
+                "call_id":"missing_call",
+                "item_id":"item_1",
+                "arguments":"{}"
+            }),
+        ] {
+            let mut reducer = base.clone();
+            let error = reducer.push(event).unwrap_err();
+            assert!(
+                error.to_string().contains("unknown")
+                    || error.to_string().contains("different function calls"),
+                "{error:#}"
+            );
+            assert_eq!(reducer.calls.len(), 2);
+            assert_eq!(reducer.item_calls.len(), 2);
+        }
+
+        let mut reducer = base;
+        reducer
+            .push(serde_json::json!({
+                "type":"response.function_call_arguments.delta",
+                "call_id":"call_1",
+                "item_id":"item_1",
+                "delta":"{}"
+            }))
+            .unwrap();
+    }
+
+    #[test]
+    fn completed_function_item_rejects_conflicting_id_or_name() {
+        let base = reducer_with_two_identified_function_calls();
+        for item in [
+            serde_json::json!({
+                "type":"function_call",
+                "id":"item_2",
+                "call_id":"call_1",
+                "name":"first",
+                "arguments":"{}"
+            }),
+            serde_json::json!({
+                "type":"function_call",
+                "id":"item_1",
+                "call_id":"call_1",
+                "name":"second",
+                "arguments":"{}"
+            }),
+            serde_json::json!({
+                "type":"function_call",
+                "id":"item_1",
+                "call_id":"missing_call",
+                "name":"first",
+                "arguments":"{}"
+            }),
+        ] {
+            let mut reducer = base.clone();
+            let error = reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.done",
+                    "item":item
+                }))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("disagrees") || error.to_string().contains("unknown"),
+                "{error:#}"
+            );
+            assert_eq!(reducer.calls.len(), 2);
+            assert_eq!(reducer.item_calls.len(), 2);
+        }
+    }
+
+    #[test]
+    fn function_argument_fields_reject_present_non_string_values() {
+        let mut base = Reducer::default();
+        base.push(serde_json::json!({
+            "type":"response.output_item.added",
+            "item":{
+                "type":"function_call",
+                "id":"item_1",
+                "call_id":"call_1",
+                "name":"lookup"
+            }
+        }))
+        .unwrap();
+        base.push(serde_json::json!({
+            "type":"response.function_call_arguments.delta",
+            "call_id":"call_1",
+            "delta":"{}"
+        }))
+        .unwrap();
+
+        for arguments in [
+            serde_json::json!(42),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            let mut reducer = base.clone();
+            let error = reducer
+                .push(serde_json::json!({
+                    "type":"response.function_call_arguments.done",
+                    "call_id":"call_1",
+                    "arguments":arguments.clone()
+                }))
+                .unwrap_err();
+            assert!(error.to_string().contains("must be a string"), "{error:#}");
+
+            let mut reducer = base.clone();
+            let error = reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.done",
+                    "item":{
+                        "type":"function_call",
+                        "id":"item_1",
+                        "call_id":"call_1",
+                        "name":"lookup",
+                        "arguments":arguments
+                    }
+                }))
+                .unwrap_err();
+            assert!(error.to_string().contains("must be a string"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn completed_function_call_and_item_ids_cannot_be_reused() {
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"function_call",
+                    "id":"item_1",
+                    "call_id":"call_1",
+                    "name":"lookup"
+                }
+            }))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{
+                    "type":"function_call",
+                    "id":"item_1",
+                    "call_id":"call_1",
+                    "name":"lookup",
+                    "arguments":"{}"
+                }
+            }))
+            .unwrap();
+
+        assert!(reducer.calls.is_empty());
+        assert!(reducer.item_calls.is_empty());
+        assert!(reducer.tool_args.is_empty());
+        assert!(reducer.completed_arguments.is_empty());
+        assert!(reducer.completed_calls.contains_key("call_1"));
+        assert!(reducer.tool_item_ids.contains("item_1"));
+
+        for item in [
+            serde_json::json!({
+                "type":"function_call",
+                "id":"item_2",
+                "call_id":"call_1",
+                "name":"lookup"
+            }),
+            serde_json::json!({
+                "type":"function_call",
+                "id":"item_1",
+                "call_id":"call_2",
+                "name":"lookup"
+            }),
+        ] {
+            let mut attempt = reducer.clone();
+            let error = attempt
+                .push(serde_json::json!({
+                    "type":"response.output_item.added",
+                    "item":item
+                }))
+                .unwrap_err();
+            assert!(error.to_string().contains("duplicate"));
+            assert!(attempt.calls.is_empty());
+            assert!(attempt.item_calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn function_and_hosted_calls_share_one_output_item_id_namespace() {
+        let mut function_first = Reducer::default();
+        function_first
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"function_call",
+                    "id":"shared_item",
+                    "call_id":"call_1",
+                    "name":"lookup"
+                }
+            }))
+            .unwrap();
+        let error = function_first
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"custom_tool_call",
+                    "id":"shared_item",
+                    "name":"web_search"
+                }
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate output tool item id"));
+
+        let mut hosted_first = Reducer::default();
+        hosted_first
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"custom_tool_call",
+                    "id":"shared_item",
+                    "name":"web_search"
+                }
+            }))
+            .unwrap();
+        let error = hosted_first
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"function_call",
+                    "id":"shared_item",
+                    "call_id":"call_1",
+                    "name":"lookup"
+                }
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate output tool item id"));
+    }
+
+    #[test]
+    fn response_total_tool_item_history_has_an_explicit_limit() {
+        let mut reducer = Reducer::default();
+        for index in 0..MAX_TOTAL_TOOL_ITEMS {
+            let call_id = format!("call_{index}");
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.added",
+                    "item":{
+                        "type":"function_call",
+                        "call_id":call_id.clone(),
+                        "name":"lookup"
+                    }
+                }))
+                .unwrap();
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.done",
+                    "item":{
+                        "type":"function_call",
+                        "call_id":call_id,
+                        "arguments":"{}"
+                    }
+                }))
+                .unwrap();
+        }
+        assert_eq!(reducer.total_tool_items, MAX_TOTAL_TOOL_ITEMS);
+        assert_eq!(reducer.completed_calls.len(), MAX_TOTAL_TOOL_ITEMS);
+        assert!(reducer.calls.is_empty());
+
+        let error = reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{
+                    "type":"function_call",
+                    "call_id":"one_too_many",
+                    "name":"lookup"
+                }
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("too many tool items"));
+    }
+
+    #[test]
+    fn completed_function_calls_release_all_active_lookup_state() {
+        let mut reducer = Reducer::default();
+
+        for index in 0..128 {
+            let call_id = format!("call_{index}");
+            let item_id = format!("item_{index}");
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.added",
+                    "item":{
+                        "type":"function_call",
+                        "id":item_id,
+                        "call_id":call_id,
+                        "name":"lookup"
+                    }
+                }))
+                .unwrap();
+            assert_eq!(reducer.calls.len(), 1);
+            assert_eq!(reducer.item_calls.len(), 1);
+
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.function_call_arguments.delta",
+                    "item_id":item_id,
+                    "delta":"{}"
+                }))
+                .unwrap();
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.done",
+                    "item":{
+                        "type":"function_call",
+                        "id":item_id,
+                        "call_id":call_id
+                    }
+                }))
+                .unwrap();
+
+            assert!(reducer.calls.is_empty());
+            assert!(reducer.item_calls.is_empty());
+            assert!(reducer.tool_args.is_empty());
+            assert!(reducer.completed_arguments.is_empty());
+            assert_eq!(reducer.completed_calls.len(), index + 1);
+            assert_eq!(reducer.tool_item_ids.len(), index + 1);
+        }
+    }
+
     #[test]
     fn grok_reducer_accepts_live_reasoning_text_events() {
         let input = b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"think\"}\n\ndata: {\"type\":\"response.reasoning_text.done\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n";
@@ -1600,6 +2604,168 @@ mod tests {
                 ..
             }) if stop_reason == "end_turn"
         ));
+    }
+
+    #[test]
+    fn hosted_search_declarations_accept_only_exact_known_identities() {
+        for item in [
+            serde_json::json!({"type":"custom_tool_call","id":"search_1"}),
+            serde_json::json!({
+                "type":"custom_tool_call",
+                "name":"x_search_recent",
+                "id":"search_1"
+            }),
+            serde_json::json!({
+                "type":"web_search_call",
+                "name":"x_search",
+                "id":"search_1"
+            }),
+        ] {
+            let mut reducer = Reducer::default();
+            let error = reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.added",
+                    "item":item
+                }))
+                .unwrap_err();
+            assert!(error.to_string().contains("hosted") || error.to_string().contains("custom"));
+            assert!(reducer.hosted_calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_hosted_search_lifecycle_rejects_unknown_mismatch_and_out_of_order() {
+        let unknown = Reducer::default()
+            .push(serde_json::json!({
+                "type":"response.web_search_call.in_progress",
+                "item_id":"missing"
+            }))
+            .unwrap_err();
+        assert!(unknown.to_string().contains("out of order"));
+
+        let mut mismatch = Reducer::default();
+        mismatch
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"x_search_call","id":"search_1"}
+            }))
+            .unwrap();
+        let error = mismatch
+            .push(serde_json::json!({
+                "type":"response.web_search_call.in_progress",
+                "item_id":"search_1"
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("disagrees"));
+
+        let mut out_of_order = Reducer::default();
+        out_of_order
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"web_search_call","id":"search_1"}
+            }))
+            .unwrap();
+        let error = out_of_order
+            .push(serde_json::json!({
+                "type":"response.web_search_call.searching",
+                "item_id":"search_1"
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("out of order"));
+    }
+
+    #[test]
+    fn hosted_search_completion_requires_matching_active_call() {
+        let unknown = Reducer::default()
+            .push(serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{"type":"web_search_call","id":"missing"}
+            }))
+            .unwrap_err();
+        assert!(unknown.to_string().contains("unknown"));
+
+        let mut mismatch = Reducer::default();
+        mismatch
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"custom_tool_call","name":"web_search","id":"search_1"}
+            }))
+            .unwrap();
+        let error = mismatch
+            .push(serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{"type":"custom_tool_call","name":"x_search","id":"search_1"}
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("disagrees"));
+        assert!(mismatch.hosted_calls.contains_key("search_1"));
+
+        let mut out_of_order = Reducer::default();
+        out_of_order
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"web_search_call","id":"search_1"}
+            }))
+            .unwrap();
+        let error = out_of_order
+            .push(serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{"type":"web_search_call","id":"search_1"}
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("out of order"));
+    }
+
+    #[test]
+    fn completed_hosted_search_ids_cannot_be_reused() {
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"custom_tool_call","name":"web_search","id":"search_1"}
+            }))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.custom_tool_call_input.delta",
+                "item_id":"search_1",
+                "delta":"{\"query\":\"rust\"}"
+            }))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.custom_tool_call_input.done",
+                "item_id":"search_1"
+            }))
+            .unwrap();
+        let events = reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{"type":"custom_tool_call","name":"web_search","id":"search_1"}
+            }))
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ReducerEvent::HostedSearch { id, .. }] if id == "srvtoolu_search_1"
+        ));
+        assert!(reducer.hosted_calls.is_empty());
+        assert!(reducer.completed_hosted_inputs.is_empty());
+        assert!(reducer.completed_hosted_calls.contains_key("search_1"));
+
+        let duplicate_done = reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{"type":"custom_tool_call","name":"web_search","id":"search_1"}
+            }))
+            .unwrap_err();
+        assert!(duplicate_done.to_string().contains("duplicate"));
+        let duplicate_added = reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"custom_tool_call","name":"web_search","id":"search_1"}
+            }))
+            .unwrap_err();
+        assert!(duplicate_added.to_string().contains("duplicate"));
     }
 
     #[test]
@@ -1728,6 +2894,26 @@ mod tests {
             .collect::<String>();
 
         assert_eq!(text, "answer 😊");
+    }
+
+    #[test]
+    fn grok_reducer_rejects_done_snapshot_that_conflicts_with_streamed_text() {
+        for snapshot in ["hullo", ""] {
+            let mut reducer = Reducer::default();
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.output_text.delta",
+                    "delta":"hello"
+                }))
+                .unwrap();
+            let error = reducer
+                .push(serde_json::json!({
+                    "type":"response.output_text.done",
+                    "text":snapshot
+                }))
+                .unwrap_err();
+            assert!(error.to_string().contains("disagrees with streamed deltas"));
+        }
     }
 
     #[test]

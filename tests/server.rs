@@ -3,7 +3,10 @@ use axum::http::{Method, Request, StatusCode};
 use claude_code_proxy::{
     monitor::{MonitorHandle, RequestStatus},
     registry::Registry,
-    server::{ServerLimits, app, app_with_limits, app_with_monitor, bind_proxy_listener},
+    server::{
+        ServerLimits, app, app_with_limits, app_with_monitor, bind_proxy_listener,
+        bind_proxy_listener_with_ack,
+    },
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -58,9 +61,19 @@ async fn bind_error_names_address_and_port() {
 }
 
 #[tokio::test]
-async fn configurable_bind_address_accepts_all_interfaces() {
-    let listener = bind_proxy_listener("0.0.0.0", 0).await.unwrap();
+async fn non_loopback_bind_requires_explicit_unsafe_ack() {
+    let error = bind_proxy_listener("0.0.0.0", 0)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("refusing unauthenticated non-loopback bind address"));
+    assert!(error.contains("--allow-remote-unauthenticated"));
+
+    let listener = bind_proxy_listener_with_ack("0.0.0.0", 0, true)
+        .await
+        .unwrap();
     assert_eq!(listener.local_addr().unwrap().ip().to_string(), "0.0.0.0");
+    assert_ne!(listener.local_addr().unwrap().port(), 0);
 }
 
 #[tokio::test]
@@ -518,6 +531,10 @@ async fn count_tokens_accepts_tool_reference_results_for_grok_and_codex() {
         let app = app(Arc::new(Registry::with_default_alias()));
         let payload = json!({
             "model": model,
+            "tools": [
+                {"name": "ToolSearch", "input_schema": {"type": "object"}},
+                {"name": "WebFetch", "defer_loading": true, "input_schema": {"type": "object"}}
+            ],
             "messages": [
                 {
                     "role": "assistant",
@@ -623,13 +640,17 @@ async fn count_tokens_accepts_all_anthropic_tool_result_shapes_for_grok_and_code
             }
             let payload = json!({
                 "model": model,
+                "tools": [
+                    {"name": "ToolSearch", "input_schema": {"type": "object"}},
+                    {"name": "WebFetch", "defer_loading": true, "input_schema": {"type": "object"}}
+                ],
                 "messages": [
                     {
                         "role": "assistant",
                         "content": [{
                             "type": "tool_use",
                             "id": "call_shape_1",
-                            "name": "ShapeProbe",
+                            "name": "ToolSearch",
                             "input": {},
                             "caller": {"type": "direct"}
                         }]

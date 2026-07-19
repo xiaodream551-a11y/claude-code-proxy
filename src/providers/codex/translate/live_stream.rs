@@ -3,11 +3,15 @@ use std::collections::{HashMap, HashSet};
 use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
 
+use super::super::events::validate_terminal_snapshot_status;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
-    CodexUsage, STOP_END_TURN, STOP_TOOL_USE, map_codex_usage_to_anthropic,
-    stop_reason_for_incomplete_response, validate_tool_arguments,
+    CodexUsage, OutputItemIdentity, OutputItemKind, STOP_END_TURN, STOP_TOOL_USE, event_type,
+    is_post_terminal_telemetry, map_codex_usage_to_anthropic, parse_output_item_added,
+    reconcile_output_text_snapshot, register_output_item, require_active_output_kind,
+    resolve_semantic_output_index, stop_reason_for_incomplete_response, unfinished_output_indices,
+    validate_output_item_done, validate_tool_arguments,
 };
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
@@ -64,6 +68,9 @@ pub struct LiveStreamTranslator {
     message_started: bool,
     blocks_by_output_index: HashMap<usize, LiveBlock>,
     item_id_to_output_index: HashMap<String, usize>,
+    call_id_to_output_index: HashMap<String, usize>,
+    output_identities: HashMap<usize, OutputItemIdentity>,
+    completed_output_indices: HashSet<usize>,
     anthropic_index: usize,
     thinking: Option<LiveThinking>,
     reasoning_by_output_index: HashMap<usize, PendingReasoning>,
@@ -85,6 +92,9 @@ impl LiveStreamTranslator {
             message_started: false,
             blocks_by_output_index: HashMap::new(),
             item_id_to_output_index: HashMap::new(),
+            call_id_to_output_index: HashMap::new(),
+            output_identities: HashMap::new(),
+            completed_output_indices: HashSet::new(),
             anthropic_index: 0,
             thinking: None,
             reasoning_by_output_index: HashMap::new(),
@@ -105,7 +115,16 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
     ) -> Result<Vec<u8>, String> {
         if self.finished {
-            return Ok(Vec::new());
+            if is_post_terminal_telemetry(payload) {
+                return Ok(Vec::new());
+            }
+            let kind = payload
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<missing>");
+            return Err(format!(
+                "unexpected Codex event {kind:?} after terminal response event"
+            ));
         }
         let input_bytes = serde_json::to_vec(payload)
             .map_err(|error| format!("Codex stream event could not be encoded: {error}"))?
@@ -115,7 +134,8 @@ impl LiveStreamTranslator {
         }
         self.upstream_input_bytes += input_bytes;
 
-        let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = event_type(payload)?;
+        validate_terminal_snapshot_status(payload)?;
         let mut out = Vec::new();
 
         match kind {
@@ -130,17 +150,48 @@ impl LiveStreamTranslator {
                 }
             }
             "keepalive" => {}
-            "response.failed" | "response.error" | "error" => {
+            "response.failed" | "response.error" | "response.cancelled" | "error" => {
                 return Err(error_message(payload));
             }
             "response.web_search_call.in_progress"
             | "response.web_search_call.searching"
-            | "response.web_search_call.completed" => {}
+            | "response.web_search_call.completed" => {
+                let output_index = self.semantic_output_index(payload, kind)?;
+                require_active_output_kind(
+                    &self.output_identities,
+                    &self.completed_output_indices,
+                    output_index,
+                    OutputItemKind::WebSearchCall,
+                    kind,
+                )?;
+            }
             "response.output_item.added" => {
-                self.output_item_added(payload, traffic, &mut out);
+                self.output_item_added(payload, traffic, &mut out)?;
             }
             "response.reasoning_summary_part.added" => {
-                let output_index = output_index(payload);
+                let output_index = self.semantic_output_index(payload, kind)?;
+                require_active_output_kind(
+                    &self.output_identities,
+                    &self.completed_output_indices,
+                    output_index,
+                    OutputItemKind::Reasoning,
+                    kind,
+                )?;
+                payload
+                    .get("summary_index")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| {
+                        format!("{kind} is missing a non-negative integer summary_index")
+                    })?;
+                if payload
+                    .get("part")
+                    .filter(|part| part.is_object())
+                    .and_then(|part| part.get("type"))
+                    .and_then(|value| value.as_str())
+                    != Some("summary_text")
+                {
+                    return Err(format!("{kind} is missing a summary_text part"));
+                }
                 if let Some(thinking) = self
                     .thinking
                     .filter(|thinking| thinking.output_index == output_index)
@@ -158,13 +209,13 @@ impl LiveStreamTranslator {
                 }
             }
             "response.reasoning_summary_text.delta" => {
-                self.reasoning_delta(payload, traffic, &mut out);
+                self.reasoning_delta(payload, traffic, &mut out)?;
             }
             "response.output_text.delta" => {
-                self.text_delta(payload, traffic, &mut out);
+                self.text_delta(payload, traffic, &mut out)?;
             }
             "response.output_text.annotation.added" => {
-                self.web_search_annotation(payload);
+                self.web_search_annotation(payload)?;
             }
             "response.function_call_arguments.delta" => {
                 self.tool_delta(payload, traffic, &mut out)?;
@@ -178,7 +229,31 @@ impl LiveStreamTranslator {
             "response.completed" | "response.incomplete" | "response.done" => {
                 self.finish(payload, traffic, &mut out)?;
             }
-            _ => {}
+            "response.created" | "response.in_progress" | "response.queued" => {}
+            "response.content_part.added" | "response.content_part.done" => {
+                let output_index = self.semantic_output_index(payload, kind)?;
+                require_active_output_kind(
+                    &self.output_identities,
+                    &self.completed_output_indices,
+                    output_index,
+                    OutputItemKind::Message,
+                    kind,
+                )?;
+            }
+            "response.output_text.done" => {
+                self.text_done(payload, traffic, &mut out)?;
+            }
+            "response.reasoning_summary_part.done" | "response.reasoning_summary_text.done" => {
+                let output_index = self.semantic_output_index(payload, kind)?;
+                require_active_output_kind(
+                    &self.output_identities,
+                    &self.completed_output_indices,
+                    output_index,
+                    OutputItemKind::Reasoning,
+                    kind,
+                )?;
+            }
+            _ => return Err(format!("unsupported Codex semantic event {kind:?}")),
         }
 
         Ok(out)
@@ -194,6 +269,17 @@ impl LiveStreamTranslator {
     ) -> Vec<u8> {
         let mut out = Vec::new();
         if self.finished || !self.saw_tool_use {
+            return out;
+        }
+
+        let unfinished =
+            unfinished_output_indices(&self.output_identities, &self.completed_output_indices);
+        if unfinished.iter().any(|output_index| {
+            self.output_identities
+                .get(output_index)
+                .is_none_or(|identity| identity.kind != OutputItemKind::FunctionCall)
+                || !self.blocks_by_output_index.contains_key(output_index)
+        }) {
             return out;
         }
 
@@ -330,28 +416,28 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) {
-        let Some(item) = payload.get("item") else {
-            return;
-        };
-        let output_index = output_index(payload);
-        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    ) -> Result<(), String> {
+        let (output_index, item, identity) = parse_output_item_added(payload)?;
+        let item_type = identity.kind;
+        register_output_item(
+            output_index,
+            identity,
+            &mut self.output_identities,
+            &mut self.item_id_to_output_index,
+            &mut self.call_id_to_output_index,
+        )?;
 
         match item_type {
-            "reasoning" => {
+            OutputItemKind::Reasoning => {
                 self.reasoning_by_output_index
                     .entry(output_index)
                     .or_default()
                     .capture(item);
             }
-            "message" => {
+            OutputItemKind::Message => {
                 self.close_thinking(traffic, out);
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
-                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                    self.item_id_to_output_index
-                        .insert(id.to_string(), output_index);
-                }
                 let deferred = !self.web_searches.is_empty();
                 self.blocks_by_output_index.insert(
                     output_index,
@@ -375,25 +461,22 @@ impl LiveStreamTranslator {
                     );
                 }
             }
-            "function_call" => {
+            OutputItemKind::FunctionCall => {
                 self.close_thinking(traffic, out);
-                self.saw_tool_use = true;
                 let index = self.anthropic_index;
+                let identity = self
+                    .output_identities
+                    .get(&output_index)
+                    .expect("registered output item identity");
+                let call_id = identity
+                    .call_id
+                    .clone()
+                    .expect("validated function call_id");
+                let name = identity.name.clone().expect("validated function name");
+                // Do not mutate content indices or tool-use state until the
+                // complete function identity has passed validation.
+                self.saw_tool_use = true;
                 self.anthropic_index += 1;
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
-                    self.item_id_to_output_index
-                        .insert(id.to_string(), output_index);
-                }
                 self.blocks_by_output_index.insert(
                     output_index,
                     LiveBlock::Tool {
@@ -423,17 +506,13 @@ impl LiveStreamTranslator {
                     }),
                 );
             }
-            "web_search_call" => {
-                if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
-                    self.item_id_to_output_index
-                        .insert(id.to_string(), output_index);
-                }
+            OutputItemKind::WebSearchCall => {
                 if self.web_search_output_indices.insert(output_index) {
                     self.web_search_requests += 1;
                 }
             }
-            _ => {}
         }
+        Ok(())
     }
 
     fn reasoning_delta(
@@ -441,11 +520,26 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) {
-        let output_index = output_index(payload);
-        let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+    ) -> Result<(), String> {
+        let event = "response.reasoning_summary_text.delta";
+        let output_index = self.semantic_output_index(payload, event)?;
+        require_active_output_kind(
+            &self.output_identities,
+            &self.completed_output_indices,
+            output_index,
+            OutputItemKind::Reasoning,
+            event,
+        )?;
+        payload
+            .get("summary_index")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| format!("{event} is missing a non-negative integer summary_index"))?;
+        let delta = payload
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{event} is missing a string delta"))?;
         if delta.is_empty() {
-            return;
+            return Ok(());
         }
         if self.thinking.map(|thinking| thinking.output_index) != Some(output_index) {
             self.close_thinking(traffic, out);
@@ -481,6 +575,7 @@ impl LiveStreamTranslator {
                 "delta": {"type": "thinking_delta", "thinking": delta}
             }),
         );
+        Ok(())
     }
 
     fn text_delta(
@@ -488,51 +583,24 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) {
-        self.close_thinking(traffic, out);
-        let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+    ) -> Result<(), String> {
+        let event = "response.output_text.delta";
+        let output_index = self.semantic_output_index(payload, event)?;
+        require_active_output_kind(
+            &self.output_identities,
+            &self.completed_output_indices,
+            output_index,
+            OutputItemKind::Message,
+            event,
+        )?;
+        let delta = payload
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{event} is missing a string delta"))?;
         if delta.is_empty() {
-            return;
+            return Ok(());
         }
-
-        let output_index = payload
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .or_else(|| {
-                payload
-                    .get("item_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|id| self.item_id_to_output_index.get(id).copied())
-            })
-            .unwrap_or(0);
-
-        if !self.blocks_by_output_index.contains_key(&output_index) {
-            let index = self.anthropic_index;
-            self.anthropic_index += 1;
-            let deferred = !self.web_searches.is_empty();
-            self.blocks_by_output_index.insert(
-                output_index,
-                LiveBlock::Text {
-                    index,
-                    text: String::new(),
-                    deferred,
-                },
-            );
-            if !deferred {
-                self.ensure_message_start(traffic, out);
-                self.emit(
-                    traffic,
-                    out,
-                    "content_block_start",
-                    &serde_json::json!({
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "text", "text": "", "citations": null}
-                    }),
-                );
-            }
-        }
+        self.close_thinking(traffic, out);
 
         let Some(LiveBlock::Text {
             index,
@@ -540,11 +608,13 @@ impl LiveStreamTranslator {
             deferred,
         }) = self.blocks_by_output_index.get_mut(&output_index)
         else {
-            return;
+            return Err(format!(
+                "{event} references closed or missing output_index {output_index}"
+            ));
         };
         text.push_str(delta);
         if *deferred {
-            return;
+            return Ok(());
         }
         let index = *index;
         self.emit(
@@ -557,6 +627,56 @@ impl LiveStreamTranslator {
                 "delta": {"type": "text_delta", "text": delta}
             }),
         );
+        Ok(())
+    }
+
+    fn text_done(
+        &mut self,
+        payload: &serde_json::Value,
+        traffic: Option<&TrafficCapture>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let event = "response.output_text.done";
+        let output_index = self.semantic_output_index(payload, event)?;
+        require_active_output_kind(
+            &self.output_identities,
+            &self.completed_output_indices,
+            output_index,
+            OutputItemKind::Message,
+            event,
+        )?;
+        let snapshot = payload
+            .get("text")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("{event} is missing a string text snapshot"))?;
+        let (index, deferred, suffix) = {
+            let Some(LiveBlock::Text {
+                index,
+                text,
+                deferred,
+            }) = self.blocks_by_output_index.get_mut(&output_index)
+            else {
+                return Err(format!(
+                    "{event} references closed or missing output_index {output_index}"
+                ));
+            };
+            let suffix = reconcile_output_text_snapshot(text, snapshot, event)?.to_string();
+            text.push_str(&suffix);
+            (*index, *deferred, suffix)
+        };
+        if !deferred && !suffix.is_empty() {
+            self.emit(
+                traffic,
+                out,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "text_delta", "text": suffix}
+                }),
+            );
+        }
+        Ok(())
     }
 
     fn tool_delta(
@@ -565,10 +685,19 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let Some(output_index) = self.resolve_output_index(payload) else {
-            return Ok(());
-        };
-        let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+        let event = "response.function_call_arguments.delta";
+        let output_index = self.semantic_output_index(payload, event)?;
+        require_active_output_kind(
+            &self.output_identities,
+            &self.completed_output_indices,
+            output_index,
+            OutputItemKind::FunctionCall,
+            event,
+        )?;
+        let delta = payload
+            .get("delta")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{event} is missing a string delta"))?;
         if delta.is_empty() {
             return Ok(());
         }
@@ -582,13 +711,16 @@ impl LiveStreamTranslator {
             ..
         }) = self.blocks_by_output_index.get_mut(&output_index)
         else {
-            return Ok(());
+            return Err(format!(
+                "{event} references closed or missing output_index {output_index}"
+            ));
         };
 
-        // `response.function_call_arguments.done` is the authoritative snapshot.
-        // A late/replayed delta must never mutate arguments after that boundary.
+        // `response.function_call_arguments.done` is an ordering boundary.
         if done_snapshot.is_some() {
-            return Ok(());
+            return Err(format!(
+                "{event} arrived after arguments.done at output_index {output_index}"
+            ));
         }
         args_accum.push_str(delta);
         if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
@@ -604,6 +736,7 @@ impl LiveStreamTranslator {
 
         if let Some((index, repaired)) = repaired_read {
             self.blocks_by_output_index.remove(&output_index);
+            self.completed_output_indices.insert(output_index);
             self.emit(
                 traffic,
                 out,
@@ -631,20 +764,32 @@ impl LiveStreamTranslator {
     }
 
     fn tool_arguments_done(&mut self, payload: &serde_json::Value) -> Result<(), String> {
-        let Some(output_index) = self.resolve_output_index(payload) else {
-            return Ok(());
-        };
-        let Some(args) = payload.get("arguments").and_then(|v| v.as_str()) else {
-            return Ok(());
-        };
+        let event = "response.function_call_arguments.done";
+        let output_index = self.semantic_output_index(payload, event)?;
+        require_active_output_kind(
+            &self.output_identities,
+            &self.completed_output_indices,
+            output_index,
+            OutputItemKind::FunctionCall,
+            event,
+        )?;
+        let args = payload
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{event} is missing string arguments"))?;
         let Some(LiveBlock::Tool {
             name,
             done_snapshot,
             ..
         }) = self.blocks_by_output_index.get_mut(&output_index)
         else {
-            return Ok(());
+            return Err(format!(
+                "{event} references closed or missing output_index {output_index}"
+            ));
         };
+        if done_snapshot.is_some() {
+            return Err(format!("duplicate {event} for output_index {output_index}"));
+        }
         if args.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
             return Err(format!(
                 "Buffered {name} tool arguments exceeded safe limits"
@@ -660,16 +805,21 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let Some(output_index) = self.resolve_output_index(payload) else {
-            return Ok(());
-        };
-        if let Some(item) = payload
-            .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(|v| v.as_str())
-            .filter(|item_type| *item_type == "reasoning")
-            .and_then(|_| payload.get("item"))
-        {
+        let event = "response.output_item.done";
+        let output_index = self.semantic_output_index(payload, event)?;
+        let identity = self
+            .output_identities
+            .get(&output_index)
+            .cloned()
+            .ok_or_else(|| {
+                format!("{event} references output_index {output_index} before output_item.added")
+            })?;
+        if self.completed_output_indices.contains(&output_index) {
+            return Err(format!("duplicate {event} for output_index {output_index}"));
+        }
+        let item = validate_output_item_done(payload, output_index, &identity)?;
+
+        if identity.kind == OutputItemKind::Reasoning {
             self.reasoning_by_output_index
                 .entry(output_index)
                 .or_default()
@@ -681,17 +831,12 @@ impl LiveStreamTranslator {
             if !had_active_summary {
                 self.emit_signature_only_reasoning(output_index, traffic, out);
             }
+            self.completed_output_indices.insert(output_index);
             return Ok(());
         }
 
-        if payload
-            .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(|v| v.as_str())
-            == Some("web_search_call")
-        {
+        if identity.kind == OutputItemKind::WebSearchCall {
             self.close_thinking(traffic, out);
-            let item = &payload["item"];
             let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
             if self.web_search_output_indices.insert(output_index) {
                 self.web_search_requests += 1;
@@ -715,6 +860,7 @@ impl LiveStreamTranslator {
                 query: web_search_query(item),
                 results: web_search_sources(item),
             });
+            self.completed_output_indices.insert(output_index);
             return Ok(());
         }
 
@@ -742,7 +888,9 @@ impl LiveStreamTranslator {
         }
 
         let Some(mut state) = self.blocks_by_output_index.remove(&output_index) else {
-            return Ok(());
+            return Err(format!(
+                "{event} references closed or missing output_index {output_index}"
+            ));
         };
 
         match &mut state {
@@ -777,6 +925,7 @@ impl LiveStreamTranslator {
                 );
             }
         }
+        self.completed_output_indices.insert(output_index);
         Ok(())
     }
 
@@ -818,42 +967,17 @@ impl LiveStreamTranslator {
         }))
     }
 
-    fn resolve_output_index(&self, payload: &serde_json::Value) -> Option<usize> {
-        payload
-            .get("output_index")
-            .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
-            .or_else(|| {
-                payload
-                    .get("item_id")
-                    .and_then(|value| value.as_str())
-                    .or_else(|| {
-                        payload
-                            .get("item")
-                            .and_then(|item| item.get("id"))
-                            .and_then(|value| value.as_str())
-                    })
-                    .and_then(|id| self.item_id_to_output_index.get(id).copied())
-            })
-            .or_else(|| {
-                let call_id = payload
-                    .get("call_id")
-                    .and_then(|value| value.as_str())
-                    .or_else(|| {
-                        payload
-                            .get("item")
-                            .and_then(|item| item.get("call_id"))
-                            .and_then(|value| value.as_str())
-                    })?;
-                self.blocks_by_output_index
-                    .iter()
-                    .find_map(|(output_index, block)| match block {
-                        LiveBlock::Tool {
-                            call_id: candidate, ..
-                        } if candidate == call_id => Some(*output_index),
-                        _ => None,
-                    })
-            })
+    fn semantic_output_index(
+        &self,
+        payload: &serde_json::Value,
+        event: &str,
+    ) -> Result<usize, String> {
+        resolve_semantic_output_index(
+            payload,
+            event,
+            &self.item_id_to_output_index,
+            &self.call_id_to_output_index,
+        )
     }
 
     fn commit_tool_arguments(
@@ -879,22 +1003,34 @@ impl LiveStreamTranslator {
         }
     }
 
-    fn web_search_annotation(&mut self, payload: &serde_json::Value) {
-        let Some(annotation) = payload.get("annotation") else {
-            return;
-        };
+    fn web_search_annotation(&mut self, payload: &serde_json::Value) -> Result<(), String> {
+        let event = "response.output_text.annotation.added";
+        let output_index = self.semantic_output_index(payload, event)?;
+        require_active_output_kind(
+            &self.output_identities,
+            &self.completed_output_indices,
+            output_index,
+            OutputItemKind::Message,
+            event,
+        )?;
+        let annotation = payload
+            .get("annotation")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| format!("{event} is missing an object annotation"))?;
         if annotation.get("type").and_then(|v| v.as_str()) != Some("url_citation") {
-            return;
+            return Err(format!("{event} contains an unsupported annotation type"));
         }
-        let Some(url) = annotation.get("url").and_then(|v| v.as_str()) else {
-            return;
-        };
+        let url = annotation
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| format!("{event} url citation is missing a non-empty url"))?;
         if self
             .web_search_results
             .iter()
             .any(|result| result.url == url)
         {
-            return;
+            return Ok(());
         }
         let title = annotation
             .get("title")
@@ -905,6 +1041,7 @@ impl LiveStreamTranslator {
             title: title.to_string(),
             url: url.to_string(),
         });
+        Ok(())
     }
 
     fn emit_web_searches(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
@@ -1025,41 +1162,29 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let mut output_indices: Vec<_> = self.blocks_by_output_index.keys().copied().collect();
-        output_indices.sort_unstable();
-        let mut prepared_tools = Vec::new();
-        for output_index in output_indices {
-            if let Some(prepared) = self.prepare_tool_arguments(output_index, None)? {
-                prepared_tools.push(prepared);
-            }
-        }
-        prepared_tools.sort_by_key(|prepared| prepared.index);
-        for prepared in prepared_tools {
-            if let Some((index, arguments)) = self.commit_tool_arguments(prepared) {
-                self.emit(
-                    traffic,
-                    out,
-                    "content_block_delta",
-                    &serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": arguments
-                        }
-                    }),
-                );
-            }
-        }
-        self.close_thinking(traffic, out);
-        self.close_open_blocks(traffic, out);
-        self.emit_web_searches(traffic, out);
-        self.ensure_message_start(traffic, out);
-        let usage = payload.get("response").map(parse_codex_usage);
         let event_type = payload
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("");
+        if !payload
+            .get("response")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            return Err(format!(
+                "{event_type} is missing an object response snapshot"
+            ));
+        }
+        let unfinished =
+            unfinished_output_indices(&self.output_identities, &self.completed_output_indices);
+        if !unfinished.is_empty() {
+            return Err(format!(
+                "{event_type} arrived with unfinished Codex output items at output_index(es) {unfinished:?}"
+            ));
+        }
+        self.close_thinking(traffic, out);
+        self.emit_web_searches(traffic, out);
+        self.ensure_message_start(traffic, out);
+        let usage = payload.get("response").map(parse_codex_usage);
         let stop_reason =
             if let Some(reason) = stop_reason_for_incomplete_response(payload, event_type) {
                 reason
@@ -1279,13 +1404,6 @@ fn web_search_sources(item: &serde_json::Value) -> Vec<LiveWebSearchResult> {
     results
 }
 
-fn output_index(payload: &serde_json::Value) -> usize {
-    payload
-        .get("output_index")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize
-}
-
 fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
     let usage = match response.get("usage") {
         Some(u) => u,
@@ -1406,22 +1524,430 @@ mod tests {
     #[test]
     fn emits_text_delta_before_terminal_event() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let out = translator
+        let mut out = translator
             .accept(
                 &json!({
-                    "type": "response.output_text.delta",
+                    "type": "response.output_item.added",
                     "output_index": 0,
-                    "delta": "hello"
+                    "item": {"type": "message", "id": "msg_up"}
                 }),
                 None,
             )
             .unwrap();
+        out.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "delta": "hello"
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("message_start"));
         assert!(out.contains("content_block_start"));
         assert!(out.contains("text_delta"));
         assert!(out.contains("hello"));
         assert!(!out.contains("message_stop"));
+    }
+
+    #[test]
+    fn codex_live_and_buffered_reconcile_output_text_done_snapshots() {
+        let added = json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"message","id":"msg_up"}
+        });
+        let delta = json!({
+            "type":"response.output_text.delta",
+            "output_index":0,
+            "delta":"hel"
+        });
+        let done = json!({
+            "type":"response.output_text.done",
+            "output_index":0,
+            "text":"hello"
+        });
+
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        translator.accept(&added, None).unwrap();
+        translator.accept(&delta, None).unwrap();
+        let live_suffix = String::from_utf8(translator.accept(&done, None).unwrap()).unwrap();
+        assert!(live_suffix.contains("\"text\":\"lo\""));
+
+        let buffered = [
+            added,
+            delta,
+            done,
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_up"}
+            }),
+            json!({
+                "type":"response.completed",
+                "response":{"id":"resp_1","usage":{}}
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let buffered = super::super::reducer::reduce_upstream_bytes(buffered.as_bytes()).unwrap();
+        let text = buffered
+            .iter()
+            .filter_map(|event| match event {
+                super::super::reducer::ReducerEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn codex_live_and_buffered_reject_missing_or_conflicting_text_done_snapshots() {
+        let added = json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"message","id":"msg_up"}
+        });
+        let delta = json!({
+            "type":"response.output_text.delta",
+            "output_index":0,
+            "delta":"hello"
+        });
+        for done in [
+            json!({
+                "type":"response.output_text.done",
+                "output_index":0
+            }),
+            json!({
+                "type":"response.output_text.done",
+                "output_index":0,
+                "text":"hullo"
+            }),
+        ] {
+            let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+            translator.accept(&added, None).unwrap();
+            translator.accept(&delta, None).unwrap();
+            let live_error = translator.accept(&done, None).unwrap_err();
+            assert!(
+                live_error.contains("string text snapshot")
+                    || live_error.contains("disagrees with accumulated output")
+            );
+
+            let buffered = [added.clone(), delta.clone(), done]
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            let buffered_error =
+                super::super::reducer::reduce_upstream_bytes(buffered.as_bytes()).unwrap_err();
+            assert!(
+                buffered_error.message.contains("string text snapshot")
+                    || buffered_error
+                        .message
+                        .contains("disagrees with accumulated output")
+            );
+        }
+    }
+
+    #[test]
+    fn codex_live_and_buffered_reject_mismatched_terminal_snapshot_statuses() {
+        for (event_type, status) in [
+            ("response.completed", "failed"),
+            ("response.done", "incomplete"),
+            ("response.incomplete", "completed"),
+            ("response.failed", "completed"),
+            ("response.error", "completed"),
+            ("response.cancelled", "failed"),
+            ("error", "completed"),
+        ] {
+            let terminal = json!({
+                "type":event_type,
+                "response":{"status":status, "usage":{}}
+            });
+
+            let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+            let live_error = translator.accept(&terminal, None).unwrap_err();
+            assert!(
+                live_error.contains("response.status"),
+                "{event_type}/{status}: {live_error}"
+            );
+
+            let buffered = format!("data: {terminal}\n\n");
+            let buffered_error =
+                super::super::reducer::reduce_upstream_bytes(buffered.as_bytes()).unwrap_err();
+            assert!(
+                buffered_error.message.contains("response.status"),
+                "{event_type}/{status}: {}",
+                buffered_error.message
+            );
+        }
+    }
+
+    #[test]
+    fn codex_live_and_buffered_reject_the_same_unresolved_delta() {
+        let delta = json!({
+            "type":"response.output_text.delta",
+            "item_id":"missing_item",
+            "delta":"lost"
+        });
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let live_error = translator.accept(&delta, None).unwrap_err();
+        assert!(live_error.contains("unknown item_id"));
+
+        let buffered = format!(
+            "data: {}\n\ndata: {}\n\n",
+            delta,
+            json!({
+                "type":"response.completed",
+                "response":{"id":"resp_1","usage":{}}
+            })
+        );
+        let buffered_error =
+            super::super::reducer::reduce_upstream_bytes(buffered.as_bytes()).unwrap_err();
+        assert!(buffered_error.message.contains("unknown item_id"));
+    }
+
+    #[test]
+    fn codex_live_and_buffered_reject_terminal_with_any_unfinished_item_kind() {
+        for (label, item) in [
+            ("message", json!({"type":"message","id":"item_message"})),
+            (
+                "function_call",
+                json!({
+                    "type":"function_call",
+                    "id":"item_tool",
+                    "call_id":"call_1",
+                    "name":"Read"
+                }),
+            ),
+            (
+                "reasoning",
+                json!({"type":"reasoning","id":"item_reasoning"}),
+            ),
+            (
+                "web_search_call",
+                json!({"type":"web_search_call","id":"item_search"}),
+            ),
+        ] {
+            let added = json!({
+                "type":"response.output_item.added",
+                "output_index":7,
+                "item":item
+            });
+            let terminal = json!({
+                "type":"response.completed",
+                "response":{"id":"resp_1","usage":{}}
+            });
+
+            let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+            translator.accept(&added, None).unwrap();
+            let live_error = translator.accept(&terminal, None).unwrap_err();
+            assert!(
+                live_error.contains("unfinished Codex output items"),
+                "{label}: {live_error}"
+            );
+
+            let buffered = format!("data: {added}\n\ndata: {terminal}\n\n");
+            let buffered_error =
+                super::super::reducer::reduce_upstream_bytes(buffered.as_bytes()).unwrap_err();
+            assert!(
+                buffered_error
+                    .message
+                    .contains("unfinished Codex output items"),
+                "{label}: {}",
+                buffered_error.message
+            );
+        }
+    }
+
+    #[test]
+    fn codex_live_and_buffered_reject_mixed_known_and_unknown_item_identities() {
+        let added = json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{
+                "type":"function_call",
+                "id":"item_1",
+                "call_id":"call_1",
+                "name":"Read"
+            }
+        });
+        for (event, expected) in [
+            (
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "item_id":"item_1",
+                    "call_id":"unknown_call",
+                    "delta":"{}"
+                }),
+                "unknown call_id",
+            ),
+            (
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "item_id":"unknown_item",
+                    "call_id":"call_1",
+                    "delta":"{}"
+                }),
+                "unknown item_id",
+            ),
+        ] {
+            let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+            translator.accept(&added, None).unwrap();
+            let live_error = translator.accept(&event, None).unwrap_err();
+            assert!(live_error.contains(expected), "{live_error}");
+
+            let buffered = format!("data: {added}\n\ndata: {event}\n\n");
+            let buffered_error =
+                super::super::reducer::reduce_upstream_bytes(buffered.as_bytes()).unwrap_err();
+            assert!(
+                buffered_error.message.contains(expected),
+                "{}",
+                buffered_error.message
+            );
+        }
+    }
+
+    #[test]
+    fn codex_duplicate_output_index_fails_before_second_start() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let first = translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_1"}
+                }),
+                None,
+            )
+            .unwrap();
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("duplicate Codex output_index 0"));
+
+        let mut rendered = String::from_utf8(first).unwrap();
+        rendered.push_str(
+            &String::from_utf8(translator.error_chunk(&error, "api_error", None)).unwrap(),
+        );
+        assert_eq!(rendered.matches("event: content_block_start").count(), 1);
+        assert_eq!(rendered.matches("event: content_block_stop").count(), 1);
+        assert!(!rendered.contains("message_stop"));
+    }
+
+    #[test]
+    fn codex_missing_function_identity_fails_before_downstream_bytes() {
+        for item in [
+            json!({"type":"function_call","name":"Read"}),
+            json!({"type":"function_call","call_id":"call_1"}),
+            json!({"type":"function_call","call_id":"","name":"Read"}),
+            json!({"type":"function_call","call_id":"call_1","name":""}),
+        ] {
+            let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+            let error = translator
+                .accept(
+                    &json!({
+                        "type":"response.output_item.added",
+                        "output_index":0,
+                        "item":item
+                    }),
+                    None,
+                )
+                .unwrap_err();
+            assert!(error.contains("must be a non-empty string"));
+            assert!(!translator.message_started);
+            assert!(translator.blocks_by_output_index.is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_live_rejects_terminal_tail_but_allows_rate_limit_telemetry() {
+        let terminal = json!({
+            "type":"response.completed",
+            "response":{"id":"resp_1","usage":{}}
+        });
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let terminal_bytes = translator.accept(&terminal, None).unwrap();
+        assert!(
+            String::from_utf8(terminal_bytes)
+                .unwrap()
+                .contains("message_stop")
+        );
+        assert!(
+            translator
+                .accept(
+                    &json!({"type":"codex.rate_limits","rate_limits":{"limit_reached":true}}),
+                    None
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.output_text.delta",
+                    "output_index":0,
+                    "delta":"late"
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("after terminal"));
+    }
+
+    #[test]
+    fn codex_live_rejects_done_before_added_and_unknown_semantic_event() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_1"}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("before output_item.added") || error.contains("unknown item_id"));
+
+        let error = translator
+            .accept(&json!({"type":"future.semantic.event","value":1}), None)
+            .unwrap_err();
+        assert!(error.contains("unsupported Codex semantic event"));
+
+        let mut translator = LiveStreamTranslator::new("msg_2", "gpt-5.6-sol");
+        translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_up"}
+                }),
+                None,
+            )
+            .unwrap();
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{"type":"message"}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("missing the non-empty id"));
     }
 
     #[test]
@@ -1440,7 +1966,7 @@ mod tests {
             json!({
                 "type": "response.output_item.done",
                 "output_index": 0,
-                "item": {"type": "message"}
+                "item": {"type": "message", "id": "msg_up"}
             }),
             json!({
                 "type": "response.completed",
@@ -1513,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn done_snapshot_overrides_deltas_item_snapshot_and_late_delta() {
+    fn done_snapshot_overrides_deltas_and_item_snapshot() {
         let out = render(vec![
             json!({
                 "type": "response.output_item.added",
@@ -1529,11 +2055,6 @@ mod tests {
                 "type": "response.function_call_arguments.done",
                 "call_id": "call_1",
                 "arguments": "{\"command\":\"from done\"}"
-            }),
-            json!({
-                "type": "response.function_call_arguments.delta",
-                "item_id": "item_1",
-                "delta": "{late garbage"
             }),
             json!({
                 "type": "response.output_item.done",
@@ -1554,8 +2075,37 @@ mod tests {
         assert!(out.contains(r#""partial_json":"{\"command\":\"from done\"}""#));
         assert!(!out.contains("from delta"));
         assert!(!out.contains("from item"));
-        assert!(!out.contains("late garbage"));
         assert_eq!(out.matches(r#""type":"input_json_delta""#).count(), 1);
+    }
+
+    #[test]
+    fn live_rejects_delta_after_arguments_done() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        for event in [
+            json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"Bash"}
+            }),
+            json!({
+                "type":"response.function_call_arguments.done",
+                "output_index":0,
+                "arguments":"{\"command\":\"done\"}"
+            }),
+        ] {
+            translator.accept(&event, None).unwrap();
+        }
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.function_call_arguments.delta",
+                    "output_index":0,
+                    "delta":"{late garbage"
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("after arguments.done"));
     }
 
     #[test]
@@ -1623,7 +2173,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error.contains("completed without JSON arguments"));
+        assert!(error.contains("unfinished Codex output items"));
         assert!(!translator.is_finished());
         let terminal =
             String::from_utf8(translator.error_chunk(&error, "api_error", None)).unwrap();
@@ -1670,7 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_event_emits_valid_buffered_tool_arguments_before_success() {
+    fn terminal_rejects_buffered_tool_until_output_item_done() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
         let mut out = Vec::new();
         for event in [
@@ -1683,6 +2233,37 @@ mod tests {
                 "type": "response.function_call_arguments.done",
                 "output_index": 0,
                 "arguments": "{\"file_path\":\"/tmp/a\"}"
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        let error = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_1", "usage": {}}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("unfinished Codex output items"));
+        assert!(
+            !String::from_utf8(out.clone())
+                .unwrap()
+                .contains("input_json_delta")
+        );
+
+        for event in [
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": "{\"file_path\":\"/tmp/a\"}"
+                }
             }),
             json!({
                 "type": "response.completed",
@@ -1700,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_tool_argument_completion_commits_all_tools_transactionally() {
+    fn unfinished_terminal_rejection_is_transactional_and_recoverable() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
         for event in [
             json!({
@@ -1719,9 +2300,9 @@ mod tests {
                 "item": {"type": "function_call", "call_id": "call_b", "name": "Read"}
             }),
             json!({
-                "type": "response.function_call_arguments.done",
+                "type": "response.function_call_arguments.delta",
                 "output_index": 1,
-                "arguments": "{\"file_path\":"
+                "delta": "{\"file_path\":"
             }),
         ] {
             translator.accept(&event, None).unwrap();
@@ -1736,7 +2317,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert!(error.contains("invalid JSON arguments"));
+        assert!(error.contains("unfinished Codex output items"));
 
         for output_index in [0, 1] {
             let Some(LiveBlock::Tool { emitted_args, .. }) =
@@ -1753,14 +2334,14 @@ mod tests {
         translator
             .accept(
                 &json!({
-                    "type": "response.function_call_arguments.done",
+                    "type": "response.function_call_arguments.delta",
                     "output_index": 1,
-                    "arguments": "{\"file_path\":\"/tmp/b\"}"
+                    "delta": "\"/tmp/b\"}"
                 }),
                 None,
             )
             .unwrap();
-        let repaired_b = translator
+        let mut recovered = translator
             .accept(
                 &json!({
                     "type": "response.output_item.done",
@@ -1775,18 +2356,37 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(String::from_utf8(repaired_b).unwrap().contains("/tmp/b"));
+        recovered.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "call_id": "call_a",
+                            "name": "Read",
+                            "arguments": "{\"file_path\":\"/tmp/a\"}"
+                        }
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
 
-        let completed = translator
-            .accept(
-                &json!({
-                    "type": "response.completed",
-                    "response": {"id": "resp_ok", "usage": {}}
-                }),
-                None,
-            )
-            .unwrap();
-        let completed = String::from_utf8(completed).unwrap();
+        recovered.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.completed",
+                        "response": {"id": "resp_ok", "usage": {}}
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
+        let completed = String::from_utf8(recovered).unwrap();
+        assert!(completed.contains("/tmp/b"));
         assert!(
             completed.contains("/tmp/a"),
             "the valid first tool must remain available after the failed transaction"
@@ -2007,8 +2607,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_snapshot_closes_parallel_tools_in_content_block_order() {
-        let out = render(vec![
+    fn terminal_rejects_parallel_tools_without_output_item_done() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let mut out = Vec::new();
+        for event in [
             json!({
                 "type":"response.output_item.added",
                 "output_index":20,
@@ -2039,30 +2641,22 @@ mod tests {
                 "output_index":5,
                 "arguments":"{\"q\":\"b\"}"
             }),
-            json!({
-                "type":"response.completed",
-                "response":{"id":"resp_1","usage":{}}
-            }),
-        ]);
-        let values: Vec<serde_json::Value> =
-            crate::anthropic::sse::try_parse_sse_events(out.as_bytes())
-                .unwrap()
-                .into_iter()
-                .map(|event| serde_json::from_str(&event.data).unwrap())
-                .collect();
-        let argument_order: Vec<_> = values
-            .iter()
-            .filter(|value| value["delta"]["type"] == "input_json_delta")
-            .filter_map(|value| value["index"].as_u64())
-            .collect();
-        let stop_order: Vec<_> = values
-            .iter()
-            .filter(|value| value["type"] == "content_block_stop")
-            .filter_map(|value| value["index"].as_u64())
-            .collect();
-        assert_eq!(argument_order, vec![0, 1, 2]);
-        assert_eq!(stop_order, vec![0, 1, 2]);
-        assert_eq!(out.matches("event: message_stop").count(), 1);
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.completed",
+                    "response":{"id":"resp_1","usage":{}}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("[5, 10, 20]"));
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(!rendered.contains("input_json_delta"));
+        assert!(!rendered.contains("message_stop"));
     }
 
     #[test]
@@ -2233,6 +2827,62 @@ mod tests {
     }
 
     #[test]
+    fn transport_close_salvage_rejects_unfinished_non_tool_items() {
+        for (label, unfinished_item) in [
+            ("reasoning", json!({"type":"reasoning","id":"reasoning_1"})),
+            (
+                "web_search_call",
+                json!({"type":"web_search_call","id":"search_1"}),
+            ),
+        ] {
+            let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+            for event in [
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"tool_item_1",
+                        "call_id":"call_1",
+                        "name":"Workflow"
+                    }
+                }),
+                json!({
+                    "type":"response.function_call_arguments.delta",
+                    "output_index":0,
+                    "delta":"{}"
+                }),
+                json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "id":"tool_item_1",
+                        "call_id":"call_1",
+                        "name":"Workflow",
+                        "arguments":"{}"
+                    }
+                }),
+                json!({
+                    "type":"response.output_item.added",
+                    "output_index":1,
+                    "item":unfinished_item
+                }),
+            ] {
+                translator.accept(&event, None).unwrap();
+            }
+
+            assert!(
+                translator
+                    .finish_after_closed_completed_tool_call(None)
+                    .is_empty(),
+                "transport-close salvage accepted unfinished {label}"
+            );
+            assert!(!translator.is_finished());
+        }
+    }
+
+    #[test]
     fn emits_web_search_results_from_citations_before_deferred_text() {
         let out = render(vec![
             json!({
@@ -2261,6 +2911,8 @@ mod tests {
             }),
             json!({
                 "type": "response.output_text.annotation.added",
+                "output_index": 1,
+                "item_id": "msg_up",
                 "annotation": {
                     "type": "url_citation",
                     "title": "Reasoning",
@@ -2270,7 +2922,7 @@ mod tests {
             json!({
                 "type": "response.output_item.done",
                 "output_index": 1,
-                "item": {"type": "message"}
+                "item": {"type": "message", "id": "msg_up"}
             }),
             json!({
                 "type": "response.completed",
@@ -2308,6 +2960,11 @@ mod tests {
                         "sources": [{"type":"url","title":"Source A","url":"https://a.example"}]
                     }
                 }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "web_search_call", "id": "ws_2"}
             }),
             json!({
                 "type": "response.output_item.done",
@@ -2396,13 +3053,24 @@ mod tests {
     #[test]
     fn cumulative_live_input_is_bounded_across_many_valid_deltas() {
         let mut translator = LiveStreamTranslator::new("msg_limit", "gpt-5.5");
+        translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_up"}
+                }),
+                None,
+            )
+            .unwrap();
         let event = json!({
             "type": "response.output_text.delta",
             "output_index": 0,
             "delta": "x".repeat(512 * 1024),
         });
         let event_bytes = serde_json::to_vec(&event).unwrap().len();
-        let accepted = MAX_LIVE_TRANSLATOR_INPUT_BYTES / event_bytes;
+        let accepted =
+            (MAX_LIVE_TRANSLATOR_INPUT_BYTES - translator.upstream_input_bytes) / event_bytes;
         for _ in 0..accepted {
             translator.accept(&event, None).unwrap();
         }
@@ -2422,6 +3090,7 @@ mod tests {
             json!({
                 "type":"response.reasoning_summary_text.delta",
                 "output_index":0,
+                "summary_index":0,
                 "delta":"plan"
             }),
             json!({

@@ -369,6 +369,7 @@ pub struct CodexHttpClient {
     auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
     base_url: String,
     websocket_circuit_key: String,
+    transport_decision: config::CodexTransportDecision,
     header_timeout_ms: u64,
     http_first_byte_timeout_ms: u64,
     body_idle_timeout_ms: u64,
@@ -403,11 +404,16 @@ impl CodexHttpClient {
         // first-chunk limit as well.
         let http_first_byte_timeout_ms =
             config::codex_http_first_byte_timeout_ms(body_idle_timeout_ms);
+        // Reqwest snapshots its system proxy matcher when the client is built.
+        // Capture the Auto transport decision in the same construction window
+        // and keep both immutable for this provider lifetime.
+        let transport_decision = config::codex_transport_decision_for_url(&base_url);
         Self {
             client: build_codex_http_client(&base_url, connect_timeout_ms),
             auth_manager: CodexAuthManager::new(file_store()),
             websocket_circuit_key: websocket_circuit_key_for_url(&base_url),
             base_url,
+            transport_decision,
             header_timeout_ms: config::codex_header_timeout_ms(HTTP_RESPONSE_HEADER_TIMEOUT_MS),
             http_first_byte_timeout_ms,
             body_idle_timeout_ms,
@@ -422,11 +428,13 @@ impl CodexHttpClient {
         base_url: String,
     ) -> Self {
         let websocket_circuit_key = websocket_circuit_key_for_url(&base_url);
+        let transport_decision = config::codex_transport_decision_for_url(&base_url);
         Self {
             client,
             auth_manager,
             base_url,
             websocket_circuit_key,
+            transport_decision,
             header_timeout_ms: HTTP_RESPONSE_HEADER_TIMEOUT_MS,
             http_first_byte_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
@@ -442,11 +450,13 @@ impl CodexHttpClient {
         total_timeout_ms: u64,
     ) -> Self {
         let websocket_circuit_key = websocket_circuit_key_for_url(&base_url);
+        let transport_decision = config::codex_transport_decision_for_url(&base_url);
         Self {
             client: build_codex_http_client(&base_url, HTTP_CONNECT_TIMEOUT_MS),
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
             websocket_circuit_key,
+            transport_decision,
             header_timeout_ms,
             http_first_byte_timeout_ms: body_idle_timeout_ms,
             body_idle_timeout_ms,
@@ -462,13 +472,21 @@ impl CodexHttpClient {
         &self.websocket_circuit_key
     }
 
+    pub(super) fn transport_decision(&self) -> config::CodexTransportDecision {
+        self.transport_decision
+    }
+
+    pub(super) fn transport(&self) -> config::CodexTransport {
+        self.transport_decision.effective()
+    }
+
     pub async fn post_codex(
         &self,
         body: &ResponsesRequest,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationCandidate>,
     ) -> Result<CodexResponse, CodexError> {
-        self.post_codex_with_transport(body, ctx, continuation, crate::config::codex_transport())
+        self.post_codex_with_transport(body, ctx, continuation, self.transport())
             .await
     }
 
@@ -479,14 +497,8 @@ impl CodexHttpClient {
         continuation: Option<&super::continuation::ContinuationCandidate>,
         deadline: CodexRequestDeadline,
     ) -> Result<CodexResponse, CodexError> {
-        self.post_codex_with_transport_before(
-            body,
-            ctx,
-            continuation,
-            crate::config::codex_transport(),
-            deadline,
-        )
-        .await
+        self.post_codex_with_transport_before(body, ctx, continuation, self.transport(), deadline)
+            .await
     }
 
     async fn post_codex_with_transport(
@@ -1846,6 +1858,7 @@ async fn forward_live_http_response(
     let mut captured_body = ctx.traffic.is_some().then(Vec::new);
     let mut capture_truncated = false;
     let mut terminal = false;
+    let mut pending_terminal: Option<serde_json::Value> = None;
     let mut final_error = None;
     let mut cancelled = false;
     let mut first_chunk = true;
@@ -1898,7 +1911,20 @@ async fn forward_live_http_response(
             match decoder.finish() {
                 Ok(payloads) => {
                     for payload in payloads {
-                        terminal |= live_http_terminal_event(&payload);
+                        if pending_terminal.is_some() {
+                            if super::translate::reducer::is_post_terminal_telemetry(&payload) {
+                                continue;
+                            }
+                            final_error = Some(live_http_body_error(format!(
+                                "unexpected Codex event {:?} after terminal response event",
+                                payload.get("type").and_then(|value| value.as_str())
+                            )));
+                            break;
+                        }
+                        if live_http_terminal_event(&payload) {
+                            pending_terminal = Some(payload);
+                            continue;
+                        }
                         if !send_live_http_item(&tx, Ok(payload), deadline).await {
                             cancelled = true;
                             break 'body;
@@ -1906,6 +1932,15 @@ async fn forward_live_http_response(
                     }
                 }
                 Err(message) => final_error = Some(live_http_body_error(message)),
+            }
+            if final_error.is_none()
+                && !cancelled
+                && let Some(payload) = pending_terminal.take()
+            {
+                terminal = true;
+                if !send_live_http_item(&tx, Ok(payload), deadline).await {
+                    cancelled = true;
+                }
             }
             if !terminal && final_error.is_none() && !cancelled {
                 final_error = Some(live_http_body_error(
@@ -1934,14 +1969,24 @@ async fn forward_live_http_response(
             }
         };
         for payload in payloads {
-            terminal |= live_http_terminal_event(&payload);
+            if pending_terminal.is_some() {
+                if super::translate::reducer::is_post_terminal_telemetry(&payload) {
+                    continue;
+                }
+                final_error = Some(live_http_body_error(format!(
+                    "unexpected Codex event {:?} after terminal response event",
+                    payload.get("type").and_then(|value| value.as_str())
+                )));
+                break 'body;
+            }
+            if live_http_terminal_event(&payload) {
+                pending_terminal = Some(payload);
+                continue;
+            }
             if !send_live_http_item(&tx, Ok(payload), deadline).await {
                 cancelled = true;
                 break 'body;
             }
-        }
-        if terminal {
-            break;
         }
     }
 
@@ -2379,6 +2424,12 @@ pub(super) fn is_retryable_transport_error(err: &CodexError) -> bool {
     if err.origin == CodexErrorOrigin::WebSocketHandshake {
         return err.status == 0 || should_retry_codex_status(err.status);
     }
+    if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_TERMINAL_BARRIER_DETAIL) {
+        // A terminal frame proves the model request was dispatched. Any
+        // ordering-barrier failure is protocol corruption after dispatch, not
+        // a replay-safe transport startup failure.
+        return false;
+    }
     if super::websocket::is_retryable_transport_detail(err.detail.as_deref()) {
         return true;
     }
@@ -2578,6 +2629,7 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         }
     }
 
@@ -3250,6 +3302,26 @@ mod tests {
             )
             .await
             .unwrap();
+            loop {
+                let frame = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    futures_util::StreamExt::next(&mut websocket),
+                )
+                .await
+                .expect("401 terminal ordering barrier Ping should arrive")
+                .expect("401 terminal ordering barrier connection should remain open")
+                .unwrap();
+                match frame {
+                    Message::Ping(payload) => {
+                        futures_util::SinkExt::send(&mut websocket, Message::Pong(payload))
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    Message::Pong(_) | Message::Frame(_) => {}
+                    other => panic!("unexpected frame after 401 terminal response: {other:?}"),
+                }
+            }
             drop(websocket);
 
             let (mut oauth, _) = listener.accept().await.unwrap();
@@ -3287,7 +3359,44 @@ mod tests {
             )
             .await
             .unwrap();
-
+            let barrier_deadline = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(barrier_deadline);
+            let mut saw_barrier_ping = false;
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        accepted.unwrap();
+                        panic!("response.created followed by 401 must not trigger an extra replay");
+                    }
+                    frame = futures_util::StreamExt::next(&mut retried_websocket) => {
+                        match frame {
+                            Some(Ok(Message::Ping(payload))) => {
+                                futures_util::SinkExt::send(
+                                    &mut retried_websocket,
+                                    Message::Pong(payload),
+                                )
+                                .await
+                                .unwrap();
+                                saw_barrier_ping = true;
+                                barrier_deadline.as_mut().reset(
+                                    tokio::time::Instant::now() + Duration::from_millis(300),
+                                );
+                            }
+                            Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                            Some(Ok(other)) => {
+                                panic!("unexpected frame after terminal response: {other:?}");
+                            }
+                            Some(Err(_)) | None if saw_barrier_ping => break,
+                            Some(Err(error)) => panic!("terminal barrier stream failed: {error}"),
+                            None => panic!("terminal barrier connection closed"),
+                        }
+                    }
+                    () = &mut barrier_deadline => {
+                        assert!(saw_barrier_ping, "terminal ordering barrier Ping should arrive");
+                        break;
+                    }
+                }
+            }
             assert!(
                 tokio::time::timeout(Duration::from_millis(150), listener.accept())
                     .await
@@ -4014,6 +4123,122 @@ mod tests {
                 "response.completed"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn live_http_rejects_same_chunk_terminal_tail_before_forwarding_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"late\"}\n\n",
+                )
+                .await
+                .unwrap();
+        });
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut events = client
+            .stream_codex_http_events(
+                &buffered_test_request(),
+                &http_test_context(),
+                CodexRequestDeadline::from_timeout_ms(1_000),
+                CodexDispatchBudget::new(),
+            )
+            .await
+            .unwrap();
+
+        let error = events.recv().await.unwrap().unwrap_err();
+        assert!(error.message.contains("after terminal response event"));
+        assert!(events.recv().await.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_http_holds_cross_chunk_terminal_until_tail_is_validated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stream
+                .write_all(
+                    b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"late\"}\n\n",
+                )
+                .await
+                .unwrap();
+        });
+        let client = Arc::new(authenticated_http_test_client_with_body_timeouts(
+            format!("http://{addr}/responses"),
+            100,
+            300,
+        ));
+        let mut events = client
+            .stream_codex_http_events(
+                &buffered_test_request(),
+                &http_test_context(),
+                CodexRequestDeadline::from_timeout_ms(1_000),
+                CodexDispatchBudget::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "the terminal must not be forwarded before the next chunk is validated"
+        );
+        let error = events.recv().await.unwrap().unwrap_err();
+        assert!(error.message.contains("after terminal response event"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_http_allows_rate_limit_telemetry_after_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true}}\n\n",
+                )
+                .await
+                .unwrap();
+        });
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut events = client
+            .stream_codex_http_events(
+                &buffered_test_request(),
+                &http_test_context(),
+                CodexRequestDeadline::from_timeout_ms(1_000),
+                CodexDispatchBudget::new(),
+            )
+            .await
+            .unwrap();
+
+        let terminal = events.recv().await.unwrap().unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+        assert!(events.recv().await.is_none());
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -4943,6 +5168,7 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         };
         let headers = build_codex_headers(&auth, &ctx, false).unwrap();
         assert_eq!(
@@ -4967,6 +5193,7 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         };
         let headers = build_codex_headers(&auth, &ctx, true).unwrap();
         assert_eq!(
@@ -4994,6 +5221,7 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         };
         let headers = build_codex_headers(&auth, &ctx, false).unwrap();
         assert!(headers.get("session_id").is_none());
@@ -5015,6 +5243,7 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         };
         let err = build_codex_headers(&auth, &ctx, false).unwrap_err();
         assert_eq!(err.status, 500);
@@ -5070,6 +5299,7 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         };
         let disabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
@@ -5157,6 +5387,7 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         };
         let result = build_codex_headers(&auth, &ctx, false);
         assert!(

@@ -38,6 +38,7 @@ pub const WEBSOCKET_POOL_BUSY_DETAIL: &str = "websocket_pool_busy";
 pub const WEBSOCKET_CONNECTION_ERROR_DETAIL: &str = "websocket_connection_error";
 pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal";
 pub const WEBSOCKET_MALFORMED_EVENT_DETAIL: &str = "websocket_malformed_event";
+pub const WEBSOCKET_TERMINAL_BARRIER_DETAIL: &str = "websocket_terminal_barrier";
 
 pub(super) fn is_retryable_transport_detail(detail: Option<&str>) -> bool {
     matches!(
@@ -643,7 +644,7 @@ pub async fn codex_websocket_request(
         } else {
             200
         };
-        let reusable = terminal_event.kind.is_reusable();
+        let reusable = terminal_event.connection_reusable && terminal_event.kind.is_reusable();
         drop(ws_guard);
         if reusable && let Some(key) = pool_key {
             pool_insert_for_turn(
@@ -710,7 +711,7 @@ pub async fn codex_websocket_request(
         } else {
             200
         };
-        let reusable = terminal_event.kind.is_reusable();
+        let reusable = terminal_event.connection_reusable && terminal_event.kind.is_reusable();
         drop(ws_guard);
         if reusable && let Some(key) = pool_key {
             pool_insert_for_turn(
@@ -934,6 +935,16 @@ fn pool_healthcheck_error(reason: String) -> CodexError {
     }
 }
 
+fn terminal_barrier_error(reason: String) -> CodexError {
+    CodexError {
+        status: 0,
+        message: format!("WebSocket terminal ordering barrier failed: {reason}"),
+        detail: Some(WEBSOCKET_TERMINAL_BARRIER_DETAIL.to_string()),
+        retry_after: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
 fn pool_busy_error(timeout_ms: u64) -> CodexError {
     CodexError {
         status: 0,
@@ -974,83 +985,172 @@ async fn send_ws_frame(
     }
 }
 
-async fn probe_pooled_connection(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSocketPingBarrierOutcome {
+    MatchingPong,
+    OrderedClose,
+}
+
+async fn websocket_ping_barrier<F, E>(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     timeout_ms: u64,
-) -> Result<(), CodexError> {
+    description: &str,
+    mut inspect_text: F,
+    make_error: E,
+) -> Result<WebSocketPingBarrierOutcome, CodexError>
+where
+    F: FnMut(&str) -> Result<(), CodexError>,
+    E: Fn(String) -> CodexError,
+{
     let nonce = uuid::Uuid::new_v4().as_bytes().to_vec();
     send_ws_frame(
         ws,
         Message::Ping(nonce.clone()),
         timeout_ms,
-        "pooled health-check Ping",
+        &format!("{description} Ping"),
         WEBSOCKET_POOL_HEALTHCHECK_DETAIL,
     )
-    .await?;
+    .await
+    .map_err(|error| make_error(error.message))?;
 
     let started_at = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     loop {
         let Some(remaining) = timeout.checked_sub(started_at.elapsed()) else {
-            return Err(pool_healthcheck_error(format!(
+            return Err(make_error(format!(
                 "no matching Pong within {timeout_ms}ms"
             )));
         };
         if remaining.is_zero() {
-            return Err(pool_healthcheck_error(format!(
+            return Err(make_error(format!(
                 "no matching Pong within {timeout_ms}ms"
             )));
         }
 
         let frame = tokio::time::timeout(remaining, ws.next())
             .await
-            .map_err(|_| {
-                pool_healthcheck_error(format!("no matching Pong within {timeout_ms}ms"))
-            })?;
+            .map_err(|_| make_error(format!("no matching Pong within {timeout_ms}ms")))?;
         match frame {
-            Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
+            Some(Ok(Message::Pong(payload))) if payload == nonce => {
+                return Ok(WebSocketPingBarrierOutcome::MatchingPong);
+            }
             Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
             Some(Ok(Message::Ping(payload))) => {
                 send_ws_frame(
                     ws,
                     Message::Pong(payload),
                     timeout_ms,
-                    "pooled health-check Pong",
+                    &format!("{description} Pong"),
                     WEBSOCKET_POOL_HEALTHCHECK_DETAIL,
                 )
-                .await?;
+                .await
+                .map_err(|error| make_error(error.message))?;
             }
-            Some(Ok(Message::Text(text))) => {
-                let informational = serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|payload| {
-                        payload
-                            .get("type")
-                            .and_then(|value| value.as_str())
-                            .map(|event_type| {
-                                matches!(event_type, "codex.rate_limits" | "keepalive")
-                            })
-                    })
-                    .unwrap_or(false);
-                if !informational {
-                    return Err(pool_healthcheck_error(
-                        "unexpected data arrived before the next request".to_string(),
-                    ));
-                }
-            }
+            Some(Ok(Message::Text(text))) => inspect_text(&text)?,
             Some(Ok(Message::Binary(_))) => {
-                return Err(pool_healthcheck_error(
-                    "unexpected binary frame".to_string(),
-                ));
+                return Err(make_error("unexpected binary frame".to_string()));
             }
+            // A successfully decoded Close frame or clean stream exhaustion
+            // is itself an ordering fence: every preceding server frame has
+            // already been delivered. Terminal callers may commit their
+            // staged response, but the connection must not return to the pool.
             Some(Ok(Message::Close(_))) | None => {
-                return Err(pool_healthcheck_error("connection closed".to_string()));
+                return Ok(WebSocketPingBarrierOutcome::OrderedClose);
             }
             Some(Err(err)) => {
-                return Err(pool_healthcheck_error(format!("stream error: {err}")));
+                return Err(make_error(format!("stream error: {err}")));
             }
         }
     }
+}
+
+async fn probe_pooled_connection(
+    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    timeout_ms: u64,
+) -> Result<(), CodexError> {
+    let outcome = websocket_ping_barrier(
+        ws,
+        timeout_ms,
+        "pooled health-check",
+        |text| {
+            let informational = serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .map(|event_type| matches!(event_type, "codex.rate_limits" | "keepalive"))
+                })
+                .unwrap_or(false);
+            if informational {
+                Ok(())
+            } else {
+                Err(pool_healthcheck_error(
+                    "unexpected data arrived before the next request".to_string(),
+                ))
+            }
+        },
+        pool_healthcheck_error,
+    )
+    .await?;
+    match outcome {
+        WebSocketPingBarrierOutcome::MatchingPong => Ok(()),
+        WebSocketPingBarrierOutcome::OrderedClose => Err(pool_healthcheck_error(
+            "connection closed during health check".to_string(),
+        )),
+    }
+}
+
+async fn confirm_terminal_ordering_barrier<F>(
+    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    timeout_ms: u64,
+    max_event_bytes: usize,
+    traffic: Option<&TrafficCapture>,
+    mut capture_text: F,
+) -> Result<WebSocketPingBarrierOutcome, CodexError>
+where
+    F: FnMut(&str) -> Result<(), CodexError>,
+{
+    websocket_ping_barrier(
+        ws,
+        timeout_ms,
+        "terminal ordering-barrier",
+        |text| {
+            if text.len() > max_event_bytes {
+                return Err(terminal_barrier_error(format!(
+                    "post-terminal event exceeded the {max_event_bytes}-byte limit"
+                )));
+            }
+            capture_text(text)?;
+            let parsed = serde_json::from_str::<serde_json::Value>(text).map_err(|error| {
+                if let Some(traffic) = traffic {
+                    traffic.write_json_event(
+                        "040-upstream-event",
+                        &serde_json::json!({
+                            "unparseable": true,
+                            "data": text,
+                        }),
+                    );
+                }
+                terminal_barrier_error(format!(
+                    "post-terminal event contained malformed JSON: {error}"
+                ))
+            })?;
+            if let Some(traffic) = traffic {
+                traffic.write_json_event("040-upstream-event", &parsed);
+            }
+            let event_type = parsed.get("type").and_then(serde_json::Value::as_str);
+            if matches!(event_type, Some("codex.rate_limits" | "keepalive")) {
+                Ok(())
+            } else {
+                Err(terminal_barrier_error(format!(
+                    "unexpected post-terminal event {event_type:?}"
+                )))
+            }
+        },
+        terminal_barrier_error,
+    )
+    .await
 }
 
 fn log_websocket_pool_refresh(ctx: &RequestContext, reason: &str) {
@@ -1386,6 +1486,7 @@ impl WebSocketWatchdog {
 struct WsEvent {
     kind: super::events::CodexTerminalKind,
     payload: serde_json::Value,
+    connection_reusable: bool,
 }
 
 async fn collect_ws_events(
@@ -1449,9 +1550,23 @@ async fn collect_ws_events(
 
                 // Check for terminal events
                 if let Some(kind) = super::events::CodexTerminalKind::from_payload(&parsed) {
+                    let barrier = confirm_terminal_ordering_barrier(
+                        ws,
+                        timeouts.pool_probe_ms,
+                        crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES,
+                        traffic,
+                        |_| Ok(()),
+                    )
+                    .await
+                    .inspect_err(|_| invalidate_pool_owner(pool_key, pool_entry))?;
+                    let connection_reusable = barrier == WebSocketPingBarrierOutcome::MatchingPong;
+                    if !connection_reusable {
+                        invalidate_pool_owner(pool_key, pool_entry);
+                    }
                     terminal_event = Some(WsEvent {
                         kind,
                         payload: parsed,
+                        connection_reusable,
                     });
                     break;
                 }
@@ -1591,13 +1706,40 @@ async fn stream_ws_events(
                         .await;
                     break;
                 }
+                let mut terminal_connection_reusable = false;
+                if terminal {
+                    let barrier = confirm_terminal_ordering_barrier(
+                        ws,
+                        timeouts.pool_probe_ms,
+                        super::MAX_LIVE_EVENT_BYTES,
+                        traffic.as_deref(),
+                        |text| {
+                            append_live_capture_sse(&mut sse_body, text);
+                            Ok(())
+                        },
+                    )
+                    .await;
+                    match barrier {
+                        Ok(WebSocketPingBarrierOutcome::MatchingPong) => {
+                            terminal_connection_reusable = true;
+                        }
+                        Ok(WebSocketPingBarrierOutcome::OrderedClose) => {
+                            invalidate_pool_owner(pool_key, pool_entry);
+                        }
+                        Err(error) => {
+                            invalidate_pool_owner(pool_key, pool_entry);
+                            let _ = tx.send(Err(error)).await;
+                            break;
+                        }
+                    }
+                }
                 if tx.send(Ok(parsed)).await.is_err() {
                     invalidate_pool_owner(pool_key, pool_entry);
                     break;
                 }
                 if terminal {
-                    reusable =
-                        terminal_kind.is_some_and(super::events::CodexTerminalKind::is_reusable);
+                    reusable = terminal_connection_reusable
+                        && terminal_kind.is_some_and(super::events::CodexTerminalKind::is_reusable);
                     break;
                 }
             }
@@ -1692,6 +1834,7 @@ mod tests {
             provider: "codex".to_string(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         }
     }
 
@@ -1703,7 +1846,12 @@ mod tests {
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let _ = ws.next().await.unwrap().unwrap();
             ws.send(Message::Text(event.into())).await.unwrap();
-            futures_util::future::pending::<()>().await;
+            while let Some(Ok(frame)) = ws.next().await {
+                if let Message::Ping(payload) = frame {
+                    ws.send(Message::Pong(payload)).await.unwrap();
+                    futures_util::future::pending::<()>().await;
+                }
+            }
         });
         let result = tokio::time::timeout(
             Duration::from_millis(250),
@@ -1941,6 +2089,50 @@ mod tests {
         assert!(String::from_utf8_lossy(&response.body).contains("response.error"));
     }
 
+    #[tokio::test]
+    async fn buffered_terminal_error_survives_clean_close_and_connection_is_not_pooled() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        let pool_key = "terminal-clean-close";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.error","response":{"error":{"status":503,"message":"upstream overloaded"}}}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            while let Some(Ok(frame)) = ws.next().await {
+                if matches!(frame, Message::Ping(_)) {
+                    ws.close(None).await.unwrap();
+                    return;
+                }
+            }
+        });
+
+        let response = codex_websocket_request(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &serde_json::json!({"type":"response.create","input":[]}),
+            &test_context(),
+            None,
+            Some(pool_key),
+            test_timeouts(1_000, 1_000),
+            None,
+        )
+        .await
+        .expect("a clean close after terminal must preserve the upstream response");
+
+        assert_eq!(response.status, 503);
+        assert!(String::from_utf8_lossy(&response.body).contains("response.error"));
+        assert!(!WS_POOL.lock().unwrap().contains_key(pool_key));
+        server.await.unwrap();
+    }
+
     #[test]
     fn is_response_event_detection() {
         let rate_limits = serde_json::json!({"type": "codex.rate_limits"});
@@ -2091,6 +2283,151 @@ mod tests {
         server.abort();
     }
 
+    #[derive(Clone, Copy)]
+    enum TerminalBarrierPeer {
+        Clean,
+        Telemetry,
+        SemanticTail,
+        Silent,
+        Close,
+    }
+
+    async fn run_live_terminal_barrier(
+        peer: TerminalBarrierPeer,
+    ) -> (bool, Vec<Result<serde_json::Value, CodexError>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp_1","usage":{}}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            while let Some(Ok(frame)) = ws.next().await {
+                let Message::Ping(payload) = frame else {
+                    continue;
+                };
+                match peer {
+                    TerminalBarrierPeer::Clean => {
+                        ws.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    TerminalBarrierPeer::Telemetry => {
+                        ws.send(Message::Text(
+                            r#"{"type":"codex.rate_limits","remaining":42}"#.into(),
+                        ))
+                        .await
+                        .unwrap();
+                        ws.send(Message::Text(r#"{"type":"keepalive"}"#.into()))
+                            .await
+                            .unwrap();
+                        ws.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    TerminalBarrierPeer::SemanticTail => {
+                        ws.send(Message::Text(
+                            r#"{"type":"response.output_text.delta","delta":"late"}"#.into(),
+                        ))
+                        .await
+                        .unwrap();
+                        let _ = ws.send(Message::Pong(payload)).await;
+                    }
+                    TerminalBarrierPeer::Silent => {
+                        futures_util::future::pending::<()>().await;
+                    }
+                    TerminalBarrierPeer::Close => {
+                        let _ = ws.close(None).await;
+                    }
+                }
+                return;
+            }
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(super::super::LIVE_EVENT_CHANNEL_CAPACITY);
+        let reusable =
+            stream_ws_events(&mut ws, test_timeouts(1_000, 1_000), None, None, None, tx).await;
+        let mut items = Vec::new();
+        while let Some(item) = rx.recv().await {
+            items.push(item);
+        }
+        server.abort();
+        let _ = server.await;
+        (reusable, items)
+    }
+
+    #[tokio::test]
+    async fn terminal_barrier_forwards_terminal_only_after_matching_pong() {
+        let (reusable, items) = run_live_terminal_barrier(TerminalBarrierPeer::Clean).await;
+        assert!(reusable);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]
+                .as_ref()
+                .unwrap()
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("response.completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_barrier_allows_only_explicit_post_terminal_telemetry() {
+        let (reusable, items) = run_live_terminal_barrier(TerminalBarrierPeer::Telemetry).await;
+        assert!(reusable);
+        assert_eq!(
+            items.len(),
+            1,
+            "telemetry must not be forwarded after terminal"
+        );
+        assert!(items[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminal_barrier_rejects_cross_frame_semantic_tail_before_terminal_is_forwarded() {
+        let (reusable, items) = run_live_terminal_barrier(TerminalBarrierPeer::SemanticTail).await;
+        assert!(!reusable);
+        assert_eq!(items.len(), 1);
+        let error = items[0].as_ref().unwrap_err();
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_TERMINAL_BARRIER_DETAIL)
+        );
+        assert!(error.message.contains("response.output_text.delta"));
+        assert!(!is_retryable_transport_detail(error.detail.as_deref()));
+    }
+
+    #[tokio::test]
+    async fn terminal_barrier_timeout_fails_closed_without_replay_or_pool_reuse() {
+        let (reusable, items) = run_live_terminal_barrier(TerminalBarrierPeer::Silent).await;
+        assert!(!reusable);
+        assert_eq!(items.len(), 1);
+        let error = items[0].as_ref().unwrap_err();
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_TERMINAL_BARRIER_DETAIL)
+        );
+        assert!(error.message.contains("no matching Pong"));
+        assert!(!super::super::client::is_retryable_transport_error(error));
+    }
+
+    #[tokio::test]
+    async fn terminal_barrier_clean_close_forwards_terminal_without_reusing_connection() {
+        let (reusable, items) = run_live_terminal_barrier(TerminalBarrierPeer::Close).await;
+        assert!(!reusable);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]
+                .as_ref()
+                .unwrap()
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("response.completed")
+        );
+    }
+
     #[tokio::test]
     async fn heartbeat_detects_silent_half_open_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2128,15 +2465,19 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut terminal_sent = false;
             while let Some(Ok(frame)) = ws.next().await {
                 if let Message::Ping(payload) = frame {
                     ws.send(Message::Pong(payload)).await.unwrap();
+                    if terminal_sent {
+                        return;
+                    }
                     ws.send(Message::Text(
                         r#"{"type":"response.completed","response":{"id":"resp_1"}}"#.into(),
                     ))
                     .await
                     .unwrap();
-                    return;
+                    terminal_sent = true;
                 }
             }
         });
@@ -2208,6 +2549,7 @@ mod tests {
             provider: "codex".to_string(),
             traffic: None,
             monitor: None,
+            request_byte_lease: None,
         };
         let continuation = ContinuationCandidate {
             turn_id: None,

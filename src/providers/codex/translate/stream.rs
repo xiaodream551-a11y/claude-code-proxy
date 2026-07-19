@@ -515,7 +515,7 @@ mod tests {
             sse_event(
                 "response.output_item.done",
                 serde_json::json!({
-                    "output_index":0,"item":{"type":"message"}
+                    "output_index":0,"item":{"type":"message","id":"item_1"}
                 })
             ),
             sse_event(
@@ -622,7 +622,7 @@ mod tests {
             sse_event(
                 "response.output_item.done",
                 serde_json::json!({
-                    "output_index":1,"item":{"type":"message"}
+                    "output_index":1,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse_event(
@@ -649,7 +649,14 @@ mod tests {
     #[test]
     fn stream_translates_reasoning_summary_to_thinking() {
         let upstream = format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"reasoning","id":"rs_0","summary":[],"encrypted_content":"enc"}
+                })
+            ),
             sse_event(
                 "response.reasoning_summary_text.delta",
                 serde_json::json!({
@@ -660,7 +667,7 @@ mod tests {
                 "response.output_item.done",
                 serde_json::json!({
                     "output_index":0,
-                    "item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}
+                    "item":{"type":"reasoning","id":"rs_0","summary":[],"encrypted_content":"enc"}
                 })
             ),
             sse_event(
@@ -679,7 +686,7 @@ mod tests {
             sse_event(
                 "response.output_item.done",
                 serde_json::json!({
-                    "output_index":1,"item":{"type":"message"}
+                    "output_index":1,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse_event(
@@ -738,7 +745,7 @@ mod tests {
             sse_event(
                 "response.output_item.done",
                 serde_json::json!({
-                    "output_index":1,"item":{"type":"message"}
+                    "output_index":1,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse_event(
@@ -770,7 +777,7 @@ mod tests {
             ),
             sse_event(
                 "response.reasoning_summary_text.delta",
-                serde_json::json!({"output_index":0,"delta":"plan"})
+                serde_json::json!({"output_index":0,"summary_index":0,"delta":"plan"})
             ),
             sse_event(
                 "response.output_item.done",

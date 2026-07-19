@@ -5,7 +5,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use axum::response::Response;
 use clap::Subcommand;
+use std::fmt;
 use std::sync::Arc;
+use tokio::sync::OwnedSemaphorePermit;
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommand {
@@ -43,4 +45,43 @@ pub struct RequestContext {
     pub provider: String,
     pub traffic: Option<Arc<TrafficCapture>>,
     pub monitor: Option<MonitorHandle>,
+    /// Keeps the request-body admission budget charged while a provider still
+    /// needs the translated request for initial dispatch or replay. Long-lived
+    /// provider caches must move retained data under their own bounded budget.
+    pub request_byte_lease: Option<RequestByteLease>,
+}
+
+#[derive(Clone)]
+pub struct RequestByteLease {
+    inner: Arc<RequestByteLeaseInner>,
+}
+
+struct RequestByteLeaseInner {
+    _permit: OwnedSemaphorePermit,
+    buffered_bytes: usize,
+}
+
+impl RequestByteLease {
+    pub(crate) fn new(permit: OwnedSemaphorePermit, buffered_bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(RequestByteLeaseInner {
+                _permit: permit,
+                buffered_bytes,
+            }),
+        }
+    }
+
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.inner.buffered_bytes
+    }
+}
+
+impl fmt::Debug for RequestByteLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestByteLease")
+            .field("owners", &Arc::strong_count(&self.inner))
+            .field("buffered_bytes", &self.inner.buffered_bytes)
+            .finish()
+    }
 }

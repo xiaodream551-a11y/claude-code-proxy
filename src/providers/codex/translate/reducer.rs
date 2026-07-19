@@ -2,10 +2,363 @@ use serde_json::Value;
 
 use crate::providers::translate_shared::{JsonObjectError, parse_json_object};
 
+use super::super::events::validate_terminal_snapshot_status;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
 use super::web_search_compat::WebSearchResult;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutputItemKind {
+    Reasoning,
+    Message,
+    FunctionCall,
+    WebSearchCall,
+}
+
+impl OutputItemKind {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "reasoning" => Some(Self::Reasoning),
+            "message" => Some(Self::Message),
+            "function_call" => Some(Self::FunctionCall),
+            "web_search_call" => Some(Self::WebSearchCall),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reasoning => "reasoning",
+            Self::Message => "message",
+            Self::FunctionCall => "function_call",
+            Self::WebSearchCall => "web_search_call",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct OutputItemIdentity {
+    pub kind: OutputItemKind,
+    pub item_id: Option<String>,
+    pub call_id: Option<String>,
+    pub name: Option<String>,
+}
+
+pub(super) fn event_type(payload: &Value) -> Result<&str, String> {
+    payload
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.is_empty())
+        .ok_or_else(|| "Codex stream event is missing a non-empty type".to_string())
+}
+
+pub(crate) fn is_post_terminal_telemetry(payload: &Value) -> bool {
+    payload.get("type").and_then(Value::as_str) == Some("codex.rate_limits")
+}
+
+pub(super) fn parse_output_item_added(
+    payload: &Value,
+) -> Result<(usize, &Value, OutputItemIdentity), String> {
+    let output_index = required_output_index(payload, "response.output_item.added")?;
+    let item = payload
+        .get("item")
+        .filter(|item| item.is_object())
+        .ok_or_else(|| "response.output_item.added is missing an object item".to_string())?;
+    let raw_kind = item
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.is_empty())
+        .ok_or_else(|| "response.output_item.added item is missing a non-empty type".to_string())?;
+    let kind = OutputItemKind::from_str(raw_kind).ok_or_else(|| {
+        format!("unsupported Codex output item type {raw_kind:?} at output_index {output_index}")
+    })?;
+    let item_id = optional_non_empty_string(item, "id", "output item id")?;
+    let (call_id, name) = if kind == OutputItemKind::FunctionCall {
+        (
+            Some(required_non_empty_string(
+                item,
+                "call_id",
+                "function call call_id",
+            )?),
+            Some(required_non_empty_string(
+                item,
+                "name",
+                "function call name",
+            )?),
+        )
+    } else {
+        (None, None)
+    };
+    Ok((
+        output_index,
+        item,
+        OutputItemIdentity {
+            kind,
+            item_id,
+            call_id,
+            name,
+        },
+    ))
+}
+
+pub(super) fn register_output_item(
+    output_index: usize,
+    identity: OutputItemIdentity,
+    identities: &mut std::collections::HashMap<usize, OutputItemIdentity>,
+    item_id_to_output_index: &mut std::collections::HashMap<String, usize>,
+    call_id_to_output_index: &mut std::collections::HashMap<String, usize>,
+) -> Result<(), String> {
+    if let Some(existing) = identities.get(&output_index) {
+        return Err(format!(
+            "duplicate Codex output_index {output_index}: existing {} item cannot be replaced by {} item",
+            existing.kind.as_str(),
+            identity.kind.as_str()
+        ));
+    }
+    if let Some(item_id) = identity.item_id.as_deref()
+        && let Some(existing) = item_id_to_output_index.get(item_id)
+    {
+        return Err(format!(
+            "Codex item_id {item_id:?} is already bound to output_index {existing}"
+        ));
+    }
+    if let Some(call_id) = identity.call_id.as_deref()
+        && let Some(existing) = call_id_to_output_index.get(call_id)
+    {
+        return Err(format!(
+            "Codex call_id {call_id:?} is already bound to output_index {existing}"
+        ));
+    }
+
+    if let Some(item_id) = identity.item_id.as_deref() {
+        item_id_to_output_index.insert(item_id.to_string(), output_index);
+    }
+    if let Some(call_id) = identity.call_id.as_deref() {
+        call_id_to_output_index.insert(call_id.to_string(), output_index);
+    }
+    identities.insert(output_index, identity);
+    Ok(())
+}
+
+pub(super) fn resolve_semantic_output_index(
+    payload: &Value,
+    event: &str,
+    item_id_to_output_index: &std::collections::HashMap<String, usize>,
+    call_id_to_output_index: &std::collections::HashMap<String, usize>,
+) -> Result<usize, String> {
+    let explicit = match payload.get("output_index") {
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| format!("{event} output_index must be a non-negative integer"))?
+                as usize,
+        ),
+        None => None,
+    };
+    let raw_item_id = payload
+        .get("item_id")
+        .or_else(|| payload.get("item").and_then(|item| item.get("id")));
+    let item_id = match raw_item_id {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{event} item_id must be a non-empty string"))?,
+        ),
+        None => None,
+    };
+    let raw_call_id = payload
+        .get("call_id")
+        .or_else(|| payload.get("item").and_then(|item| item.get("call_id")));
+    let call_id = match raw_call_id {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{event} call_id must be a non-empty string"))?,
+        ),
+        None => None,
+    };
+
+    let item_index = item_id.and_then(|id| item_id_to_output_index.get(id).copied());
+    let call_index = call_id.and_then(|id| call_id_to_output_index.get(id).copied());
+    if item_id.is_some() && item_index.is_none() {
+        return Err(format!("{event} references an unknown item_id"));
+    }
+    if call_id.is_some() && call_index.is_none() {
+        return Err(format!("{event} references an unknown call_id"));
+    }
+
+    let output_index = explicit
+        .or(item_index)
+        .or(call_index)
+        .ok_or_else(|| format!("{event} is missing a resolvable output_index/item_id/call_id"))?;
+    for (label, candidate) in [("item_id", item_index), ("call_id", call_index)] {
+        if let Some(candidate) = candidate
+            && candidate != output_index
+        {
+            return Err(format!(
+                "{event} {label} resolves to output_index {candidate}, not {output_index}"
+            ));
+        }
+    }
+    Ok(output_index)
+}
+
+pub(super) fn unfinished_output_indices(
+    identities: &std::collections::HashMap<usize, OutputItemIdentity>,
+    completed: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
+    let mut unfinished: Vec<_> = identities
+        .keys()
+        .filter(|output_index| !completed.contains(output_index))
+        .copied()
+        .collect();
+    unfinished.sort_unstable();
+    unfinished
+}
+
+pub(super) fn validate_output_item_done<'a>(
+    payload: &'a Value,
+    output_index: usize,
+    identity: &OutputItemIdentity,
+) -> Result<&'a Value, String> {
+    let item = payload
+        .get("item")
+        .filter(|item| item.is_object())
+        .ok_or_else(|| "response.output_item.done is missing an object item".to_string())?;
+    let raw_kind = item
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.is_empty())
+        .ok_or_else(|| "response.output_item.done item is missing a non-empty type".to_string())?;
+    let kind = OutputItemKind::from_str(raw_kind).ok_or_else(|| {
+        format!("unsupported Codex output item type {raw_kind:?} at output_index {output_index}")
+    })?;
+    if kind != identity.kind {
+        return Err(format!(
+            "response.output_item.done type {} conflicts with added {} item at output_index {output_index}",
+            kind.as_str(),
+            identity.kind.as_str()
+        ));
+    }
+    if let Some(expected) = identity.item_id.as_deref() {
+        let actual = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "response.output_item.done is missing the non-empty id from output_item.added"
+                    .to_string()
+            })?;
+        if actual != expected {
+            return Err(format!(
+                "response.output_item.done item id {actual:?} conflicts with {expected:?}"
+            ));
+        }
+    }
+    if kind == OutputItemKind::FunctionCall {
+        let actual_call_id = required_non_empty_string(
+            item,
+            "call_id",
+            "response.output_item.done function call call_id",
+        )?;
+        let actual_name = required_non_empty_string(
+            item,
+            "name",
+            "response.output_item.done function call name",
+        )?;
+        if identity.call_id.as_deref() != Some(actual_call_id.as_str())
+            || identity.name.as_deref() != Some(actual_name.as_str())
+        {
+            return Err(format!(
+                "response.output_item.done function identity conflicts at output_index {output_index}"
+            ));
+        }
+    }
+    Ok(item)
+}
+
+pub(super) fn require_output_kind(
+    identities: &std::collections::HashMap<usize, OutputItemIdentity>,
+    output_index: usize,
+    expected: OutputItemKind,
+    event: &str,
+) -> Result<(), String> {
+    let identity = identities.get(&output_index).ok_or_else(|| {
+        format!("{event} references output_index {output_index} before output_item.added")
+    })?;
+    if identity.kind != expected {
+        return Err(format!(
+            "{event} expected {} at output_index {output_index}, found {}",
+            expected.as_str(),
+            identity.kind.as_str()
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn require_active_output_kind(
+    identities: &std::collections::HashMap<usize, OutputItemIdentity>,
+    completed: &std::collections::HashSet<usize>,
+    output_index: usize,
+    expected: OutputItemKind,
+    event: &str,
+) -> Result<(), String> {
+    require_output_kind(identities, output_index, expected, event)?;
+    if completed.contains(&output_index) {
+        return Err(format!(
+            "{event} references completed output_index {output_index}"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn reconcile_output_text_snapshot<'a>(
+    accumulated: &str,
+    snapshot: &'a str,
+    event: &str,
+) -> Result<&'a str, String> {
+    snapshot.strip_prefix(accumulated).ok_or_else(|| {
+        format!(
+            "{event} text snapshot disagrees with accumulated output at byte {}",
+            accumulated.len()
+        )
+    })
+}
+
+pub(super) fn required_output_index(payload: &Value, event: &str) -> Result<usize, String> {
+    payload
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .ok_or_else(|| format!("{event} is missing a non-negative integer output_index"))
+}
+
+fn required_non_empty_string(value: &Value, key: &str, label: &str) -> Result<String, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("Codex {label} must be a non-empty string"))
+}
+
+fn optional_non_empty_string(
+    value: &Value,
+    key: &str,
+    label: &str,
+) -> Result<Option<String>, String> {
+    match value.get(key) {
+        Some(value) => value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(|value| Some(value.to_string()))
+            .ok_or_else(|| format!("Codex {label} must be a non-empty string")),
+        None => Ok(None),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct UpstreamStreamError {
@@ -21,6 +374,15 @@ pub enum UpstreamErrorKind {
     Overloaded,
     Transient,
     Failed,
+}
+
+fn protocol_error(message: impl Into<String>) -> UpstreamStreamError {
+    UpstreamStreamError {
+        kind: UpstreamErrorKind::Failed,
+        message: message.into(),
+        retry_after_seconds: None,
+        diagnostics: None,
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -264,6 +626,11 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         std::collections::BTreeMap::new();
     let mut item_id_to_output_index: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut call_id_to_output_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut output_identities: std::collections::HashMap<usize, OutputItemIdentity> =
+        std::collections::HashMap::new();
+    let mut completed_output_indices = std::collections::HashSet::new();
     let mut reasoning_by_output_index: std::collections::HashMap<usize, PendingReasoning> =
         std::collections::HashMap::new();
     let mut anthropic_index = 0usize;
@@ -328,28 +695,29 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             continue;
         }
 
-        let p: serde_json::Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) if _saw_terminal => {
-                return Err(UpstreamStreamError {
-                    kind: UpstreamErrorKind::Failed,
-                    message: "invalid Codex event after terminal response event".to_string(),
-                    retry_after_seconds: None,
-                    diagnostics: None,
-                });
+        if data == "[DONE]" {
+            if _saw_terminal {
+                continue;
             }
-            Err(_) => continue,
-        };
+            return Err(protocol_error(
+                "Codex [DONE] sentinel arrived before a terminal response event",
+            ));
+        }
 
-        let t = p
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let p: serde_json::Value = serde_json::from_str(data).map_err(|error| {
+            protocol_error(if _saw_terminal {
+                format!("invalid Codex event after terminal response event: {error}")
+            } else {
+                format!("malformed Codex semantic event: {error}")
+            })
+        })?;
+
+        let t = event_type(&p).map_err(protocol_error)?.to_string();
+        validate_terminal_snapshot_status(&p).map_err(protocol_error)?;
         event_count += 1;
         last_event_type = Some(t.clone());
 
-        if _saw_terminal && t == "codex.rate_limits" {
+        if _saw_terminal && is_post_terminal_telemetry(&p) {
             // A successful Codex terminal is authoritative. The upstream may append a final
             // quota snapshot, including `limit_reached=true`, after the response has already
             // completed. Treat that tail as telemetry instead of retroactively failing the
@@ -357,12 +725,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             continue;
         }
         if _saw_terminal {
-            return Err(UpstreamStreamError {
-                kind: UpstreamErrorKind::Failed,
-                message: format!("unexpected Codex event {t:?} after terminal response event"),
-                retry_after_seconds: None,
-                diagnostics: None,
-            });
+            return Err(protocol_error(format!(
+                "unexpected Codex event {t:?} after terminal response event"
+            )));
         }
 
         if t == "codex.rate_limits" {
@@ -396,11 +761,29 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             || t == "response.web_search_call.searching"
             || t == "response.web_search_call.completed"
         {
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            require_active_output_kind(
+                &output_identities,
+                &completed_output_indices,
+                output_index,
+                OutputItemKind::WebSearchCall,
+                &t,
+            )
+            .map_err(protocol_error)?;
             out.push(ReducerEvent::Progress);
             continue;
         }
 
-        if t == "response.failed" || t == "response.error" || t == "error" {
+        if matches!(
+            t.as_str(),
+            "response.failed" | "response.error" | "response.cancelled" | "error"
+        ) {
             let msg = p
                 .get("response")
                 .and_then(|r| r.get("error"))
@@ -423,30 +806,31 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         }
 
         if t == "response.output_item.added" {
-            let item = match p.get("item") {
-                Some(v) => v,
-                None => continue,
-            };
-            let output_index: usize =
-                p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let (output_index, item, identity) =
+                parse_output_item_added(&p).map_err(protocol_error)?;
+            let item_type = identity.kind;
+            register_output_item(
+                output_index,
+                identity,
+                &mut output_identities,
+                &mut item_id_to_output_index,
+                &mut call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
 
-            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if item_type == "reasoning" {
+            if item_type == OutputItemKind::Reasoning {
                 reasoning_by_output_index
                     .entry(output_index)
                     .or_default()
                     .capture(item);
                 continue;
             }
-            if item_type == "web_search_call" {
-                if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
-                    item_id_to_output_index.insert(id.to_string(), output_index);
-                }
+            if item_type == OutputItemKind::WebSearchCall {
                 out.push(ReducerEvent::Progress);
                 continue;
             }
 
-            if item_type == "message" {
+            if item_type == OutputItemKind::Message {
                 close_thinking(
                     &mut out,
                     &mut active_thinking,
@@ -455,9 +839,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 );
                 let idx = anthropic_index;
                 anthropic_index += 1;
-                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                    item_id_to_output_index.insert(id.to_string(), output_index);
-                }
                 blocks_by_output_index.insert(
                     output_index,
                     BlockState::Text {
@@ -469,7 +850,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 continue;
             }
 
-            if item_type == "function_call" {
+            if item_type == OutputItemKind::FunctionCall {
                 close_thinking(
                     &mut out,
                     &mut active_thinking,
@@ -479,19 +860,14 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 saw_tool_use = true;
                 let idx = anthropic_index;
                 anthropic_index += 1;
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
-                    item_id_to_output_index.insert(id.to_string(), output_index);
-                }
+                let identity = output_identities
+                    .get(&output_index)
+                    .expect("registered output item identity");
+                let call_id = identity
+                    .call_id
+                    .clone()
+                    .expect("validated function call_id");
+                let name = identity.name.clone().expect("validated function name");
                 blocks_by_output_index.insert(
                     output_index,
                     BlockState::Tool {
@@ -511,12 +887,41 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 });
                 continue;
             }
-
-            continue;
         }
 
         if t == "response.reasoning_summary_part.added" {
-            let output_index = p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            p.get("summary_index")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    protocol_error(format!(
+                        "{t} is missing a non-negative integer summary_index"
+                    ))
+                })?;
+            let part_type = p
+                .get("part")
+                .filter(|part| part.is_object())
+                .and_then(|part| part.get("type"))
+                .and_then(Value::as_str);
+            if part_type != Some("summary_text") {
+                return Err(protocol_error(format!(
+                    "{t} is missing a summary_text part"
+                )));
+            }
+            require_active_output_kind(
+                &output_identities,
+                &completed_output_indices,
+                output_index,
+                OutputItemKind::Reasoning,
+                &t,
+            )
+            .map_err(protocol_error)?;
             if let Some(active) =
                 active_thinking.filter(|active| active.output_index == output_index)
             {
@@ -529,8 +934,32 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         }
 
         if t == "response.reasoning_summary_text.delta" {
-            let output_index = p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            require_active_output_kind(
+                &output_identities,
+                &completed_output_indices,
+                output_index,
+                OutputItemKind::Reasoning,
+                &t,
+            )
+            .map_err(protocol_error)?;
+            p.get("summary_index")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    protocol_error(format!(
+                        "{t} is missing a non-negative integer summary_index"
+                    ))
+                })?;
+            let delta = p
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| protocol_error(format!("{t} is missing a string delta")))?;
             if delta.is_empty() {
                 continue;
             }
@@ -565,25 +994,29 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 &mut reasoning_by_output_index,
                 &mut output_items_by_index,
             );
-            let output_index = p
-                .get("output_index")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-            let item_id = p.get("item_id").and_then(|v| v.as_str());
-            let state = if let Some(oi) = output_index {
-                blocks_by_output_index.get_mut(&oi)
-            } else if let Some(id) = item_id {
-                item_id_to_output_index
-                    .get(id)
-                    .and_then(|oi| blocks_by_output_index.get_mut(oi))
-            } else {
-                None
-            };
-            let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            require_active_output_kind(
+                &output_identities,
+                &completed_output_indices,
+                output_index,
+                OutputItemKind::Message,
+                &t,
+            )
+            .map_err(protocol_error)?;
+            let delta = p
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| protocol_error(format!("{t} is missing a string delta")))?;
             if delta.is_empty() {
                 continue;
             }
-            match state {
+            match blocks_by_output_index.get_mut(&output_index) {
                 Some(BlockState::Text { index, text_accum }) => {
                     text_accum.push_str(delta);
                     out.push(ReducerEvent::TextDelta {
@@ -591,24 +1024,50 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         text: delta.to_string(),
                     });
                 }
-                _ => continue,
+                Some(BlockState::Tool { .. }) => {
+                    return Err(protocol_error(format!(
+                        "{t} resolved to a function call at output_index {output_index}"
+                    )));
+                }
+                None => {
+                    return Err(protocol_error(format!(
+                        "{t} references closed or missing output_index {output_index}"
+                    )));
+                }
             }
             continue;
         }
 
         if t == "response.function_call_arguments.delta" {
-            let Some(output_index) =
-                resolve_event_output_index(&p, &item_id_to_output_index, &blocks_by_output_index)
-            else {
-                continue;
-            };
-            let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            require_active_output_kind(
+                &output_identities,
+                &completed_output_indices,
+                output_index,
+                OutputItemKind::FunctionCall,
+                &t,
+            )
+            .map_err(protocol_error)?;
+            let delta = p
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| protocol_error(format!("{t} is missing a string delta")))?;
             if delta.is_empty() {
                 continue;
             }
             let state = match blocks_by_output_index.get_mut(&output_index) {
                 Some(s) => s,
-                None => continue,
+                None => {
+                    return Err(protocol_error(format!(
+                        "{t} references closed or missing output_index {output_index}"
+                    )));
+                }
             };
             let mut repaired_read: Option<(usize, String)> = None;
             match state {
@@ -620,11 +1079,13 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     call_id,
                     ..
                 } => {
-                    // The done event is an authoritative snapshot. Ignore any
-                    // replayed or out-of-order delta after that boundary.
+                    // The done event is an authoritative boundary. A later
+                    // delta is an upstream ordering violation, not a replay to
+                    // silently discard.
                     if done_snapshot.is_some() {
-                        out.push(ReducerEvent::ToolProgress { index: *index });
-                        continue;
+                        return Err(protocol_error(format!(
+                            "{t} arrived after arguments.done at output_index {output_index}"
+                        )));
                     }
                     args_accum.push_str(delta);
                     if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
@@ -646,7 +1107,11 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         out.push(ReducerEvent::ToolProgress { index: *index });
                     }
                 }
-                _ => continue,
+                BlockState::Text { .. } => {
+                    return Err(protocol_error(format!(
+                        "{t} resolved to a message at output_index {output_index}"
+                    )));
+                }
             }
             if let Some((index, repaired)) = repaired_read {
                 if let Some(mut state) = blocks_by_output_index.remove(&output_index) {
@@ -666,48 +1131,81 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     partial_json: repaired,
                 });
                 out.push(ReducerEvent::ToolStop { index });
+                completed_output_indices.insert(output_index);
                 repaired_tool_completion = true;
             }
             continue;
         }
 
         if t == "response.function_call_arguments.done" {
-            let Some(output_index) =
-                resolve_event_output_index(&p, &item_id_to_output_index, &blocks_by_output_index)
-            else {
-                continue;
-            };
-            if let Some(BlockState::Tool {
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            require_active_output_kind(
+                &output_identities,
+                &completed_output_indices,
+                output_index,
+                OutputItemKind::FunctionCall,
+                &t,
+            )
+            .map_err(protocol_error)?;
+            let args = p
+                .get("arguments")
+                .and_then(Value::as_str)
+                .ok_or_else(|| protocol_error(format!("{t} is missing string arguments")))?;
+            let Some(BlockState::Tool {
                 name,
                 done_snapshot,
                 ..
             }) = blocks_by_output_index.get_mut(&output_index)
-                && let Some(args) = p.get("arguments").and_then(|v| v.as_str())
-            {
-                if args.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
-                    return Err(UpstreamStreamError {
-                        kind: UpstreamErrorKind::Failed,
-                        message: format!("Buffered {name} tool arguments exceeded safe limits"),
-                        retry_after_seconds: None,
-                        diagnostics: None,
-                    });
-                }
-                *done_snapshot = Some(args.to_string());
+            else {
+                return Err(protocol_error(format!(
+                    "{t} references closed or missing output_index {output_index}"
+                )));
+            };
+            if done_snapshot.is_some() {
+                return Err(protocol_error(format!(
+                    "duplicate {t} for output_index {output_index}"
+                )));
             }
+            if args.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
+                return Err(protocol_error(format!(
+                    "Buffered {name} tool arguments exceeded safe limits"
+                )));
+            }
+            *done_snapshot = Some(args.to_string());
             continue;
         }
 
         if t == "response.output_item.done" {
-            let Some(output_index) =
-                resolve_event_output_index(&p, &item_id_to_output_index, &blocks_by_output_index)
-            else {
-                continue;
-            };
-            let item = p.get("item");
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            let identity = output_identities
+                .get(&output_index)
+                .cloned()
+                .ok_or_else(|| {
+                    protocol_error(format!(
+                        "{t} references output_index {output_index} before output_item.added"
+                    ))
+                })?;
+            if completed_output_indices.contains(&output_index) {
+                return Err(protocol_error(format!(
+                    "duplicate {t} for output_index {output_index}"
+                )));
+            }
+            let item_val =
+                validate_output_item_done(&p, output_index, &identity).map_err(protocol_error)?;
 
-            if let Some(item_val) = item
-                && item_val.get("type").and_then(|v| v.as_str()) == Some("reasoning")
-            {
+            if identity.kind == OutputItemKind::Reasoning {
                 reasoning_by_output_index
                     .entry(output_index)
                     .or_default()
@@ -729,12 +1227,11 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         &mut output_items_by_index,
                     );
                 }
+                completed_output_indices.insert(output_index);
                 continue;
             }
 
-            if let Some(item_val) = item
-                && item_val.get("type").and_then(|v| v.as_str()) == Some("web_search_call")
-            {
+            if identity.kind == OutputItemKind::WebSearchCall {
                 close_thinking(
                     &mut out,
                     &mut active_thinking,
@@ -742,7 +1239,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     &mut output_items_by_index,
                 );
                 if !web_search_output_indices.insert(output_index) {
-                    continue;
+                    return Err(protocol_error(format!(
+                        "duplicate web search completion at output_index {output_index}"
+                    )));
                 }
                 let idx = anthropic_index;
                 anthropic_index += 1;
@@ -760,25 +1259,27 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     query,
                     sources,
                 });
+                completed_output_indices.insert(output_index);
                 continue;
             }
 
-            let state = blocks_by_output_index.remove(&output_index);
-            let mut state = match state {
-                Some(s) => s,
-                None => continue,
-            };
+            let mut state = blocks_by_output_index
+                .remove(&output_index)
+                .ok_or_else(|| {
+                    protocol_error(format!(
+                        "{t} references closed or missing output_index {output_index}"
+                    ))
+                })?;
 
-            if let Some(item_val) = item
-                && let BlockState::Tool {
-                    args_accum,
-                    name,
-                    call_id,
-                    done_snapshot,
-                    emitted_args,
-                    index,
-                    ..
-                } = &mut state
+            if let BlockState::Tool {
+                args_accum,
+                name,
+                call_id,
+                done_snapshot,
+                emitted_args,
+                index,
+                ..
+            } = &mut state
             {
                 let item_snapshot = item_val.get("arguments").and_then(|v| v.as_str());
                 let authoritative = done_snapshot
@@ -821,10 +1322,23 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     out.push(ReducerEvent::ToolStop { index: *index });
                 }
             }
+            completed_output_indices.insert(output_index);
             continue;
         }
 
         if t == "response.completed" || t == "response.incomplete" || t == "response.done" {
+            if !p.get("response").is_some_and(Value::is_object) {
+                return Err(protocol_error(format!(
+                    "{t} is missing an object response snapshot"
+                )));
+            }
+            let unfinished =
+                unfinished_output_indices(&output_identities, &completed_output_indices);
+            if !unfinished.is_empty() {
+                return Err(protocol_error(format!(
+                    "{t} arrived with unfinished Codex output items at output_index(es) {unfinished:?}"
+                )));
+            }
             _saw_terminal = true;
             terminal_type = Some(t.clone());
             response_id = p
@@ -838,11 +1352,130 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 && incomplete_stop_reason.is_none();
             continue;
         }
+
+        if matches!(
+            t.as_str(),
+            "response.created" | "response.in_progress" | "response.queued"
+        ) {
+            out.push(ReducerEvent::Progress);
+            continue;
+        }
+
+        if t == "response.output_text.done" {
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            require_active_output_kind(
+                &output_identities,
+                &completed_output_indices,
+                output_index,
+                OutputItemKind::Message,
+                &t,
+            )
+            .map_err(protocol_error)?;
+            let snapshot = p
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| protocol_error(format!("{t} is missing a string text snapshot")))?;
+            let Some(BlockState::Text { index, text_accum }) =
+                blocks_by_output_index.get_mut(&output_index)
+            else {
+                return Err(protocol_error(format!(
+                    "{t} references closed or missing output_index {output_index}"
+                )));
+            };
+            let suffix =
+                reconcile_output_text_snapshot(text_accum, snapshot, &t).map_err(protocol_error)?;
+            if !suffix.is_empty() {
+                text_accum.push_str(suffix);
+                out.push(ReducerEvent::TextDelta {
+                    index: *index,
+                    text: suffix.to_string(),
+                });
+            }
+            continue;
+        }
+
+        if matches!(
+            t.as_str(),
+            "response.content_part.added"
+                | "response.content_part.done"
+                | "response.output_text.annotation.added"
+        ) {
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            require_active_output_kind(
+                &output_identities,
+                &completed_output_indices,
+                output_index,
+                OutputItemKind::Message,
+                &t,
+            )
+            .map_err(protocol_error)?;
+            if t == "response.output_text.annotation.added" {
+                let annotation = p
+                    .get("annotation")
+                    .filter(|annotation| annotation.is_object())
+                    .ok_or_else(|| {
+                        protocol_error(format!("{t} is missing an object annotation"))
+                    })?;
+                if annotation.get("type").and_then(Value::as_str) != Some("url_citation")
+                    || annotation
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .filter(|url| !url.is_empty())
+                        .is_none()
+                {
+                    return Err(protocol_error(format!(
+                        "{t} contains an invalid url_citation annotation"
+                    )));
+                }
+            }
+            out.push(ReducerEvent::Progress);
+            continue;
+        }
+
+        if matches!(
+            t.as_str(),
+            "response.reasoning_summary_part.done" | "response.reasoning_summary_text.done"
+        ) {
+            let output_index = resolve_semantic_output_index(
+                &p,
+                &t,
+                &item_id_to_output_index,
+                &call_id_to_output_index,
+            )
+            .map_err(protocol_error)?;
+            require_active_output_kind(
+                &output_identities,
+                &completed_output_indices,
+                output_index,
+                OutputItemKind::Reasoning,
+                &t,
+            )
+            .map_err(protocol_error)?;
+            out.push(ReducerEvent::Progress);
+            continue;
+        }
+
+        return Err(protocol_error(format!(
+            "unsupported Codex semantic event {t:?}"
+        )));
     }
 
     let open_blocks = describe_open_blocks(&blocks_by_output_index);
+    let unfinished = unfinished_output_indices(&output_identities, &completed_output_indices);
     let can_finish_repaired_tool_without_terminal =
-        repaired_tool_completion && open_blocks.is_empty() && saw_tool_use;
+        repaired_tool_completion && open_blocks.is_empty() && unfinished.is_empty() && saw_tool_use;
     if (!_saw_terminal && !can_finish_repaired_tool_without_terminal) || !open_blocks.is_empty() {
         let diagnostics = UpstreamStreamDiagnostics {
             event_count,
@@ -890,48 +1523,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     });
 
     Ok(out)
-}
-
-fn resolve_event_output_index(
-    payload: &serde_json::Value,
-    item_id_to_output_index: &std::collections::HashMap<String, usize>,
-    blocks_by_output_index: &std::collections::HashMap<usize, BlockState>,
-) -> Option<usize> {
-    payload
-        .get("output_index")
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize)
-        .or_else(|| {
-            payload
-                .get("item_id")
-                .and_then(|value| value.as_str())
-                .or_else(|| {
-                    payload
-                        .get("item")
-                        .and_then(|item| item.get("id"))
-                        .and_then(|value| value.as_str())
-                })
-                .and_then(|id| item_id_to_output_index.get(id).copied())
-        })
-        .or_else(|| {
-            let call_id = payload
-                .get("call_id")
-                .and_then(|value| value.as_str())
-                .or_else(|| {
-                    payload
-                        .get("item")
-                        .and_then(|item| item.get("call_id"))
-                        .and_then(|value| value.as_str())
-                })?;
-            blocks_by_output_index
-                .iter()
-                .find_map(|(output_index, block)| match block {
-                    BlockState::Tool {
-                        call_id: candidate, ..
-                    } if candidate == call_id => Some(*output_index),
-                    _ => None,
-                })
-        })
 }
 
 fn describe_open_blocks(
@@ -1324,7 +1915,7 @@ mod tests {
             sse(
                 "response.output_item.done",
                 json!({
-                    "output_index":0,"item":{"type":"message"}
+                    "output_index":0,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse(
@@ -1370,6 +1961,113 @@ mod tests {
         let error = reduce_upstream_bytes(input).unwrap_err();
         assert_eq!(error.kind, UpstreamErrorKind::Failed);
         assert!(error.message.contains("BOM after stream start"));
+    }
+
+    #[test]
+    fn codex_buffered_malformed_semantic_event_fails() {
+        let input = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"truncated\"\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\n",
+        );
+
+        let error = reduce_upstream_bytes(input.as_bytes()).unwrap_err();
+        assert_eq!(error.kind, UpstreamErrorKind::Failed);
+        assert!(error.message.contains("malformed Codex semantic event"));
+    }
+
+    #[test]
+    fn codex_buffered_unresolved_delta_fails() {
+        let input = format!(
+            "{}{}",
+            sse(
+                "response.output_text.delta",
+                json!({"item_id":"missing_item","delta":"lost"})
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
+            )
+        );
+
+        let error = reduce_upstream_bytes(input.as_bytes()).unwrap_err();
+        assert_eq!(error.kind, UpstreamErrorKind::Failed);
+        assert!(error.message.contains("unknown item_id"));
+    }
+
+    #[test]
+    fn codex_buffered_rejects_duplicate_output_index_and_missing_function_identity() {
+        let duplicate = [
+            sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":{"type":"message","id":"msg_1"}}),
+            ),
+            sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"Read"}}),
+            ),
+        ]
+        .concat();
+        let error = reduce_upstream_bytes(duplicate.as_bytes()).unwrap_err();
+        assert!(error.message.contains("duplicate Codex output_index 0"));
+
+        for item in [
+            json!({"type":"function_call","name":"Read"}),
+            json!({"type":"function_call","call_id":"call_1"}),
+            json!({"type":"function_call","call_id":"","name":"Read"}),
+        ] {
+            let input = sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":item}),
+            );
+            let error = reduce_upstream_bytes(input.as_bytes()).unwrap_err();
+            assert!(error.message.contains("must be a non-empty string"));
+        }
+    }
+
+    #[test]
+    fn codex_buffered_rejects_done_before_added_and_item_index_conflict() {
+        let done_before_added = sse(
+            "response.output_item.done",
+            json!({"output_index":0,"item":{"type":"message","id":"msg_1"}}),
+        );
+        let error = reduce_upstream_bytes(done_before_added.as_bytes()).unwrap_err();
+        assert!(
+            error.message.contains("before output_item.added")
+                || error.message.contains("unknown item_id")
+        );
+
+        let conflict = [
+            sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":{"type":"message","id":"msg_1"}}),
+            ),
+            sse(
+                "response.output_item.added",
+                json!({"output_index":1,"item":{"type":"message","id":"msg_2"}}),
+            ),
+            sse(
+                "response.output_text.delta",
+                json!({"output_index":1,"item_id":"msg_1","delta":"wrong target"}),
+            ),
+        ]
+        .concat();
+        let error = reduce_upstream_bytes(conflict.as_bytes()).unwrap_err();
+        assert!(error.message.contains("resolves to output_index 0, not 1"));
+
+        let missing_done_id = [
+            sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":{"type":"message","id":"msg_1"}}),
+            ),
+            sse(
+                "response.output_item.done",
+                json!({"output_index":0,"item":{"type":"message"}}),
+            ),
+        ]
+        .concat();
+        let error = reduce_upstream_bytes(missing_done_id.as_bytes()).unwrap_err();
+        assert!(error.message.contains("missing the non-empty id"));
     }
 
     #[test]
@@ -1419,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn reducer_uses_done_snapshot_and_ignores_late_delta() {
+    fn reducer_uses_done_snapshot_over_item_snapshot() {
         let upstream = [
             sse(
                 "response.output_item.added",
@@ -1435,10 +2133,6 @@ mod tests {
             sse(
                 "response.function_call_arguments.done",
                 json!({"call_id":"call_1","arguments":"{\"command\":\"from done\"}"}),
-            ),
-            sse(
-                "response.function_call_arguments.delta",
-                json!({"item_id":"item_1","delta":"{late garbage"}),
             ),
             sse(
                 "response.output_item.done",
@@ -1476,6 +2170,32 @@ mod tests {
             panic!("expected function call continuation item");
         };
         assert_eq!(arguments, "{\"command\":\"from done\"}");
+    }
+
+    #[test]
+    fn reducer_rejects_delta_after_arguments_done() {
+        let upstream = [
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"Bash"}
+                }),
+            ),
+            sse(
+                "response.function_call_arguments.done",
+                json!({"output_index":0,"arguments":"{\"command\":\"done\"}"}),
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({"output_index":0,"delta":"{late garbage"}),
+            ),
+        ]
+        .concat();
+
+        let error = reduce_upstream_bytes(upstream.as_bytes()).unwrap_err();
+        assert_eq!(error.kind, UpstreamErrorKind::Failed);
+        assert!(error.message.contains("after arguments.done"));
     }
 
     #[test]
@@ -1651,6 +2371,48 @@ mod tests {
     }
 
     #[test]
+    fn buffered_read_repair_does_not_hide_unfinished_non_tool_items() {
+        for (label, unfinished_item) in [
+            ("reasoning", json!({"type":"reasoning","id":"reasoning_1"})),
+            (
+                "web_search_call",
+                json!({"type":"web_search_call","id":"search_1"}),
+            ),
+        ] {
+            let upstream = [
+                sse(
+                    "response.output_item.added",
+                    json!({
+                        "output_index":0,
+                        "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                    }),
+                ),
+                sse(
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "output_index":0,
+                        "delta":format!("{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}", " ".repeat(1024))
+                    }),
+                ),
+                sse(
+                    "response.output_item.added",
+                    json!({"output_index":1,"item":unfinished_item}),
+                ),
+            ]
+            .concat();
+
+            let error = reduce_upstream_bytes(upstream.as_bytes()).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("before terminal Codex response event"),
+                "{label}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
     fn reducer_read_repair_keeps_parallel_peer_and_finishes_once() {
         let upstream = [
             sse(
@@ -1779,7 +2541,7 @@ mod tests {
             sse(
                 "response.output_item.done",
                 json!({
-                    "output_index":1,"item":{"type":"message"}
+                    "output_index":1,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse(
@@ -1839,7 +2601,7 @@ mod tests {
             sse(
                 "response.output_item.done",
                 json!({
-                    "output_index":0,"item":{"type":"message"}
+                    "output_index":0,"item":{"type":"message","id":"msg_up"}
                 })
             ),
         );
@@ -1948,7 +2710,7 @@ mod tests {
             sse(
                 "response.output_item.done",
                 json!({
-                    "output_index":0,"item":{"type":"message"}
+                    "output_index":0,"item":{"type":"message","id":"msg_up"}
                 })
             ),
             sse(
@@ -1995,7 +2757,11 @@ mod tests {
     #[test]
     fn reduce_reasoning_summary_before_text() {
         let upstream = format!(
-            "{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":{"type":"reasoning","id":"rs_0","summary":[],"encrypted_content":"enc"}})
+            ),
             sse(
                 "response.reasoning_summary_text.delta",
                 json!({"output_index":0,"summary_index":0,"delta":"Plan"})
@@ -2006,7 +2772,7 @@ mod tests {
             ),
             sse(
                 "response.output_item.done",
-                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+                json!({"output_index":0,"item":{"type":"reasoning","id":"rs_0","summary":[],"encrypted_content":"enc"}})
             ),
             sse(
                 "response.output_item.added",
@@ -2018,7 +2784,7 @@ mod tests {
             ),
             sse(
                 "response.output_item.done",
-                json!({"output_index":1,"item":{"type":"message"}})
+                json!({"output_index":1,"item":{"type":"message","id":"msg_up"}})
             ),
             sse(
                 "response.completed",
@@ -2077,7 +2843,7 @@ mod tests {
             ),
             sse(
                 "response.output_item.done",
-                json!({"output_index":1,"item":{"type":"message"}})
+                json!({"output_index":1,"item":{"type":"message","id":"msg_up"}})
             ),
             sse(
                 "response.completed",
@@ -2096,7 +2862,11 @@ mod tests {
     #[test]
     fn reduce_multiple_reasoning_summary_parts() {
         let upstream = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":{"type":"reasoning","id":"rs_0","summary":[],"encrypted_content":"enc"}})
+            ),
             sse(
                 "response.reasoning_summary_text.delta",
                 json!({"output_index":0,"summary_index":0,"delta":"part one"})
@@ -2111,7 +2881,7 @@ mod tests {
             ),
             sse(
                 "response.output_item.done",
-                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+                json!({"output_index":0,"item":{"type":"reasoning","id":"rs_0","summary":[],"encrypted_content":"enc"}})
             ),
             sse(
                 "response.completed",
@@ -2138,14 +2908,22 @@ mod tests {
     #[test]
     fn reduce_two_reasoning_items() {
         let upstream = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({"output_index":0,"item":{"type":"reasoning","id":"rs_0","summary":[],"encrypted_content":"enc"}})
+            ),
             sse(
                 "response.reasoning_summary_text.delta",
                 json!({"output_index":0,"summary_index":0,"delta":"first"})
             ),
             sse(
                 "response.output_item.done",
-                json!({"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+                json!({"output_index":0,"item":{"type":"reasoning","id":"rs_0","summary":[],"encrypted_content":"enc"}})
+            ),
+            sse(
+                "response.output_item.added",
+                json!({"output_index":1,"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"enc"}})
             ),
             sse(
                 "response.reasoning_summary_text.delta",
@@ -2153,7 +2931,7 @@ mod tests {
             ),
             sse(
                 "response.output_item.done",
-                json!({"output_index":1,"item":{"type":"reasoning","summary":[],"encrypted_content":"enc"}})
+                json!({"output_index":1,"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"enc"}})
             ),
             sse(
                 "response.completed",

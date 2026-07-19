@@ -79,6 +79,35 @@ fn help_discovers_serverless_tui_demo() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[test]
+fn serve_help_documents_remote_bind_acknowledgement() -> Result<(), Box<dyn std::error::Error>> {
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["serve", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--allow-remote-unauthenticated"))
+        .stdout(contains("remote clients are not authenticated"))
+        .stdout(contains("authenticating reverse proxy"));
+    Ok(())
+}
+
+#[test]
+fn serve_rejects_non_loopback_without_acknowledgement() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["serve", "--no-monitor"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env("CCP_BIND_ADDRESS", "0.0.0.0")
+        .env("PORT", "0")
+        .env_remove("CCP_ALLOW_REMOTE_UNAUTHENTICATED")
+        .assert()
+        .failure()
+        .stderr(contains(
+            "refusing unauthenticated non-loopback bind address",
+        ));
+    Ok(())
+}
+
+#[test]
 fn invalid_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
     Command::cargo_bin("claude-code-proxy")?
         .arg("definitely-not-a-command")

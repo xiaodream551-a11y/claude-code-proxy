@@ -1,19 +1,30 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
+use std::num::NonZeroU64;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_source_to_url, is_claude_code_compaction_request,
-    normalize_content, normalize_strict_json_schema, read_effort,
+    ContentBlock, RequestedOutputFormat, flatten_system_text, image_source_to_url,
+    is_claude_code_compaction_request, normalize_content, normalize_strict_json_schema,
+    parse_output_format, read_effort, validate_message_roles, validate_tool_reference_provenance,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
 
 const PARALLEL_TOOL_GUIDANCE: &str = "When multiple independent function tools are needed, call them together in one response. Serialize only calls that have data dependencies.";
+const MAX_CODEX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CODEX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+const MAX_CODEX_IMAGE_DECODE_BYTES: usize = 64 * 1024 * 1024;
+const INVALID_CODEX_IMAGE: &str =
+    "does not match source.media_type or is not a complete decodable image";
+const CODEX_IMAGE_DECODE_LIMIT: &str = "exceeds the image decode limit";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -406,7 +417,10 @@ pub fn translate_request_with_overrides(
     opts: TranslateOptions,
     overrides: TranslationOverrides,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    validate_message_roles(req)?;
+    validate_codex_image_inputs(req)?;
     validate_tool_contract(req)?;
+    let output_format = read_output_format(req)?;
     let mut instructions = flatten_system_text(req.extra.get("system"));
     let tool_plan = read_tools(req)?;
     let input = build_input(req, &tool_plan.deferred);
@@ -433,7 +447,7 @@ pub fn translate_request_with_overrides(
         format: None,
     };
 
-    if let Some(fmt) = read_output_format(req) {
+    if let Some(fmt) = output_format {
         text.format = Some(fmt);
     }
 
@@ -596,28 +610,420 @@ fn append_web_search_request_guidance(req: &MessagesRequest, instructions: &mut 
     }
 }
 
-fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
-    let output_config = req.extra.get("output_config")?.as_object()?;
-    let format = output_config.get("format")?.as_object()?;
-    let kind = format.get("type")?.as_str()?;
-    match kind {
-        "json_schema" => {
-            let name = format
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("response")
-                .to_string();
-            let schema = format.get("schema")?;
-            let normalized = normalize_strict_json_schema(schema);
-            Some(ResponsesTextFormat::JsonSchema {
-                name,
-                schema: normalized,
+fn read_output_format(req: &MessagesRequest) -> anyhow::Result<Option<ResponsesTextFormat>> {
+    let Some(format) = parse_output_format(req)? else {
+        return Ok(None);
+    };
+    let format = match format {
+        RequestedOutputFormat::JsonSchema { name, schema } => {
+            if name.len() > 64
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                anyhow::bail!(
+                    "output_config.format.name must contain only ASCII letters, digits, underscores, or hyphens and be at most 64 characters"
+                );
+            }
+            ResponsesTextFormat::JsonSchema {
+                name: name.to_string(),
+                schema: normalize_strict_json_schema(schema),
                 strict: Some(true),
-            })
+            }
         }
-        "json_object" => Some(ResponsesTextFormat::JsonObject),
-        _ => Some(ResponsesTextFormat::Text),
+        RequestedOutputFormat::JsonObject => ResponsesTextFormat::JsonObject,
+        RequestedOutputFormat::Text => ResponsesTextFormat::Text,
+    };
+    Ok(Some(format))
+}
+
+fn validate_codex_image_inputs(req: &MessagesRequest) -> Result<(), anyhow::Error> {
+    let mut validated_base64_images = HashSet::new();
+    for (message_index, message) in req.messages.iter().enumerate() {
+        let Some(blocks) = message.content.as_array() else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            let Some(kind) = block.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = format!("messages[{message_index}].content[{block_index}]");
+            if kind == "image" {
+                if message.role != "user" {
+                    anyhow::bail!("{path} image blocks must have user role");
+                }
+                validate_codex_image_block(block, &path, &mut validated_base64_images)?;
+            } else if kind == "tool_result"
+                && let Some(result_blocks) = block.get("content").and_then(Value::as_array)
+            {
+                for (result_index, result_block) in result_blocks.iter().enumerate() {
+                    if result_block.get("type").and_then(Value::as_str) == Some("image") {
+                        validate_codex_image_block(
+                            result_block,
+                            &format!("{path}.content[{result_index}]"),
+                            &mut validated_base64_images,
+                        )?;
+                    }
+                }
+            }
+        }
     }
+    Ok(())
+}
+
+fn validate_codex_image_block<'a>(
+    block: &'a Value,
+    path: &str,
+    validated_base64_images: &mut HashSet<(&'a str, &'a str)>,
+) -> Result<(), anyhow::Error> {
+    let source = block
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("{path}.source must be an object"))?;
+    let source_type = source
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{path}.source.type must be a string"))?;
+    match source_type {
+        "url" => {
+            let raw = source
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("{path}.source.url must be a non-empty string"))?;
+            let url = Url::parse(raw)
+                .map_err(|_| anyhow::anyhow!("{path}.source.url must be a fully qualified URL"))?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                anyhow::bail!("{path}.source.url must use http or https and include a host");
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                anyhow::bail!("{path}.source.url must not contain credentials");
+            }
+        }
+        "base64" => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("{path}.source.media_type must be a string"))?;
+            if !matches!(
+                media_type,
+                "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+            ) {
+                anyhow::bail!("{path}.source.media_type is not supported: {media_type}");
+            }
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|data| !data.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("{path}.source.data must be a non-empty string"))?;
+            if validated_base64_images.insert((media_type, data)) {
+                validate_codex_base64_image(data, media_type, MAX_CODEX_IMAGE_BYTES)
+                    .map_err(|message| anyhow::anyhow!("{path}.source.data {message}"))?;
+            }
+        }
+        other => anyhow::bail!("{path}.source.type is not supported: {other}"),
+    }
+    Ok(())
+}
+
+fn validate_codex_base64_image(
+    encoded: &str,
+    media_type: &str,
+    max_decoded_bytes: usize,
+) -> Result<(), &'static str> {
+    let max_encoded_bytes = max_decoded_bytes
+        .saturating_add(2)
+        .checked_div(3)
+        .unwrap_or(0)
+        .saturating_mul(4);
+    if encoded.len() > max_encoded_bytes {
+        return Err("exceeds the image byte limit");
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "must be valid base64")?;
+    if decoded.len() > max_decoded_bytes {
+        return Err("exceeds the image byte limit");
+    }
+
+    match media_type {
+        "image/png" => validate_complete_png(&decoded),
+        "image/jpeg" => validate_complete_jpeg(&decoded),
+        "image/gif" => validate_complete_gif(&decoded),
+        "image/webp" => validate_complete_webp(&decoded),
+        _ => Err(INVALID_CODEX_IMAGE),
+    }
+}
+
+fn validate_image_pixel_count(width: u64, height: u64) -> Result<u64, &'static str> {
+    let pixels = width
+        .checked_mul(height)
+        .filter(|pixels| width != 0 && height != 0 && *pixels <= MAX_CODEX_IMAGE_PIXELS)
+        .ok_or(CODEX_IMAGE_DECODE_LIMIT)?;
+    Ok(pixels)
+}
+
+fn allocate_image_validation_buffer(size: usize) -> Result<Vec<u8>, &'static str> {
+    if size > MAX_CODEX_IMAGE_DECODE_BYTES {
+        return Err(CODEX_IMAGE_DECODE_LIMIT);
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(size)
+        .map_err(|_| CODEX_IMAGE_DECODE_LIMIT)?;
+    output.resize(size, 0);
+    Ok(output)
+}
+
+fn validate_complete_png(bytes: &[u8]) -> Result<(), &'static str> {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+
+    let mut cursor = Cursor::new(bytes);
+    let decoder = png::Decoder::new_with_limits(
+        &mut cursor,
+        png::Limits {
+            bytes: MAX_CODEX_IMAGE_DECODE_BYTES,
+        },
+    );
+    let mut reader = decoder.read_info().map_err(map_codex_png_error)?;
+    validate_image_pixel_count(
+        u64::from(reader.info().width),
+        u64::from(reader.info().height),
+    )?;
+    if reader
+        .output_buffer_size()
+        .filter(|size| *size <= MAX_CODEX_IMAGE_DECODE_BYTES)
+        .is_none()
+    {
+        return Err(CODEX_IMAGE_DECODE_LIMIT);
+    }
+
+    while reader.next_row().map_err(map_codex_png_error)?.is_some() {}
+    reader.finish().map_err(map_codex_png_error)?;
+    drop(reader);
+    if cursor.position() != bytes.len() as u64 {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+    Ok(())
+}
+
+fn map_codex_png_error(error: png::DecodingError) -> &'static str {
+    match error {
+        png::DecodingError::LimitsExceeded => CODEX_IMAGE_DECODE_LIMIT,
+        _ => INVALID_CODEX_IMAGE,
+    }
+}
+
+fn validate_complete_jpeg(bytes: &[u8]) -> Result<(), &'static str> {
+    validate_codex_jpeg_framing(bytes)?;
+
+    let options = zune_core::options::DecoderOptions::new_safe()
+        .set_strict_mode(true)
+        .set_max_width(usize::from(u16::MAX))
+        .set_max_height(usize::from(u16::MAX))
+        .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::Luma);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(bytes), options);
+    decoder.decode_headers().map_err(|_| INVALID_CODEX_IMAGE)?;
+    let info = decoder.info().ok_or(INVALID_CODEX_IMAGE)?;
+    validate_image_pixel_count(u64::from(info.width), u64::from(info.height))?;
+    let output_size = decoder
+        .output_buffer_size()
+        .filter(|size| *size <= MAX_CODEX_IMAGE_DECODE_BYTES)
+        .ok_or(CODEX_IMAGE_DECODE_LIMIT)?;
+    let mut output = allocate_image_validation_buffer(output_size)?;
+    decoder
+        .decode_into(&mut output)
+        .map_err(|_| INVALID_CODEX_IMAGE)?;
+    Ok(())
+}
+
+fn validate_codex_jpeg_framing(bytes: &[u8]) -> Result<(), &'static str> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+
+    let mut offset = 2;
+    let mut saw_scan = false;
+    while offset < bytes.len() {
+        if bytes[offset] != 0xff {
+            return Err(INVALID_CODEX_IMAGE);
+        }
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset).ok_or(INVALID_CODEX_IMAGE)?;
+        offset += 1;
+
+        match marker {
+            0xd9 => {
+                return if saw_scan && offset == bytes.len() {
+                    Ok(())
+                } else {
+                    Err(INVALID_CODEX_IMAGE)
+                };
+            }
+            0xd8 | 0x00 | 0xd0..=0xd7 => return Err(INVALID_CODEX_IMAGE),
+            0x01 => continue,
+            _ => {}
+        }
+
+        let length_bytes = bytes
+            .get(offset..offset.saturating_add(2))
+            .ok_or(INVALID_CODEX_IMAGE)?;
+        let segment_length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+        if segment_length < 2 {
+            return Err(INVALID_CODEX_IMAGE);
+        }
+        offset = offset
+            .checked_add(segment_length)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(INVALID_CODEX_IMAGE)?;
+        if marker != 0xda {
+            continue;
+        }
+
+        saw_scan = true;
+        let mut entropy_bytes = 0_usize;
+        while offset < bytes.len() {
+            if bytes[offset] != 0xff {
+                entropy_bytes += 1;
+                offset += 1;
+                continue;
+            }
+            let marker_start = offset;
+            while offset < bytes.len() && bytes[offset] == 0xff {
+                offset += 1;
+            }
+            let next = *bytes.get(offset).ok_or(INVALID_CODEX_IMAGE)?;
+            match next {
+                0x00 => {
+                    entropy_bytes += 1;
+                    offset += 1;
+                }
+                0xd0..=0xd7 => offset += 1,
+                _ => {
+                    offset = marker_start;
+                    break;
+                }
+            }
+        }
+        if entropy_bytes == 0 {
+            return Err(INVALID_CODEX_IMAGE);
+        }
+    }
+    Err(INVALID_CODEX_IMAGE)
+}
+
+fn validate_complete_gif(bytes: &[u8]) -> Result<(), &'static str> {
+    if !bytes.starts_with(b"GIF87a") && !bytes.starts_with(b"GIF89a") {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::Indexed);
+    options.set_memory_limit(gif::MemoryLimit::Bytes(
+        NonZeroU64::new(MAX_CODEX_IMAGE_DECODE_BYTES as u64)
+            .expect("image decode limit is non-zero"),
+    ));
+    options.check_frame_consistency(true);
+    options.check_lzw_end_code(true);
+    options.allow_unknown_blocks(false);
+    let mut decoder = options
+        .read_info(Cursor::new(bytes))
+        .map_err(|_| INVALID_CODEX_IMAGE)?;
+    validate_image_pixel_count(u64::from(decoder.width()), u64::from(decoder.height()))?;
+
+    let mut frame_count = 0_u64;
+    while let Some(frame) = decoder.read_next_frame().map_err(|_| INVALID_CODEX_IMAGE)? {
+        validate_image_pixel_count(u64::from(frame.width), u64::from(frame.height))?;
+        frame_count += 1;
+        if frame_count > 1 {
+            return Err(INVALID_CODEX_IMAGE);
+        }
+    }
+    if frame_count == 0 {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+
+    let reader = decoder.into_inner();
+    let logical_position = reader
+        .get_ref()
+        .position()
+        .checked_sub(reader.buffer().len() as u64)
+        .ok_or(INVALID_CODEX_IMAGE)?;
+    if logical_position != bytes.len() as u64 {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+    Ok(())
+}
+
+fn validate_complete_webp(bytes: &[u8]) -> Result<(), &'static str> {
+    validate_webp_riff_layout(bytes)?;
+    let mut decoder =
+        image_webp::WebPDecoder::new(Cursor::new(bytes)).map_err(|_| INVALID_CODEX_IMAGE)?;
+    decoder.set_memory_limit(MAX_CODEX_IMAGE_DECODE_BYTES);
+    let (width, height) = decoder.dimensions();
+    validate_image_pixel_count(u64::from(width), u64::from(height))?;
+    let output_size = decoder
+        .output_buffer_size()
+        .filter(|size| *size <= MAX_CODEX_IMAGE_DECODE_BYTES)
+        .ok_or(CODEX_IMAGE_DECODE_LIMIT)?;
+    let mut output = allocate_image_validation_buffer(output_size)?;
+
+    if decoder.is_animated() {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+    decoder
+        .read_image(&mut output)
+        .map_err(|_| INVALID_CODEX_IMAGE)?;
+    Ok(())
+}
+
+fn validate_webp_riff_layout(bytes: &[u8]) -> Result<(), &'static str> {
+    if bytes.len() < 20 || bytes.get(..4) != Some(b"RIFF") || bytes.get(8..12) != Some(b"WEBP") {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+    let riff_size = u32::from_le_bytes(bytes[4..8].try_into().map_err(|_| INVALID_CODEX_IMAGE)?);
+    let total_size = usize::try_from(riff_size)
+        .ok()
+        .and_then(|size| size.checked_add(8))
+        .ok_or(INVALID_CODEX_IMAGE)?;
+    if total_size != bytes.len() {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+
+    let mut offset = 12_usize;
+    let mut chunk_count = 0_usize;
+    while offset < bytes.len() {
+        let header_end = offset.checked_add(8).ok_or(INVALID_CODEX_IMAGE)?;
+        let header = bytes.get(offset..header_end).ok_or(INVALID_CODEX_IMAGE)?;
+        let chunk_size = usize::try_from(u32::from_le_bytes(
+            header[4..8].try_into().map_err(|_| INVALID_CODEX_IMAGE)?,
+        ))
+        .map_err(|_| INVALID_CODEX_IMAGE)?;
+        let data_end = header_end
+            .checked_add(chunk_size)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(INVALID_CODEX_IMAGE)?;
+        let padded_end = data_end
+            .checked_add(chunk_size & 1)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(INVALID_CODEX_IMAGE)?;
+        if chunk_size & 1 == 1 && bytes[data_end] != 0 {
+            return Err(INVALID_CODEX_IMAGE);
+        }
+        if matches!(&header[..4], b"ANIM" | b"ANMF") {
+            return Err(INVALID_CODEX_IMAGE);
+        }
+        offset = padded_end;
+        chunk_count += 1;
+    }
+    if offset != bytes.len() || chunk_count == 0 {
+        return Err(INVALID_CODEX_IMAGE);
+    }
+    Ok(())
 }
 
 fn validate_tool_contract(req: &MessagesRequest) -> Result<(), anyhow::Error> {
@@ -692,6 +1098,7 @@ fn validate_tool_contract(req: &MessagesRequest) -> Result<(), anyhow::Error> {
 
     validate_tool_choice(req, &registered_tools)?;
     validate_message_tool_history(req)?;
+    validate_tool_reference_provenance(req)?;
     Ok(())
 }
 
@@ -1691,15 +2098,14 @@ fn codex_input_blocks(content: &Value) -> Vec<CodexInputBlock> {
             .collect(),
         Value::Array(blocks) => blocks
             .iter()
-            .filter_map(|block| {
+            .map(|block| {
                 let normalized = normalize_content(&Value::Array(vec![block.clone()]), Value::Null);
                 if let Some(block) = normalized.into_iter().next() {
-                    return Some(CodexInputBlock::Native(block));
+                    return CodexInputBlock::Native(block);
                 }
-                let kind = block.get("type").and_then(Value::as_str)?;
-                (matches!(kind, "server_tool_use" | "document" | "search_result")
-                    || is_hosted_tool_result_type(kind))
-                .then(|| CodexInputBlock::PreservedText(preserved_anthropic_block_text(block)))
+                // Future or provider-specific Anthropic blocks must remain visible
+                // to the model instead of disappearing through filter_map.
+                CodexInputBlock::PreservedText(preserved_anthropic_block_text(block))
             })
             .collect(),
         _ => Vec::new(),
@@ -1728,12 +2134,13 @@ fn deferred_tools_for_result(
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_reference"))
         .filter_map(|block| block.get("tool_name").and_then(Value::as_str))
         .filter_map(|name| {
-            if !loaded.insert(name.to_string()) {
+            if loaded.contains(name) {
                 return None;
             }
-            deferred_tools
-                .get(name)
-                .and_then(|tool| serde_json::to_value(tool).ok())
+            let tool = deferred_tools.get(name)?;
+            let encoded = serde_json::to_value(tool).ok()?;
+            loaded.insert(name.to_string());
+            Some(encoded)
         })
         .collect()
 }
@@ -1996,6 +2403,63 @@ fn unsupported_tool_result_block_to_string(block: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const VALID_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAGklEQVR4nO3BAQEAAACCIP+vbkhAAQAAAO8GECAAARlDNO4AAAAASUVORK5CYII=";
+
+    fn valid_png_bytes() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(VALID_PNG_BASE64)
+            .unwrap()
+    }
+
+    fn valid_jpeg_bytes() -> Vec<u8> {
+        let mut image = Vec::new();
+        jpeg_encoder::Encoder::new(&mut image, 90)
+            .encode(&vec![0; 32 * 32], 32, 32, jpeg_encoder::ColorType::Luma)
+            .unwrap();
+        image
+    }
+
+    fn valid_gif_bytes(frame_count: usize) -> Vec<u8> {
+        let mut image = Vec::new();
+        {
+            let mut encoder =
+                gif::Encoder::new(&mut image, 32, 32, &[0, 0, 0, 255, 255, 255]).unwrap();
+            for index in 0..frame_count {
+                let frame =
+                    gif::Frame::from_indexed_pixels(32, 32, vec![(index & 1) as u8; 32 * 32], None);
+                encoder.write_frame(&frame).unwrap();
+            }
+        }
+        image
+    }
+
+    fn valid_webp_bytes() -> Vec<u8> {
+        let mut image = Vec::new();
+        image_webp::WebPEncoder::new(&mut image)
+            .encode(&vec![0; 32 * 32 * 3], 32, 32, image_webp::ColorType::Rgb8)
+            .unwrap();
+        image
+    }
+
+    fn base64_image(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn webp_with_chunk(chunk_type: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let padded_size = data.len() + (data.len() & 1);
+        let mut image = Vec::with_capacity(20 + padded_size);
+        image.extend_from_slice(b"RIFF");
+        image.extend_from_slice(&u32::try_from(12 + padded_size).unwrap().to_le_bytes());
+        image.extend_from_slice(b"WEBP");
+        image.extend_from_slice(chunk_type);
+        image.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+        image.extend_from_slice(data);
+        if data.len() & 1 == 1 {
+            image.push(0);
+        }
+        image
+    }
 
     // Translation tests exercise protocol semantics only. Runtime configuration
     // is injected explicitly by the provider and covered by dedicated tests.
@@ -2575,6 +3039,98 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tool_references_without_valid_search_provenance() {
+        let cases = [
+            (
+                "non-search source",
+                "Read",
+                json!([
+                    {"name":"Read", "input_schema":{"type":"object"}},
+                    {"name":"Bash", "defer_loading":true, "input_schema":{"type":"object"}}
+                ]),
+                json!([{"type":"tool_reference", "tool_name":"Bash"}]),
+                "not a declared, non-deferred Claude Code client ToolSearch tool",
+            ),
+            (
+                "undeclared source",
+                "ToolSearch",
+                json!([
+                    {"name":"Bash", "defer_loading":true, "input_schema":{"type":"object"}}
+                ]),
+                json!([{"type":"tool_reference", "tool_name":"Bash"}]),
+                "not a declared Claude Code client ToolSearch tool",
+            ),
+            (
+                "unknown reference",
+                "ToolSearch",
+                json!([
+                    {"name":"ToolSearch", "input_schema":{"type":"object"}}
+                ]),
+                json!([{"type":"tool_reference", "tool_name":"Missing"}]),
+                "not found in available tools",
+            ),
+            (
+                "eager reference",
+                "ToolSearch",
+                json!([
+                    {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                    {"name":"Bash", "input_schema":{"type":"object"}}
+                ]),
+                json!([{"type":"tool_reference", "tool_name":"Bash"}]),
+                "defer_loading=true",
+            ),
+            (
+                "duplicate reference",
+                "ToolSearch",
+                json!([
+                    {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                    {"name":"Bash", "defer_loading":true, "input_schema":{"type":"object"}}
+                ]),
+                json!([
+                    {"type":"tool_reference", "tool_name":"Bash"},
+                    {"type":"tool_reference", "tool_name":"Bash"}
+                ]),
+                "duplicate tool_reference",
+            ),
+            (
+                "mixed valid and invalid references",
+                "ToolSearch",
+                json!([
+                    {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                    {"name":"Bash", "defer_loading":true, "input_schema":{"type":"object"}}
+                ]),
+                json!([
+                    {"type":"tool_reference", "tool_name":"Bash"},
+                    {"type":"tool_reference", "tool_name":"Missing"}
+                ]),
+                "not found in available tools",
+            ),
+        ];
+
+        for (case, caller, tools, references, expected) in cases {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol",
+                "tools":tools,
+                "messages":[
+                    {"role":"assistant", "content":[{
+                        "type":"tool_use", "id":"call_1", "name":caller, "input":{}
+                    }]},
+                    {"role":"user", "content":[{
+                        "type":"tool_result", "tool_use_id":"call_1", "content":references
+                    }]}
+                ]
+            }))
+            .unwrap();
+
+            let error = translate_request(&req, opts()).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "{case}: expected {expected:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn referenced_deferred_web_search_requests_per_call_sources() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model":"gpt-5.6-sol",
@@ -2972,7 +3528,7 @@ mod tests {
             "model": "gpt-5.5",
             "messages": [{"role":"user", "content": [
                 {"type":"text", "text":"describe"},
-                {"type":"image", "source": {"type":"base64", "media_type":"image/jpeg", "data":"xyz"}}
+                {"type":"image", "source": {"type":"base64", "media_type":"image/png", "data":VALID_PNG_BASE64}}
             ]}]
         }))
         .unwrap();
@@ -2984,6 +3540,235 @@ mod tests {
         } else {
             panic!("expected Message");
         }
+    }
+
+    #[test]
+    fn codex_image_validation_accepts_supported_base64_and_https_urls() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content": [
+                {"type":"image", "source": {
+                    "type":"base64", "media_type":"image/png", "data":VALID_PNG_BASE64
+                }},
+                {"type":"image", "source": {
+                    "type":"url", "url":"https://example.invalid/image.png"
+                }}
+            ]}]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        let ResponsesInputItem::Message { content, .. } = &out.input[0] else {
+            panic!("expected image message");
+        };
+        assert_eq!(content.len(), 2);
+    }
+
+    #[test]
+    fn codex_image_validation_fully_decodes_each_supported_base64_format() {
+        for (media_type, image) in [
+            ("image/png", valid_png_bytes()),
+            ("image/jpeg", valid_jpeg_bytes()),
+            ("image/gif", valid_gif_bytes(1)),
+            ("image/webp", valid_webp_bytes()),
+        ] {
+            let encoded = base64_image(&image);
+            assert_eq!(
+                validate_codex_base64_image(&encoded, media_type, image.len()),
+                Ok(()),
+                "{media_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_image_validation_rejects_magic_only_truncated_and_trailing_payloads() {
+        let fake_webp = webp_with_chunk(b"VP8L", &[0x2f, 0, 0, 0, 0]);
+        for (media_type, fake) in [
+            ("image/png", b"\x89PNG\r\n\x1a\n".to_vec()),
+            ("image/jpeg", vec![0xff, 0xd8, 0xff, 0xd9]),
+            ("image/gif", b"GIF89a".to_vec()),
+            ("image/webp", fake_webp),
+        ] {
+            let encoded = base64_image(&fake);
+            assert_eq!(
+                validate_codex_base64_image(&encoded, media_type, usize::MAX),
+                Err(INVALID_CODEX_IMAGE),
+                "header-only {media_type}"
+            );
+        }
+
+        for (media_type, valid) in [
+            ("image/png", valid_png_bytes()),
+            ("image/jpeg", valid_jpeg_bytes()),
+            ("image/gif", valid_gif_bytes(1)),
+            ("image/webp", valid_webp_bytes()),
+        ] {
+            let mut truncated = valid.clone();
+            truncated.pop();
+            assert_eq!(
+                validate_codex_base64_image(&base64_image(&truncated), media_type, usize::MAX,),
+                Err(INVALID_CODEX_IMAGE),
+                "truncated {media_type}"
+            );
+
+            let mut trailing = valid;
+            trailing.push(0);
+            assert_eq!(
+                validate_codex_base64_image(&base64_image(&trailing), media_type, usize::MAX),
+                Err(INVALID_CODEX_IMAGE),
+                "trailing bytes in {media_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_image_validation_rejects_corrupt_complete_containers() {
+        let mut corrupt_png = valid_png_bytes();
+        let idat = corrupt_png
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .unwrap();
+        corrupt_png[idat + 4] ^= 1;
+
+        let incomplete_lzw_gif = vec![
+            b'G', b'I', b'F', b'8', b'9', b'a', 1, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 255, 255, 255,
+            0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 1, 0, 0, 0x3b,
+        ];
+
+        for (media_type, image) in [
+            ("image/png", corrupt_png),
+            ("image/gif", incomplete_lzw_gif),
+        ] {
+            assert_eq!(
+                validate_codex_base64_image(&base64_image(&image), media_type, usize::MAX,),
+                Err(INVALID_CODEX_IMAGE),
+                "{media_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_image_validation_rejects_animated_gif_and_webp() {
+        let animated_gif = valid_gif_bytes(2);
+        assert_eq!(
+            validate_codex_base64_image(&base64_image(&animated_gif), "image/gif", usize::MAX,),
+            Err(INVALID_CODEX_IMAGE)
+        );
+
+        for chunk_type in [b"ANIM", b"ANMF"] {
+            let animated_webp = webp_with_chunk(chunk_type, &[0; 24]);
+            assert_eq!(
+                validate_codex_base64_image(
+                    &base64_image(&animated_webp),
+                    "image/webp",
+                    usize::MAX,
+                ),
+                Err(INVALID_CODEX_IMAGE),
+                "{}",
+                String::from_utf8_lossy(chunk_type)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_image_validation_rejects_malformed_sources_before_dispatch() {
+        let invalid_sources = [
+            json!(null),
+            json!({"type":"base64", "media_type":"image/png", "data":""}),
+            json!({"type":"base64", "media_type":"image/svg+xml", "data":VALID_PNG_BASE64}),
+            json!({"type":"base64", "media_type":"image/png", "data":"%%%"}),
+            json!({"type":"base64", "media_type":"image/png", "data":"aGVsbG8="}),
+            json!({"type":"url", "url":"file:///tmp/image.png"}),
+            json!({"type":"url", "url":"https://user:secret@example.invalid/image.png"}),
+            json!({"type":"url", "url":"/relative/image.png"}),
+            json!({"type":"future", "url":"https://example.invalid/image.png"}),
+        ];
+
+        for source in invalid_sources {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.5",
+                "messages": [{"role":"user", "content": [{"type":"image", "source":source}]}]
+            }))
+            .unwrap();
+            assert!(translate_request(&req, opts()).is_err());
+        }
+    }
+
+    #[test]
+    fn codex_image_validation_rejects_mime_mismatch_and_oversize_data() {
+        assert_eq!(
+            validate_codex_base64_image(VALID_PNG_BASE64, "image/jpeg", usize::MAX),
+            Err(INVALID_CODEX_IMAGE)
+        );
+        assert_eq!(
+            validate_codex_base64_image(VALID_PNG_BASE64, "image/png", 7),
+            Err("exceeds the image byte limit")
+        );
+    }
+
+    #[test]
+    fn codex_image_validation_covers_images_nested_in_tool_results() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role":"assistant", "content":[{
+                    "type":"tool_use", "id":"tool_1", "name":"Read", "input":{}
+                }]},
+                {"role":"user", "content":[{
+                    "type":"tool_result", "tool_use_id":"tool_1", "content":[{
+                        "type":"image", "source":{
+                            "type":"base64", "media_type":"image/png", "data":"aGVsbG8="
+                        }
+                    }]
+                }]}
+            ]
+        }))
+        .unwrap();
+
+        let error = translate_request(&req, opts()).unwrap_err().to_string();
+        assert!(error.contains("messages[1].content[0].content[0]"));
+    }
+
+    #[test]
+    fn codex_unknown_content_blocks_are_preserved_as_visible_text() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user", "content":[{
+                "type":"future_widget", "payload":{"answer":42}
+            }]}]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        let ResponsesInputItem::Message { content, .. } = &out.input[0] else {
+            panic!("expected user message");
+        };
+        let ResponsesContentPart::InputText { text } = &content[0] else {
+            panic!("expected preserved text");
+        };
+        assert!(text.contains("[Anthropic future_widget block]"));
+        assert!(text.contains("\"answer\":42"));
+    }
+
+    #[test]
+    fn codex_rejects_assistant_image_blocks_instead_of_dropping_them() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"assistant", "content":[{
+                "type":"image", "source":{
+                    "type":"base64", "media_type":"image/png", "data":VALID_PNG_BASE64
+                }
+            }]}]
+        }))
+        .unwrap();
+
+        assert!(
+            translate_request(&req, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("image blocks must have user role")
+        );
     }
 
     #[test]
@@ -3027,6 +3812,97 @@ mod tests {
             assert!(required.iter().any(|v| v == "reason"));
         } else {
             panic!("expected JsonSchema format");
+        }
+    }
+
+    #[test]
+    fn translate_rejects_malformed_output_formats() {
+        for (case, output_config) in [
+            ("non-object output_config", json!(null)),
+            ("non-object format", json!({"format":[]})),
+            ("missing type", json!({"format":{}})),
+            ("unknown type", json!({"format":{"type":"json_schmea"}})),
+            ("missing schema", json!({"format":{"type":"json_schema"}})),
+            (
+                "non-object schema",
+                json!({"format":{"type":"json_schema","schema":[]}}),
+            ),
+            (
+                "empty name",
+                json!({"format":{"type":"json_schema","name":"","schema":{}}}),
+            ),
+            (
+                "non-string name",
+                json!({"format":{"type":"json_schema","name":1,"schema":{}}}),
+            ),
+            (
+                "invalid name characters",
+                json!({"format":{"type":"json_schema","name":"bad name","schema":{}}}),
+            ),
+            (
+                "overlong name",
+                json!({"format":{"type":"json_schema","name":"a".repeat(65),"schema":{}}}),
+            ),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user","content":"hello"}],
+                "output_config":output_config
+            }))
+            .unwrap();
+            let error = translate_request(&req, opts()).unwrap_err().to_string();
+            assert!(!error.is_empty(), "{case}");
+        }
+
+        let effort_only: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user","content":"hello"}],
+            "output_config":{"effort":"high"}
+        }))
+        .unwrap();
+        assert!(translate_request(&effort_only, opts()).is_ok());
+    }
+
+    #[test]
+    fn translate_rejects_unknown_and_nested_system_message_roles() {
+        for role in ["foo", "system"] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":role,"content":"do not reinterpret me"}]
+            }))
+            .unwrap();
+            let error = translate_request(&req, opts()).unwrap_err().to_string();
+            assert!(
+                error.contains("role must be user or assistant"),
+                "{role}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn translate_rejects_invalid_message_content_and_text_shapes() {
+        for (content, expected) in [
+            (
+                json!(42),
+                "content must be a string or array of content blocks",
+            ),
+            (
+                json!({"type":"text","text":"not wrapped in an array"}),
+                "content must be a string or array of content blocks",
+            ),
+            (json!([{"type":"text"}]), "content[0].text must be a string"),
+            (
+                json!([{"type":"text","text":42}]),
+                "content[0].text must be a string",
+            ),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user","content":content}]
+            }))
+            .unwrap();
+            let error = translate_request(&req, opts()).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
         }
     }
 
@@ -3638,9 +4514,10 @@ mod tests {
 
     #[test]
     fn tool_result_preserves_images_and_marks_malformed_blocks() {
+        let png_url = format!("data:image/png;base64,{VALID_PNG_BASE64}");
         let output = tool_result_to_output(&json!([
             {"type": "text", "text": "caption"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": VALID_PNG_BASE64}},
             {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}},
             {"type": "text"},
             {"type": "image"},
@@ -3651,7 +4528,7 @@ mod tests {
             rendered,
             json!([
                 {"type":"input_text", "text":"caption"},
-                {"type":"input_image", "image_url":"data:image/png;base64,abc"},
+                {"type":"input_image", "image_url":png_url},
                 {"type":"input_image", "image_url":"https://example.invalid/a.png"},
                 {"type":"input_text", "text":"[Anthropic text tool result block]\n{\"type\":\"text\"}"},
                 {"type":"input_text", "text":"[Anthropic image tool result block]\n{\"type\":\"image\"}"},

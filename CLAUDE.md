@@ -53,7 +53,7 @@ For an in-module unit test, use Cargo's name filter: `cargo test <test_name>`.
 - `src/main.rs` defines the `clap` CLI. No subcommand defaults to `serve`; serve mode starts the monitor TUI only when stdout is a terminal and `--no-monitor` is absent. Provider auth subcommands are delegated through the registry and each provider's CLI hook rather than implemented in the CLI layer.
 - `src/lib.rs` exposes the reusable modules and core provider interfaces.
 - `src/server.rs` owns the Axum surface and request lifecycle: parse an Anthropic `MessagesRequest`, remove the optional model suffix, look up existing session affinity, select a provider, record the session request, create monitoring/traffic context, and dispatch through `Provider`.
-- The implemented HTTP routes are `GET /healthz`, `POST /v1/messages`, and `POST /v1/messages/count_tokens`. Treat this router as authoritative; there is no HTTP `/v1/models` route even though older README text mentions one. Model listing is a CLI command.
+- The implemented HTTP routes are `GET /healthz`, `GET /version`, `GET /v1/models`, `POST /v1/messages`, and `POST /v1/messages/count_tokens`. Treat the router in `src/server.rs` as authoritative; model listing is available both over HTTP and through the CLI.
 - Successful response bodies are monitored until the downstream client consumes or drops them. Do not eagerly collect a successful streaming body in the server layer, because completion versus abandonment accounting depends on body consumption. Failed responses are collected, redacted, and persisted separately.
 
 ### Model routing and process-local state

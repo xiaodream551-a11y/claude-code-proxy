@@ -3,7 +3,7 @@ use crate::{
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     project,
-    provider::{Provider, RequestContext},
+    provider::{Provider, RequestByteLease, RequestContext},
     registry::{Registry, normalize_incoming_model},
     session,
     traffic::{TrafficCaptureOptions, create_traffic_capture},
@@ -148,6 +148,7 @@ pub struct ServerConfig {
     pub bind_address: String,
     pub port: u16,
     pub monitor: Option<MonitorHandle>,
+    pub allow_remote_unauthenticated: bool,
 }
 
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
@@ -165,18 +166,56 @@ async fn serve_inner(
     config: ServerConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let listener = bind_proxy_listener(&config.bind_address, config.port).await?;
+    let listener = bind_proxy_listener_with_ack(
+        &config.bind_address,
+        config.port,
+        config.allow_remote_unauthenticated,
+    )
+    .await?;
     serve_listener(listener, config.monitor, shutdown).await
 }
 
 pub async fn bind_proxy_listener(bind_address: &str, port: u16) -> anyhow::Result<TcpListener> {
+    bind_proxy_listener_with_ack(bind_address, port, false).await
+}
+
+pub async fn bind_proxy_listener_with_ack(
+    bind_address: &str,
+    port: u16,
+    allow_remote_unauthenticated: bool,
+) -> anyhow::Result<TcpListener> {
     let ip = bind_address
         .parse::<std::net::IpAddr>()
         .map_err(|err| anyhow::anyhow!("invalid proxy bind address {bind_address:?}: {err}"))?;
+    if !ip.is_loopback() && !allow_remote_unauthenticated {
+        anyhow::bail!(
+            "refusing unauthenticated non-loopback bind address {bind_address:?}; pass \
+             --allow-remote-unauthenticated or set \
+             CCP_ALLOW_REMOTE_UNAUTHENTICATED=1 only when a firewall or authenticating reverse \
+             proxy protects this listener"
+        );
+    }
     let addr = std::net::SocketAddr::new(ip, port);
-    TcpListener::bind(addr)
+    let listener = TcpListener::bind(addr)
         .await
-        .map_err(|err| anyhow::anyhow!("failed to bind proxy listener on {addr}: {err}"))
+        .map_err(|err| anyhow::anyhow!("failed to bind proxy listener on {addr}: {err}"))?;
+    if !ip.is_loopback() {
+        let local_addr = listener.local_addr().map_err(|err| {
+            anyhow::anyhow!("failed to inspect bound proxy listener on {addr}: {err}")
+        })?;
+        create_logger("server").warn(
+            "SECURITY WARNING: unauthenticated proxy bound to a non-loopback address",
+            Some(serde_json::Map::from_iter([
+                (
+                    "bindAddress".to_string(),
+                    json!(local_addr.ip().to_string()),
+                ),
+                ("port".to_string(), json!(local_addr.port())),
+                ("remoteUnauthenticated".to_string(), json!(true)),
+            ])),
+        );
+    }
+    Ok(listener)
 }
 
 pub async fn serve_listener(
@@ -1044,6 +1083,10 @@ async fn dispatch_request_with_id(
         );
     }
 
+    let request_byte_lease = permits
+        .request_bytes
+        .take()
+        .map(|permit| RequestByteLease::new(permit, body_bytes.len()));
     let context = RequestContext {
         req_id: req_id.clone(),
         session_id,
@@ -1051,6 +1094,7 @@ async fn dispatch_request_with_id(
         provider: provider.name().to_string(),
         traffic,
         monitor: state.monitor.clone(),
+        request_byte_lease: request_byte_lease.clone(),
     };
 
     let response = if count_tokens {
@@ -1058,6 +1102,11 @@ async fn dispatch_request_with_id(
     } else {
         provider.handle_messages(body, context).await
     };
+    // Release the server's lease after dispatch. A provider may keep its clone
+    // only through initial dispatch or replay; long-lived provider state uses
+    // a separate bounded budget so request admission is not coupled to stream
+    // duration.
+    drop(request_byte_lease);
     log_response_started(
         &log,
         RequestLogContext {
@@ -2191,6 +2240,26 @@ mod tests {
         assert!(semaphore.clone().try_acquire_owned().is_err());
         drop(response);
         assert!(semaphore.try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn buffered_request_budget_follows_request_sized_provider_material_only() {
+        let request_bytes = Arc::new(Semaphore::new(1));
+        let global = Arc::new(Semaphore::new(1));
+        let mut permits = RequestPermits {
+            global: Some(global.clone().try_acquire_owned().unwrap()),
+            request_bytes: Some(request_bytes.clone().try_acquire_owned().unwrap()),
+            ..RequestPermits::default()
+        };
+
+        let server_lease = RequestByteLease::new(permits.request_bytes.take().unwrap(), 1);
+        let provider_material_lease = server_lease.clone();
+        drop(server_lease);
+
+        assert!(request_bytes.clone().try_acquire_owned().is_err());
+        assert!(global.try_acquire_owned().is_err());
+        drop(provider_material_lease);
+        assert!(request_bytes.try_acquire_owned().is_ok());
     }
 
     #[tokio::test]

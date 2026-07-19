@@ -9,6 +9,7 @@ pub(crate) enum CodexTerminalKind {
     Incomplete,
     Failed,
     ResponseError,
+    Cancelled,
     Error,
 }
 
@@ -20,17 +21,58 @@ impl CodexTerminalKind {
             Some("response.incomplete") => Some(Self::Incomplete),
             Some("response.failed") => Some(Self::Failed),
             Some("response.error") => Some(Self::ResponseError),
+            Some("response.cancelled") => Some(Self::Cancelled),
             Some("error") => Some(Self::Error),
             _ => None,
         }
     }
 
     pub(crate) fn is_failure(self) -> bool {
-        matches!(self, Self::Failed | Self::ResponseError | Self::Error)
+        matches!(
+            self,
+            Self::Failed | Self::ResponseError | Self::Cancelled | Self::Error
+        )
     }
 
     pub(crate) fn is_reusable(self) -> bool {
         matches!(self, Self::Completed | Self::Done)
+    }
+}
+
+/// Validate an optional terminal response snapshot status against the event that carries it.
+///
+/// Codex has emitted both full Responses events and the Lite `response.done` success alias.
+/// Omitted and null statuses remain compatible with both shapes, but a provided status must never
+/// contradict the terminal event and turn an upstream failure into a successful Anthropic
+/// response. This is deliberately the Codex Responses contract, not Realtime's multi-outcome
+/// `response.done` event.
+pub(crate) fn validate_terminal_snapshot_status(payload: &Value) -> Result<(), String> {
+    let Some(kind) = CodexTerminalKind::from_payload(payload) else {
+        return Ok(());
+    };
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let expected = match kind {
+        CodexTerminalKind::Completed | CodexTerminalKind::Done => "completed",
+        CodexTerminalKind::Incomplete => "incomplete",
+        CodexTerminalKind::Failed => "failed",
+        // `error` is an event name, not a valid Responses snapshot status. A
+        // response snapshot carried by either error event describes a failed
+        // response.
+        CodexTerminalKind::ResponseError | CodexTerminalKind::Error => "failed",
+        CodexTerminalKind::Cancelled => "cancelled",
+    };
+    match payload.pointer("/response/status") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(status)) if status == expected => Ok(()),
+        Some(Value::String(status)) => Err(format!(
+            "{event_type} response.status must be {expected:?} when provided, got {status:?}"
+        )),
+        Some(_) => Err(format!(
+            "{event_type} response.status must be {expected:?} or null when provided"
+        )),
     }
 }
 
@@ -76,6 +118,12 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         });
     }
     if !CodexTerminalKind::from_payload(payload).is_some_and(CodexTerminalKind::is_failure) {
+        return None;
+    }
+    if validate_terminal_snapshot_status(payload).is_err() {
+        // A contradictory terminal snapshot is protocol corruption. It must be
+        // surfaced by the reducers, never promoted into a replayable service
+        // failure by the retry classifier.
         return None;
     }
 
@@ -280,6 +328,12 @@ mod tests {
                 false,
                 true,
             ),
+            (
+                "response.cancelled",
+                CodexTerminalKind::Cancelled,
+                false,
+                true,
+            ),
             ("error", CodexTerminalKind::Error, false, true),
         ];
 
@@ -297,6 +351,46 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn terminal_snapshot_status_must_match_its_event_when_provided() {
+        for (event_type, accepted, rejected) in [
+            ("response.completed", "completed", "failed"),
+            ("response.done", "completed", "incomplete"),
+            ("response.incomplete", "incomplete", "completed"),
+            ("response.failed", "failed", "completed"),
+            ("response.error", "failed", "completed"),
+            ("response.cancelled", "cancelled", "failed"),
+            ("error", "failed", "completed"),
+        ] {
+            for status in [
+                None,
+                Some(Value::Null),
+                Some(Value::String(accepted.into())),
+            ] {
+                let mut response = serde_json::json!({});
+                if let Some(status) = status {
+                    response["status"] = status;
+                }
+                let payload = serde_json::json!({"type":event_type, "response":response});
+                validate_terminal_snapshot_status(&payload)
+                    .unwrap_or_else(|error| panic!("{event_type}: {error}"));
+            }
+
+            let mismatch = serde_json::json!({
+                "type":event_type,
+                "response":{"status":rejected}
+            });
+            let error = validate_terminal_snapshot_status(&mismatch).unwrap_err();
+            assert!(error.contains("response.status"), "{event_type}: {error}");
+
+            let wrong_type = serde_json::json!({
+                "type":event_type,
+                "response":{"status":42}
+            });
+            assert!(validate_terminal_snapshot_status(&wrong_type).is_err());
+        }
     }
 
     #[test]

@@ -57,7 +57,9 @@ deploy-homebrew:
     cargo build --release --locked
     prefix="$(brew --prefix claude-code-proxy)"
     target="$prefix/bin/claude-code-proxy"
-    source="$(pwd)/target/release/claude-code-proxy"
+    build_dir="${CARGO_TARGET_DIR:-$(pwd)/target}"
+    [[ "$build_dir" == /* ]] || build_dir="$(pwd)/$build_dir"
+    source="$build_dir/release/claude-code-proxy"
     health_url="${CCP_DEPLOY_HEALTH_URL:-http://127.0.0.1:${PORT:-18765}/healthz}"
     case "$health_url" in
         */healthz) version_url="${health_url%/healthz}/version" ;;
