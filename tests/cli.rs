@@ -137,3 +137,164 @@ fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>
     cmd.assert().success().stdout(contains("User: u"));
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ClaudeLauncherFixture::new("co")?;
+    let mut cmd = Command::new(&fixture.shortcut);
+    cmd.args(["--effort", "max", "hello world"])
+        .env("PATH", fixture.path_env())
+        .env("PORT", "19876")
+        .env("CCP_BIND_ADDRESS", "0.0.0.0");
+
+    cmd.assert()
+        .success()
+        .stdout(contains("base=http://127.0.0.1:19876"))
+        .stdout(contains("main=gpt-5.6-sol"))
+        .stdout(contains("fable=gpt-5.6-sol"))
+        .stdout(contains("sonnet=gpt-5.6-terra"))
+        .stdout(contains("haiku=gpt-5.6-luna"))
+        .stdout(contains("small=gpt-5.6-luna"))
+        .stdout(contains("max_context=272000"))
+        .stdout(contains("compact_window=272000"))
+        .stdout(contains("compact_pct=90"))
+        .stdout(contains("disable_1m=1"))
+        .stdout(contains("max_retries=1"))
+        .stdout(contains("tool_concurrency=10"))
+        .stdout(contains("tool_search=true"))
+        .stdout(contains("arg=<--settings>"))
+        .stdout(contains("arg=<--agents>"))
+        .stdout(contains("\"Explore\":{\"model\":\"gpt-5.6-luna\"}"))
+        .stdout(contains("\"effortLevel\":\"xhigh\""))
+        .stdout(contains("\"model\":\"gpt-5.6-sol\""))
+        .stdout(contains("\"ultracode\":true"))
+        .stdout(contains("arg=<--effort>"))
+        .stdout(contains("arg=<max>"))
+        .stdout(contains("arg=<hello world>"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cg_execs_claude_with_grok_profile_and_preserves_exit_code()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ClaudeLauncherFixture::new("cg")?;
+    let mut cmd = Command::new(&fixture.shortcut);
+    cmd.args(["--continue"])
+        .env("PATH", fixture.path_env())
+        .env("PORT", "19877")
+        .env("FAKE_CLAUDE_EXIT_CODE", "37");
+
+    cmd.assert()
+        .failure()
+        .code(37)
+        .stdout(contains("base=http://127.0.0.1:19877"))
+        .stdout(contains("main=grok-4.5-high"))
+        .stdout(contains("fable=grok-4.5-high"))
+        .stdout(contains("opus=grok-4.5-high"))
+        .stdout(contains("sonnet=grok-4.5-high"))
+        .stdout(contains("haiku=grok-4.5-medium"))
+        .stdout(contains("small=grok-4.5-medium"))
+        .stdout(contains("max_context=500000"))
+        .stdout(contains("compact_window=500000"))
+        .stdout(contains("compact_pct=90"))
+        .stdout(contains("disable_1m=1"))
+        .stdout(contains("max_retries=1"))
+        .stdout(contains("tool_concurrency=10"))
+        .stdout(contains("tool_search=true"))
+        .stdout(contains("arg=<--settings>"))
+        .stdout(contains("arg=<--agents>"))
+        .stdout(contains("\"Explore\":{\"model\":\"grok-4.5-medium\"}"))
+        .stdout(contains("\"effortLevel\":\"high\""))
+        .stdout(contains("\"model\":\"grok-4.5-high\""))
+        .stdout(contains("\"ultracode\":false"))
+        .stdout(contains("arg=<--continue>"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_shortcuts_reject_cross_family_models_and_settings_overrides()
+-> Result<(), Box<dyn std::error::Error>> {
+    let grok = ClaudeLauncherFixture::new("cg")?;
+    Command::new(&grok.shortcut)
+        .args(["--model", "gpt-5.6-sol"])
+        .env("PATH", grok.path_env())
+        .assert()
+        .failure()
+        .stderr(contains("outside the Grok launch profile"));
+
+    let gpt = ClaudeLauncherFixture::new("co")?;
+    Command::new(&gpt.shortcut)
+        .args(["--settings", "{}"])
+        .env("PATH", gpt.path_env())
+        .assert()
+        .failure()
+        .stderr(contains("--settings is disabled"));
+    Ok(())
+}
+
+#[cfg(unix)]
+struct ClaudeLauncherFixture {
+    _temp: TempDir,
+    shortcut: std::path::PathBuf,
+    bin_dir: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl ClaudeLauncherFixture {
+    fn new(shortcut_name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TempDir::new()?;
+        let bin_dir = temp.path().to_path_buf();
+        let fake_claude = bin_dir.join("claude");
+        std::fs::write(
+            &fake_claude,
+            r#"#!/bin/sh
+printf 'base=%s\n' "$ANTHROPIC_BASE_URL"
+printf 'main=%s\n' "$ANTHROPIC_MODEL"
+printf 'fable=%s\n' "$ANTHROPIC_DEFAULT_FABLE_MODEL"
+printf 'opus=%s\n' "$ANTHROPIC_DEFAULT_OPUS_MODEL"
+printf 'sonnet=%s\n' "$ANTHROPIC_DEFAULT_SONNET_MODEL"
+printf 'haiku=%s\n' "$ANTHROPIC_DEFAULT_HAIKU_MODEL"
+printf 'small=%s\n' "$ANTHROPIC_SMALL_FAST_MODEL"
+printf 'max_context=%s\n' "$CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+printf 'compact_window=%s\n' "$CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+printf 'compact_pct=%s\n' "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+printf 'disable_1m=%s\n' "$CLAUDE_CODE_DISABLE_1M_CONTEXT"
+printf 'max_retries=%s\n' "$CLAUDE_CODE_MAX_RETRIES"
+printf 'tool_concurrency=%s\n' "$CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"
+printf 'tool_search=%s\n' "$ENABLE_TOOL_SEARCH"
+for arg in "$@"; do
+  printf 'arg=<%s>\n' "$arg"
+done
+exit "${FAKE_CLAUDE_EXIT_CODE:-0}"
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&fake_claude)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_claude, permissions)?;
+
+        let shortcut = bin_dir.join(shortcut_name);
+        symlink(
+            assert_cmd::cargo::cargo_bin!("claude-code-proxy"),
+            &shortcut,
+        )?;
+        Ok(Self {
+            _temp: temp,
+            shortcut,
+            bin_dir,
+        })
+    }
+
+    fn path_env(&self) -> std::ffi::OsString {
+        let mut paths = vec![self.bin_dir.clone()];
+        if let Some(existing) = env::var_os("PATH") {
+            paths.extend(env::split_paths(&existing));
+        }
+        env::join_paths(paths).expect("test PATH must be valid")
+    }
+}

@@ -176,7 +176,55 @@ counts) against its built-in "small/fast" haiku model id. Those requests
 would 400 because no provider claims it, so set
 `ANTHROPIC_DEFAULT_HAIKU_MODEL` to a concrete id too. Claude Code 2.1.212 still
 prefers its deprecated `ANTHROPIC_SMALL_FAST_MODEL` variable when both are set,
-so gateways supporting that version should set both to the same value:
+so gateways supporting that version should set both to the same value.
+
+For day-to-day GPT/Grok use, the proxy has launch profiles that keep the main
+model, Claude model aliases used by subagents, and context window coherent. Pass
+any remaining Claude Code arguments after `--`:
+
+```sh
+claude-code-proxy claude gpt -- --continue
+claude-code-proxy claude grok -- --continue
+```
+
+| Profile | Main model | `haiku` | `sonnet` | `opus` | Context | Default effort |
+| --- | --- | --- | --- | --- | ---: | --- |
+| `gpt` / `co` | GPT-5.6 Sol | GPT-5.6 Luna | GPT-5.6 Terra | GPT-5.6 Sol | 272K | ultracode (xhigh + workflows) |
+| `grok` / `cg` | Grok 4.5 High | Grok 4.5 Medium | Grok 4.5 High | Grok 4.5 High | 500K | high |
+
+Each profile also supplies Claude Code with a concrete, same-family model
+allowlist and clears any inherited fallback model. It injects model-only
+overrides for Claude Code's current agent types while preserving their existing
+prompts, tools, and effort settings:
+
+| Agent type | `co` | `cg` |
+| --- | --- | --- |
+| `claude` | GPT-5.6 Sol | Grok 4.5 High |
+| `Explore` | GPT-5.6 Luna | Grok 4.5 Medium |
+| `general-purpose` | GPT-5.6 Sol | Grok 4.5 High |
+| `Plan` | GPT-5.6 Terra | Grok 4.5 High |
+
+The generic Claude aliases are not broad family entries in the model picker.
+`--model` and `--fallback-model` remain available for concrete models in the
+active profile, while a cross-family model is rejected before Claude Code
+starts. Options that can replace profile isolation (`--settings`,
+`--managed-settings`, `--agents`, `--autocompact`, and `--advisor`) are also
+rejected. Run plain `claude` for fully custom combinations. A future custom
+agent outside the injected table that names a generic model alias inherits the
+active parent model unless its definition uses a profile-allowed concrete id.
+
+On Unix, symlinking the same binary as `co` and `cg` enables shorter forms. The
+proxy selects the profile from the executable name and then replaces itself
+with Claude Code:
+
+```sh
+ln -s /path/to/claude-code-proxy ~/.local/bin/co
+ln -s /path/to/claude-code-proxy ~/.local/bin/cg
+co
+cg
+```
+
+Minimal manual environment examples are:
 
 ```sh
 # Codex
@@ -203,11 +251,15 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
 # Grok
 ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=grok-composer-2.5-fast \
-ANTHROPIC_SMALL_FAST_MODEL=grok-composer-2.5-fast \
+ANTHROPIC_MODEL=grok-4.5-high \
+ANTHROPIC_DEFAULT_HAIKU_MODEL=grok-4.5-medium \
+ANTHROPIC_SMALL_FAST_MODEL=grok-4.5-medium \
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000 \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000 \
+CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
-  claude --model grok-composer-2.5-fast
+  claude
 
 # Cursor Agent
 ANTHROPIC_BASE_URL=http://localhost:18765 \
@@ -270,9 +322,7 @@ custom gateway model ids, Claude Code 2.1.193 and later can use
 capacity.
 
 Codex CLI 0.144.6 corrected the bundled GPT-5.6 Sol, Terra, and Luna catalog to
-a 272K raw context window. At the recommended 90% threshold, Claude Code starts
-compaction at 244,800 tokens. Match that
-behavior in Claude Code with:
+a 272K raw context window. Match that behavior in Claude Code with:
 
 ```sh
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
@@ -284,6 +334,13 @@ Use the concrete custom model ids (`gpt-5.6-sol`, `gpt-5.6-terra`, and
 `gpt-5.6-luna`) with these overrides. A `[1m]` suffix remains supported and is
 stripped by the proxy, but it makes Claude Code report a 1M window rather than
 the bundled catalog's 272K capacity.
+
+Claude Code 2.1.212 reserves up to 20K tokens for output before applying the
+configured compaction percentage. With the settings above, the current 90%
+trigger is therefore approximately `(272K - 20K) * 90% = 226.8K`, rather than
+the simpler `272K * 90%` estimate. The Grok launch profile uses a 500K raw and
+auto-compact window, which triggers at approximately 432K under the same
+reserve and percentage.
 
 If you'd rather disable auto-compact completely, set
 `DISABLE_AUTO_COMPACT=1` in your env or `~/.claude/settings.json`. Manual
@@ -525,6 +582,7 @@ sequenceDiagram
 | --------------------------------------------------- | --------------------------- |
 | [`serve`](#serve)                                   | Start the proxy and monitor |
 | [`demo`](#demo)                                     | Open the TUI with mock data |
+| `claude gpt -- <args>` / `claude grok -- <args>`    | Launch a coherent GPT or Grok Claude Code profile |
 | `codex auth login` / `device` / `status` / `logout` | Codex OAuth management      |
 | `kimi  auth login` / `status` / `logout`            | Kimi OAuth management       |
 | `cursor auth login` / `status` / `logout`           | Cursor OAuth management     |
@@ -1042,32 +1100,36 @@ CCP_TRAFFIC_LOG=1`.
 
 Claude Code binds the API base URL and auth when the process starts. Switching
 **backends** (proxy vs direct Anthropic, or a different Anthropic-compatible
-host) is a launch-time concern. Switching **models while already pointed at
-this proxy** can often stay in-session, because the proxy routes each request
-by model id.
+host) is a launch-time concern. The proxy can route many model ids in one
+`serve` process, but a Claude Code client process has one context window and
+one set of model aliases. In-session `/model` changes are therefore safe only
+within a compatible profile family. Exit and relaunch with `co` or `cg` when
+switching between GPT and Grok.
 
-This project does not ship a universal profile manager. Use process env, a
-tiny shell wrapper, or Claude Code's own `/model` when the base URL already
-points here.
+For the common GPT and Grok paths, use the built-in `claude gpt` and
+`claude grok` launch profiles (or the `co`/`cg` executable-name shortcuts).
+Use process env, a shell wrapper, or Claude Code's own `/model` for other
+backends and custom combinations.
 
 ### Choose a pattern
 
 | Goal | Pattern |
 | --- | --- |
 | Always use the proxy | Put proxy env in `~/.claude/settings.json` (see [Quick start](#4-point-claude-code-at-it)) |
+| Keep GPT/Grok aliases and context windows isolated | `co` / `cg`, or `claude-code-proxy claude gpt` / `grok` |
 | Try one model once | Prefix `claude` with env vars, or use a shell alias |
 | Flip proxy on/off without editing JSON | Flag-file wrapper + toggle script |
-| Stay on the proxy, change model | `/model`, `--model`, or change `ANTHROPIC_MODEL` for new sessions |
+| Change models inside one profile family | `/model` or `--model` within the GPT models under `co`, or Grok models under `cg` |
 
 ### One-shot launch and aliases
 
 Any of the `ANTHROPIC_BASE_URL=... claude` examples in
 [Quick start](#4-point-claude-code-at-it) are one-shots: they do not rewrite
-settings. Shell aliases are enough for daily muscle memory:
+settings. Prefer the complete built-in profiles for daily use:
 
 ```sh
-alias csol='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
-alias cgrok='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=grok-4.5 ANTHROPIC_SMALL_FAST_MODEL=grok-4.5 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
+co
+cg
 ```
 
 ### Sticky proxy on/off (recommended multi-backend setup)
@@ -1075,7 +1137,9 @@ alias cgrok='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unus
 If you still use an Anthropic subscription sometimes, leave proxy env out of
 `~/.claude/settings.json` and inject it only when a flag file exists. Put a
 wrapper ahead of the real `claude` on `PATH`, and point `exec` at the real
-binary (not back at the wrapper).
+binary (not back at the wrapper). For GPT/Grok, prefer `co`/`cg`; unlike this
+generic wrapper, the built-in profiles also keep every Claude model alias,
+effort level, retry setting, and subagent routing coherent.
 
 Example wrapper:
 
@@ -1108,9 +1172,13 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
         main_model="kimi-for-coding[1m]"
         small_model="kimi-for-coding[1m]"
         ;;
-      grok|grok-4.5)
-        main_model="grok-4.5"
-        small_model="grok-4.5"
+      grok|grok-4.5|grok-4.5-high)
+        main_model="grok-4.5-high"
+        small_model="grok-4.5-medium"
+        ;;
+      grok-4.5-medium)
+        main_model="grok-4.5-medium"
+        small_model="grok-4.5-medium"
         ;;
       composer|composer-2.5-fast)
         main_model="composer-2.5-fast"
@@ -1124,8 +1192,8 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
 
   export ANTHROPIC_BASE_URL="http://localhost:18765"
   export ANTHROPIC_AUTH_TOKEN="unused"
-  export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-$main_model}"
-  export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-$small_model}"
+  export ANTHROPIC_MODEL="$main_model"
+  export ANTHROPIC_SMALL_FAST_MODEL="$small_model"
   export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
   export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
 
@@ -1133,6 +1201,11 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
     gpt-5.6-sol|gpt-5.6-luna|gpt-5.6-terra)
       export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-272000}"
       export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-272000}"
+      export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
+      ;;
+    grok-4.5|grok-4.5-high|grok-4.5-medium)
+      export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-500000}"
+      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-500000}"
       export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
       ;;
   esac
@@ -1194,9 +1267,9 @@ Examples:
 
 ```sh
 claude-proxy-toggle                 # proxy on/off for new sessions
-claude-proxy-model grok-4.5         # sticky default while proxy is on
+claude-proxy-model grok-4.5-high    # sticky default while proxy is on
 claude-proxy-model gpt-5.6-sol
-ANTHROPIC_MODEL=kimi-for-coding[1m] claude   # one-shot override
+claude-proxy-model kimi-for-coding[1m]
 ```
 
 New Claude sessions pick up flag/model changes. A session that is already
@@ -1204,8 +1277,8 @@ running keeps the env it started with.
 
 ### Switch models while staying on the proxy
 
-While `ANTHROPIC_BASE_URL` already points at this proxy, Claude Code can change
-the request model without a new backend:
+While `ANTHROPIC_BASE_URL` already points at this proxy, a generic Claude Code
+process can change the request model without restarting the proxy server:
 
 - start a session with a different `ANTHROPIC_MODEL`
 - pass `claude --model <id>`
@@ -1213,7 +1286,10 @@ the request model without a new backend:
 
 The proxy chooses the upstream provider from the model id on each request, so
 `gpt-5.6-sol`, `kimi-for-coding`, `grok-4.5`, and `cursor:...` can share one
-`serve` process.
+`serve` process. The client process still has only one context window and one
+set of model aliases. With `co` and `cg`, use `/model` or `--model` only within
+the models offered by that profile; exit and relaunch with the other command
+to switch between GPT and Grok.
 
 To populate Claude Code's model picker from the proxy's `/v1/models` catalog,
 enable gateway discovery when launching:
@@ -1227,10 +1303,15 @@ ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 ```
+
+Do not combine gateway discovery with
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`; the latter suppresses model
+discovery. The `/v1/models` response populates model choices but does not tell
+Claude Code the context size of arbitrary gateway models, so keep the context
+variables matched to the selected model family.
 
 `/model` only changes the model id. It does not move a session from the proxy
 to direct Anthropic or the other way around. For that, start a new process with
@@ -1244,8 +1325,8 @@ different env (or flip the flag-file wrapper and open a new session).
 - IDE or Desktop launch wiring outside process env
 
 If you need a cross-app profile switcher, use a dedicated tool for that. For
-Claude Code + this proxy, process-start env plus `/model` on the proxy is the
-supported shape.
+Claude Code + this proxy, use process-start profiles and keep `/model` changes
+within the active profile family.
 
 ## Limitations
 
