@@ -795,6 +795,67 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
 }
 
 #[tokio::test]
+async fn smoke_co_marker_promotes_codex_xhigh_to_wire_max() {
+    let _guard = env_lock().await;
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let _ = captured.lock().map(|mut guard| *guard = Some(body));
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"wire max ok\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = app(Arc::new(Registry::with_default_alias()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-ccproxy-codex-xhigh-as-max", "1")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.6-sol",
+                        "max_tokens": 64,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "output_config": {"effort": "xhigh"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["text"], "wire max ok");
+
+    let sent = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(sent["model"], "gpt-5.6-sol");
+    assert_eq!(sent["reasoning"]["effort"], "max");
+}
+
+#[tokio::test]
 async fn smoke_codex_http_nonstream_keeps_completed_response_after_rate_limit_telemetry() {
     let _guard = env_lock().await;
     let config = TempDir::new().unwrap();

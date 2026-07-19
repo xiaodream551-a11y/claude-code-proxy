@@ -15,6 +15,14 @@ use std::process::Command;
 use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const CODEX_XHIGH_AS_MAX_HEADER_NAME: &str = "x-ccproxy-codex-xhigh-as-max";
+const CODEX_XHIGH_AS_MAX_HEADER: &str = "x-ccproxy-codex-xhigh-as-max: 1";
+const EXPLORE_AGENT_DESCRIPTION: &str = "Fast, focused, read-only codebase exploration and search. Use proactively to locate files, trace code paths, understand architecture, and gather evidence before implementation.";
+const EXPLORE_AGENT_PROMPT: &str = "You are a focused codebase exploration agent. Investigate the requested scope without modifying files. Prefer targeted searches and exact paths, trace the relevant control flow, and return concise findings with file and line references. Clearly separate confirmed evidence from inference.";
+const GENERAL_PURPOSE_AGENT_DESCRIPTION: &str = "General-purpose agent for complex, multi-step work that may require investigation, reasoning, implementation, and verification. Use proactively for substantial tasks that do not fit a narrower specialist.";
+const GENERAL_PURPOSE_AGENT_PROMPT: &str = "You are a capable general-purpose engineering agent. Complete the delegated task end to end: inspect the relevant context, make focused changes when authorized, verify the result in proportion to risk, and return a concise evidence-backed summary. Preserve unrelated user changes and follow all applicable instructions.";
+const PLAN_AGENT_DESCRIPTION: &str = "Read-only planning and research agent. Use proactively to investigate architecture, constraints, risks, and verification needs before implementation.";
+const PLAN_AGENT_PROMPT: &str = "You are a read-only planning and research agent. Investigate the requested scope without modifying files, identify the relevant architecture and constraints, surface risks and edge cases, and produce a decision-complete implementation and verification plan grounded in file and line evidence.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -91,6 +99,10 @@ struct ClaudeProfileConfig {
     context_tokens: &'static str,
     effort_level: &'static str,
     ultracode: bool,
+    explore_effort: &'static str,
+    general_purpose_effort: &'static str,
+    plan_effort: &'static str,
+    promote_codex_xhigh_to_max: bool,
     available_models: &'static [&'static str],
 }
 
@@ -107,6 +119,10 @@ impl ClaudeProfile {
                 context_tokens: "272000",
                 effort_level: "xhigh",
                 ultracode: true,
+                explore_effort: "medium",
+                general_purpose_effort: "high",
+                plan_effort: "high",
+                promote_codex_xhigh_to_max: true,
                 available_models: &[
                     "gpt-5.6-sol",
                     "gpt-5.6-sol-fast",
@@ -126,6 +142,10 @@ impl ClaudeProfile {
                 context_tokens: "500000",
                 effort_level: "high",
                 ultracode: false,
+                explore_effort: "medium",
+                general_purpose_effort: "high",
+                plan_effort: "high",
+                promote_codex_xhigh_to_max: false,
                 available_models: &["grok-4.5", "grok-4.5-high", "grok-4.5-medium"],
             },
         }
@@ -318,11 +338,33 @@ fn build_claude_command(
         "fallbackModel": [],
     })
     .to_string();
+    // CLI agent definitions are replacements, not partial overrides: Claude
+    // Code requires both description and prompt. Keep its private built-in
+    // `claude` agent untouched because public definitions cannot preserve that
+    // agent's appendSystemPrompt/FleetView completion protocol.
     let inline_agents = serde_json::json!({
-        "claude": {"model": profile.main_model},
-        "Explore": {"model": profile.haiku_model},
-        "general-purpose": {"model": profile.opus_model},
-        "Plan": {"model": profile.sonnet_model},
+        "Explore": {
+            "description": EXPLORE_AGENT_DESCRIPTION,
+            "prompt": EXPLORE_AGENT_PROMPT,
+            "tools": ["Read", "Glob", "Grep"],
+            "permissionMode": "plan",
+            "model": profile.haiku_model,
+            "effort": profile.explore_effort,
+        },
+        "general-purpose": {
+            "description": GENERAL_PURPOSE_AGENT_DESCRIPTION,
+            "prompt": GENERAL_PURPOSE_AGENT_PROMPT,
+            "model": profile.opus_model,
+            "effort": profile.general_purpose_effort,
+        },
+        "Plan": {
+            "description": PLAN_AGENT_DESCRIPTION,
+            "prompt": PLAN_AGENT_PROMPT,
+            "tools": ["Read", "Glob", "Grep"],
+            "permissionMode": "plan",
+            "model": profile.sonnet_model,
+            "effort": profile.plan_effort,
+        },
     })
     .to_string();
 
@@ -423,7 +465,7 @@ fn claude_profile_environment(
     profile: ClaudeProfileConfig,
     base_url: &str,
 ) -> Vec<(&'static str, String)> {
-    vec![
+    let mut environment = vec![
         ("ANTHROPIC_BASE_URL", base_url.to_string()),
         ("ANTHROPIC_AUTH_TOKEN", "unused".to_string()),
         ("ANTHROPIC_MODEL", profile.main_model.to_string()),
@@ -478,7 +520,31 @@ fn claude_profile_environment(
         ("CLAUDE_CODE_MAX_RETRIES", "1".to_string()),
         ("CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY", "10".to_string()),
         ("ENABLE_TOOL_SEARCH", "true".to_string()),
-    ]
+    ];
+    if profile.promote_codex_xhigh_to_max {
+        let existing = std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok();
+        environment.push((
+            "ANTHROPIC_CUSTOM_HEADERS",
+            merged_anthropic_custom_headers(existing.as_deref()),
+        ));
+    }
+    environment
+}
+
+fn merged_anthropic_custom_headers(existing: Option<&str>) -> String {
+    let mut headers = existing
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            let name = line.split_once(':').map_or(*line, |(name, _)| name);
+            !name
+                .trim()
+                .eq_ignore_ascii_case(CODEX_XHIGH_AS_MAX_HEADER_NAME)
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    headers.push(CODEX_XHIGH_AS_MAX_HEADER);
+    headers.join("\n")
 }
 
 fn proxy_client_url(bind_address: &str, port: u16) -> String {
@@ -741,14 +807,18 @@ mod tests {
         );
         let settings = command_inline_settings(&command);
         let agents = command_inline_agents(&command);
+        assert_complete_inline_agents(&agents);
         assert_eq!(settings["model"], "gpt-5.6-sol");
         assert_eq!(settings["effortLevel"], "xhigh");
         assert_eq!(settings["ultracode"], true);
         assert_eq!(settings["enforceAvailableModels"], true);
         assert_eq!(settings["fallbackModel"], serde_json::json!([]));
         assert_eq!(agents["Explore"]["model"], "gpt-5.6-luna");
+        assert_eq!(agents["Explore"]["effort"], "medium");
         assert_eq!(agents["Plan"]["model"], "gpt-5.6-terra");
+        assert_eq!(agents["Plan"]["effort"], "high");
         assert_eq!(agents["general-purpose"]["model"], "gpt-5.6-sol");
+        assert_eq!(agents["general-purpose"]["effort"], "high");
         assert!(
             settings["availableModels"]
                 .as_array()
@@ -781,6 +851,11 @@ mod tests {
             command_env(&command, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
             "272000"
         );
+        assert!(
+            command_env(&command, "ANTHROPIC_CUSTOM_HEADERS")
+                .lines()
+                .any(|line| line == CODEX_XHIGH_AS_MAX_HEADER)
+        );
     }
 
     #[test]
@@ -790,11 +865,15 @@ mod tests {
 
         let settings = command_inline_settings(&command);
         let agents = command_inline_agents(&command);
+        assert_complete_inline_agents(&agents);
         assert_eq!(settings["model"], "grok-4.5-high");
         assert_eq!(settings["effortLevel"], "high");
         assert_eq!(settings["ultracode"], false);
         assert_eq!(agents["Explore"]["model"], "grok-4.5-medium");
+        assert_eq!(agents["Explore"]["effort"], "medium");
         assert_eq!(agents["Plan"]["model"], "grok-4.5-high");
+        assert_eq!(agents["Plan"]["effort"], "high");
+        assert_eq!(agents["general-purpose"]["effort"], "high");
         assert!(
             settings["availableModels"]
                 .as_array()
@@ -828,6 +907,31 @@ mod tests {
         assert_eq!(
             command_env(&command, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
             "90"
+        );
+        assert!(command_env_optional(&command, "ANTHROPIC_CUSTOM_HEADERS").is_none());
+    }
+
+    #[test]
+    fn codex_max_marker_merges_existing_headers_and_deduplicates_it() {
+        let merged = merged_anthropic_custom_headers(Some(
+            "x-existing: keep\nX-CCPROXY-CODEX-XHIGH-AS-MAX: 0\n\nsecond: value\n\
+             x-ccproxy-codex-xhigh-as-max: duplicate",
+        ));
+
+        assert_eq!(
+            merged,
+            "x-existing: keep\nsecond: value\nx-ccproxy-codex-xhigh-as-max: 1"
+        );
+        assert_eq!(
+            merged
+                .lines()
+                .filter(|line| {
+                    line.split_once(':').is_some_and(|(name, _)| {
+                        name.eq_ignore_ascii_case(CODEX_XHIGH_AS_MAX_HEADER_NAME)
+                    })
+                })
+                .count(),
+            1
         );
     }
 
@@ -918,14 +1022,18 @@ mod tests {
     }
 
     fn command_env(command: &Command, key: &str) -> String {
+        command_env_optional(command, key)
+            .unwrap_or_else(|| panic!("missing UTF-8 command environment variable: {key}"))
+    }
+
+    fn command_env_optional(command: &Command, key: &str) -> Option<String> {
         command
             .get_envs()
             .find_map(|(name, value)| {
                 (name == OsStr::new(key)).then(|| value.and_then(OsStr::to_str))
             })
             .flatten()
-            .unwrap_or_else(|| panic!("missing UTF-8 command environment variable: {key}"))
-            .to_string()
+            .map(str::to_string)
     }
 
     fn command_inline_settings(command: &Command) -> serde_json::Value {
@@ -948,5 +1056,34 @@ mod tests {
                 .expect("inline agents must be a UTF-8 argument"),
         )
         .expect("inline agents must be valid JSON")
+    }
+
+    fn assert_complete_inline_agents(agents: &serde_json::Value) {
+        assert!(
+            agents.get("claude").is_none(),
+            "the private built-in claude agent must not be overridden"
+        );
+        for name in ["Explore", "general-purpose", "Plan"] {
+            assert!(
+                agents[name]["description"]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "{name} must have a nonempty description"
+            );
+            assert!(
+                agents[name]["prompt"]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty()),
+                "{name} must have a nonempty prompt"
+            );
+        }
+
+        let read_only_tools = serde_json::json!(["Read", "Glob", "Grep"]);
+        for name in ["Explore", "Plan"] {
+            assert_eq!(agents[name]["tools"], read_only_tools);
+            assert_eq!(agents[name]["permissionMode"], "plan");
+        }
+        assert!(agents["general-purpose"].get("tools").is_none());
+        assert!(agents["general-purpose"].get("permissionMode").is_none());
     }
 }

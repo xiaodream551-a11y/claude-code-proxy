@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::env;
 use tempfile::TempDir;
@@ -147,7 +148,11 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
     cmd.args(["--effort", "max", "hello world"])
         .env("PATH", fixture.path_env())
         .env("PORT", "19876")
-        .env("CCP_BIND_ADDRESS", "0.0.0.0");
+        .env("CCP_BIND_ADDRESS", "0.0.0.0")
+        .env(
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "x-existing: keep\nX-CCPROXY-CODEX-XHIGH-AS-MAX: 0",
+        );
 
     cmd.assert()
         .success()
@@ -166,13 +171,33 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .stdout(contains("tool_search=true"))
         .stdout(contains("arg=<--settings>"))
         .stdout(contains("arg=<--agents>"))
-        .stdout(contains("\"Explore\":{\"model\":\"gpt-5.6-luna\"}"))
+        .stdout(contains(
+            "\"Explore\":{\"description\":\"Fast, focused, read-only codebase exploration and search.",
+        ))
+        .stdout(contains(
+            "\"effort\":\"medium\",\"model\":\"gpt-5.6-luna\"",
+        ))
+        .stdout(contains("\"claude\":").not())
+        .stdout(contains(
+            "\"general-purpose\":{\"description\":\"General-purpose agent",
+        ))
+        .stdout(contains(
+            "\"Plan\":{\"description\":\"Read-only planning and research agent.",
+        ))
+        .stdout(contains(
+            "\"permissionMode\":\"plan\",\"prompt\":\"You are a focused codebase exploration agent.",
+        ))
+        .stdout(contains(
+            "\"tools\":[\"Read\",\"Glob\",\"Grep\"]",
+        ))
         .stdout(contains("\"effortLevel\":\"xhigh\""))
         .stdout(contains("\"model\":\"gpt-5.6-sol\""))
         .stdout(contains("\"ultracode\":true"))
         .stdout(contains("arg=<--effort>"))
         .stdout(contains("arg=<max>"))
-        .stdout(contains("arg=<hello world>"));
+        .stdout(contains("arg=<hello world>"))
+        .stdout(contains("custom_headers=x-existing: keep"))
+        .stdout(contains("x-ccproxy-codex-xhigh-as-max: 1"));
     Ok(())
 }
 
@@ -206,7 +231,25 @@ fn cg_execs_claude_with_grok_profile_and_preserves_exit_code()
         .stdout(contains("tool_search=true"))
         .stdout(contains("arg=<--settings>"))
         .stdout(contains("arg=<--agents>"))
-        .stdout(contains("\"Explore\":{\"model\":\"grok-4.5-medium\"}"))
+        .stdout(contains(
+            "\"Explore\":{\"description\":\"Fast, focused, read-only codebase exploration and search.",
+        ))
+        .stdout(contains(
+            "\"effort\":\"medium\",\"model\":\"grok-4.5-medium\"",
+        ))
+        .stdout(contains("\"claude\":").not())
+        .stdout(contains(
+            "\"general-purpose\":{\"description\":\"General-purpose agent",
+        ))
+        .stdout(contains(
+            "\"Plan\":{\"description\":\"Read-only planning and research agent.",
+        ))
+        .stdout(contains(
+            "\"permissionMode\":\"plan\",\"prompt\":\"You are a focused codebase exploration agent.",
+        ))
+        .stdout(contains(
+            "\"tools\":[\"Read\",\"Glob\",\"Grep\"]",
+        ))
         .stdout(contains("\"effortLevel\":\"high\""))
         .stdout(contains("\"model\":\"grok-4.5-high\""))
         .stdout(contains("\"ultracode\":false"))
@@ -268,6 +311,7 @@ printf 'disable_1m=%s\n' "$CLAUDE_CODE_DISABLE_1M_CONTEXT"
 printf 'max_retries=%s\n' "$CLAUDE_CODE_MAX_RETRIES"
 printf 'tool_concurrency=%s\n' "$CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"
 printf 'tool_search=%s\n' "$ENABLE_TOOL_SEARCH"
+printf 'custom_headers=%s\n' "$ANTHROPIC_CUSTOM_HEADERS"
 for arg in "$@"; do
   printf 'arg=<%s>\n' "$arg"
 done

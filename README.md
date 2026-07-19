@@ -189,20 +189,36 @@ claude-code-proxy claude grok -- --continue
 
 | Profile | Main model | `haiku` | `sonnet` | `opus` | Context | Default effort |
 | --- | --- | --- | --- | --- | ---: | --- |
-| `gpt` / `co` | GPT-5.6 Sol | GPT-5.6 Luna | GPT-5.6 Terra | GPT-5.6 Sol | 272K | ultracode (xhigh + workflows) |
+| `gpt` / `co` | GPT-5.6 Sol | GPT-5.6 Luna | GPT-5.6 Terra | GPT-5.6 Sol | 272K | ultracode (Claude xhigh orchestration; Codex wire max) |
 | `grok` / `cg` | Grok 4.5 High | Grok 4.5 Medium | Grok 4.5 High | Grok 4.5 High | 500K | high |
 
 Each profile also supplies Claude Code with a concrete, same-family model
-allowlist and clears any inherited fallback model. It injects model-only
-overrides for Claude Code's current agent types while preserving their existing
-prompts, tools, and effort settings:
+allowlist and clears any inherited fallback model. It injects complete,
+session-scoped definitions for the configurable Explore, general-purpose, and
+Plan agent types so their models and efforts do not depend on user or project
+agent files:
 
 | Agent type | `co` | `cg` |
 | --- | --- | --- |
-| `claude` | GPT-5.6 Sol | Grok 4.5 High |
-| `Explore` | GPT-5.6 Luna | Grok 4.5 Medium |
-| `general-purpose` | GPT-5.6 Sol | Grok 4.5 High |
-| `Plan` | GPT-5.6 Terra | Grok 4.5 High |
+| built-in `claude` | GPT-5.6 Sol / inherited (`max` wire by default) | Grok 4.5 High / inherited (`high` by default) |
+| `Explore` | GPT-5.6 Luna / `medium` | Grok 4.5 Medium / `medium` |
+| `general-purpose` | GPT-5.6 Sol / `high` | Grok 4.5 High / `high` |
+| `Plan` | GPT-5.6 Terra / `high` | Grok 4.5 High / `high` |
+
+The special built-in `claude` catch-all remains untouched because Claude Code
+adds a private background-job and Agent View protocol that public `--agents`
+definitions cannot preserve. It therefore inherits the current main-session
+effort: the profile defaults still produce `max` wire effort under `co` and
+`high` under `cg`, while an explicit `/effort` change also applies to this one
+built-in agent. Explore and Plan use profile-managed read-only definitions;
+general-purpose inherits the parent tool set.
+
+The `co` launcher keeps Claude Code's Ultracode workflow and internal `xhigh`
+orchestration, then adds an internal profile marker that makes ordinary Codex
+requests use wire-level `max`. It newline-merges that marker into
+`ANTHROPIC_CUSTOM_HEADERS`, preserving custom headers inherited from the launch
+environment. The `cg` profile does not add the marker and keeps its existing
+Grok effort behavior.
 
 The generic Claude aliases are not broad family entries in the model picker.
 `--model` and `--fallback-model` remain available for concrete models in the
@@ -366,14 +382,15 @@ model `gpt-5.6-sol` with `service_tier: "priority"`. An explicit
 `codex.serviceTier` / `CCP_CODEX_SERVICE_TIER` override still takes precedence.
 
 Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
-the UI as `◐ medium · /effort`) is forwarded as Codex `reasoning.effort` (`low`
-/ `medium` / `high` / `xhigh` / `max`). Codex CLI's `ultra` preset adds
-client-side automatic delegation to maximum reasoning, so the proxy mirrors its
-wire behavior by sending `max`; Claude Code/UltraCode remains responsible for
-delegation. When Claude Code omits effort for a
-Haiku request, the mapped `gpt-5.6-luna` model defaults to `medium`. An explicit
-request effort or `codex.effort` / `CCP_CODEX_EFFORT` override still takes
-precedence, and the global override can also force `none`.
+the UI as `◐ medium · /effort`) is normally forwarded as Codex
+`reasoning.effort` (`low` / `medium` / `high` / `xhigh` / `max`). Under the `co`
+profile, `/effort xhigh` and Ultracode's internal `xhigh` requests become
+wire-level `max`; `low`, `medium`, `high`, and `max` pass through unchanged.
+Claude Code/UltraCode remains responsible for client-side workflow and
+delegation. When Claude Code omits effort for a Haiku request, the mapped
+`gpt-5.6-luna` model defaults to `medium`. An explicit `codex.effort` /
+`CCP_CODEX_EFFORT` override still takes precedence, and the global override can
+also force `none`.
 
 Reasoning summaries: when a Codex request has reasoning effort, the proxy asks
 Codex for `reasoning.summary: "auto"` and translates returned summary deltas
@@ -386,8 +403,9 @@ Without `x-ccproxy-compaction-model`, Claude Code's automatic and manual
 compaction requests keep the selected Codex model but cap reasoning effort at
 `medium`. Compaction is a structured summary pass, and avoiding `max` reasoning
 substantially reduces the wait without changing the effort used by normal
-turns. An explicit global `codex.effort` / `CCP_CODEX_EFFORT` override still
-takes precedence.
+turns. This existing compaction policy also applies under `co`; its internal
+profile marker does not promote compaction to `max`. An explicit global
+`codex.effort` / `CCP_CODEX_EFFORT` override still takes precedence.
 
 Claude Code's hosted `web_search_20250305` tool is translated to Codex's native
 Responses `web_search` tool with live external web access and non-empty native
