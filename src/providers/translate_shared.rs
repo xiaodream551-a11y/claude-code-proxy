@@ -64,7 +64,7 @@ pub fn read_effort(req: &MessagesRequest) -> Result<Option<&str>, anyhow::Error>
     };
     match output_config.get("effort") {
         Some(Value::String(s)) => {
-            let valid = ["low", "medium", "high", "xhigh", "max"];
+            let valid = ["low", "medium", "high", "xhigh", "max", "ultra"];
             if valid.contains(&s.as_str()) {
                 Ok(Some(s.as_str()))
             } else {
@@ -323,6 +323,18 @@ mod tests {
         }))
         .unwrap();
         assert!(!is_claude_code_compaction_request(&ordinary));
+    }
+
+    #[test]
+    fn effort_reader_accepts_ultra() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "output_config": {"effort": "ultra"}
+        }))
+        .unwrap();
+
+        assert_eq!(read_effort(&request).unwrap(), Some("ultra"));
     }
 
     #[test]

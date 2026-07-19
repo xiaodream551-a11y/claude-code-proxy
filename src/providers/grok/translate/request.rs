@@ -227,7 +227,7 @@ pub fn translate_request(
     let reasoning = if model == "grok-4.5" {
         reasoning_effort.map(|effort| GrokReasoning {
             effort: match effort {
-                "max" | "xhigh" => "high",
+                "ultra" | "max" | "xhigh" => "high",
                 value => value,
             }
             .to_string(),
@@ -1022,6 +1022,7 @@ mod tests {
             ("high", "high"),
             ("xhigh", "high"),
             ("max", "high"),
+            ("ultra", "high"),
         ] {
             let request: MessagesRequest = serde_json::from_value(serde_json::json!({
                 "model":"grok-4.5",

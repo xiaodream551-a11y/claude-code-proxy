@@ -274,6 +274,10 @@ impl TranslationOverrides {
 
 fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     match effort {
+        // Codex CLI treats `ultra` as max wire reasoning plus client-side
+        // automatic delegation. Claude Code owns delegation here, so mirror
+        // the official wire-level clamp and never send an unsupported value.
+        Some("ultra") => Some(Effort::Max),
         Some("max") => Some(Effort::Max),
         Some("xhigh") => Some(Effort::Xhigh),
         Some("low") => Some(Effort::Low),
@@ -295,13 +299,14 @@ fn resolve_effort_override(
     override_effort: Option<&str>,
 ) -> Result<Option<Effort>, anyhow::Error> {
     if let Some(val) = override_effort {
-        let valid = ["none", "low", "medium", "high", "xhigh", "max"];
+        let valid = ["none", "low", "medium", "high", "xhigh", "max", "ultra"];
         if !valid.contains(&val) {
             anyhow::bail!(
-                "Invalid effort override: \"{val}\". Must be one of: none, low, medium, high, xhigh, max"
+                "Invalid effort override: \"{val}\". Must be one of: none, low, medium, high, xhigh, max, ultra"
             );
         }
         return Ok(Some(match val {
+            "ultra" => Effort::Max,
             "max" => Effort::Max,
             "xhigh" => Effort::Xhigh,
             "high" => Effort::High,
@@ -1504,6 +1509,18 @@ mod tests {
     }
 
     #[test]
+    fn translate_effort_ultra_maps_to_wire_max() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role":"user", "content":"hello"}],
+            "output_config": {"effort": "ultra"}
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(matches!(out.reasoning.unwrap().effort, Some(Effort::Max)));
+    }
+
+    #[test]
     fn claude_code_compaction_caps_effort_at_medium() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
@@ -1528,6 +1545,12 @@ mod tests {
     #[test]
     fn translate_effort_override_max_maps_to_max() {
         let effort = resolve_effort_override(Some(Effort::Low), Some("max")).unwrap();
+        assert!(matches!(effort, Some(Effort::Max)));
+    }
+
+    #[test]
+    fn translate_effort_override_ultra_maps_to_wire_max() {
+        let effort = resolve_effort_override(Some(Effort::Low), Some("ultra")).unwrap();
         assert!(matches!(effort, Some(Effort::Max)));
     }
 

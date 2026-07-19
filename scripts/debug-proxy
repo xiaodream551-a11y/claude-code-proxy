@@ -129,8 +129,8 @@ In another shell, load the proxy endpoint and choose models:
   source "$client_env"
   export ANTHROPIC_MODEL='gpt-5.6-sol'
   export ANTHROPIC_SMALL_FAST_MODEL='gpt-5.6-luna'
-  export CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000
-  export CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
+  export CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000
   export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90
   claude
 

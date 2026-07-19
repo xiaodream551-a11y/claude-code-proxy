@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Match Codex CLI 0.144.6 model metadata by using a 272K Claude Code context
+  window for GPT-5.6 Sol, Terra, and Luna setup examples.
+- Accept Claude Code's `ultra` effort without an API error, matching Codex CLI's
+  wire behavior by sending `max` to Codex and capping it at `high` for Grok.
 - Allow GPT-5.6 requests to opt out of Responses Lite so accounts that support
   the full request shape can use parallel tool calls.
 - Preserve Claude tool-choice modes and single-tool constraints when translating

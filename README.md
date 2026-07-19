@@ -185,8 +185,8 @@ ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=gpt-5.6-sol \
 ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna \
 ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000 \
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 \
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
@@ -246,8 +246,8 @@ the same Claude config, put the env in `~/.claude/settings.json`:
     "ANTHROPIC_AUTH_TOKEN": "unused",
     "ANTHROPIC_MODEL": "gpt-5.6-sol",
     "ANTHROPIC_SMALL_FAST_MODEL": "gpt-5.6-luna",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "372000",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "372000",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "272000",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "272000",
     "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90",
     "CLAUDE_CODE_MAX_RETRIES": "2",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
@@ -269,20 +269,21 @@ custom gateway model ids, Claude Code 2.1.193 and later can use
 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` to trigger compaction at a percentage of that
 capacity.
 
-The current ChatGPT/Codex catalog for GPT-5.6 exposes a 372K raw context window
-and derives its default compaction point at 90%, or 334,800 tokens. Match that
+Codex CLI 0.144.6 corrected the bundled GPT-5.6 Sol, Terra, and Luna catalog to
+a 272K raw context window. At the recommended 90% threshold, Claude Code starts
+compaction at 244,800 tokens. Match that
 behavior in Claude Code with:
 
 ```sh
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90
 ```
 
 Use the concrete custom model ids (`gpt-5.6-sol`, `gpt-5.6-terra`, and
 `gpt-5.6-luna`) with these overrides. A `[1m]` suffix remains supported and is
 stripped by the proxy, but it makes Claude Code report a 1M window rather than
-the subscription's 372K capacity.
+the bundled catalog's 272K capacity.
 
 If you'd rather disable auto-compact completely, set
 `DISABLE_AUTO_COMPACT=1` in your env or `~/.claude/settings.json`. Manual
@@ -309,7 +310,10 @@ model `gpt-5.6-sol` with `service_tier: "priority"`. An explicit
 
 Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
 the UI as `◐ medium · /effort`) is forwarded as Codex `reasoning.effort` (`low`
-/ `medium` / `high` / `xhigh` / `max`). When Claude Code omits effort for a
+/ `medium` / `high` / `xhigh` / `max`). Codex CLI's `ultra` preset adds
+client-side automatic delegation to maximum reasoning, so the proxy mirrors its
+wire behavior by sending `max`; Claude Code/UltraCode remains responsible for
+delegation. When Claude Code omits effort for a
 Haiku request, the mapped `gpt-5.6-luna` model defaults to `medium`. An explicit
 request effort or `codex.effort` / `CCP_CODEX_EFFORT` override still takes
 precedence, and the global override can also force `none`.
@@ -373,7 +377,8 @@ is **Kimi-k2.6**, 256k context, supports reasoning + image input + video input).
 
 Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
 the UI as `◐ medium · /effort`) is forwarded as Kimi's `reasoning_effort` (`low`
-/ `medium` / `high`). Thinking blocks from the upstream model are forwarded to
+/ `medium` / `high`); `xhigh`, `max`, and `ultra` are capped at `high`. Thinking
+blocks from the upstream model are forwarded to
 Claude Code and rendered as thinking content. If Claude Code disables thinking,
 the proxy drops both `reasoning_effort` and the `thinking: {type: "enabled"}`
 flag before forwarding.
@@ -409,7 +414,8 @@ body/stream failures, and explicit 204 or non-SSE success responses leave the
 POST outcome ambiguous and therefore terminate without replaying the model
 request.
 Claude Code reasoning effort is forwarded as Responses `reasoning.effort` for
-Grok 4.5; `xhigh` and `max` are capped at Grok's supported `high` level.
+Grok 4.5; `xhigh`, `max`, and `ultra` are capped at Grok's supported `high`
+level.
 Claude Code's `WebSearch` uses Grok's hosted general web search. Requests to
 search X use Grok's hosted `x_search` tool, with citations and search usage
 reported in Claude Code. Function tools explicitly enable parallel calls unless
@@ -828,7 +834,7 @@ Windows, and at
 | `CCP_KIMI_OAUTH_HOST`            | `kimi.oauthHost`           | `https://auth.kimi.com`                           | Override Kimi's OAuth host (debugging only)                                                                                                                                       |
 | `CCP_KIMI_BASE_URL`              | `kimi.baseUrl`             | `https://api.kimi.com/coding/v1`                  | Override Kimi's API base URL                                                                                                                                                      |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
-| `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`)                                                                               |
+| `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`; `ultra` is sent as wire-level `max`)                                  |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
 | `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it                     |
@@ -1060,7 +1066,7 @@ Any of the `ANTHROPIC_BASE_URL=... claude` examples in
 settings. Shell aliases are enough for daily muscle memory:
 
 ```sh
-alias csol='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000 CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
+alias csol='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=gpt-5.6-sol ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
 alias cgrok='ANTHROPIC_BASE_URL=http://localhost:18765 ANTHROPIC_AUTH_TOKEN=unused ANTHROPIC_MODEL=grok-4.5 ANTHROPIC_SMALL_FAST_MODEL=grok-4.5 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 claude'
 ```
 
@@ -1125,8 +1131,8 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
 
   case "$main_model" in
     gpt-5.6-sol|gpt-5.6-luna|gpt-5.6-terra)
-      export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-372000}"
-      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-372000}"
+      export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-272000}"
+      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-272000}"
       export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
       ;;
   esac
@@ -1218,8 +1224,8 @@ ANTHROPIC_BASE_URL=http://localhost:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=gpt-5.6-sol \
 ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=372000 \
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=372000 \
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \

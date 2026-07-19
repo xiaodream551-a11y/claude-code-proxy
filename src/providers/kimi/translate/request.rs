@@ -172,7 +172,7 @@ fn clamp_max_tokens(requested: Option<u32>) -> u32 {
 
 fn map_reasoning_effort(effort: Option<&str>) -> String {
     match effort {
-        Some("max" | "xhigh") => "high".to_string(),
+        Some("ultra" | "max" | "xhigh") => "high".to_string(),
         Some(v) => v.to_string(),
         None => "medium".to_string(),
     }
@@ -766,6 +766,18 @@ mod tests {
             "model": "kimi-for-coding",
             "messages": [{"role": "user", "content": "hi"}],
             "output_config": {"effort": "xhigh"}
+        }))
+        .unwrap();
+        let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
+        assert_eq!(translated.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn effort_ultra_maps_to_high() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "kimi-for-coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "ultra"}
         }))
         .unwrap();
         let translated = translate_request(&req, TranslateOptions { session_id: None }).unwrap();
