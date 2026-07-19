@@ -574,6 +574,179 @@ async fn count_tokens_accepts_tool_reference_results_for_grok_and_codex() {
 }
 
 #[tokio::test]
+async fn count_tokens_accepts_all_anthropic_tool_result_shapes_for_grok_and_codex() {
+    let result_contents = [
+        None,
+        Some(json!([])),
+        Some(json!([
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"}
+        ])),
+        Some(json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            }
+        }])),
+        Some(json!([{
+            "type": "search_result",
+            "source": "https://example.com/result",
+            "title": "Example result",
+            "content": [{"type": "text", "text": "search body"}]
+        }])),
+        Some(json!([{
+            "type": "document",
+            "source": {
+                "type": "text",
+                "media_type": "text/plain",
+                "data": "document body"
+            },
+            "title": "Example document"
+        }])),
+        Some(json!([{
+            "type": "tool_reference",
+            "tool_name": "WebFetch"
+        }])),
+    ];
+
+    for model in ["grok-4.5-high", "gpt-5.6-sol"] {
+        for result_content in &result_contents {
+            let app = app(Arc::new(Registry::with_default_alias()));
+            let mut result = json!({
+                "type": "tool_result",
+                "tool_use_id": "call_shape_1"
+            });
+            if let Some(content) = result_content {
+                result["content"] = content.clone();
+            }
+            let payload = json!({
+                "model": model,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "call_shape_1",
+                            "name": "ShapeProbe",
+                            "input": {},
+                            "caller": {"type": "direct"}
+                        }]
+                    },
+                    {"role": "user", "content": [result]}
+                ]
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/messages/count_tokens")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{model} rejected tool_result content {result_content:?}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn count_tokens_accepts_current_web_search_versions_for_grok_and_codex() {
+    for model in ["grok-4.5-high", "gpt-5.6-sol"] {
+        for version in [
+            "web_search_20250305",
+            "web_search_20260209",
+            "web_search_20260318",
+        ] {
+            let app = app(Arc::new(Registry::with_default_alias()));
+            let payload = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "search rust"}],
+                "tools": [{
+                    "type": version,
+                    "name": "web_search",
+                    "max_uses": 3,
+                    "allowed_domains": ["rust-lang.org"],
+                    "user_location": {
+                        "type": "approximate",
+                        "city": "Shanghai",
+                        "country": "CN",
+                        "timezone": "Asia/Shanghai"
+                    },
+                    "allowed_callers": ["direct"]
+                }]
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/messages/count_tokens")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{model} rejected {version}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn count_tokens_rejects_unknown_forced_tools_locally_for_grok_and_codex() {
+    for model in ["grok-4.5-high", "gpt-5.6-sol"] {
+        let app = app(Arc::new(Registry::with_default_alias()));
+        let payload = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "run it"}],
+            "tools": [{
+                "name": "KnownTool",
+                "description": "A known tool",
+                "input_schema": {"type": "object", "properties": {}}
+            }],
+            "tool_choice": {"type": "tool", "name": "MissingTool"}
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{model} should reject an unknown forced tool before dispatch"
+        );
+    }
+}
+
+#[tokio::test]
 async fn context_window_hint_is_removed_before_provider_dispatch() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app

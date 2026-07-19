@@ -291,7 +291,7 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent, usage: &GrokUsage) {
         ReducerEvent::TextStart(i) => emit(
             out,
             "content_block_start",
-            serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"text","text":""}}),
+            serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"text","text":"","citations":null}}),
         ),
         ReducerEvent::TextDelta(i, t) => emit(
             out,
@@ -301,7 +301,7 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent, usage: &GrokUsage) {
         ReducerEvent::ToolStart(i, id, name) => emit(
             out,
             "content_block_start",
-            serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+            serde_json::json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":id,"name":name,"input":{},"caller":{"type":"direct"}}}),
         ),
         ReducerEvent::ToolDelta(i, t) => emit(
             out,
@@ -315,11 +315,16 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent, usage: &GrokUsage) {
             name,
             query,
         } => {
-            let result_type = format!("{name}_tool_result");
+            // Only web_search belongs to Anthropic's server-tool ContentBlock union. Reducer-side
+            // x_search degradation should make this branch unreachable for x_search, but keep the
+            // renderer fail-closed against synthetic internal events as well.
+            if name != "web_search" {
+                return;
+            }
             emit(
                 out,
                 "content_block_start",
-                serde_json::json!({"type":"content_block_start","index":index,"content_block":{"type":"server_tool_use","id":id,"name":name,"input":{}}}),
+                serde_json::json!({"type":"content_block_start","index":index,"content_block":{"type":"server_tool_use","id":id,"name":name,"input":{},"caller":{"type":"direct"}}}),
             );
             emit(
                 out,
@@ -334,7 +339,7 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent, usage: &GrokUsage) {
             emit(
                 out,
                 "content_block_start",
-                serde_json::json!({"type":"content_block_start","index":result_index,"content_block":{"type":result_type,"tool_use_id":id,"content":[]}}),
+                serde_json::json!({"type":"content_block_start","index":result_index,"content_block":{"type":"web_search_tool_result","tool_use_id":id,"content":[],"caller":{"type":"direct"}}}),
             );
             emit(
                 out,
@@ -347,7 +352,8 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent, usage: &GrokUsage) {
                 "type":"web_search_result_location",
                 "url":annotation.get("url").and_then(serde_json::Value::as_str).unwrap_or_default(),
                 "title":annotation.get("title").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                "cited_text":annotation.get("text").and_then(serde_json::Value::as_str).unwrap_or_default()
+                "cited_text":annotation.get("text").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                "encrypted_index":""
             });
             emit(
                 out,
@@ -361,13 +367,12 @@ fn render(out: &mut Vec<u8>, event: ReducerEvent, usage: &GrokUsage) {
             input_tokens,
             output_tokens,
             web_search_requests,
-            x_search_requests,
+            x_search_requests: _,
         } => {
-            let hosted_search_requests = web_search_requests + x_search_requests;
             emit(
                 out,
                 "message_delta",
-                serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":anthropic_usage(usage, input_tokens, output_tokens, hosted_search_requests)}),
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":anthropic_usage(usage, input_tokens, output_tokens, web_search_requests)}),
             );
             emit(
                 out,
@@ -467,22 +472,65 @@ mod tests {
             String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
         assert!(output.contains("server_tool_use"));
         assert!(output.contains("web_search_tool_result"));
+        assert_eq!(
+            output.matches("\"caller\":{\"type\":\"direct\"}").count(),
+            2
+        );
         assert!(output.contains("citations_delta"));
         assert!(output.contains("https://example.com"));
+        assert!(output.contains("\"encrypted_index\":\"\""));
+        assert!(output.contains("\"citations\":null"));
         assert!(output.contains("\"web_search_requests\":1"));
     }
 
     #[test]
-    fn stream_translates_hosted_x_search_usage_and_citations() {
+    fn stream_marks_function_tools_as_direct_calls() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let output =
+            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
+        assert!(output.contains("\"caller\":{\"type\":\"direct\"}"));
+    }
+
+    #[test]
+    fn stream_degrades_x_search_to_schema_valid_text_and_citations() {
         let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"xs_1\",\"delta\":\"{\\\"query\\\":\\\"claude-code-proxy\\\"}\"}\n\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"xs_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Recent post\"}\n\ndata: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://x.com/example/status/1\",\"title\":\"Example post\"}}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n\n";
         let output =
             String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
-        assert!(output.contains("\"name\":\"x_search\""));
-        assert!(output.contains("x_search_tool_result"));
+        assert!(!output.contains("\"type\":\"server_tool_use\""));
+        assert!(!output.contains("x_search_tool_result"));
+        assert!(!output.contains("\"name\":\"x_search\""));
+        assert!(output.contains("Recent post"));
         assert!(output.contains("https://x.com/example/status/1"));
-        assert!(output.contains("\"web_search_requests\":1"));
+        assert!(output.contains("\"encrypted_index\":\"\""));
+        assert!(output.contains("\"citations\":null"));
+        assert!(output.contains("\"web_search_requests\":0"));
+        assert!(output.contains("\"stop_reason\":\"end_turn\""));
         assert!(!output.contains("x_search_requests"));
-        assert!(!output.contains("\"name\":\"Bash\""));
+
+        let mut decoder = SseDecoder::default();
+        let starts: Vec<serde_json::Value> = decoder
+            .push(output.as_bytes())
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| serde_json::from_str(&event.data).ok())
+            .filter(|event: &serde_json::Value| {
+                event.get("type").and_then(serde_json::Value::as_str) == Some("content_block_start")
+            })
+            .collect();
+        decoder.finish().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["content_block"]["type"], "text");
+        assert!(starts[0]["content_block"]["citations"].is_null());
+    }
+
+    #[test]
+    fn stream_incomplete_after_completed_tool_uses_terminal_stop_reason() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{}}}\n\n";
+        let output =
+            String::from_utf8(translate_stream_bytes(input, "msg_1", "grok-4.5").unwrap()).unwrap();
+        assert!(output.contains("\"type\":\"tool_use\""));
+        assert!(output.contains("\"stop_reason\":\"max_tokens\""));
+        assert!(!output.contains("\"stop_reason\":\"tool_use\""));
     }
 
     #[test]

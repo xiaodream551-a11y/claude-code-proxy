@@ -146,7 +146,12 @@ pub fn accumulate_response_with_traffic(
         let compat_blocks = build_web_search_compat_blocks(&web_search_events, &text_from_deferred);
         for block in &compat_blocks {
             match &block.content {
-                WebSearchCompatContent::ServerToolUse { id, name, input } => {
+                WebSearchCompatContent::ServerToolUse {
+                    id,
+                    name,
+                    input,
+                    caller,
+                } => {
                     indexed_content.push((
                         block.index,
                         serde_json::json!({
@@ -154,12 +159,14 @@ pub fn accumulate_response_with_traffic(
                             "id": id,
                             "name": name,
                             "input": input,
+                            "caller": caller,
                         }),
                     ));
                 }
                 WebSearchCompatContent::WebSearchToolResult {
                     tool_use_id,
                     content: results,
+                    caller,
                 } => {
                     let result_content: Vec<Value> = results
                         .iter()
@@ -168,6 +175,8 @@ pub fn accumulate_response_with_traffic(
                                 "type": "web_search_result",
                                 "title": r.title,
                                 "url": r.url,
+                                "encrypted_content": "",
+                                "page_age": null,
                             })
                         })
                         .collect();
@@ -177,6 +186,7 @@ pub fn accumulate_response_with_traffic(
                             "type": "web_search_tool_result",
                             "tool_use_id": tool_use_id,
                             "content": result_content,
+                            "caller": caller,
                         }),
                     ));
                 }
@@ -205,6 +215,7 @@ pub fn accumulate_response_with_traffic(
                         serde_json::json!({
                             "type": "text",
                             "text": text,
+                            "citations": null,
                         }),
                     ));
                 }
@@ -219,6 +230,7 @@ pub fn accumulate_response_with_traffic(
                         "id": id,
                         "name": name,
                         "input": parsed,
+                        "caller": {"type": "direct"},
                     }),
                 ));
             }
@@ -432,6 +444,7 @@ mod tests {
         let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
         assert_eq!(response["content"][0]["type"], "tool_use");
         assert_eq!(response["content"][0]["input"]["file_path"], "/tmp/a");
+        assert_eq!(response["content"][0]["caller"]["type"], "direct");
     }
 
     #[test]
@@ -461,7 +474,10 @@ mod tests {
                 "response.output_item.done",
                 json!({
                     "output_index":0,
-                    "item":{"type":"web_search_call","id":"ws_1","action":{"query":"test query"}}
+                    "item":{"type":"web_search_call","id":"ws_1","action":{
+                        "query":"test query",
+                        "sources":[{"title":"Bound source","url":"https://bound.example"}]
+                    }}
                 })
             ),
             sse_event(
@@ -495,10 +511,17 @@ mod tests {
         assert!(content.len() >= 3);
         // First should be server_tool_use
         assert_eq!(content[0]["type"], "server_tool_use");
+        assert_eq!(content[0]["caller"]["type"], "direct");
         // Second should be web_search_tool_result
         assert_eq!(content[1]["type"], "web_search_tool_result");
+        assert_eq!(content[1]["caller"]["type"], "direct");
+        assert_eq!(content[1]["content"][0]["url"], "https://bound.example");
+        assert_eq!(content[1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(content[1]["content"][0]["encrypted_content"], "");
+        assert!(content[1]["content"][0]["page_age"].is_null());
         // Third should be text
         assert_eq!(content[2]["type"], "text");
+        assert!(content[2]["citations"].is_null());
     }
 
     #[test]

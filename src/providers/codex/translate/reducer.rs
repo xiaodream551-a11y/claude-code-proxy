@@ -1,8 +1,11 @@
+use serde_json::Value;
+
 use crate::providers::translate_shared::{JsonObjectError, parse_json_object};
 
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
+use super::web_search_compat::WebSearchResult;
 
 #[derive(Debug, Clone)]
 pub struct UpstreamStreamError {
@@ -112,6 +115,7 @@ pub enum ReducerEvent {
         result_index: usize,
         id: String,
         query: String,
+        sources: Vec<WebSearchResult>,
     },
     Finish {
         stop_reason: StopReason,
@@ -143,8 +147,7 @@ enum BlockState {
         call_id: String,
         name: String,
         args_accum: String,
-        had_delta: bool,
-        buffer_until_done: bool,
+        done_snapshot: Option<String>,
         emitted_args: bool,
     },
 }
@@ -272,7 +275,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let mut continuation_eligible = false;
     let mut incomplete_stop_reason: Option<StopReason> = None;
     let mut web_search_requests = 0usize;
+    let mut web_search_output_indices = std::collections::HashSet::new();
     let mut _saw_terminal = false;
+    let mut repaired_tool_completion = false;
     let mut event_count = 0usize;
     let mut last_event_type: Option<String> = None;
 
@@ -325,6 +330,14 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
 
         let p: serde_json::Value = match serde_json::from_str(data) {
             Ok(v) => v,
+            Err(_) if _saw_terminal => {
+                return Err(UpstreamStreamError {
+                    kind: UpstreamErrorKind::Failed,
+                    message: "invalid Codex event after terminal response event".to_string(),
+                    retry_after_seconds: None,
+                    diagnostics: None,
+                });
+            }
             Err(_) => continue,
         };
 
@@ -342,6 +355,14 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             // completed. Treat that tail as telemetry instead of retroactively failing the
             // completed request.
             continue;
+        }
+        if _saw_terminal {
+            return Err(UpstreamStreamError {
+                kind: UpstreamErrorKind::Failed,
+                message: format!("unexpected Codex event {t:?} after terminal response event"),
+                retry_after_seconds: None,
+                diagnostics: None,
+            });
         }
 
         if t == "codex.rate_limits" {
@@ -418,6 +439,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 continue;
             }
             if item_type == "web_search_call" {
+                if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                    item_id_to_output_index.insert(id.to_string(), output_index);
+                }
                 out.push(ReducerEvent::Progress);
                 continue;
             }
@@ -465,7 +489,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let buffer_until_done = should_buffer_tool_args(&name);
+                if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                    item_id_to_output_index.insert(id.to_string(), output_index);
+                }
                 blocks_by_output_index.insert(
                     output_index,
                     BlockState::Tool {
@@ -474,8 +500,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         call_id: call_id.clone(),
                         name: name.clone(),
                         args_accum: String::new(),
-                        had_delta: false,
-                        buffer_until_done,
+                        done_snapshot: None,
                         emitted_args: false,
                     },
                 );
@@ -572,9 +597,10 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         }
 
         if t == "response.function_call_arguments.delta" {
-            let output_index = match p.get("output_index").and_then(|v| v.as_u64()) {
-                Some(v) => v as usize,
-                None => continue,
+            let Some(output_index) =
+                resolve_event_output_index(&p, &item_id_to_output_index, &blocks_by_output_index)
+            else {
+                continue;
             };
             let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if delta.is_empty() {
@@ -588,16 +614,19 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             match state {
                 BlockState::Tool {
                     args_accum,
-                    had_delta,
-                    buffer_until_done,
-                    emitted_args,
+                    done_snapshot,
                     name,
                     index,
                     call_id,
                     ..
                 } => {
+                    // The done event is an authoritative snapshot. Ignore any
+                    // replayed or out-of-order delta after that boundary.
+                    if done_snapshot.is_some() {
+                        out.push(ReducerEvent::ToolProgress { index: *index });
+                        continue;
+                    }
                     args_accum.push_str(delta);
-                    *had_delta = true;
                     if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
                         return Err(UpstreamStreamError {
                             kind: UpstreamErrorKind::Failed,
@@ -607,30 +636,29 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         });
                     }
 
-                    if *buffer_until_done {
-                        if let Some(repaired) = repair_whitespace_stalled_read_args(
-                            name,
-                            args_accum,
-                            Some(call_id.as_str()),
-                        ) {
-                            *args_accum = repaired.clone();
-                            *emitted_args = true;
-                            repaired_read = Some((*index, repaired));
-                        } else {
-                            out.push(ReducerEvent::ToolProgress { index: *index });
-                        }
+                    if let Some(repaired) = repair_whitespace_stalled_read_args(
+                        name,
+                        args_accum,
+                        Some(call_id.as_str()),
+                    ) {
+                        repaired_read = Some((*index, repaired));
                     } else {
-                        *emitted_args = true;
-                        out.push(ReducerEvent::ToolDelta {
-                            index: *index,
-                            partial_json: delta.to_string(),
-                        });
+                        out.push(ReducerEvent::ToolProgress { index: *index });
                     }
                 }
                 _ => continue,
             }
             if let Some((index, repaired)) = repaired_read {
-                if let Some(state) = blocks_by_output_index.remove(&output_index) {
+                if let Some(mut state) = blocks_by_output_index.remove(&output_index) {
+                    if let BlockState::Tool {
+                        args_accum,
+                        emitted_args,
+                        ..
+                    } = &mut state
+                    {
+                        *args_accum = repaired.clone();
+                        *emitted_args = true;
+                    }
                     capture_output_item(output_index, &state, &mut output_items_by_index);
                 }
                 out.push(ReducerEvent::ToolDelta {
@@ -638,40 +666,43 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     partial_json: repaired,
                 });
                 out.push(ReducerEvent::ToolStop { index });
-                let output_items: Vec<ResponsesInputItem> =
-                    output_items_by_index.into_values().collect();
-                out.push(ReducerEvent::Finish {
-                    stop_reason: STOP_TOOL_USE,
-                    terminal_type: TERM_INCOMPLETE.to_string(),
-                    continuation_eligible: false,
-                    usage: None,
-                    web_search_requests,
-                    response_id: None,
-                    output_items,
-                });
-                return Ok(out);
+                repaired_tool_completion = true;
             }
             continue;
         }
 
         if t == "response.function_call_arguments.done" {
-            let output_index = match p.get("output_index").and_then(|v| v.as_u64()) {
-                Some(v) => v as usize,
-                None => continue,
+            let Some(output_index) =
+                resolve_event_output_index(&p, &item_id_to_output_index, &blocks_by_output_index)
+            else {
+                continue;
             };
-            if let Some(BlockState::Tool { args_accum, .. }) =
-                blocks_by_output_index.get_mut(&output_index)
+            if let Some(BlockState::Tool {
+                name,
+                done_snapshot,
+                ..
+            }) = blocks_by_output_index.get_mut(&output_index)
                 && let Some(args) = p.get("arguments").and_then(|v| v.as_str())
-                && args_accum.is_empty()
             {
-                *args_accum = args.to_string();
+                if args.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
+                    return Err(UpstreamStreamError {
+                        kind: UpstreamErrorKind::Failed,
+                        message: format!("Buffered {name} tool arguments exceeded safe limits"),
+                        retry_after_seconds: None,
+                        diagnostics: None,
+                    });
+                }
+                *done_snapshot = Some(args.to_string());
             }
             continue;
         }
 
         if t == "response.output_item.done" {
-            let output_index: usize =
-                p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let Some(output_index) =
+                resolve_event_output_index(&p, &item_id_to_output_index, &blocks_by_output_index)
+            else {
+                continue;
+            };
             let item = p.get("item");
 
             if let Some(item_val) = item
@@ -710,6 +741,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     &mut reasoning_by_output_index,
                     &mut output_items_by_index,
                 );
+                if !web_search_output_indices.insert(output_index) {
+                    continue;
+                }
                 let idx = anthropic_index;
                 anthropic_index += 1;
                 let result_index = anthropic_index;
@@ -718,11 +752,13 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 let id_val = item_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let id = server_tool_use_id_from_codex_web_search_id(id_val);
                 let query = web_search_query(item_val);
+                let sources = web_search_sources(item_val);
                 out.push(ReducerEvent::WebSearch {
                     index: idx,
                     result_index,
                     id,
                     query,
+                    sources,
                 });
                 continue;
             }
@@ -738,26 +774,19 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     args_accum,
                     name,
                     call_id,
-                    buffer_until_done,
+                    done_snapshot,
                     emitted_args,
-                    had_delta,
                     index,
                     ..
                 } = &mut state
             {
-                if let Some(final_args) = item_val
-                    .get("arguments")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    if !args_accum.is_empty() && !*emitted_args {
-                        // Already have accum from deltas - skip
-                    } else if *had_delta {
-                        // Already emitted deltas
-                    } else {
-                        *args_accum = final_args.to_string();
-                    }
-                }
+                let item_snapshot = item_val.get("arguments").and_then(|v| v.as_str());
+                let authoritative = done_snapshot
+                    .as_deref()
+                    .or(item_snapshot)
+                    .unwrap_or(args_accum)
+                    .to_string();
+                *args_accum = authoritative;
 
                 if !args_accum.is_empty() {
                     let sanitized = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
@@ -773,7 +802,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     }
                 })?;
 
-                if *buffer_until_done || !*emitted_args {
+                if !*emitted_args {
                     *emitted_args = true;
                     out.push(ReducerEvent::ToolDelta {
                         index: *index,
@@ -812,7 +841,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     }
 
     let open_blocks = describe_open_blocks(&blocks_by_output_index);
-    if !_saw_terminal || !open_blocks.is_empty() {
+    let can_finish_repaired_tool_without_terminal =
+        repaired_tool_completion && open_blocks.is_empty() && saw_tool_use;
+    if (!_saw_terminal && !can_finish_repaired_tool_without_terminal) || !open_blocks.is_empty() {
         let diagnostics = UpstreamStreamDiagnostics {
             event_count,
             last_event_type,
@@ -859,6 +890,48 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     });
 
     Ok(out)
+}
+
+fn resolve_event_output_index(
+    payload: &serde_json::Value,
+    item_id_to_output_index: &std::collections::HashMap<String, usize>,
+    blocks_by_output_index: &std::collections::HashMap<usize, BlockState>,
+) -> Option<usize> {
+    payload
+        .get("output_index")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .or_else(|| {
+            payload
+                .get("item_id")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    payload
+                        .get("item")
+                        .and_then(|item| item.get("id"))
+                        .and_then(|value| value.as_str())
+                })
+                .and_then(|id| item_id_to_output_index.get(id).copied())
+        })
+        .or_else(|| {
+            let call_id = payload
+                .get("call_id")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    payload
+                        .get("item")
+                        .and_then(|item| item.get("call_id"))
+                        .and_then(|value| value.as_str())
+                })?;
+            blocks_by_output_index
+                .iter()
+                .find_map(|(output_index, block)| match block {
+                    BlockState::Tool {
+                        call_id: candidate, ..
+                    } if candidate == call_id => Some(*output_index),
+                    _ => None,
+                })
+        })
 }
 
 fn describe_open_blocks(
@@ -962,10 +1035,6 @@ pub(super) fn validate_tool_arguments(
     }
 }
 
-fn should_buffer_tool_args(name: &str) -> bool {
-    name == "Read"
-}
-
 fn repair_whitespace_stalled_read_args(
     name: &str,
     args: &str,
@@ -1043,13 +1112,45 @@ fn web_search_query(item: &serde_json::Value) -> String {
         return query.to_string();
     }
     if let Some(queries) = action.get("queries").and_then(|v| v.as_array()) {
-        for q in queries {
-            if let Some(s) = q.as_str() {
-                return s.to_string();
-            }
-        }
+        return queries
+            .iter()
+            .filter_map(|query| query.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
     }
     String::new()
+}
+
+fn web_search_sources(item: &serde_json::Value) -> Vec<WebSearchResult> {
+    let Some(sources) = item
+        .get("action")
+        .and_then(|action| action.get("sources"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    for source in sources {
+        let Some(url) = source.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if results
+            .iter()
+            .any(|result: &WebSearchResult| result.url == url)
+        {
+            continue;
+        }
+        let title = source
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(url);
+        results.push(WebSearchResult {
+            title: title.to_string(),
+            url: url.to_string(),
+        });
+    }
+    results
 }
 
 fn server_tool_use_id_from_codex_web_search_id(id: &str) -> String {
@@ -1318,6 +1419,104 @@ mod tests {
     }
 
     #[test]
+    fn reducer_uses_done_snapshot_and_ignores_late_delta() {
+        let upstream = [
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"Bash"}
+                }),
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({"item_id":"item_1","delta":"{\"command\":\"from delta\"}"}),
+            ),
+            sse(
+                "response.function_call_arguments.done",
+                json!({"call_id":"call_1","arguments":"{\"command\":\"from done\"}"}),
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({"item_id":"item_1","delta":"{late garbage"}),
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "item":{
+                        "type":"function_call",
+                        "id":"item_1",
+                        "call_id":"call_1",
+                        "name":"Bash",
+                        "arguments":"{\"command\":\"from item\"}"
+                    }
+                }),
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}}),
+            ),
+        ]
+        .concat();
+
+        let events = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let deltas: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ReducerEvent::ToolDelta { partial_json, .. } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["{\"command\":\"from done\"}"]);
+
+        let Some(ReducerEvent::Finish { output_items, .. }) = events.last() else {
+            panic!("expected Finish");
+        };
+        let Some(ResponsesInputItem::FunctionCall { arguments, .. }) = output_items.first() else {
+            panic!("expected function call continuation item");
+        };
+        assert_eq!(arguments, "{\"command\":\"from done\"}");
+    }
+
+    #[test]
+    fn reducer_rejects_malformed_done_snapshot_even_when_item_snapshot_is_valid() {
+        let upstream = [
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Bash"}
+                }),
+            ),
+            sse(
+                "response.function_call_arguments.done",
+                json!({"output_index":0,"arguments":"{\"command\":"}),
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "call_id":"call_1",
+                        "name":"Bash",
+                        "arguments":"{\"command\":\"valid but non-authoritative\"}"
+                    }
+                }),
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}}),
+            ),
+        ]
+        .concat();
+
+        let error = reduce_upstream_bytes(upstream.as_bytes()).unwrap_err();
+        assert_eq!(error.kind, UpstreamErrorKind::Failed);
+        assert!(error.message.contains("invalid JSON arguments"));
+    }
+
+    #[test]
     fn reducer_rejects_invalid_tool_arguments_before_nonstream_accumulation() {
         for (arguments, expected) in [
             ("", "completed without JSON arguments"),
@@ -1373,6 +1572,44 @@ mod tests {
     }
 
     #[test]
+    fn terminal_tail_only_allows_rate_limit_telemetry() {
+        let terminal = sse(
+            "response.completed",
+            json!({"response":{"id":"resp_1","usage":{}}}),
+        );
+        let telemetry = sse(
+            "codex.rate_limits",
+            json!({"rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30}}}),
+        );
+        let completed_with_telemetry = format!("{terminal}{telemetry}");
+        assert!(reduce_upstream_bytes(completed_with_telemetry.as_bytes()).is_ok());
+
+        for tail in [
+            sse(
+                "response.output_text.delta",
+                json!({"output_index":0,"delta":"late"}),
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                }),
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_2","usage":{}}}),
+            ),
+            sse("future.semantic.event", json!({"value":1})),
+        ] {
+            let input = format!("{terminal}{tail}");
+            let error = reduce_upstream_bytes(input.as_bytes()).unwrap_err();
+            assert_eq!(error.kind, UpstreamErrorKind::Failed);
+            assert!(error.message.contains("after terminal"));
+        }
+    }
+
+    #[test]
     fn reduce_repairs_whitespace_stalled_read_args() {
         let upstream = format!(
             "{}{}",
@@ -1414,6 +1651,87 @@ mod tests {
     }
 
     #[test]
+    fn reducer_read_repair_keeps_parallel_peer_and_finishes_once() {
+        let upstream = [
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"read_1","name":"Read"}
+                }),
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":1,
+                    "item":{"type":"function_call","call_id":"bash_1","name":"Bash"}
+                }),
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({"output_index":1,"delta":"{\"command\":\"echo peer\"}"}),
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({
+                    "output_index":0,
+                    "delta":format!("{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}", " ".repeat(1024))
+                }),
+            ),
+            sse(
+                "response.function_call_arguments.done",
+                json!({"output_index":1,"arguments":"{\"command\":\"echo peer\"}"}),
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":1,
+                    "item":{
+                        "type":"function_call",
+                        "call_id":"bash_1",
+                        "name":"Bash",
+                        "arguments":"{\"command\":\"echo peer\"}"
+                    }
+                }),
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}}),
+            ),
+        ]
+        .concat();
+
+        let events = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let stops: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ReducerEvent::ToolStop { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, vec![0, 1]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ReducerEvent::Finish { .. }))
+                .count(),
+            1
+        );
+        let Some(ReducerEvent::Finish { output_items, .. }) = events.last() else {
+            panic!("expected Finish");
+        };
+        assert_eq!(output_items.len(), 2);
+    }
+
+    #[test]
+    fn web_search_query_preserves_all_queries() {
+        assert_eq!(
+            web_search_query(&json!({"action":{"queries":["alpha","beta","gamma"]}})),
+            "alpha\nbeta\ngamma"
+        );
+    }
+
+    #[test]
     fn reduce_upstream_error_event() {
         let upstream = sse("error", json!({"error":{"message":"upstream failure"}}));
         let result = reduce_upstream_bytes(upstream.as_bytes());
@@ -1439,7 +1757,10 @@ mod tests {
                 "response.output_item.done",
                 json!({
                     "output_index":0,
-                    "item":{"type":"web_search_call","id":"ws_1","action":{"query":"test query"}}
+                    "item":{"type":"web_search_call","id":"ws_1","action":{
+                        "query":"test query",
+                        "sources":[{"title":"Bound source","url":"https://bound.example"}]
+                    }}
                 })
             ),
             sse(
@@ -1473,6 +1794,19 @@ mod tests {
             .iter()
             .any(|e| matches!(e, ReducerEvent::WebSearch { .. }));
         assert!(has_web_search, "expected WebSearch event");
+        let search = out.iter().find_map(|event| match event {
+            ReducerEvent::WebSearch { query, sources, .. } => Some((query, sources)),
+            _ => None,
+        });
+        let (query, sources) = search.unwrap();
+        assert_eq!(query, "test query");
+        assert_eq!(
+            sources,
+            &vec![WebSearchResult {
+                title: "Bound source".to_string(),
+                url: "https://bound.example".to_string(),
+            }]
+        );
         let last = out.last().unwrap();
         if let ReducerEvent::Finish {
             web_search_requests,

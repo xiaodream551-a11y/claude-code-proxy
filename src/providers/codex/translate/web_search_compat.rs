@@ -10,14 +10,16 @@ pub enum WebSearchCompatContent {
         id: String,
         name: String,
         input: Value,
+        caller: Value,
     },
     WebSearchToolResult {
         tool_use_id: String,
         content: Vec<WebSearchResult>,
+        caller: Value,
     },
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSearchResult {
     pub title: String,
     pub url: String,
@@ -83,7 +85,8 @@ pub fn build_web_search_compat_blocks(
     searches: &[super::reducer::ReducerEvent],
     text: &str,
 ) -> Vec<WebSearchCompatBlock> {
-    let results = extract_web_search_results_from_text(text);
+    let fallback_results =
+        (searches.len() == 1).then(|| extract_web_search_results_from_text(text));
     let mut blocks = Vec::new();
 
     for event in searches {
@@ -92,21 +95,29 @@ pub fn build_web_search_compat_blocks(
             result_index,
             id,
             query,
+            sources,
         } = event
         {
+            let results = if sources.is_empty() {
+                fallback_results.clone().unwrap_or_default()
+            } else {
+                sources.clone()
+            };
             blocks.push(WebSearchCompatBlock {
                 index: *index,
                 content: WebSearchCompatContent::ServerToolUse {
                     id: id.clone(),
                     name: "web_search".to_string(),
                     input: serde_json::json!({"query": query}),
+                    caller: serde_json::json!({"type":"direct"}),
                 },
             });
             blocks.push(WebSearchCompatBlock {
                 index: *result_index,
                 content: WebSearchCompatContent::WebSearchToolResult {
                     tool_use_id: id.clone(),
-                    content: results.clone(),
+                    content: results,
+                    caller: serde_json::json!({"type":"direct"}),
                 },
             });
         }
@@ -183,23 +194,78 @@ mod tests {
             result_index: 1,
             id: "ws_1".to_string(),
             query: "test".to_string(),
+            sources: vec![WebSearchResult {
+                title: "Bound result".to_string(),
+                url: "https://bound.example".to_string(),
+            }],
         }];
         let text = "See [Result](https://result.com)";
         let blocks = build_web_search_compat_blocks(&searches, text);
         assert_eq!(blocks.len(), 2);
         match &blocks[0].content {
-            WebSearchCompatContent::ServerToolUse { name, input, .. } => {
+            WebSearchCompatContent::ServerToolUse {
+                name,
+                input,
+                caller,
+                ..
+            } => {
                 assert_eq!(name, "web_search");
                 assert_eq!(input.get("query").and_then(|v| v.as_str()), Some("test"));
+                assert_eq!(caller["type"], "direct");
             }
             _ => panic!("expected ServerToolUse"),
         }
         match &blocks[1].content {
-            WebSearchCompatContent::WebSearchToolResult { content, .. } => {
+            WebSearchCompatContent::WebSearchToolResult {
+                content, caller, ..
+            } => {
                 assert_eq!(content.len(), 1);
-                assert_eq!(content[0].url, "https://result.com");
+                assert_eq!(content[0].url, "https://bound.example");
+                assert_eq!(caller["type"], "direct");
             }
             _ => panic!("expected WebSearchToolResult"),
         }
+    }
+
+    #[test]
+    fn multiple_searches_keep_sources_bound_to_each_call() {
+        let searches = vec![
+            super::super::reducer::ReducerEvent::WebSearch {
+                index: 0,
+                result_index: 1,
+                id: "ws_1".to_string(),
+                query: "first".to_string(),
+                sources: vec![WebSearchResult {
+                    title: "First".to_string(),
+                    url: "https://first.example".to_string(),
+                }],
+            },
+            super::super::reducer::ReducerEvent::WebSearch {
+                index: 2,
+                result_index: 3,
+                id: "ws_2".to_string(),
+                query: "second".to_string(),
+                sources: vec![WebSearchResult {
+                    title: "Second".to_string(),
+                    url: "https://second.example".to_string(),
+                }],
+            },
+        ];
+        let blocks = build_web_search_compat_blocks(
+            &searches,
+            "Unrelated https://final-text.example must not be copied.",
+        );
+        let results: Vec<&[WebSearchResult]> = blocks
+            .iter()
+            .filter_map(|block| match &block.content {
+                WebSearchCompatContent::WebSearchToolResult { content, .. } => {
+                    Some(content.as_slice())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0][0].url, "https://first.example");
+        assert_eq!(results[1][0].url, "https://second.example");
     }
 }

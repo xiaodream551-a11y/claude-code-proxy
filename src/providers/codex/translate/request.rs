@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -232,6 +232,8 @@ pub struct ResponsesWebSearchTool {
     pub search_content_types: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<ResponsesWebSearchFilters>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_location: Option<ResponsesWebSearchUserLocation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +242,25 @@ pub struct ResponsesWebSearchFilters {
     pub allowed_domains: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponsesWebSearchUserLocation {
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ToolPlan {
+    initial: Option<Vec<ResponsesTool>>,
+    deferred: HashMap<String, ResponsesTool>,
 }
 
 pub struct TranslateOptions {
@@ -356,9 +377,21 @@ pub fn has_hosted_web_search(req: &MessagesRequest) -> bool {
         .and_then(|v| v.as_array())
         .is_some_and(|tools| {
             tools.iter().any(|tool| {
-                tool.get("type").and_then(|v| v.as_str()) == Some("web_search_20250305")
+                tool.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tool_type| {
+                        is_supported_web_search_type(tool_type)
+                            && tool_allows_direct_calls(tool, tool_type)
+                    })
             })
         })
+}
+
+fn is_supported_web_search_type(tool_type: &str) -> bool {
+    matches!(
+        tool_type,
+        "web_search_20250305" | "web_search_20260209" | "web_search_20260318"
+    )
 }
 
 pub fn translate_request(
@@ -373,9 +406,26 @@ pub fn translate_request_with_overrides(
     opts: TranslateOptions,
     overrides: TranslationOverrides,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    let instructions = flatten_system_text(req.extra.get("system"));
-    let input = build_input(req);
-    let tools = read_tools(req)?;
+    validate_tool_contract(req)?;
+    let mut instructions = flatten_system_text(req.extra.get("system"));
+    let tool_plan = read_tools(req)?;
+    let input = build_input(req, &tool_plan.deferred);
+    validate_effective_tool_choice(req, &tool_plan, &input)?;
+    let hosted_web_search_available = tool_plan.initial.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| matches!(tool, ResponsesTool::WebSearch(_)))
+    }) || input.iter().any(|item| {
+        matches!(
+            item,
+            ResponsesInputItem::AdditionalTools { tools, .. }
+                if tools.iter().any(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search"))
+        )
+    });
+    if hosted_web_search_available {
+        append_web_search_request_guidance(req, &mut instructions);
+    }
+    let tools = tool_plan.initial;
     let tool_choice = map_tool_choice(req)?;
 
     let mut text = ResponsesText {
@@ -452,6 +502,10 @@ pub fn translate_request_with_overrides(
         out.tools = Some(tools);
     }
 
+    if hosted_web_search_available && let Some(include) = &mut out.include {
+        include.push("web_search_call.action.sources".to_string());
+    }
+
     // Never force a web_search tool_choice the request didn't register —
     // upstream 502s instead of ignoring it.
     if matches!(
@@ -513,6 +567,35 @@ fn append_instruction(instructions: &mut Option<String>, guidance: &str) {
     });
 }
 
+fn append_web_search_request_guidance(req: &MessagesRequest, instructions: &mut Option<String>) {
+    let Some(tools) = req.extra.get("tools").and_then(Value::as_array) else {
+        return;
+    };
+    for tool in tools {
+        let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !is_supported_web_search_type(tool_type) || !tool_allows_direct_calls(tool, tool_type) {
+            continue;
+        }
+        if let Some(max_uses) = tool.get("max_uses").and_then(Value::as_u64) {
+            // Codex's hosted web search schema has no hard per-request call
+            // limit. Preserve Anthropic's intent as explicit best-effort
+            // model guidance without claiming protocol-level enforcement.
+            append_instruction(
+                instructions,
+                &format!(
+                    "Best-effort compatibility limit: use web_search no more than {max_uses} time(s) in this response."
+                ),
+            );
+        }
+        // response_inclusion only controls results consumed by a completed
+        // Anthropic code_execution call. Codex does not expose programmatic
+        // hosted-tool callers here, while direct calls are always returned in
+        // full, so both `full` and `excluded` safely map to direct full output.
+    }
+}
+
 fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
     let output_config = req.extra.get("output_config")?.as_object()?;
     let format = output_config.get("format")?.as_object()?;
@@ -537,55 +620,689 @@ fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
     }
 }
 
-fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
+fn validate_tool_contract(req: &MessagesRequest) -> Result<(), anyhow::Error> {
+    let mut registered_tools: HashMap<&str, bool> = HashMap::new();
+    if let Some(tools) = req.extra.get("tools") {
+        let tools = tools
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("tools must be an array"))?;
+        for (index, tool) in tools.iter().enumerate() {
+            let tool = tool
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("tools[{index}] must be an object"))?;
+            let tool_type = match tool.get("type") {
+                Some(Value::String(value)) => value.as_str(),
+                Some(Value::Null) => "function",
+                Some(_) => anyhow::bail!("tools[{index}].type must be a string"),
+                None => "function",
+            };
+            if tool_type.starts_with("web_search_") && !is_supported_web_search_type(tool_type) {
+                anyhow::bail!("unsupported Anthropic web search tool type: {tool_type}");
+            }
+            if tool_type.starts_with("tool_search_tool_") {
+                anyhow::bail!(
+                    "Anthropic hosted tool search is not supported by Codex translation; use the client ToolSearch tool"
+                );
+            }
+
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("tools[{index}].name must be a non-empty string"))?;
+            if is_supported_web_search_type(tool_type) && name != "web_search" {
+                anyhow::bail!("tools[{index}].name must be web_search for {tool_type}");
+            }
+            if registered_tools
+                .insert(
+                    name,
+                    tool_allows_direct_calls(&Value::Object(tool.clone()), tool_type),
+                )
+                .is_some()
+            {
+                anyhow::bail!("duplicate tool name: {name}");
+            }
+
+            for field in ["defer_loading", "strict", "eager_input_streaming"] {
+                if let Some(value) = tool.get(field)
+                    && !value.is_null()
+                    && !value.is_boolean()
+                {
+                    anyhow::bail!("tools[{index}].{field} must be a boolean");
+                }
+            }
+            if let Some(value) = tool.get("description")
+                && !value.is_string()
+                && !value.is_null()
+            {
+                anyhow::bail!("tools[{index}].description must be a string");
+            }
+            if !is_supported_web_search_type(tool_type)
+                && let Some(schema) = tool.get("input_schema")
+                && !schema.is_object()
+            {
+                anyhow::bail!("tools[{index}].input_schema must be an object");
+            }
+            validate_allowed_callers(tool, index)?;
+            if is_supported_web_search_type(tool_type) {
+                validate_web_search_tool(tool, index, tool_type)?;
+            }
+        }
+    }
+
+    validate_tool_choice(req, &registered_tools)?;
+    validate_message_tool_history(req)?;
+    Ok(())
+}
+
+fn validate_allowed_callers(
+    tool: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<(), anyhow::Error> {
+    let Some(callers) = tool.get("allowed_callers") else {
+        return Ok(());
+    };
+    if callers.is_null() {
+        return Ok(());
+    }
+    let callers = callers
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tools[{index}].allowed_callers must be an array"))?;
+    for caller in callers {
+        let caller = caller.as_str().ok_or_else(|| {
+            anyhow::anyhow!("tools[{index}].allowed_callers entries must be strings")
+        })?;
+        if caller.is_empty() {
+            anyhow::bail!("tools[{index}].allowed_callers entries must not be empty");
+        }
+    }
+    Ok(())
+}
+
+fn validate_web_search_tool(
+    tool: &serde_json::Map<String, Value>,
+    index: usize,
+    tool_type: &str,
+) -> Result<(), anyhow::Error> {
+    for field in ["allowed_domains", "blocked_domains"] {
+        if let Some(value) = tool.get(field)
+            && !value.is_null()
+        {
+            let values = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("tools[{index}].{field} must be an array"))?;
+            if values.iter().any(|entry| !entry.is_string()) {
+                anyhow::bail!("tools[{index}].{field} entries must be strings");
+            }
+        }
+    }
+    let has_allowed = tool
+        .get("allowed_domains")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.is_empty());
+    let has_blocked = tool
+        .get("blocked_domains")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.is_empty());
+    if has_allowed && has_blocked {
+        anyhow::bail!("tools[{index}] cannot specify both allowed_domains and blocked_domains");
+    }
+
+    if let Some(value) = tool.get("max_uses")
+        && !value.is_null()
+        && value.as_u64().is_none_or(|value| value == 0)
+    {
+        anyhow::bail!("tools[{index}].max_uses must be a positive integer");
+    }
+    if let Some(value) = tool.get("response_inclusion")
+        && !value.is_null()
+    {
+        if tool_type != "web_search_20260318" {
+            anyhow::bail!("tools[{index}].response_inclusion requires web_search_20260318");
+        }
+        if !matches!(value.as_str(), Some("full" | "excluded")) {
+            anyhow::bail!("tools[{index}].response_inclusion must be full or excluded");
+        }
+    }
+    if let Some(value) = tool.get("user_location")
+        && !value.is_null()
+    {
+        let location = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("tools[{index}].user_location must be an object"))?;
+        if location.get("type").and_then(Value::as_str) != Some("approximate") {
+            anyhow::bail!("tools[{index}].user_location.type must be approximate");
+        }
+        for field in ["city", "country", "region", "timezone"] {
+            if let Some(value) = location.get(field)
+                && !value.is_string()
+                && !value.is_null()
+            {
+                anyhow::bail!("tools[{index}].user_location.{field} must be a string");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_choice(
+    req: &MessagesRequest,
+    registered_tools: &HashMap<&str, bool>,
+) -> Result<(), anyhow::Error> {
+    let Some(choice) = req.extra.get("tool_choice") else {
+        return Ok(());
+    };
+    if let Some(choice) = choice.as_str() {
+        if !matches!(choice, "auto" | "none" | "any" | "required") {
+            anyhow::bail!("unsupported tool_choice: {choice}");
+        }
+        return Ok(());
+    }
+    let choice = choice
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("tool_choice must be a string or object"))?;
+    let choice_type = choice
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("tool_choice.type must be a string"))?;
+    if !matches!(choice_type, "auto" | "none" | "any" | "required" | "tool") {
+        anyhow::bail!("unsupported tool_choice.type: {choice_type}");
+    }
+    if let Some(value) = choice.get("disable_parallel_tool_use")
+        && !value.is_boolean()
+    {
+        anyhow::bail!("tool_choice.disable_parallel_tool_use must be a boolean");
+    }
+    if choice_type == "tool" {
+        let name = choice
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("tool_choice.name must be a non-empty string"))?;
+        let Some(allows_direct) = registered_tools.get(name) else {
+            anyhow::bail!("tool_choice references unknown tool: {name}");
+        };
+        if !allows_direct {
+            anyhow::bail!("tool_choice cannot force tool {name} because it disallows direct calls");
+        }
+    }
+    Ok(())
+}
+
+fn validate_effective_tool_choice(
+    req: &MessagesRequest,
+    tool_plan: &ToolPlan,
+    input: &[ResponsesInputItem],
+) -> Result<(), anyhow::Error> {
+    let requires_tool = match req.extra.get("tool_choice") {
+        Some(Value::String(value)) => matches!(value.as_str(), "any" | "required"),
+        Some(Value::Object(choice)) => choice
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "any" | "required")),
+        _ => false,
+    };
+    if !requires_tool {
+        return Ok(());
+    }
+    let has_initial = tool_plan
+        .initial
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty());
+    let has_loaded_deferred = input.iter().any(|item| {
+        matches!(item, ResponsesInputItem::AdditionalTools { tools, .. } if !tools.is_empty())
+    });
+    if !has_initial && !has_loaded_deferred {
+        anyhow::bail!("tool_choice requires a tool, but no directly callable tools are available");
+    }
+    Ok(())
+}
+
+fn validate_message_tool_history(req: &MessagesRequest) -> Result<(), anyhow::Error> {
+    let mut seen_use_ids = HashSet::new();
+    let mut pending_custom = HashSet::new();
+    let mut custom_use_order = Vec::new();
+    let mut pending_hosted: HashMap<String, String> = HashMap::new();
+    let mut hosted_use_order = Vec::new();
+    let mut hosted_mixed_pause = false;
+
+    for (message_index, message) in req.messages.iter().enumerate() {
+        let expects_custom_results = !pending_custom.is_empty();
+        if expects_custom_results && message.role != "user" {
+            let id = first_pending_id(&custom_use_order, &pending_custom);
+            anyhow::bail!(
+                "custom tool use id {id} must be resolved in the immediately following user message"
+            );
+        }
+        let expects_delayed_hosted_results =
+            hosted_mixed_pause && pending_custom.is_empty() && !pending_hosted.is_empty();
+        if expects_delayed_hosted_results && message.role != "assistant" {
+            let id = first_pending_id(&hosted_use_order, &pending_hosted);
+            anyhow::bail!(
+                "delayed hosted tool use id {id} must be resolved at the start of the next assistant message"
+            );
+        }
+
+        let blocks = match &message.content {
+            Value::String(_) => {
+                if expects_custom_results {
+                    let id = first_pending_id(&custom_use_order, &pending_custom);
+                    anyhow::bail!(
+                        "custom tool use id {id} must be resolved in the immediately following user message"
+                    );
+                }
+                if expects_delayed_hosted_results {
+                    let id = first_pending_id(&hosted_use_order, &pending_hosted);
+                    anyhow::bail!(
+                        "delayed hosted tool use id {id} must be resolved at the start of the next assistant message"
+                    );
+                }
+                continue;
+            }
+            Value::Array(blocks) => blocks,
+            _ => anyhow::bail!("messages[{message_index}].content must be a string or array"),
+        };
+        let mut saw_non_tool_result = false;
+        let mixed_pause_user_message = expects_custom_results && !pending_hosted.is_empty();
+        let mut resolving_delayed_hosted = expects_delayed_hosted_results;
+
+        for (block_index, block) in blocks.iter().enumerate() {
+            let Some(block) = block.as_object() else {
+                anyhow::bail!("messages[{message_index}].content[{block_index}] must be an object");
+            };
+            let Some(kind) = block.get("type").and_then(Value::as_str) else {
+                anyhow::bail!(
+                    "messages[{message_index}].content[{block_index}].type must be a string"
+                );
+            };
+
+            if mixed_pause_user_message && kind != "tool_result" {
+                anyhow::bail!(
+                    "messages[{message_index}] must contain only client tool_result blocks while hosted tools are paused"
+                );
+            }
+            if expects_custom_results && kind == "tool_result" {
+                if saw_non_tool_result {
+                    anyhow::bail!(
+                        "messages[{message_index}].content[{block_index}] tool_result blocks must precede text and other content"
+                    );
+                }
+            } else if expects_custom_results {
+                saw_non_tool_result = true;
+            }
+
+            if resolving_delayed_hosted {
+                if !is_hosted_tool_result_type(kind) {
+                    let id = first_pending_id(&hosted_use_order, &pending_hosted);
+                    anyhow::bail!(
+                        "delayed hosted tool use id {id} must be resolved before other assistant content"
+                    );
+                }
+                let id = validate_hosted_tool_result_id(block, message_index, block_index)?;
+                resolve_hosted_tool_result(&mut pending_hosted, id, kind)?;
+                if pending_hosted.is_empty() {
+                    resolving_delayed_hosted = false;
+                    hosted_mixed_pause = false;
+                }
+                continue;
+            }
+
+            if kind == "tool_use" {
+                if message.role != "assistant" {
+                    anyhow::bail!(
+                        "messages[{message_index}].content[{block_index}] tool_use must have assistant role"
+                    );
+                }
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "messages[{message_index}].content[{block_index}].id must be a non-empty string"
+                        )
+                    })?;
+                if !seen_use_ids.insert(id.to_string()) {
+                    anyhow::bail!("duplicate tool use id: {id}");
+                }
+                if block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    anyhow::bail!(
+                        "messages[{message_index}].content[{block_index}].name must be a non-empty string"
+                    );
+                }
+                if !block.get("input").is_some_and(Value::is_object) {
+                    anyhow::bail!(
+                        "messages[{message_index}].content[{block_index}].input must be an object"
+                    );
+                }
+                pending_custom.insert(id.to_string());
+                custom_use_order.push(id.to_string());
+            } else if kind == "server_tool_use" {
+                if message.role != "assistant" {
+                    anyhow::bail!(
+                        "messages[{message_index}].content[{block_index}] server_tool_use must have assistant role"
+                    );
+                }
+                let id = validate_tool_use_identity(block, message_index, block_index)?;
+                if !seen_use_ids.insert(id.to_string()) {
+                    anyhow::bail!("duplicate tool use id: {id}");
+                }
+                if !block.contains_key("input") {
+                    anyhow::bail!(
+                        "messages[{message_index}].content[{block_index}].input is required"
+                    );
+                }
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .expect("tool identity validation guarantees a name");
+                let expected_result = hosted_tool_result_kind(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "messages[{message_index}].content[{block_index}] unsupported server tool name: {name}"
+                    )
+                })?;
+                pending_hosted.insert(id.to_string(), expected_result.to_string());
+                hosted_use_order.push(id.to_string());
+            } else if kind == "tool_result" {
+                if message.role != "user" {
+                    anyhow::bail!(
+                        "messages[{message_index}].content[{block_index}] tool_result must have user role"
+                    );
+                }
+                let id = validate_tool_result_block(block, message_index, block_index)?;
+                if !pending_custom.remove(id) {
+                    anyhow::bail!(
+                        "tool result references unknown tool use id (already resolved or not-yet-seen): {id}"
+                    );
+                }
+            } else if is_hosted_tool_result_type(kind) {
+                if message.role != "assistant" {
+                    anyhow::bail!(
+                        "messages[{message_index}].content[{block_index}] {kind} must have assistant role"
+                    );
+                }
+                let id = validate_hosted_tool_result_id(block, message_index, block_index)?;
+                resolve_hosted_tool_result(&mut pending_hosted, id, kind)?;
+            }
+        }
+
+        if expects_custom_results && !pending_custom.is_empty() {
+            let id = first_pending_id(&custom_use_order, &pending_custom);
+            anyhow::bail!(
+                "custom tool use id {id} must be resolved in the immediately following user message"
+            );
+        }
+
+        if resolving_delayed_hosted {
+            let id = first_pending_id(&hosted_use_order, &pending_hosted);
+            anyhow::bail!(
+                "delayed hosted tool use id {id} must be resolved at the start of the next assistant message"
+            );
+        }
+        if message.role == "assistant" && !pending_hosted.is_empty() {
+            if pending_custom.is_empty() {
+                let id = first_pending_id(&hosted_use_order, &pending_hosted);
+                anyhow::bail!("unresolved server tool use id: {id}");
+            }
+            hosted_mixed_pause = true;
+        }
+    }
+
+    if let Some(id) = custom_use_order
+        .iter()
+        .find(|id| pending_custom.contains(id.as_str()))
+    {
+        anyhow::bail!("unresolved custom tool use id: {id}");
+    }
+    if let Some(id) = hosted_use_order
+        .iter()
+        .find(|id| pending_hosted.contains_key(id.as_str()))
+    {
+        anyhow::bail!("unresolved server tool use id: {id}");
+    }
+    Ok(())
+}
+
+trait PendingToolIds {
+    fn contains_pending(&self, id: &str) -> bool;
+}
+
+impl PendingToolIds for HashSet<String> {
+    fn contains_pending(&self, id: &str) -> bool {
+        self.contains(id)
+    }
+}
+
+impl PendingToolIds for HashMap<String, String> {
+    fn contains_pending(&self, id: &str) -> bool {
+        self.contains_key(id)
+    }
+}
+
+fn first_pending_id<'a>(order: &'a [String], pending: &impl PendingToolIds) -> &'a str {
+    order
+        .iter()
+        .find(|id| pending.contains_pending(id))
+        .expect("pending tool ids originate from the recorded use order")
+}
+
+fn resolve_hosted_tool_result(
+    pending: &mut HashMap<String, String>,
+    id: &str,
+    actual_kind: &str,
+) -> Result<(), anyhow::Error> {
+    let Some(expected_kind) = pending.get(id) else {
+        anyhow::bail!(
+            "hosted tool result references unknown server tool use id (already resolved or not-yet-seen): {id}"
+        );
+    };
+    if actual_kind != expected_kind {
+        anyhow::bail!(
+            "hosted tool result kind mismatch for server tool use id {id}: expected {expected_kind}, got {actual_kind}"
+        );
+    }
+    pending.remove(id);
+    Ok(())
+}
+
+fn validate_tool_use_identity(
+    block: &serde_json::Map<String, Value>,
+    message_index: usize,
+    block_index: usize,
+) -> Result<&str, anyhow::Error> {
+    let id = block
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "messages[{message_index}].content[{block_index}].id must be a non-empty string"
+            )
+        })?;
+    if block
+        .get("name")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        anyhow::bail!(
+            "messages[{message_index}].content[{block_index}].name must be a non-empty string"
+        );
+    }
+    Ok(id)
+}
+
+fn is_hosted_tool_result_type(kind: &str) -> bool {
+    kind != "tool_result" && kind.ends_with("_tool_result")
+}
+
+fn hosted_tool_result_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "web_search" => Some("web_search_tool_result"),
+        "web_fetch" => Some("web_fetch_tool_result"),
+        "code_execution" => Some("code_execution_tool_result"),
+        "bash_code_execution" => Some("bash_code_execution_tool_result"),
+        "text_editor_code_execution" => Some("text_editor_code_execution_tool_result"),
+        "tool_search_tool_regex" | "tool_search_tool_bm25" => Some("tool_search_tool_result"),
+        // Compatibility for transcripts emitted by older cg builds. This is
+        // accepted as history but is not generated by the Codex translator.
+        "x_search" => Some("x_search_tool_result"),
+        _ => None,
+    }
+}
+
+fn validate_hosted_tool_result_id(
+    block: &serde_json::Map<String, Value>,
+    message_index: usize,
+    block_index: usize,
+) -> Result<&str, anyhow::Error> {
+    block
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "messages[{message_index}].content[{block_index}].tool_use_id must be a non-empty string"
+            )
+        })
+}
+
+fn validate_tool_result_block(
+    block: &serde_json::Map<String, Value>,
+    message_index: usize,
+    block_index: usize,
+) -> Result<&str, anyhow::Error> {
+    let id = block
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "messages[{message_index}].content[{block_index}].tool_use_id must be a non-empty string"
+            )
+        })?;
+    if let Some(value) = block.get("is_error")
+        && !value.is_boolean()
+    {
+        anyhow::bail!(
+            "messages[{message_index}].content[{block_index}].is_error must be a boolean"
+        );
+    }
+    let Some(content) = block.get("content") else {
+        return Ok(id);
+    };
+    match content {
+        Value::String(_) => {}
+        Value::Array(children) => {
+            for (child_index, child) in children.iter().enumerate() {
+                validate_tool_result_child(child, message_index, block_index, child_index)?;
+            }
+        }
+        _ => anyhow::bail!(
+            "messages[{message_index}].content[{block_index}].content must be a string or array"
+        ),
+    }
+    Ok(id)
+}
+
+fn validate_tool_result_child(
+    child: &Value,
+    message_index: usize,
+    block_index: usize,
+    child_index: usize,
+) -> Result<(), anyhow::Error> {
+    let child = child.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "messages[{message_index}].content[{block_index}].content[{child_index}] must be an object"
+        )
+    })?;
+    let kind = child.get("type").and_then(Value::as_str).ok_or_else(|| {
+        anyhow::anyhow!(
+            "messages[{message_index}].content[{block_index}].content[{child_index}].type must be a string"
+        )
+    })?;
+    if !matches!(
+        kind,
+        "text" | "image" | "search_result" | "document" | "tool_reference"
+    ) {
+        anyhow::bail!(
+            "unsupported tool result content type at messages[{message_index}].content[{block_index}].content[{child_index}]: {kind}"
+        );
+    }
+    if kind == "text" && !child.get("text").is_some_and(Value::is_string) {
+        anyhow::bail!("tool result text block must contain a string text field");
+    }
+    if kind == "tool_reference"
+        && child
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        anyhow::bail!("tool_reference block must contain a non-empty tool_name");
+    }
+    if matches!(kind, "image" | "document") && !child.get("source").is_some_and(Value::is_object) {
+        anyhow::bail!("tool result {kind} block must contain an object source field");
+    }
+    Ok(())
+}
+
+fn read_tools(req: &MessagesRequest) -> Result<ToolPlan, anyhow::Error> {
     let Some(tools) = req.extra.get("tools") else {
-        return Ok(None);
+        return Ok(ToolPlan::default());
     };
-    let tools_arr = match tools {
-        Value::Array(a) => a,
-        _ => return Ok(None),
-    };
-    let mut out = Vec::new();
+    let tools_arr = tools
+        .as_array()
+        .expect("tool contract validation guarantees an array");
+    let forced_name = forced_tool_name(req);
+    let mut initial = Vec::new();
+    let mut deferred = HashMap::new();
+
     for tool in tools_arr {
         let tool_type = tool
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("function");
-        if tool_type == "web_search_20250305" {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .expect("tool contract validation guarantees a name")
+            .to_string();
+
+        // Codex has no equivalent for Anthropic's programmatic callers. Never
+        // expose a tool directly when the request explicitly forbids direct
+        // use; silently exposing it would widen permissions.
+        if !tool_allows_direct_calls(tool, tool_type) {
+            continue;
+        }
+
+        let translated = if is_supported_web_search_type(tool_type) {
             let mut filters = ResponsesWebSearchFilters {
                 allowed_domains: None,
                 blocked_domains: None,
             };
-            let allowed = tool.get("allowed_domains").and_then(|v| v.as_array());
-            if allowed.is_some_and(|a| !a.is_empty()) {
-                filters.allowed_domains = allowed.map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                });
+            if let Some(allowed) = read_string_array(tool, "allowed_domains")
+                && !allowed.is_empty()
+            {
+                filters.allowed_domains = Some(allowed);
             }
-            let blocked = tool.get("blocked_domains").and_then(|v| v.as_array());
-            if blocked.is_some_and(|a| !a.is_empty()) {
-                filters.blocked_domains = blocked.map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                });
+            if let Some(blocked) = read_string_array(tool, "blocked_domains")
+                && !blocked.is_empty()
+            {
+                filters.blocked_domains = Some(blocked);
             }
             let has_filters =
                 filters.allowed_domains.is_some() || filters.blocked_domains.is_some();
-            out.push(ResponsesTool::WebSearch(ResponsesWebSearchTool {
+            ResponsesTool::WebSearch(ResponsesWebSearchTool {
                 kind: "web_search".to_string(),
                 external_web_access: true,
                 search_content_types: vec!["text".to_string(), "image".to_string()],
                 filters: if has_filters { Some(filters) } else { None },
-            }));
+                user_location: read_web_search_user_location(tool),
+            })
         } else {
-            let name = tool
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
             let description = tool
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -596,19 +1313,113 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 .unwrap_or(serde_json::json!({}));
             let description = codex_tool_description(&name, description);
             let parameters = codex_tool_parameters(&name, parameters);
-            out.push(ResponsesTool::Function(ResponsesFunctionTool {
+            let strict_requested = tool.get("strict").and_then(Value::as_bool) == Some(true);
+            let strict = strict_requested && strict_schema_is_supported(&parameters);
+            ResponsesTool::Function(ResponsesFunctionTool {
                 kind: "function".to_string(),
-                name,
+                name: name.clone(),
                 description,
                 parameters,
-                strict: false,
-            }));
+                strict,
+            })
+        };
+
+        let wants_deferred = tool
+            .get("defer_loading")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let forced = forced_name.is_some_and(|forced| forced == name);
+        if wants_deferred && !forced {
+            deferred.insert(name, translated);
+        } else {
+            initial.push(translated);
         }
     }
-    if out.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(out))
+
+    Ok(ToolPlan {
+        initial: (!initial.is_empty()).then_some(initial),
+        deferred,
+    })
+}
+
+fn forced_tool_name(req: &MessagesRequest) -> Option<&str> {
+    let choice = req.extra.get("tool_choice")?.as_object()?;
+    (choice.get("type")?.as_str()? == "tool")
+        .then(|| choice.get("name").and_then(Value::as_str))
+        .flatten()
+}
+
+fn tool_allows_direct_calls(tool: &Value, tool_type: &str) -> bool {
+    let direct_by_default = !matches!(tool_type, "web_search_20260209" | "web_search_20260318");
+    match tool.get("allowed_callers") {
+        Some(Value::Array(callers)) => callers
+            .iter()
+            .any(|caller| caller.as_str() == Some("direct")),
+        Some(Value::Null) | None => direct_by_default,
+        Some(_) => false,
+    }
+}
+
+fn read_string_array(tool: &Value, field: &str) -> Option<Vec<String>> {
+    tool.get(field).and_then(Value::as_array).map(|values| {
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn read_web_search_user_location(tool: &Value) -> Option<ResponsesWebSearchUserLocation> {
+    let location = tool.get("user_location")?.as_object()?;
+    Some(ResponsesWebSearchUserLocation {
+        r#type: "approximate".to_string(),
+        city: location
+            .get("city")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        country: location
+            .get("country")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        region: location
+            .get("region")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        timezone: location
+            .get("timezone")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn strict_schema_is_supported(schema: &Value) -> bool {
+    match schema {
+        Value::Array(values) => values.iter().all(strict_schema_is_supported),
+        Value::Object(object) => {
+            let is_object_schema = object.get("type").and_then(Value::as_str) == Some("object")
+                || object.contains_key("properties");
+            if is_object_schema {
+                let Some(properties) = object.get("properties").and_then(Value::as_object) else {
+                    return false;
+                };
+                if object.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
+                    return false;
+                }
+                let Some(required) = object.get("required").and_then(Value::as_array) else {
+                    return properties.is_empty();
+                };
+                let required: HashSet<&str> = required.iter().filter_map(Value::as_str).collect();
+                if properties
+                    .keys()
+                    .any(|key| !required.contains(key.as_str()))
+                {
+                    return false;
+                }
+            }
+            object.values().all(strict_schema_is_supported)
+        }
+        _ => true,
     }
 }
 
@@ -688,7 +1499,9 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
             let tools = req.extra.get("tools").and_then(|v| v.as_array());
             let is_web_search = tools.is_some_and(|t| {
                 t.iter().any(|tool| {
-                    (tool.get("type").and_then(|v| v.as_str()) == Some("web_search_20250305"))
+                    tool.get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_supported_web_search_type)
                         && tool.get("name").and_then(|v| v.as_str()) == Some(name)
                 })
             });
@@ -718,31 +1531,41 @@ fn parallel_tool_calls_enabled(req: &MessagesRequest) -> bool {
         .unwrap_or(false)
 }
 
-fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
+enum CodexInputBlock {
+    Native(ContentBlock),
+    PreservedText(String),
+}
+
+fn build_input(
+    req: &MessagesRequest,
+    deferred_tools: &HashMap<String, ResponsesTool>,
+) -> Vec<ResponsesInputItem> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
+    let mut loaded_deferred_tools = HashSet::new();
 
     for msg in &req.messages {
-        let blocks = normalize_content(&msg.content, Value::Null);
+        let blocks = codex_input_blocks(&msg.content);
         match msg.role.as_str() {
             "user" => {
                 let mut parts: Vec<ResponsesContentPart> = Vec::new();
                 for block in &blocks {
                     match block {
-                        ContentBlock::Text { text } => {
+                        CodexInputBlock::Native(ContentBlock::Text { text })
+                        | CodexInputBlock::PreservedText(text) => {
                             parts.push(ResponsesContentPart::InputText { text: text.clone() });
                         }
-                        ContentBlock::Image { source } => {
+                        CodexInputBlock::Native(ContentBlock::Image { source }) => {
                             parts.push(ResponsesContentPart::InputImage {
                                 image_url: image_source_to_url(source),
                                 detail: None,
                             });
                         }
-                        ContentBlock::ToolResult {
+                        CodexInputBlock::Native(ContentBlock::ToolResult {
                             tool_use_id,
                             content,
                             is_error,
-                        } => {
+                        }) => {
                             if !parts.is_empty() {
                                 out.push(ResponsesInputItem::Message {
                                     role: "user".to_string(),
@@ -763,6 +1586,18 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                 call_id: tool_use_id.clone(),
                                 output,
                             });
+                            let additions = deferred_tools_for_result(
+                                content,
+                                deferred_tools,
+                                &mut loaded_deferred_tools,
+                            );
+                            if !additions.is_empty() {
+                                out.push(ResponsesInputItem::AdditionalTools {
+                                    id: None,
+                                    role: "developer".to_string(),
+                                    tools: additions,
+                                });
+                            }
                         }
                         _ => {}
                     }
@@ -778,7 +1613,8 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                 let parts: Vec<ResponsesContentPart> = blocks
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::Text { text } => {
+                        CodexInputBlock::Native(ContentBlock::Text { text })
+                        | CodexInputBlock::PreservedText(text) => {
                             Some(ResponsesContentPart::InputText { text: text.clone() })
                         }
                         _ => None,
@@ -805,11 +1641,12 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                     };
                 for block in &blocks {
                     match block {
-                        ContentBlock::Text { text } => {
+                        CodexInputBlock::Native(ContentBlock::Text { text })
+                        | CodexInputBlock::PreservedText(text) => {
                             text_parts
                                 .push(ResponsesContentPart::OutputText { text: text.clone() });
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
+                        CodexInputBlock::Native(ContentBlock::ToolUse { id, name, input }) => {
                             flush_text(&mut out, &mut text_parts);
                             if is_read_tool_use_with_offset(name, input) {
                                 read_tool_uses_with_offset.insert(id.clone());
@@ -822,7 +1659,7 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                 arguments: args,
                             });
                         }
-                        ContentBlock::Thinking { signature, .. } => {
+                        CodexInputBlock::Native(ContentBlock::Thinking { signature, .. }) => {
                             let Some(replay) =
                                 signature.as_deref().and_then(decode_reasoning_signature)
                             else {
@@ -844,6 +1681,61 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
     }
 
     out
+}
+
+fn codex_input_blocks(content: &Value) -> Vec<CodexInputBlock> {
+    match content {
+        Value::String(_) => normalize_content(content, Value::Null)
+            .into_iter()
+            .map(CodexInputBlock::Native)
+            .collect(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| {
+                let normalized = normalize_content(&Value::Array(vec![block.clone()]), Value::Null);
+                if let Some(block) = normalized.into_iter().next() {
+                    return Some(CodexInputBlock::Native(block));
+                }
+                let kind = block.get("type").and_then(Value::as_str)?;
+                (matches!(kind, "server_tool_use" | "document" | "search_result")
+                    || is_hosted_tool_result_type(kind))
+                .then(|| CodexInputBlock::PreservedText(preserved_anthropic_block_text(block)))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn preserved_anthropic_block_text(block: &Value) -> String {
+    let kind = block
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let encoded = serde_json::to_string(block).unwrap_or_else(|_| "null".to_string());
+    format!("[Anthropic {kind} block]\n{encoded}")
+}
+
+fn deferred_tools_for_result(
+    content: &Value,
+    deferred_tools: &HashMap<String, ResponsesTool>,
+    loaded: &mut HashSet<String>,
+) -> Vec<Value> {
+    let Some(blocks) = content.as_array() else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_reference"))
+        .filter_map(|block| block.get("tool_name").and_then(Value::as_str))
+        .filter_map(|name| {
+            if !loaded.insert(name.to_string()) {
+                return None;
+            }
+            deferred_tools
+                .get(name)
+                .and_then(|tool| serde_json::to_value(tool).ok())
+        })
+        .collect()
 }
 
 fn is_read_tool_use_with_offset(name: &str, input: &Value) -> bool {
@@ -964,10 +1856,11 @@ fn tool_result_to_output(content: &Value) -> ResponsesFunctionCallOutput {
                         text_parts.push(text.clone());
                         content_parts.push(ResponsesFunctionCallOutputContent::InputText { text });
                     }
-                    Some(other) => {
-                        let text = format!("[unsupported content block omitted: {other}]");
-                        text_parts.push(text.clone());
-                        content_parts.push(ResponsesFunctionCallOutputContent::InputText { text });
+                    Some("document" | "search_result") => {
+                        push_preserved_tool_result_block(b, &mut text_parts, &mut content_parts)
+                    }
+                    Some(_) => {
+                        push_preserved_tool_result_block(b, &mut text_parts, &mut content_parts)
                     }
                     None => {
                         push_unsupported_tool_result_block(b, &mut text_parts, &mut content_parts)
@@ -1008,6 +1901,14 @@ fn tool_result_image_url(block: &Value) -> Option<String> {
 }
 
 fn push_unsupported_tool_result_block(
+    block: &Value,
+    text_parts: &mut Vec<String>,
+    content_parts: &mut Vec<ResponsesFunctionCallOutputContent>,
+) {
+    push_preserved_tool_result_block(block, text_parts, content_parts);
+}
+
+fn push_preserved_tool_result_block(
     block: &Value,
     text_parts: &mut Vec<String>,
     content_parts: &mut Vec<ResponsesFunctionCallOutputContent>,
@@ -1087,7 +1988,8 @@ fn unsupported_tool_result_block_to_string(block: &Value) -> String {
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    format!("[unsupported content block omitted: {kind}]")
+    let encoded = serde_json::to_string(block).unwrap_or_else(|_| "null".to_string());
+    format!("[Anthropic {kind} tool result block]\n{encoded}")
 }
 
 #[cfg(test)]
@@ -1154,6 +2056,255 @@ mod tests {
             Some(&["example.com".to_string()][..])
         );
         assert!(out.instructions.is_none());
+        assert_eq!(
+            out.include.as_ref().unwrap(),
+            &vec![
+                "reasoning.encrypted_content".to_string(),
+                "web_search_call.action.sources".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn all_current_web_search_versions_use_hosted_tool_and_location() {
+        for version in [
+            "web_search_20250305",
+            "web_search_20260209",
+            "web_search_20260318",
+        ] {
+            let mut body = json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"find it"}],
+                "tools":[{
+                    "type":version,
+                    "name":"web_search",
+                    "allowed_callers":["direct"],
+                    "max_uses":3,
+                    "user_location":{
+                        "type":"approximate",
+                        "city":"Nanjing",
+                        "country":"CN",
+                        "timezone":"Asia/Shanghai"
+                    }
+                }]
+            });
+            if version == "web_search_20260318" {
+                body["tools"][0]["response_inclusion"] = json!("excluded");
+            }
+            let req: MessagesRequest = serde_json::from_value(body).unwrap();
+            let out = translate_request(&req, opts()).unwrap();
+            let ResponsesTool::WebSearch(tool) = &out.tools.as_ref().unwrap()[0] else {
+                panic!("expected hosted web search for {version}");
+            };
+            assert_eq!(
+                tool.user_location,
+                Some(ResponsesWebSearchUserLocation {
+                    r#type: "approximate".to_string(),
+                    city: Some("Nanjing".to_string()),
+                    country: Some("CN".to_string()),
+                    region: None,
+                    timezone: Some("Asia/Shanghai".to_string()),
+                })
+            );
+            assert!(has_hosted_web_search(&req));
+            assert!(
+                out.instructions
+                    .as_deref()
+                    .unwrap()
+                    .contains("Best-effort compatibility limit")
+            );
+            assert!(
+                !serde_json::to_value(tool)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .contains_key("response_inclusion")
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_default_callers_follow_version_semantics() {
+        let legacy: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"find it"}],
+            "tools":[{"type":"web_search_20250305", "name":"web_search"}]
+        }))
+        .unwrap();
+        let legacy_out = translate_request(&legacy, opts()).unwrap();
+        assert!(legacy_out.tools.as_ref().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| matches!(tool, ResponsesTool::WebSearch(_)))
+        }));
+
+        for version in ["web_search_20260209", "web_search_20260318"] {
+            let implicit_code_only: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"find it"}],
+                "tools":[{"type":version, "name":"web_search"}]
+            }))
+            .unwrap();
+            let out = translate_request(&implicit_code_only, opts()).unwrap();
+            assert!(out.tools.is_none(), "{version} must not default to direct");
+            assert!(!has_hosted_web_search(&implicit_code_only));
+
+            let explicit_direct: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"find it"}],
+                "tools":[{
+                    "type":version,
+                    "name":"web_search",
+                    "allowed_callers":["direct"]
+                }]
+            }))
+            .unwrap();
+            let out = translate_request(&explicit_direct, opts()).unwrap();
+            assert!(out.tools.as_ref().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| matches!(tool, ResponsesTool::WebSearch(_)))
+            }));
+            assert!(has_hosted_web_search(&explicit_direct));
+        }
+    }
+
+    #[test]
+    fn nullable_anthropic_tool_fields_follow_omitted_field_defaults() {
+        let custom: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"run"}],
+            "tools":[{
+                "type":null,
+                "name":"NullableCustom",
+                "input_schema":{"type":"object"},
+                "defer_loading":null,
+                "strict":null,
+                "eager_input_streaming":null,
+                "allowed_callers":null
+            }]
+        }))
+        .unwrap();
+        let custom_out = translate_request(&custom, opts()).unwrap();
+        let Some(ResponsesTool::Function(tool)) = custom_out.tools.as_ref().unwrap().first() else {
+            panic!("nullable custom tool type must default to a function tool");
+        };
+        assert_eq!(tool.name, "NullableCustom");
+        assert!(!tool.strict);
+
+        for (version, expected_direct) in [
+            ("web_search_20250305", true),
+            ("web_search_20260209", false),
+            ("web_search_20260318", false),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"find it"}],
+                "tools":[{
+                    "type":version,
+                    "name":"web_search",
+                    "allowed_callers":null,
+                    "allowed_domains":null,
+                    "blocked_domains":null,
+                    "max_uses":null,
+                    "user_location":null,
+                    "response_inclusion":null
+                }]
+            }))
+            .unwrap();
+            let out = translate_request(&req, opts()).unwrap();
+            assert_eq!(out.tools.is_some(), expected_direct, "{version}");
+            assert_eq!(has_hosted_web_search(&req), expected_direct, "{version}");
+            if expected_direct {
+                let Some(ResponsesTool::WebSearch(tool)) = out.tools.as_ref().unwrap().first()
+                else {
+                    panic!("expected hosted web search for {version}");
+                };
+                assert!(tool.filters.is_none());
+                assert!(tool.user_location.is_none());
+            }
+        }
+
+        let current_direct: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"find it"}],
+            "tools":[{
+                "type":"web_search_20260318",
+                "name":"web_search",
+                "allowed_callers":["direct"],
+                "allowed_domains":null,
+                "blocked_domains":null,
+                "max_uses":null,
+                "user_location":null,
+                "response_inclusion":null
+            }]
+        }))
+        .unwrap();
+        assert!(translate_request(&current_direct, opts()).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_web_search_version_and_conflicting_domains() {
+        let unknown: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"find it"}],
+            "tools":[{"type":"web_search_20990101", "name":"web_search"}]
+        }))
+        .unwrap();
+        assert!(
+            translate_request(&unknown, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+
+        let conflicting: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"find it"}],
+            "tools":[{
+                "type":"web_search_20260318",
+                "name":"web_search",
+                "allowed_domains":["example.com"],
+                "blocked_domains":["spam.example"]
+            }]
+        }))
+        .unwrap();
+        assert!(
+            translate_request(&conflicting, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("cannot specify both")
+        );
+
+        for (version, inclusion, expected) in [
+            (
+                "web_search_20260209",
+                "full",
+                "requires web_search_20260318",
+            ),
+            (
+                "web_search_20260318",
+                "citations",
+                "must be full or excluded",
+            ),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"find it"}],
+                "tools":[{
+                    "type":version,
+                    "name":"web_search",
+                    "allowed_callers":["direct"],
+                    "response_inclusion":inclusion
+                }]
+            }))
+            .unwrap();
+            let error = translate_request(&req, opts()).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -1164,7 +2315,6 @@ mod tests {
             "tools": [{
                 "type":"web_search_20250305",
                 "name":"web_search",
-                "allowed_domains":["example.com"],
                 "blocked_domains":["spam.example"]
             }],
             "tool_choice": {"type":"auto"}
@@ -1176,10 +2326,7 @@ mod tests {
         };
         assert!(tool.external_web_access);
         let filters = tool.filters.as_ref().unwrap();
-        assert_eq!(
-            filters.allowed_domains.as_deref(),
-            Some(&["example.com".to_string()][..])
-        );
+        assert!(filters.allowed_domains.is_none());
         assert_eq!(
             filters.blocked_domains.as_deref(),
             Some(&["spam.example".to_string()][..])
@@ -1246,8 +2393,7 @@ mod tests {
             "tools": [{
                 "type":"web_search_20250305",
                 "name":"web_search",
-                "allowed_domains":["a.example", "b.example"],
-                "blocked_domains":["spam.example"]
+                "allowed_domains":["a.example", "b.example"]
             }],
             "tool_choice": {"type":"tool", "name":"web_search"}
         }))
@@ -1261,10 +2407,7 @@ mod tests {
             filters.allowed_domains.as_deref(),
             Some(&["a.example".to_string(), "b.example".to_string()][..])
         );
-        assert_eq!(
-            filters.blocked_domains.as_deref(),
-            Some(&["spam.example".to_string()][..])
-        );
+        assert!(filters.blocked_domains.is_none());
         assert_eq!(out.instructions.as_deref(), Some("Be brief."));
         assert!(matches!(
             out.tool_choice,
@@ -1381,6 +2524,129 @@ mod tests {
     }
 
     #[test]
+    fn deferred_tools_load_only_after_historical_tool_reference() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[{
+                    "type":"tool_use", "id":"search_1", "name":"ToolSearch",
+                    "input":{"query":"deferred"}
+                }]},
+                {"role":"user", "content":[{
+                    "type":"tool_result", "tool_use_id":"search_1",
+                    "content":[
+                        {"type":"text", "text":"one match"},
+                        {"type":"tool_reference", "tool_name":"DeferredTool"}
+                    ]
+                }]}
+            ],
+            "tools":[
+                {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                {"name":"EagerTool", "input_schema":{"type":"object"}},
+                {"name":"DeferredTool", "defer_loading":true,
+                 "input_schema":{"type":"object", "properties":{"value":{"type":"string"}}}}
+            ]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        let initial_names: Vec<&str> = out
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| match tool {
+                ResponsesTool::Function(tool) => Some(tool.name.as_str()),
+                ResponsesTool::WebSearch(_) => None,
+            })
+            .collect();
+        assert_eq!(initial_names, ["ToolSearch", "EagerTool"]);
+
+        let additions: Vec<&Vec<Value>> = out
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                ResponsesInputItem::AdditionalTools { tools, .. } => Some(tools),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(additions.len(), 1);
+        assert_eq!(additions[0][0]["name"], "DeferredTool");
+    }
+
+    #[test]
+    fn referenced_deferred_web_search_requests_per_call_sources() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[{
+                    "type":"tool_use", "id":"search_1", "name":"ToolSearch", "input":{"query":"web"}
+                }]},
+                {"role":"user", "content":[{
+                    "type":"tool_result", "tool_use_id":"search_1", "content":[{
+                        "type":"tool_reference", "tool_name":"web_search"
+                    }]
+                }]}
+            ],
+            "tools":[
+                {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                {"type":"web_search_20260318", "name":"web_search", "defer_loading":true,
+                 "allowed_callers":["direct"]}
+            ]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(
+            out.include
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|value| { value == "web_search_call.action.sources" })
+        );
+        assert!(out.input.iter().any(|item| {
+            matches!(
+                item,
+                ResponsesInputItem::AdditionalTools { tools, .. }
+                    if tools.iter().any(|tool| tool["type"] == "web_search")
+            )
+        }));
+    }
+
+    #[test]
+    fn deferred_tool_is_kept_only_when_forced_without_a_reference() {
+        let forced: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"run"}],
+            "tools":[
+                {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                {"name":"DeferredTool", "defer_loading":true, "input_schema":{"type":"object"}}
+            ],
+            "tool_choice":{"type":"tool", "name":"DeferredTool"}
+        }))
+        .unwrap();
+        let out = translate_request(&forced, opts()).unwrap();
+        assert!(out.tools.as_ref().unwrap().iter().any(|tool| {
+            matches!(tool, ResponsesTool::Function(function) if function.name == "DeferredTool")
+        }));
+
+        let no_search: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"run"}],
+            "tools":[{
+                "name":"DeferredTool", "defer_loading":true, "input_schema":{"type":"object"}
+            }]
+        }))
+        .unwrap();
+        let out = translate_request(&no_search, opts()).unwrap();
+        assert!(out.tools.is_none());
+        assert!(
+            !serde_json::to_string(&out)
+                .unwrap()
+                .contains("DeferredTool")
+        );
+    }
+
+    #[test]
     fn translate_read_tool_adds_codex_offset_guidance() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
@@ -1471,6 +2737,71 @@ mod tests {
                 .and_then(Value::as_str),
             Some("record offset")
         );
+    }
+
+    #[test]
+    fn explicit_strict_preserves_optional_fields_and_degrades_when_incompatible() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"run"}],
+            "tools":[
+                {
+                    "name":"Compatible",
+                    "strict":true,
+                    "input_schema":{
+                        "type":"object",
+                        "properties":{"value":{"type":"string"}},
+                        "required":["value"],
+                        "additionalProperties":false
+                    }
+                },
+                {
+                    "name":"OptionalField",
+                    "strict":true,
+                    "input_schema":{
+                        "type":"object",
+                        "properties":{"value":{"type":"string"}},
+                        "additionalProperties":false
+                    }
+                },
+                {
+                    "name":"NotRequested",
+                    "strict":false,
+                    "input_schema":{
+                        "type":"object",
+                        "properties":{},
+                        "additionalProperties":false
+                    }
+                },
+                {
+                    "name":"EmptyStrict",
+                    "strict":true,
+                    "input_schema":{"type":"object"}
+                }
+            ]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let strict_values: Vec<bool> = out
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| match tool {
+                ResponsesTool::Function(tool) => tool.strict,
+                ResponsesTool::WebSearch(_) => false,
+            })
+            .collect();
+        assert_eq!(strict_values, [true, false, false, false]);
+        let ResponsesTool::Function(optional) = &out.tools.as_ref().unwrap()[1] else {
+            panic!("expected function tool");
+        };
+        assert!(optional.parameters.get("required").is_none());
+        assert_eq!(optional.parameters["additionalProperties"], false);
+        let ResponsesTool::Function(empty) = &out.tools.as_ref().unwrap()[3] else {
+            panic!("expected function tool");
+        };
+        assert_eq!(empty.parameters, json!({"type":"object"}));
     }
 
     #[test]
@@ -1659,14 +2990,19 @@ mod tests {
     fn translate_assistant_with_text_and_tool_use() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
-            "messages": [{"role":"assistant", "content": [
-                {"type":"text", "text":"answer"},
-                {"type":"tool_use", "id":"tu_1", "name":"search", "input": {"q":"rust"}}
-            ]}]
+            "messages": [
+                {"role":"assistant", "content": [
+                    {"type":"text", "text":"answer"},
+                    {"type":"tool_use", "id":"tu_1", "name":"search", "input": {"q":"rust"}}
+                ]},
+                {"role":"user", "content":[{
+                    "type":"tool_result", "tool_use_id":"tu_1", "content":"done"
+                }]}
+            ]
         }))
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
-        assert_eq!(out.input.len(), 2);
+        assert_eq!(out.input.len(), 3);
     }
 
     #[test]
@@ -1698,20 +3034,473 @@ mod tests {
     fn translate_tool_result_content() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
-            "messages": [{"role":"user", "content": [{
-                "type": "tool_result",
-                "tool_use_id": "tu_1",
-                "content": [{"type":"text", "text":"result"}]
-            }]}]
+            "messages": [
+                {"role":"assistant", "content": [{
+                    "type":"tool_use", "id":"tu_1", "name":"test", "input":{}
+                }]},
+                {"role":"user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu_1",
+                    "content": [{"type":"text", "text":"result"}]
+                }]}
+            ]
         }))
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
-        assert_eq!(out.input.len(), 1);
-        if let ResponsesInputItem::FunctionCallOutput { call_id, .. } = &out.input[0] {
+        assert_eq!(out.input.len(), 2);
+        if let ResponsesInputItem::FunctionCallOutput { call_id, .. } = &out.input[1] {
             assert_eq!(call_id, "tu_1");
         } else {
             panic!("expected FunctionCallOutput");
         }
+    }
+
+    #[test]
+    fn omitted_and_structured_tool_results_are_preserved() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[
+                    {"type":"tool_use", "id":"empty_1", "name":"Empty", "input":{}},
+                    {"type":"tool_use", "id":"rich_1", "name":"Rich", "input":{}}
+                ]},
+                {"role":"user", "content":[
+                    {"type":"tool_result", "tool_use_id":"empty_1"},
+                    {"type":"tool_result", "tool_use_id":"rich_1", "content":[
+                        {"type":"document", "source":{"type":"text", "media_type":"text/plain", "data":"document body"}},
+                        {"type":"search_result", "source":"https://example.test", "title":"Example", "content":[{"type":"text", "text":"search body"}]}
+                    ]}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let outputs: Vec<&ResponsesFunctionCallOutput> = out
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                ResponsesInputItem::FunctionCallOutput { output, .. } => Some(output),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(tool_result_text(outputs[0]), "");
+        let rich = tool_result_text(outputs[1]);
+        assert!(rich.contains("[Anthropic document tool result block]"));
+        assert!(rich.contains("document body"));
+        assert!(rich.contains("[Anthropic search_result tool result block]"));
+        assert!(rich.contains("https://example.test"));
+        assert!(rich.contains("search body"));
+    }
+
+    #[test]
+    fn rejects_duplicate_tools_unknown_choices_and_invalid_results() {
+        let duplicate: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"run"}],
+            "tools":[
+                {"name":"Same", "input_schema":{"type":"object"}},
+                {"name":"Same", "input_schema":{"type":"object"}}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            translate_request(&duplicate, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+
+        let missing_choice: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"run"}],
+            "tools":[{"name":"Known", "input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"tool", "name":"Missing"}
+        }))
+        .unwrap();
+        assert!(
+            translate_request(&missing_choice, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("unknown tool")
+        );
+
+        let unknown_result: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":[{
+                "type":"tool_result", "tool_use_id":"missing"
+            }]}]
+        }))
+        .unwrap();
+        assert!(
+            translate_request(&unknown_result, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("unknown tool use id")
+        );
+
+        let invalid_error: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[{
+                    "type":"tool_use", "id":"call_1", "name":"Known", "input":{}
+                }]},
+                {"role":"user", "content":[{
+                    "type":"tool_result", "tool_use_id":"call_1", "is_error":"yes"
+                }]}
+            ]
+        }))
+        .unwrap();
+        assert!(
+            translate_request(&invalid_error, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("is_error must be a boolean")
+        );
+    }
+
+    #[test]
+    fn tool_history_validation_enforces_roles_order_and_resolution() {
+        let cases = [
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[{"role":"user", "content":[{
+                        "type":"tool_use", "id":"call_1", "name":"Read", "input":{}
+                    }]}]
+                }),
+                "tool_use must have assistant role",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[{"role":"assistant", "content":[{
+                        "type":"tool_result", "tool_use_id":"call_1"
+                    }]}]
+                }),
+                "tool_result must have user role",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[
+                        {"role":"user", "content":[{
+                            "type":"tool_result", "tool_use_id":"call_1"
+                        }]},
+                        {"role":"assistant", "content":[{
+                            "type":"tool_use", "id":"call_1", "name":"Read", "input":{}
+                        }]}
+                    ]
+                }),
+                "not-yet-seen",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[
+                        {"role":"assistant", "content":[{
+                            "type":"tool_use", "id":"call_1", "name":"Read", "input":{}
+                        }]},
+                        {"role":"user", "content":[
+                            {"type":"tool_result", "tool_use_id":"call_1"},
+                            {"type":"tool_result", "tool_use_id":"call_1"}
+                        ]}
+                    ]
+                }),
+                "already resolved",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[{"role":"assistant", "content":[{
+                        "type":"tool_use", "id":"call_1", "name":"Read", "input":{}
+                    }]}]
+                }),
+                "unresolved custom tool use",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[{"role":"assistant", "content":[
+                        {"type":"web_search_tool_result", "tool_use_id":"srv_1", "content":[]},
+                        {"type":"server_tool_use", "id":"srv_1", "name":"web_search", "input":{}}
+                    ]}]
+                }),
+                "not-yet-seen",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[{"role":"user", "content":[{
+                        "type":"web_search_tool_result", "tool_use_id":"srv_1", "content":[]
+                    }]}]
+                }),
+                "must have assistant role",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[
+                        {"role":"assistant", "content":[{
+                            "type":"tool_use", "id":"call_1", "name":"Read", "input":{}
+                        }]},
+                        {"role":"user", "content":"not a tool result"},
+                        {"role":"user", "content":[{
+                            "type":"tool_result", "tool_use_id":"call_1"
+                        }]}
+                    ]
+                }),
+                "immediately following user message",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[
+                        {"role":"assistant", "content":[{
+                            "type":"tool_use", "id":"call_1", "name":"Read", "input":{}
+                        }]},
+                        {"role":"user", "content":[
+                            {"type":"text", "text":"before"},
+                            {"type":"tool_result", "tool_use_id":"call_1"}
+                        ]}
+                    ]
+                }),
+                "must precede text and other content",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[{"role":"assistant", "content":[
+                        {"type":"server_tool_use", "id":"srv_1", "name":"web_search", "input":{}},
+                        {"type":"x_search_tool_result", "tool_use_id":"srv_1", "content":[]}
+                    ]}]
+                }),
+                "kind mismatch",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[{"role":"assistant", "content":[
+                        {"type":"server_tool_use", "id":"srv_1", "name":"web_search", "input":{}},
+                        {"type":"web_search_tool_result", "tool_use_id":"srv_2", "content":[]}
+                    ]}]
+                }),
+                "unknown server tool use id",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[
+                        {"role":"assistant", "content":[
+                            {"type":"server_tool_use", "id":"srv_1", "name":"web_search", "input":{}},
+                            {"type":"tool_use", "id":"call_1", "name":"Read", "input":{}}
+                        ]},
+                        {"role":"user", "content":[
+                            {"type":"tool_result", "tool_use_id":"call_1"},
+                            {"type":"text", "text":"not allowed during the pause"}
+                        ]}
+                    ]
+                }),
+                "only client tool_result blocks",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[
+                        {"role":"assistant", "content":[
+                            {"type":"server_tool_use", "id":"srv_1", "name":"web_search", "input":{}},
+                            {"type":"tool_use", "id":"call_1", "name":"Read", "input":{}}
+                        ]},
+                        {"role":"user", "content":[{
+                            "type":"tool_result", "tool_use_id":"call_1"
+                        }]},
+                        {"role":"assistant", "content":[
+                            {"type":"text", "text":"too early"},
+                            {"type":"web_search_tool_result", "tool_use_id":"srv_1", "content":[]}
+                        ]}
+                    ]
+                }),
+                "before other assistant content",
+            ),
+            (
+                json!({
+                    "model":"gpt-5.6-sol",
+                    "messages":[
+                        {"role":"assistant", "content":[{
+                            "type":"server_tool_use", "id":"srv_1", "name":"web_search", "input":{}
+                        }]},
+                        {"role":"user", "content":"delayed"},
+                        {"role":"assistant", "content":[{
+                            "type":"web_search_tool_result", "tool_use_id":"srv_1", "content":[]
+                        }]}
+                    ]
+                }),
+                "unresolved server tool use",
+            ),
+        ];
+        for (body, expected) in cases {
+            let req: MessagesRequest = serde_json::from_value(body).unwrap();
+            let error = translate_request(&req, opts()).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_tool_histories_preserve_result_before_following_text() {
+        let custom: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[{
+                    "type":"tool_use", "id":"call_1", "name":"Read", "input":{}
+                }]},
+                {"role":"user", "content":[
+                    {"type":"tool_result", "tool_use_id":"call_1", "content":"done"},
+                    {"type":"text", "text":"continue"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let out = translate_request(&custom, opts()).unwrap();
+        assert!(matches!(
+            &out.input[0],
+            ResponsesInputItem::FunctionCall { call_id, .. } if call_id == "call_1"
+        ));
+        assert!(matches!(
+            &out.input[1],
+            ResponsesInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
+        ));
+        assert!(matches!(
+            &out.input[2],
+            ResponsesInputItem::Message { role, .. } if role == "user"
+        ));
+
+        let mixed_pause: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[
+                    {"type":"server_tool_use", "id":"srv_1", "name":"web_search", "input":{"query":"rust"}},
+                    {"type":"tool_use", "id":"call_1", "name":"Read", "input":{}}
+                ]},
+                {"role":"user", "content":[{
+                    "type":"tool_result", "tool_use_id":"call_1", "content":"done"
+                }]},
+                {"role":"assistant", "content":[
+                    {"type":"web_search_tool_result", "tool_use_id":"srv_1", "content":[]},
+                    {"type":"text", "text":"complete"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(translate_request(&mixed_pause, opts()).is_ok());
+    }
+
+    #[test]
+    fn hosted_tool_search_names_share_the_official_result_kind() {
+        for name in ["tool_search_tool_regex", "tool_search_tool_bm25"] {
+            let request: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"assistant", "content":[
+                    {"type":"server_tool_use", "id":"srv_search", "name":name, "input":{"query":"Read"}},
+                    {"type":"tool_search_tool_result", "tool_use_id":"srv_search", "content":[]}
+                ]}]
+            }))
+            .unwrap();
+            assert!(translate_request(&request, opts()).is_ok(), "name={name}");
+        }
+
+        let unknown: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"assistant", "content":[
+                {"type":"server_tool_use", "id":"srv_unknown", "name":"future_tool", "input":{}},
+                {"type":"future_tool_result", "tool_use_id":"srv_unknown", "content":[]}
+            ]}]
+        }))
+        .unwrap();
+        assert!(
+            translate_request(&unknown, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported server tool name")
+        );
+    }
+
+    #[test]
+    fn required_choice_rejects_when_all_tools_disallow_direct_calls() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"run"}],
+            "tools":[{
+                "name":"SandboxOnly",
+                "allowed_callers":["future_code_execution_version"],
+                "input_schema":{"type":"object"}
+            }],
+            "tool_choice":{"type":"any"}
+        }))
+        .unwrap();
+        assert!(
+            translate_request(&req, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("no directly callable tools")
+        );
+    }
+
+    #[test]
+    fn preserves_hosted_search_history_and_text_citations_as_context() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[
+                    {"type":"server_tool_use", "id":"srv_1", "name":"web_search", "input":{"query":"rust 2024"}},
+                    {"type":"web_search_tool_result", "tool_use_id":"srv_1", "content":[{
+                        "type":"web_search_result", "url":"https://example.test", "title":"Example", "encrypted_content":"opaque"
+                    }]},
+                    {"type":"text", "text":"Found it", "citations":[{"type":"web_search_result_location", "url":"https://example.test"}]}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        let encoded = serde_json::to_string(&out.input).unwrap();
+        assert!(encoded.contains("Anthropic server_tool_use block"));
+        assert!(encoded.contains("rust 2024"));
+        assert!(encoded.contains("Found it"));
+        assert!(encoded.contains("Anthropic web_search_tool_result block"));
+        assert!(encoded.contains("https://example.test"));
+        assert!(encoded.contains("opaque"));
+    }
+
+    #[test]
+    fn preserves_server_tool_history_with_non_object_input() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[
+                    {
+                        "type":"server_tool_use",
+                        "id":"srv_1",
+                        "name":"x_search",
+                        "input":"rust"
+                    },
+                    {
+                        "type":"x_search_tool_result",
+                        "tool_use_id":"srv_1",
+                        "content":[]
+                    }
+                ]},
+                {"role":"user", "content":"continue"}
+            ]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        let encoded = serde_json::to_string(&out.input).unwrap();
+        assert!(encoded.contains("Anthropic server_tool_use block"));
+        assert!(encoded.contains("rust"));
+        assert!(encoded.contains("Anthropic x_search_tool_result block"));
     }
 
     #[test]
@@ -1864,9 +3653,9 @@ mod tests {
                 {"type":"input_text", "text":"caption"},
                 {"type":"input_image", "image_url":"data:image/png;base64,abc"},
                 {"type":"input_image", "image_url":"https://example.invalid/a.png"},
-                {"type":"input_text", "text":"[unsupported content block omitted: text]"},
-                {"type":"input_text", "text":"[unsupported content block omitted: image]"},
-                {"type":"input_text", "text":"[unsupported content block omitted: unknown]"}
+                {"type":"input_text", "text":"[Anthropic text tool result block]\n{\"type\":\"text\"}"},
+                {"type":"input_text", "text":"[Anthropic image tool result block]\n{\"type\":\"image\"}"},
+                {"type":"input_text", "text":"[Anthropic unknown tool result block]\n{}"}
             ])
         );
     }

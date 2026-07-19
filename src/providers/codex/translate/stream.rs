@@ -136,7 +136,7 @@ fn emit_content_event(
                 &serde_json::json!({
                     "type": "content_block_start",
                     "index": index,
-                    "content_block": {"type": "text", "text": ""}
+                    "content_block": {"type": "text", "text": "", "citations": null}
                 }),
             );
             true
@@ -187,7 +187,8 @@ fn emit_content_event(
                         "type": "tool_use",
                         "id": id,
                         "name": name,
-                        "input": {}
+                        "input": {},
+                        "caller": {"type": "direct"}
                     }
                 }),
             );
@@ -321,7 +322,12 @@ pub fn translate_stream_bytes_with_traffic(
                     for block in &compat_blocks {
                         use super::web_search_compat::WebSearchCompatContent;
                         match &block.content {
-                            WebSearchCompatContent::ServerToolUse { id, name, input } => {
+                            WebSearchCompatContent::ServerToolUse {
+                                id,
+                                name,
+                                input,
+                                caller,
+                            } => {
                                 ensure_message_start(
                                     &mut out,
                                     traffic,
@@ -340,7 +346,8 @@ pub fn translate_stream_bytes_with_traffic(
                                             "type": "server_tool_use",
                                             "id": id,
                                             "name": name,
-                                            "input": {}
+                                            "input": {},
+                                            "caller": caller
                                         }
                                     }),
                                 );
@@ -370,6 +377,7 @@ pub fn translate_stream_bytes_with_traffic(
                             WebSearchCompatContent::WebSearchToolResult {
                                 tool_use_id,
                                 content: results,
+                                caller,
                             } => {
                                 let result_content: Vec<serde_json::Value> = results
                                     .iter()
@@ -378,6 +386,8 @@ pub fn translate_stream_bytes_with_traffic(
                                             "type": "web_search_result",
                                             "title": r.title,
                                             "url": r.url,
+                                            "encrypted_content": "",
+                                            "page_age": null,
                                         })
                                     })
                                     .collect();
@@ -392,6 +402,7 @@ pub fn translate_stream_bytes_with_traffic(
                                             "type": "web_search_tool_result",
                                             "tool_use_id": tool_use_id,
                                             "content": result_content,
+                                            "caller": caller,
                                         }
                                     }),
                                 );
@@ -524,6 +535,45 @@ mod tests {
     }
 
     #[test]
+    fn stream_marks_function_calls_as_direct_callers() {
+        let upstream = format!(
+            "{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                })
+            ),
+            sse_event(
+                "response.function_call_arguments.delta",
+                serde_json::json!({
+                    "output_index":0,"delta":"{\"file_path\":\"/tmp/a\"}"
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                serde_json::json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"/tmp/a\"}"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                serde_json::json!({
+                    "response":{"id":"resp_1","usage":{"input_tokens":3,"output_tokens":1}}
+                })
+            ),
+        );
+
+        let out = String::from_utf8(
+            translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.6-sol").unwrap(),
+        )
+        .unwrap();
+        assert!(out.contains(r#""caller":{"type":"direct"}"#));
+    }
+
+    #[test]
     fn stream_translates_web_search_response() {
         let upstream = format!(
             "{}{}{}{}{}{}{}{}",
@@ -550,7 +600,10 @@ mod tests {
                 "response.output_item.done",
                 serde_json::json!({
                     "output_index":0,
-                    "item":{"type":"web_search_call","id":"ws_1","action":{"query":"test query"}}
+                    "item":{"type":"web_search_call","id":"ws_1","action":{
+                        "query":"test query",
+                        "sources":[{"title":"Bound source","url":"https://bound.example"}]
+                    }}
                 })
             ),
             sse_event(
@@ -586,6 +639,11 @@ mod tests {
             out.contains("web_search_tool_result"),
             "missing web_search_tool_result"
         );
+        assert_eq!(out.matches(r#""caller":{"type":"direct"}"#).count(), 2);
+        assert!(out.contains("https://bound.example"));
+        assert!(out.contains(r#""encrypted_content":"""#));
+        assert!(out.contains(r#""page_age":null"#));
+        assert!(out.contains(r#""citations":null"#));
     }
 
     #[test]

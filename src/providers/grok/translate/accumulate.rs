@@ -53,7 +53,6 @@ pub fn accumulate_response_with_traffic(
     let mut output = 0;
     let mut reported_usage: Option<GrokUsage> = None;
     let mut web_search_requests = 0;
-    let mut x_search_requests = 0;
     let reduced = match reduce_upstream_bytes(upstream) {
         Ok(events) => events,
         Err(error) => {
@@ -72,7 +71,7 @@ pub fn accumulate_response_with_traffic(
             | ReducerEvent::ThinkingStop(_) => {}
             ReducerEvent::TextStart(index) => {
                 block_positions.insert(index, blocks.len());
-                blocks.push(serde_json::json!({"type":"text","text":""}))
+                blocks.push(serde_json::json!({"type":"text","text":"","citations":null}))
             }
             ReducerEvent::TextDelta(index, text) => {
                 if let Some(block) = block_positions
@@ -85,7 +84,7 @@ pub fn accumulate_response_with_traffic(
             }
             ReducerEvent::ToolStart(index, id, name) => {
                 block_positions.insert(index, blocks.len());
-                blocks.push(serde_json::json!({"type":"tool_use","id":id,"name":name,"input":{}}))
+                blocks.push(serde_json::json!({"type":"tool_use","id":id,"name":name,"input":{},"caller":{"type":"direct"}}))
             }
             ReducerEvent::ToolDelta(index, text) => {
                 if let Some(block) = block_positions
@@ -131,10 +130,13 @@ pub fn accumulate_response_with_traffic(
                 name,
                 query,
             } => {
+                if name != "web_search" {
+                    continue;
+                }
                 block_positions.insert(index, blocks.len());
-                blocks.push(serde_json::json!({"type":"server_tool_use","id":id,"name":name,"input":{"query":query}}));
+                blocks.push(serde_json::json!({"type":"server_tool_use","id":id,"name":name,"input":{"query":query},"caller":{"type":"direct"}}));
                 block_positions.insert(result_index, blocks.len());
-                blocks.push(serde_json::json!({"type":format!("{name}_tool_result"),"tool_use_id":id,"content":[]}));
+                blocks.push(serde_json::json!({"type":"web_search_tool_result","tool_use_id":id,"content":[],"caller":{"type":"direct"}}));
             }
             ReducerEvent::Citation(index, annotation) => {
                 if let Some(block) = block_positions
@@ -145,12 +147,16 @@ pub fn accumulate_response_with_traffic(
                         .as_object_mut()
                         .unwrap()
                         .entry("citations")
-                        .or_insert_with(|| Value::Array(Vec::new()));
+                        .or_insert(Value::Null);
+                    if citations.is_null() {
+                        *citations = Value::Array(Vec::new());
+                    }
                     citations.as_array_mut().unwrap().push(serde_json::json!({
                         "type":"web_search_result_location",
                         "url":annotation.get("url").and_then(Value::as_str).unwrap_or_default(),
                         "title":annotation.get("title").and_then(Value::as_str).unwrap_or_default(),
-                        "cited_text":annotation.get("text").and_then(Value::as_str).unwrap_or_default()
+                        "cited_text":annotation.get("text").and_then(Value::as_str).unwrap_or_default(),
+                        "encrypted_index":""
                     }));
                 }
             }
@@ -160,23 +166,21 @@ pub fn accumulate_response_with_traffic(
                 input_tokens,
                 output_tokens,
                 web_search_requests: web_requests,
-                x_search_requests: x_requests,
+                x_search_requests: _,
             } => {
                 stop = stop_reason;
                 input = input_tokens;
                 output = output_tokens;
                 web_search_requests = web_requests;
-                x_search_requests = x_requests;
             }
             _ => {}
         }
     }
-    let hosted_search_requests = web_search_requests + x_search_requests;
     let usage = anthropic_usage(
         reported_usage.as_ref().unwrap_or(&GrokUsage::default()),
         input,
         output,
-        hosted_search_requests,
+        web_search_requests,
     );
     let response = serde_json::json!({"id":message_id,"type":"message","role":"assistant","model":model,"content":blocks,"stop_reason":stop,"stop_sequence":null,"usage":usage});
     if let Some(mut capture) = capture {
@@ -234,6 +238,10 @@ mod tests {
 
         assert_eq!(response["content"][0]["input"]["value"], 1);
         assert_eq!(response["content"][1]["input"]["value"], 2);
+        assert_eq!(
+            response["content"][0]["caller"],
+            serde_json::json!({"type":"direct"})
+        );
     }
 
     #[test]
@@ -243,7 +251,7 @@ mod tests {
 
         assert_eq!(
             response["content"],
-            serde_json::json!([{"type":"text","text":"answer"}])
+            serde_json::json!([{"type":"text","text":"answer","citations":null}])
         );
     }
 
@@ -259,8 +267,8 @@ mod tests {
     }
 
     #[test]
-    fn streaming_and_non_streaming_emit_the_same_standard_usage_schema() {
-        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"xs_1\",\"delta\":\"{\\\"query\\\":\\\"rust\\\"}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":7}}}\n\n";
+    fn streaming_and_non_streaming_degrade_x_search_to_standard_schema() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"xs_1\",\"delta\":\"{\\\"query\\\":\\\"rust\\\"}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_search\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Recent post\"}\n\ndata: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://x.com/example/status/1\",\"title\":\"Example\"}}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":7}}}\n\n";
         let non_streaming = accumulate_response(input, "message", "grok-4.5").unwrap();
         let streaming = streaming_final_usage(input);
         let expected = serde_json::json!({
@@ -268,11 +276,22 @@ mod tests {
             "output_tokens":7,
             "cache_creation_input_tokens":0,
             "cache_read_input_tokens":3,
-            "server_tool_use":{"web_search_requests":1}
+            "server_tool_use":{"web_search_requests":0}
         });
 
         assert_eq!(non_streaming["usage"], expected);
         assert_eq!(streaming, expected);
+        assert_eq!(non_streaming["content"].as_array().unwrap().len(), 1);
+        assert_eq!(non_streaming["content"][0]["type"], "text");
+        assert_eq!(non_streaming["content"][0]["text"], "Recent post");
+        assert_eq!(
+            non_streaming["content"][0]["citations"][0]["encrypted_index"],
+            ""
+        );
+        assert_eq!(non_streaming["stop_reason"], "end_turn");
+        let encoded = non_streaming.to_string();
+        assert!(!encoded.contains("x_search_tool_result"));
+        assert!(!encoded.contains("\"name\":\"x_search\""));
         assert!(non_streaming["usage"].get("x_search_requests").is_none());
         assert!(streaming.get("x_search_requests").is_none());
     }
@@ -308,8 +327,16 @@ mod tests {
 
         assert_eq!(
             response["content"],
-            serde_json::json!([{"type":"text","text":"answer 😊"}])
+            serde_json::json!([{"type":"text","text":"answer 😊","citations":null}])
         );
+    }
+
+    #[test]
+    fn accumulate_incomplete_after_completed_tool_uses_terminal_stop_reason() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}\n\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},\"usage\":{}}}\n\n";
+        let response = accumulate_response(input, "message", "grok-4.5").unwrap();
+        assert_eq!(response["content"][0]["type"], "tool_use");
+        assert_eq!(response["stop_reason"], "refusal");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -312,6 +312,8 @@ pub struct Reducer {
     tool_args: HashMap<String, String>,
     completed_arguments: HashMap<String, bool>,
     hosted_calls: HashMap<String, (String, String)>,
+    completed_hosted_inputs: HashSet<String>,
+    pending_citations: Vec<Value>,
     web_search_requests: u64,
     x_search_requests: u64,
     saw_tool: bool,
@@ -362,6 +364,9 @@ impl Reducer {
                     .get("delta")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("custom tool delta is invalid"))?;
+                if self.completed_hosted_inputs.contains(id) {
+                    anyhow::bail!("custom tool delta arrived after input completion");
+                }
                 let (_, input) = self
                     .hosted_calls
                     .get_mut(id)
@@ -372,22 +377,42 @@ impl Reducer {
                 input.push_str(delta);
                 Ok(vec![])
             }
-            "response.custom_tool_call_input.done"
-            | "response.web_search_call.in_progress"
+            "response.custom_tool_call_input.done" => {
+                let id = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("custom tool completion lacks item id"))?;
+                if !self.hosted_calls.contains_key(id) {
+                    anyhow::bail!("custom tool completion is out of order");
+                }
+                if !self.completed_hosted_inputs.insert(id.into()) {
+                    anyhow::bail!("duplicate custom tool input completion");
+                }
+                Ok(vec![])
+            }
+            "response.web_search_call.in_progress"
             | "response.web_search_call.searching"
-            | "response.web_search_call.completed" => Ok(vec![]),
+            | "response.web_search_call.completed"
+            | "response.x_search_call.in_progress"
+            | "response.x_search_call.searching"
+            | "response.x_search_call.completed" => Ok(vec![]),
             "response.output_text.annotation.added" => {
-                let Some((kind, index)) = self.active.as_ref() else {
-                    return Ok(vec![]);
-                };
                 let Some(annotation) = value.get("annotation") else {
                     return Ok(vec![]);
                 };
-                if kind == "text"
-                    && annotation.get("type").and_then(Value::as_str) == Some("url_citation")
+                if annotation.get("type").and_then(Value::as_str) != Some("url_citation")
+                    || annotation
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    Ok(vec![])
+                } else if let Some((kind, index)) = self.active.as_ref()
+                    && kind == "text"
                 {
                     Ok(vec![ReducerEvent::Citation(*index, annotation.clone())])
                 } else {
+                    self.pending_citations.push(annotation.clone());
                     Ok(vec![])
                 }
             }
@@ -403,17 +428,31 @@ impl Reducer {
                     .get("item")
                     .and_then(Value::as_object)
                     .ok_or_else(|| anyhow::anyhow!("output item is invalid"))?;
-                if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+                let item_type = item.get("type").and_then(Value::as_str);
+                if matches!(
+                    item_type,
+                    Some("custom_tool_call" | "web_search_call" | "x_search_call")
+                ) {
                     let id = item
                         .get("id")
                         .and_then(Value::as_str)
                         .filter(|id| !id.is_empty())
                         .ok_or_else(|| anyhow::anyhow!("custom tool call id is invalid"))?;
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or("x_search");
+                    if self.hosted_calls.contains_key(id) {
+                        anyhow::bail!("duplicate hosted tool call id");
+                    }
+                    if self.hosted_calls.len() >= MAX_INCOMPLETE_TOOL_CALLS {
+                        anyhow::bail!("too many incomplete hosted tool calls");
+                    }
+                    let name = match item_type {
+                        Some("web_search_call") => "web_search",
+                        Some("x_search_call") => "x_search",
+                        _ => item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("x_search"),
+                    };
                     let name = if name.starts_with("x_") {
                         "x_search"
                     } else {
@@ -422,7 +461,7 @@ impl Reducer {
                     self.hosted_calls
                         .insert(id.into(), (name.into(), String::new()));
                     Ok(vec![])
-                } else if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                } else if item_type == Some("function_call") {
                     let id = item
                         .get("call_id")
                         .and_then(Value::as_str)
@@ -475,6 +514,9 @@ impl Reducer {
                     .get(id)
                     .ok_or_else(|| anyhow::anyhow!("function delta is out of order"))?
                     .clone();
+                if self.completed_arguments.get(id) == Some(&true) {
+                    anyhow::bail!("function delta arrived after arguments completion");
+                }
                 let args = self
                     .tool_args
                     .get_mut(id)
@@ -497,6 +539,12 @@ impl Reducer {
                     })
                     .ok_or_else(|| anyhow::anyhow!("function completion lacks call id"))?;
                 let args = value.get("arguments").and_then(Value::as_str);
+                if self.completed_arguments.get(id) == Some(&true) {
+                    anyhow::bail!("duplicate function arguments completion");
+                }
+                if args.is_some_and(|args| args.len() > MAX_TOOL_ARGUMENT_BYTES) {
+                    anyhow::bail!("function arguments exceed the size limit");
+                }
                 let accumulated = self
                     .tool_args
                     .get(id)
@@ -539,84 +587,36 @@ impl Reducer {
                     .and_then(Value::as_object)
                     .ok_or_else(|| anyhow::anyhow!("completed output item is invalid"))?;
                 match item.get("type").and_then(Value::as_str) {
-                    Some("web_search_call") => {
-                        let id = item
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .filter(|id| !id.is_empty())
-                            .ok_or_else(|| anyhow::anyhow!("completed web search lacks id"))?;
-                        let query = item
-                            .get("action")
-                            .and_then(|action| action.get("query"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let mut out = self.close_active()?;
-                        let index = self.next_index;
-                        let result_index = index + 1;
-                        self.next_index += 2;
-                        self.web_search_requests += 1;
-                        out.push(ReducerEvent::HostedSearch {
-                            index,
-                            result_index,
-                            id: format!("srvtoolu_{id}"),
-                            name: "web_search".into(),
-                            query: query.into(),
-                        });
-                        Ok(out)
-                    }
-                    Some("custom_tool_call") => {
-                        let id = item
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .filter(|id| !id.is_empty())
-                            .ok_or_else(|| anyhow::anyhow!("completed custom tool lacks id"))?;
-                        let (name, input) = self.hosted_calls.remove(id).unwrap_or_else(|| {
-                            (
-                                item.get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("x_search")
-                                    .into(),
-                                String::new(),
-                            )
-                        });
-                        if name != "x_search" {
-                            return Ok(vec![]);
-                        }
-                        let query = serde_json::from_str::<Value>(&input)
-                            .ok()
-                            .and_then(|input| {
-                                input
-                                    .get("query")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .unwrap_or_default();
-                        let mut out = self.close_active()?;
-                        let index = self.next_index;
-                        let result_index = index + 1;
-                        self.next_index += 2;
-                        self.x_search_requests += 1;
-                        out.push(ReducerEvent::HostedSearch {
-                            index,
-                            result_index,
-                            id: format!("srvtoolu_{id}"),
-                            name,
-                            query,
-                        });
-                        Ok(out)
+                    Some(kind @ ("web_search_call" | "x_search_call" | "custom_tool_call")) => {
+                        self.complete_hosted_search(item, kind)
                     }
                     Some("function_call") => {
                         let id = item.get("call_id").and_then(Value::as_str).ok_or_else(|| {
                             anyhow::anyhow!("completed function call lacks call id")
                         })?;
-                        let (index, _) = self
-                            .calls
-                            .remove(id)
-                            .ok_or_else(|| anyhow::anyhow!("completed function call is unknown"))?;
-                        let args = self.tool_args.remove(id).unwrap_or_default();
-                        self.completed_arguments.remove(id);
+                        let index =
+                            self.calls.get(id).map(|(index, _)| *index).ok_or_else(|| {
+                                anyhow::anyhow!("completed function call is unknown")
+                            })?;
+                        let mut args = self.tool_args.get(id).cloned().unwrap_or_default();
+                        let mut out = Vec::new();
+                        if let Some(snapshot) = item.get("arguments").and_then(Value::as_str) {
+                            if snapshot.len() > MAX_TOOL_ARGUMENT_BYTES {
+                                anyhow::bail!("function arguments exceed the size limit");
+                            }
+                            if args.is_empty() && !snapshot.is_empty() {
+                                args.push_str(snapshot);
+                                out.push(ReducerEvent::ToolDelta(index, snapshot.into()));
+                            } else if snapshot != args {
+                                anyhow::bail!("completed function arguments disagree with deltas");
+                            }
+                        }
                         parse_function_arguments(&args)?;
-                        Ok(vec![ReducerEvent::ToolStop(index)])
+                        self.calls.remove(id);
+                        self.tool_args.remove(id);
+                        self.completed_arguments.remove(id);
+                        out.push(ReducerEvent::ToolStop(index));
+                        Ok(out)
                     }
                     _ => Ok(vec![]),
                 }
@@ -627,6 +627,9 @@ impl Reducer {
                 self.usage = Some(usage.clone());
                 if !self.calls.is_empty() {
                     anyhow::bail!("function call is incomplete");
+                }
+                if !self.hosted_calls.is_empty() {
+                    anyhow::bail!("hosted tool call is incomplete");
                 }
                 let fallback_text = if self.saw_text_output {
                     Vec::new()
@@ -665,7 +668,7 @@ impl Reducer {
                 self.incomplete_reason = response_is_incomplete
                     .then(|| incomplete_reason.map(bounded_incomplete_reason))
                     .flatten();
-                let stop = if self.saw_tool {
+                let stop = if terminal == GrokTerminal::Completed && self.saw_tool {
                     "tool_use"
                 } else {
                     terminal.stop_reason()
@@ -689,6 +692,57 @@ impl Reducer {
             }
             _ => anyhow::bail!("unsupported Grok stream event: {typ}"),
         }
+    }
+
+    fn complete_hosted_search(
+        &mut self,
+        item: &serde_json::Map<String, Value>,
+        item_type: &str,
+    ) -> anyhow::Result<Vec<ReducerEvent>> {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("completed hosted search lacks id"))?;
+        let fallback_name = match item_type {
+            "web_search_call" => "web_search",
+            "x_search_call" => "x_search",
+            _ => item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("x_search"),
+        };
+        let (mut name, input) = self
+            .hosted_calls
+            .remove(id)
+            .unwrap_or_else(|| (fallback_name.into(), String::new()));
+        self.completed_hosted_inputs.remove(id);
+        if name.starts_with("x_") {
+            name = "x_search".into();
+        }
+        if !matches!(name.as_str(), "web_search" | "x_search") {
+            return Ok(vec![]);
+        }
+        let mut out = self.close_active()?;
+        // Anthropic's response ContentBlock union has no x_search server-tool variant. Keep the
+        // model's subsequent text and citation events, but do not synthesize an invalid hosted
+        // block or charge it as an Anthropic web-search request.
+        if name == "x_search" {
+            return Ok(out);
+        }
+        let query = hosted_search_query(item, &input);
+        let index = self.next_index;
+        let result_index = index + 1;
+        self.next_index += 2;
+        self.web_search_requests += 1;
+        out.push(ReducerEvent::HostedSearch {
+            index,
+            result_index,
+            id: format!("srvtoolu_{id}"),
+            name,
+            query,
+        });
+        Ok(out)
     }
 
     /// Apply every event decoded from one upstream byte chunk atomically.
@@ -778,6 +832,13 @@ impl Reducer {
         } else {
             ReducerEvent::TextDelta(index, delta.into())
         });
+        if kind == "text" {
+            out.extend(
+                self.pending_citations
+                    .drain(..)
+                    .map(|citation| ReducerEvent::Citation(index, citation)),
+            );
+        }
         Ok(out)
     }
     fn close_active(&mut self) -> anyhow::Result<Vec<ReducerEvent>> {
@@ -826,6 +887,38 @@ impl Reducer {
     pub fn incomplete_reason(&self) -> Option<&str> {
         self.incomplete_reason.as_deref()
     }
+}
+
+fn hosted_search_query(item: &serde_json::Map<String, Value>, buffered_input: &str) -> String {
+    item.get("action")
+        .and_then(|action| action.get("query"))
+        .and_then(Value::as_str)
+        .or_else(|| item.get("query").and_then(Value::as_str))
+        .map(str::to_string)
+        .or_else(|| {
+            item.get("action")
+                .and_then(|action| action.get("queries"))
+                .and_then(Value::as_array)
+                .map(|queries| {
+                    queries
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|queries| !queries.is_empty())
+        })
+        .or_else(|| {
+            serde_json::from_str::<Value>(buffered_input)
+                .ok()
+                .and_then(|input| {
+                    input
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_default()
 }
 
 fn bounded_incomplete_reason(reason: &str) -> String {
@@ -1398,6 +1491,47 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_terminal_overrides_completed_function_tool_stop_reason() {
+        for (reason, expected_stop) in [
+            ("max_output_tokens", "max_tokens"),
+            ("content_filter", "refusal"),
+        ] {
+            let mut reducer = Reducer::default();
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.added",
+                    "item":{"type":"function_call","call_id":"call_1","name":"lookup"}
+                }))
+                .unwrap();
+            let completed_tool = reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.done",
+                    "item":{"type":"function_call","call_id":"call_1","arguments":"{}"}
+                }))
+                .unwrap();
+            assert!(
+                completed_tool
+                    .iter()
+                    .any(|event| matches!(event, ReducerEvent::ToolStop(_)))
+            );
+            let terminal = reducer
+                .push(serde_json::json!({
+                    "type":"response.incomplete",
+                    "response":{
+                        "status":"incomplete",
+                        "incomplete_details":{"reason":reason},
+                        "usage":{}
+                    }
+                }))
+                .unwrap();
+            assert!(terminal.iter().any(|event| matches!(
+                event,
+                ReducerEvent::Finish { stop_reason, .. } if stop_reason == expected_stop
+            )));
+        }
+    }
+
+    #[test]
     fn grok_reducer_handles_text_tool_and_completion() {
         let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"call_id\":\"call_1\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n";
         let events = reduce_upstream_bytes(input).unwrap();
@@ -1432,20 +1566,132 @@ mod tests {
 
     #[test]
     fn grok_reducer_accepts_hosted_search_lifecycle() {
-        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_keyword_search\",\"id\":\"search_1\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"search_1\",\"delta\":\"{\\\"query\\\":\\\"test\\\"}\"}\n\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"search_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"x_keyword_search\",\"id\":\"search_1\"}}\n\ndata: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"result\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"web_search\",\"id\":\"search_1\"}}\n\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"item_id\":\"search_1\",\"delta\":\"{\\\"query\\\":\\\"test\\\"}\"}\n\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"item_id\":\"search_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"name\":\"web_search\",\"id\":\"search_1\"}}\n\ndata: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"result\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
         let events = reduce_upstream_bytes(input).unwrap();
         assert!(events.iter().any(|event| matches!(
             event,
             ReducerEvent::HostedSearch { name, query, .. }
-                if name == "x_search" && query == "test"
+                if name == "web_search" && query == "test"
         )));
         assert!(matches!(
             events.last(),
             Some(ReducerEvent::Finish {
-                x_search_requests: 1,
+                web_search_requests: 1,
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn grok_reducer_accepts_current_x_search_call_lifecycle() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"x_search_call\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.x_search_call.in_progress\",\"item_id\":\"xs_1\"}\n\ndata: {\"type\":\"response.x_search_call.searching\",\"item_id\":\"xs_1\"}\n\ndata: {\"type\":\"response.x_search_call.completed\",\"item_id\":\"xs_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"x_search_call\",\"id\":\"xs_1\",\"action\":{\"query\":\"rust\"}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let events = reduce_upstream_bytes(input).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ReducerEvent::HostedSearch { .. }))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ReducerEvent::Finish {
+                stop_reason,
+                web_search_requests: 0,
+                x_search_requests: 0,
+                ..
+            }) if stop_reason == "end_turn"
+        ));
+    }
+
+    #[test]
+    fn grok_reducer_rejects_unfinished_hosted_search_at_terminal() {
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"web_search_call","id":"ws_1"}
+            }))
+            .unwrap();
+        let error = reducer
+            .push(serde_json::json!({
+                "type":"response.completed",
+                "response":{"usage":{}}
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("hosted tool call is incomplete"));
+    }
+
+    #[test]
+    fn grok_reducer_rejects_deltas_after_argument_completion() {
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"function_call","call_id":"call_1","name":"lookup"}
+            }))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.function_call_arguments.done",
+                "call_id":"call_1",
+                "arguments":"{}"
+            }))
+            .unwrap();
+        let error = reducer
+            .push(serde_json::json!({
+                "type":"response.function_call_arguments.delta",
+                "call_id":"call_1",
+                "delta":" "
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("after arguments completion"));
+    }
+
+    #[test]
+    fn grok_reducer_limits_snapshot_only_function_arguments() {
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"function_call","call_id":"call_1","name":"lookup"}
+            }))
+            .unwrap();
+        let error = reducer
+            .push(serde_json::json!({
+                "type":"response.function_call_arguments.done",
+                "call_id":"call_1",
+                "arguments":"x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("size limit"));
+    }
+
+    #[test]
+    fn grok_reducer_accepts_arguments_snapshot_on_output_item_done() {
+        let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"arguments\":\"{\\\"q\\\":1}\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let events = reduce_upstream_bytes(input).unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, ReducerEvent::ToolDelta(_, arguments) if arguments == "{\"q\":1}")
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ReducerEvent::ToolStop(_)))
+        );
+    }
+
+    #[test]
+    fn grok_reducer_associates_early_citation_with_following_text() {
+        let input = b"data: {\"type\":\"response.output_text.annotation.added\",\"annotation\":{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"result\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        let events = reduce_upstream_bytes(input).unwrap();
+        let text_position = events
+            .iter()
+            .position(|event| matches!(event, ReducerEvent::TextDelta(0, _)))
+            .unwrap();
+        let citation_position = events
+            .iter()
+            .position(|event| matches!(event, ReducerEvent::Citation(0, _)))
+            .unwrap();
+        assert!(citation_position > text_position);
     }
 
     #[test]

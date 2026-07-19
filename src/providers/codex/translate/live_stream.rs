@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
@@ -25,17 +25,18 @@ enum LiveBlock {
         call_id: String,
         name: String,
         args_accum: String,
-        had_delta: bool,
-        buffer_until_done: bool,
+        done_snapshot: Option<String>,
         emitted_args: bool,
     },
 }
 
 struct LiveWebSearch {
+    output_index: usize,
     index: usize,
     result_index: usize,
     id: String,
     query: String,
+    results: Vec<LiveWebSearchResult>,
 }
 
 #[derive(Clone)]
@@ -68,6 +69,7 @@ pub struct LiveStreamTranslator {
     reasoning_by_output_index: HashMap<usize, PendingReasoning>,
     saw_tool_use: bool,
     web_search_requests: usize,
+    web_search_output_indices: HashSet<usize>,
     web_searches: Vec<LiveWebSearch>,
     web_search_results: Vec<LiveWebSearchResult>,
     deferred_text: Vec<(usize, String)>,
@@ -88,6 +90,7 @@ impl LiveStreamTranslator {
             reasoning_by_output_index: HashMap::new(),
             saw_tool_use: false,
             web_search_requests: 0,
+            web_search_output_indices: HashSet::new(),
             web_searches: Vec::new(),
             web_search_results: Vec::new(),
             deferred_text: Vec::new(),
@@ -167,7 +170,7 @@ impl LiveStreamTranslator {
                 self.tool_delta(payload, traffic, &mut out)?;
             }
             "response.function_call_arguments.done" => {
-                self.tool_arguments_done(payload);
+                self.tool_arguments_done(payload)?;
             }
             "response.output_item.done" => {
                 self.output_item_done(payload, traffic, &mut out)?;
@@ -367,7 +370,7 @@ impl LiveStreamTranslator {
                         &serde_json::json!({
                             "type": "content_block_start",
                             "index": index,
-                            "content_block": {"type": "text", "text": ""}
+                            "content_block": {"type": "text", "text": "", "citations": null}
                         }),
                     );
                 }
@@ -387,6 +390,10 @@ impl LiveStreamTranslator {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                    self.item_id_to_output_index
+                        .insert(id.to_string(), output_index);
+                }
                 self.blocks_by_output_index.insert(
                     output_index,
                     LiveBlock::Tool {
@@ -394,8 +401,7 @@ impl LiveStreamTranslator {
                         call_id: call_id.clone(),
                         name: name.clone(),
                         args_accum: String::new(),
-                        had_delta: false,
-                        buffer_until_done: name == "Read",
+                        done_snapshot: None,
                         emitted_args: false,
                     },
                 );
@@ -411,13 +417,20 @@ impl LiveStreamTranslator {
                             "type": "tool_use",
                             "id": call_id,
                             "name": name,
-                            "input": {}
+                            "input": {},
+                            "caller": {"type": "direct"}
                         }
                     }),
                 );
             }
             "web_search_call" => {
-                self.web_search_requests += 1;
+                if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                    self.item_id_to_output_index
+                        .insert(id.to_string(), output_index);
+                }
+                if self.web_search_output_indices.insert(output_index) {
+                    self.web_search_requests += 1;
+                }
             }
             _ => {}
         }
@@ -515,7 +528,7 @@ impl LiveStreamTranslator {
                     &serde_json::json!({
                         "type": "content_block_start",
                         "index": index,
-                        "content_block": {"type": "text", "text": ""}
+                        "content_block": {"type": "text", "text": "", "citations": null}
                     }),
                 );
             }
@@ -552,11 +565,7 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let Some(output_index) = payload
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-        else {
+        let Some(output_index) = self.resolve_output_index(payload) else {
             return Ok(());
         };
         let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
@@ -569,47 +578,30 @@ impl LiveStreamTranslator {
             call_id,
             name,
             args_accum,
-            had_delta,
-            buffer_until_done,
-            emitted_args,
+            done_snapshot,
             ..
         }) = self.blocks_by_output_index.get_mut(&output_index)
         else {
             return Ok(());
         };
-        args_accum.push_str(delta);
-        *had_delta = true;
-        if *buffer_until_done {
-            if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
-                return Err(format!(
-                    "Buffered {name} tool arguments exceeded safe limits"
-                ));
-            }
-            if let Some(repaired) =
-                repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
-            {
-                *args_accum = repaired.clone();
-                *emitted_args = true;
-                repaired_read = Some((*index, repaired));
-            }
-        } else {
-            *emitted_args = true;
-            let index = *index;
-            self.emit(
-                traffic,
-                out,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": delta
-                    }
-                }),
-            );
+
+        // `response.function_call_arguments.done` is the authoritative snapshot.
+        // A late/replayed delta must never mutate arguments after that boundary.
+        if done_snapshot.is_some() {
             return Ok(());
         }
+        args_accum.push_str(delta);
+        if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
+            return Err(format!(
+                "Buffered {name} tool arguments exceeded safe limits"
+            ));
+        }
+        if let Some(repaired) =
+            repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
+        {
+            repaired_read = Some((*index, repaired));
+        }
+
         if let Some((index, repaired)) = repaired_read {
             self.blocks_by_output_index.remove(&output_index);
             self.emit(
@@ -634,31 +626,32 @@ impl LiveStreamTranslator {
                     "index": index,
                 }),
             );
-            self.ensure_message_start(traffic, out);
-            self.emit_finish(STOP_TOOL_USE, None, traffic, out);
         }
         Ok(())
     }
 
-    fn tool_arguments_done(&mut self, payload: &serde_json::Value) {
-        let Some(output_index) = payload
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-        else {
-            return;
+    fn tool_arguments_done(&mut self, payload: &serde_json::Value) -> Result<(), String> {
+        let Some(output_index) = self.resolve_output_index(payload) else {
+            return Ok(());
         };
         let Some(args) = payload.get("arguments").and_then(|v| v.as_str()) else {
-            return;
+            return Ok(());
         };
-        let Some(LiveBlock::Tool { args_accum, .. }) =
-            self.blocks_by_output_index.get_mut(&output_index)
+        let Some(LiveBlock::Tool {
+            name,
+            done_snapshot,
+            ..
+        }) = self.blocks_by_output_index.get_mut(&output_index)
         else {
-            return;
+            return Ok(());
         };
-        if args_accum.is_empty() {
-            *args_accum = args.to_string();
+        if args.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
+            return Err(format!(
+                "Buffered {name} tool arguments exceeded safe limits"
+            ));
         }
+        *done_snapshot = Some(args.to_string());
+        Ok(())
     }
 
     fn output_item_done(
@@ -667,7 +660,9 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let output_index = output_index(payload);
+        let Some(output_index) = self.resolve_output_index(payload) else {
+            return Ok(());
+        };
         if let Some(item) = payload
             .get("item")
             .and_then(|item| item.get("type"))
@@ -697,16 +692,28 @@ impl LiveStreamTranslator {
         {
             self.close_thinking(traffic, out);
             let item = &payload["item"];
+            let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if self.web_search_output_indices.insert(output_index) {
+                self.web_search_requests += 1;
+            }
+            if self
+                .web_searches
+                .iter()
+                .any(|search| search.output_index == output_index)
+            {
+                return Ok(());
+            }
             let index = self.anthropic_index;
             self.anthropic_index += 1;
             let result_index = self.anthropic_index;
             self.anthropic_index += 1;
-            let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
             self.web_searches.push(LiveWebSearch {
+                output_index,
                 index,
                 result_index,
                 id: super::web_search_compat::server_tool_use_id_from_codex_web_search_id(raw_id),
                 query: web_search_query(item),
+                results: web_search_sources(item),
             });
             return Ok(());
         }
@@ -783,7 +790,7 @@ impl LiveStreamTranslator {
             name,
             call_id,
             args_accum,
-            had_delta,
+            done_snapshot,
             emitted_args,
             ..
         }) = self.blocks_by_output_index.get(&output_index)
@@ -791,12 +798,13 @@ impl LiveStreamTranslator {
             return Ok(None);
         };
 
-        let mut arguments = args_accum.clone();
-        if let Some(final_args) = final_args.filter(|arguments| !arguments.is_empty())
-            && (arguments.is_empty() || (!*had_delta && !*emitted_args))
-        {
-            arguments = final_args.to_string();
-        }
+        // Prefer the explicit arguments-done snapshot, then the completed item
+        // snapshot, and only fall back to accumulated deltas for truncated streams.
+        let mut arguments = done_snapshot
+            .as_deref()
+            .or(final_args)
+            .unwrap_or(args_accum)
+            .to_string();
         if !arguments.is_empty() {
             arguments = sanitize_read_args(name, &arguments, Some(call_id.as_str()));
         }
@@ -808,6 +816,44 @@ impl LiveStreamTranslator {
             arguments,
             emit: !*emitted_args,
         }))
+    }
+
+    fn resolve_output_index(&self, payload: &serde_json::Value) -> Option<usize> {
+        payload
+            .get("output_index")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .or_else(|| {
+                payload
+                    .get("item_id")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| {
+                        payload
+                            .get("item")
+                            .and_then(|item| item.get("id"))
+                            .and_then(|value| value.as_str())
+                    })
+                    .and_then(|id| self.item_id_to_output_index.get(id).copied())
+            })
+            .or_else(|| {
+                let call_id = payload
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| {
+                        payload
+                            .get("item")
+                            .and_then(|item| item.get("call_id"))
+                            .and_then(|value| value.as_str())
+                    })?;
+                self.blocks_by_output_index
+                    .iter()
+                    .find_map(|(output_index, block)| match block {
+                        LiveBlock::Tool {
+                            call_id: candidate, ..
+                        } if candidate == call_id => Some(*output_index),
+                        _ => None,
+                    })
+            })
     }
 
     fn commit_tool_arguments(
@@ -863,6 +909,7 @@ impl LiveStreamTranslator {
 
     fn emit_web_searches(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
         let searches = std::mem::take(&mut self.web_searches);
+        let allow_global_annotation_fallback = searches.len() == 1;
         for search in searches {
             self.ensure_message_start(traffic, out);
             self.emit(
@@ -876,7 +923,8 @@ impl LiveStreamTranslator {
                         "type": "server_tool_use",
                         "id": search.id,
                         "name": "web_search",
-                        "input": {}
+                        "input": {},
+                        "caller": {"type":"direct"}
                     }
                 }),
             );
@@ -899,14 +947,20 @@ impl LiveStreamTranslator {
                 "content_block_stop",
                 &serde_json::json!({"type": "content_block_stop", "index": search.index}),
             );
-            let results: Vec<_> = self
-                .web_search_results
+            let search_results = if search.results.is_empty() && allow_global_annotation_fallback {
+                &self.web_search_results
+            } else {
+                &search.results
+            };
+            let results: Vec<_> = search_results
                 .iter()
                 .map(|result| {
                     serde_json::json!({
                         "type": "web_search_result",
                         "title": result.title,
                         "url": result.url,
+                        "encrypted_content": "",
+                        "page_age": null,
                     })
                 })
                 .collect();
@@ -920,7 +974,8 @@ impl LiveStreamTranslator {
                     "content_block": {
                         "type": "web_search_tool_result",
                         "tool_use_id": search.id,
-                        "content": results
+                        "content": results,
+                        "caller": {"type":"direct"}
                     }
                 }),
             );
@@ -940,7 +995,7 @@ impl LiveStreamTranslator {
                 &serde_json::json!({
                     "type": "content_block_start",
                     "index": index,
-                    "content_block": {"type": "text", "text": ""}
+                    "content_block": {"type": "text", "text": "", "citations": null}
                 }),
             );
             if !text.is_empty() {
@@ -978,6 +1033,7 @@ impl LiveStreamTranslator {
                 prepared_tools.push(prepared);
             }
         }
+        prepared_tools.sort_by_key(|prepared| prepared.index);
         for prepared in prepared_tools {
             if let Some((index, arguments)) = self.commit_tool_arguments(prepared) {
                 self.emit(
@@ -1048,8 +1104,18 @@ impl LiveStreamTranslator {
 
     fn close_open_blocks(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
         self.close_thinking(traffic, out);
-        let open: Vec<usize> = self.blocks_by_output_index.keys().copied().collect();
-        for output_index in open {
+        let mut open: Vec<_> = self
+            .blocks_by_output_index
+            .iter()
+            .map(|(output_index, state)| {
+                let index = match state {
+                    LiveBlock::Text { index, .. } | LiveBlock::Tool { index, .. } => *index,
+                };
+                (*output_index, index)
+            })
+            .collect();
+        open.sort_by_key(|(_, index)| *index);
+        for (output_index, _) in open {
             let Some(state) = self.blocks_by_output_index.remove(&output_index) else {
                 continue;
             };
@@ -1164,17 +1230,53 @@ fn web_search_query(item: &serde_json::Value) -> String {
     let Some(action) = item.get("action") else {
         return String::new();
     };
+    if let Some(query) = action.get("query").and_then(|v| v.as_str()) {
+        return query.to_string();
+    }
     action
-        .get("query")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            action
-                .get("queries")
-                .and_then(|v| v.as_array())
-                .and_then(|queries| queries.iter().find_map(|query| query.as_str()))
+        .get("queries")
+        .and_then(|v| v.as_array())
+        .map(|queries| {
+            queries
+                .iter()
+                .filter_map(|query| query.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
         })
-        .unwrap_or("")
-        .to_string()
+        .unwrap_or_default()
+}
+
+fn web_search_sources(item: &serde_json::Value) -> Vec<LiveWebSearchResult> {
+    let Some(sources) = item
+        .get("action")
+        .and_then(|action| action.get("sources"))
+        .and_then(|sources| sources.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::new();
+    for source in sources {
+        let Some(url) = source.get("url").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if results
+            .iter()
+            .any(|result: &LiveWebSearchResult| result.url == url)
+        {
+            continue;
+        }
+        let title = source
+            .get("title")
+            .and_then(|value| value.as_str())
+            .filter(|title| !title.is_empty())
+            .unwrap_or(url);
+        results.push(LiveWebSearchResult {
+            title: title.to_string(),
+            url: url.to_string(),
+        });
+    }
+    results
 }
 
 fn output_index(payload: &serde_json::Value) -> usize {
@@ -1411,6 +1513,93 @@ mod tests {
     }
 
     #[test]
+    fn done_snapshot_overrides_deltas_item_snapshot_and_late_delta() {
+        let out = render(vec![
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "id":"item_1", "call_id": "call_1", "name": "Bash"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "item_1",
+                "delta": "{\"command\":\"from delta\"}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "call_id": "call_1",
+                "arguments": "{\"command\":\"from done\"}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "item_1",
+                "delta": "{late garbage"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "item_1",
+                    "call_id": "call_1",
+                    "name": "Bash",
+                    "arguments": "{\"command\":\"from item\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "usage": {}}
+            }),
+        ]);
+
+        assert!(out.contains(r#""partial_json":"{\"command\":\"from done\"}""#));
+        assert!(!out.contains("from delta"));
+        assert!(!out.contains("from item"));
+        assert!(!out.contains("late garbage"));
+        assert_eq!(out.matches(r#""type":"input_json_delta""#).count(), 1);
+    }
+
+    #[test]
+    fn malformed_done_snapshot_is_rejected_before_arguments_are_emitted() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let mut rendered = String::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Bash"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": "{\"command\":"
+            }),
+        ] {
+            rendered
+                .push_str(&String::from_utf8(translator.accept(&event, None).unwrap()).unwrap());
+        }
+
+        let error = translator
+            .accept(
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "Bash",
+                        "arguments": "{\"command\":\"valid but non-authoritative\"}"
+                    }
+                }),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("invalid JSON arguments"));
+        assert!(!rendered.contains("input_json_delta"));
+        assert!(!translator.is_finished());
+    }
+
+    #[test]
     fn terminal_event_rejects_tool_call_without_json_arguments() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
         translator
@@ -1561,6 +1750,16 @@ mod tests {
             );
         }
 
+        translator
+            .accept(
+                &json!({
+                    "type": "response.function_call_arguments.done",
+                    "output_index": 1,
+                    "arguments": "{\"file_path\":\"/tmp/b\"}"
+                }),
+                None,
+            )
+            .unwrap();
         let repaired_b = translator
             .accept(
                 &json!({
@@ -1653,6 +1852,7 @@ mod tests {
         assert_eq!(starts[0]["index"], 0);
         assert_eq!(starts[0]["content_block"]["id"], "call_1");
         assert_eq!(starts[0]["content_block"]["name"], "Lookup");
+        assert_eq!(starts[0]["content_block"]["caller"]["type"], "direct");
         assert_eq!(starts[1]["index"], 1);
         assert_eq!(starts[1]["content_block"]["id"], "call_2");
         assert_eq!(starts[1]["content_block"]["name"], "Lookup");
@@ -1684,7 +1884,189 @@ mod tests {
     }
 
     #[test]
-    fn repairs_whitespace_stalled_read_args_as_tool_use_finish() {
+    fn read_stall_closes_only_read_and_preserves_parallel_peer() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let mut out = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"function_call","call_id":"read_1","name":"Read"}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type":"function_call","call_id":"bash_1","name":"Bash"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "delta": "{\"command\":\"echo peer\"}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": format!("{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}", " ".repeat(1024))
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        let before_peer_done = String::from_utf8(out.clone()).unwrap();
+        assert!(before_peer_done.contains("/tmp/a"));
+        assert!(!before_peer_done.contains("echo peer"));
+        assert!(!before_peer_done.contains("message_stop"));
+        assert!(!translator.is_finished());
+
+        for event in [
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 1,
+                "arguments": "{\"command\":\"echo peer\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type":"function_call",
+                    "call_id":"bash_1",
+                    "name":"Bash",
+                    "arguments":"{\"command\":\"echo peer\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "usage": {}}
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("echo peer"));
+        assert_eq!(rendered.matches("event: content_block_stop").count(), 2);
+        assert_eq!(rendered.matches("event: message_stop").count(), 1);
+        assert!(translator.is_finished());
+    }
+
+    #[test]
+    fn preserves_three_tools_completed_in_c_a_b_order() {
+        let mut events = Vec::new();
+        for (output_index, call_id) in [(0, "call_a"), (1, "call_b"), (2, "call_c")] {
+            events.push(json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {"type":"function_call","call_id":call_id,"name":"Lookup"}
+            }));
+            events.push(json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": output_index,
+                "delta": format!("{{\"q\":\"{call_id}\"}}")
+            }));
+        }
+        for output_index in [2, 0, 1] {
+            let call_id = ["call_a", "call_b", "call_c"][output_index];
+            events.push(json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": output_index,
+                "arguments": format!("{{\"q\":\"{call_id}\"}}")
+            }));
+            events.push(json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": {
+                    "type":"function_call",
+                    "call_id":call_id,
+                    "name":"Lookup",
+                    "arguments":format!("{{\"q\":\"{call_id}\"}}")
+                }
+            }));
+        }
+        events.push(json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "usage": {}}
+        }));
+
+        let out = render(events);
+        let values: Vec<serde_json::Value> =
+            crate::anthropic::sse::try_parse_sse_events(out.as_bytes())
+                .unwrap()
+                .into_iter()
+                .map(|event| serde_json::from_str(&event.data).unwrap())
+                .collect();
+        let stop_order: Vec<_> = values
+            .iter()
+            .filter(|value| value["type"] == "content_block_stop")
+            .filter_map(|value| value["index"].as_u64())
+            .collect();
+        assert_eq!(stop_order, vec![2, 0, 1]);
+        for call_id in ["call_a", "call_b", "call_c"] {
+            assert!(out.contains(call_id));
+        }
+        assert_eq!(out.matches("event: message_stop").count(), 1);
+    }
+
+    #[test]
+    fn terminal_snapshot_closes_parallel_tools_in_content_block_order() {
+        let out = render(vec![
+            json!({
+                "type":"response.output_item.added",
+                "output_index":20,
+                "item":{"type":"function_call","call_id":"call_a","name":"Lookup"}
+            }),
+            json!({
+                "type":"response.output_item.added",
+                "output_index":5,
+                "item":{"type":"function_call","call_id":"call_b","name":"Lookup"}
+            }),
+            json!({
+                "type":"response.output_item.added",
+                "output_index":10,
+                "item":{"type":"function_call","call_id":"call_c","name":"Lookup"}
+            }),
+            json!({
+                "type":"response.function_call_arguments.done",
+                "output_index":10,
+                "arguments":"{\"q\":\"c\"}"
+            }),
+            json!({
+                "type":"response.function_call_arguments.done",
+                "output_index":20,
+                "arguments":"{\"q\":\"a\"}"
+            }),
+            json!({
+                "type":"response.function_call_arguments.done",
+                "output_index":5,
+                "arguments":"{\"q\":\"b\"}"
+            }),
+            json!({
+                "type":"response.completed",
+                "response":{"id":"resp_1","usage":{}}
+            }),
+        ]);
+        let values: Vec<serde_json::Value> =
+            crate::anthropic::sse::try_parse_sse_events(out.as_bytes())
+                .unwrap()
+                .into_iter()
+                .map(|event| serde_json::from_str(&event.data).unwrap())
+                .collect();
+        let argument_order: Vec<_> = values
+            .iter()
+            .filter(|value| value["delta"]["type"] == "input_json_delta")
+            .filter_map(|value| value["index"].as_u64())
+            .collect();
+        let stop_order: Vec<_> = values
+            .iter()
+            .filter(|value| value["type"] == "content_block_stop")
+            .filter_map(|value| value["index"].as_u64())
+            .collect();
+        assert_eq!(argument_order, vec![0, 1, 2]);
+        assert_eq!(stop_order, vec![0, 1, 2]);
+        assert_eq!(out.matches("event: message_stop").count(), 1);
+    }
+
+    #[test]
+    fn repairs_whitespace_stalled_read_args_without_finishing_message() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
         let mut out = Vec::new();
         out.extend(
@@ -1711,8 +2093,14 @@ mod tests {
                 )
                 .unwrap(),
         );
-        let rendered = String::from_utf8(out).unwrap();
+        let rendered = String::from_utf8(out.clone()).unwrap();
         assert!(rendered.contains(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#));
+        assert!(!rendered.contains(r#""stop_reason":"tool_use""#));
+        assert!(!rendered.contains("message_stop"));
+        assert!(!translator.is_finished());
+
+        out.extend(translator.finish_after_closed_completed_tool_call(None));
+        let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains(r#""stop_reason":"tool_use""#));
         assert!(rendered.contains("message_stop"));
         assert!(translator.is_finished());
@@ -1895,7 +2283,99 @@ mod tests {
         let text = out.find("See the official docs.").unwrap();
         assert!(tool < result && result < text);
         assert!(out.contains("https://docs.x.ai/docs/guides/reasoning"));
+        assert!(out.contains(r#""caller":{"type":"direct"}"#));
+        assert!(out.contains(r#""encrypted_content":"""#));
+        assert!(out.contains(r#""page_age":null"#));
         assert!(out.contains(r#""web_search_requests":1"#));
+    }
+
+    #[test]
+    fn keeps_web_search_queries_and_sources_associated_per_call() {
+        let out = render(vec![
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "web_search_call", "id": "ws_1"}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "action": {
+                        "queries": ["alpha", "beta"],
+                        "sources": [{"type":"url","title":"Source A","url":"https://a.example"}]
+                    }
+                }
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws_2",
+                    "action": {
+                        "query": "gamma",
+                        "sources": [{"type":"url","title":"Source B","url":"https://b.example"}]
+                    }
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"status": "completed", "usage": {}}
+            }),
+        ]);
+
+        let values: Vec<serde_json::Value> =
+            crate::anthropic::sse::try_parse_sse_events(out.as_bytes())
+                .unwrap()
+                .into_iter()
+                .map(|event| serde_json::from_str(&event.data).unwrap())
+                .collect();
+        let tool_inputs: Vec<_> = values
+            .iter()
+            .filter(|value| value["delta"]["type"] == "input_json_delta")
+            .filter_map(|value| value["delta"]["partial_json"].as_str())
+            .map(|input| serde_json::from_str::<serde_json::Value>(input).unwrap())
+            .collect();
+        assert_eq!(
+            tool_inputs,
+            vec![json!({"query":"alpha\nbeta"}), json!({"query":"gamma"})]
+        );
+
+        let results: Vec<_> = values
+            .iter()
+            .filter_map(|value| {
+                let block = value.get("content_block")?;
+                (block.get("type")?.as_str()? == "web_search_tool_result").then_some(block)
+            })
+            .collect();
+        let server_uses: Vec<_> = values
+            .iter()
+            .filter_map(|value| {
+                let block = value.get("content_block")?;
+                (block.get("type")?.as_str()? == "server_tool_use").then_some(block)
+            })
+            .collect();
+        assert_eq!(server_uses.len(), 2);
+        assert!(
+            server_uses
+                .iter()
+                .all(|block| block["caller"]["type"] == "direct")
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["tool_use_id"], "srvtoolu_ws_1");
+        assert_eq!(results[0]["content"][0]["url"], "https://a.example");
+        assert_eq!(results[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(results[0]["caller"]["type"], "direct");
+        assert_eq!(results[0]["content"][0]["encrypted_content"], "");
+        assert!(results[0]["content"][0]["page_age"].is_null());
+        assert_eq!(results[1]["tool_use_id"], "srvtoolu_ws_2");
+        assert_eq!(results[1]["content"][0]["url"], "https://b.example");
+        assert_eq!(results[1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(results[1]["caller"]["type"], "direct");
+        assert!(out.contains(r#""web_search_requests":2"#));
     }
 
     #[test]

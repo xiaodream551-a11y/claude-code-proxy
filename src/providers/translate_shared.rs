@@ -139,20 +139,79 @@ pub fn normalize_strict_json_schema(schema: &Value) -> Value {
             Value::Array(items.iter().map(normalize_strict_json_schema).collect())
         }
         Value::Object(map) => {
-            let mut out = map.clone();
-            if let Some(properties) = out.get("properties").and_then(Value::as_object) {
+            let originally_required: std::collections::HashSet<&str> = map
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let mut out: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(key, value)| (key.clone(), normalize_strict_json_schema(value)))
+                .collect();
+            let is_bare_object = !out.contains_key("properties")
+                && out.get("type").and_then(Value::as_str) == Some("object");
+            let property_names = match out.get_mut("properties") {
+                Some(Value::Object(properties)) => {
+                    for (name, property_schema) in properties.iter_mut() {
+                        if !originally_required.contains(name.as_str()) {
+                            *property_schema = nullable_schema(std::mem::take(property_schema));
+                        }
+                    }
+                    Some(properties.keys().cloned().collect())
+                }
+                None if is_bare_object => {
+                    out.insert("properties".into(), Value::Object(serde_json::Map::new()));
+                    Some(Vec::new())
+                }
+                _ => None,
+            };
+            if let Some(property_names) = property_names {
                 out.insert(
                     "required".into(),
-                    Value::Array(properties.keys().cloned().map(Value::String).collect()),
+                    Value::Array(property_names.into_iter().map(Value::String).collect()),
                 );
-            }
-            for (key, value) in out.clone() {
-                out.insert(key, normalize_strict_json_schema(&value));
+                out.insert("additionalProperties".into(), Value::Bool(false));
             }
             Value::Object(out)
         }
         _ => schema.clone(),
     }
+}
+
+fn nullable_schema(schema: Value) -> Value {
+    if schema_accepts_null(&schema) {
+        schema
+    } else {
+        serde_json::json!({"anyOf": [schema, {"type": "null"}]})
+    }
+}
+
+fn schema_accepts_null(schema: &Value) -> bool {
+    let Some(schema) = schema.as_object() else {
+        return false;
+    };
+    if schema.get("const").is_some_and(Value::is_null)
+        || schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(Value::is_null))
+    {
+        return true;
+    }
+    match schema.get("type") {
+        Some(Value::String(kind)) if kind == "null" => return true,
+        Some(Value::Array(kinds)) if kinds.iter().any(|kind| kind.as_str() == Some("null")) => {
+            return true;
+        }
+        _ => {}
+    }
+    ["anyOf", "oneOf"]
+        .into_iter()
+        .filter_map(|key| schema.get(key).and_then(Value::as_array))
+        .flatten()
+        .any(schema_accepts_null)
 }
 
 pub fn normalize_content(content: &Value, missing_tool_input: Value) -> Vec<ContentBlock> {
@@ -357,8 +416,30 @@ mod tests {
         );
         assert_eq!(
             normalized["properties"]["metadata"]["required"],
+            Value::Null
+        );
+        assert_eq!(normalized["additionalProperties"], false);
+        assert_eq!(
+            normalized["properties"]["metadata"]["anyOf"][0]["required"],
             serde_json::json!(["short"])
         );
+        assert_eq!(
+            normalized["properties"]["metadata"]["anyOf"][0]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            normalized["properties"]["metadata"]["anyOf"][1],
+            serde_json::json!({"type":"null"})
+        );
+    }
+
+    #[test]
+    fn strict_empty_object_schema_gets_explicit_closed_shape() {
+        let normalized = normalize_strict_json_schema(&serde_json::json!({"type": "object"}));
+
+        assert_eq!(normalized["properties"], serde_json::json!({}));
+        assert_eq!(normalized["required"], serde_json::json!([]));
+        assert_eq!(normalized["additionalProperties"], false);
     }
 
     #[test]

@@ -1,4 +1,7 @@
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -10,6 +13,10 @@ use crate::providers::translate_shared::{
 };
 
 const MAX_GROK_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+// One maximally-sized base64 image expands to about 27 MiB. Leave room for
+// its JSON envelope while preventing multiple large blocks from growing one
+// function_call_output without bound.
+const MAX_TOOL_RESULT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -99,6 +106,12 @@ pub struct GrokTool {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Value>,
+    #[serde(skip)]
+    pub strict: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<GrokWebSearchFilters>,
+    #[serde(skip)]
+    pub location: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_x_handles: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,6 +120,19 @@ pub struct GrokTool {
     pub from_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to_date: Option<String>,
+    /// Anthropic limits hosted search calls per request. xAI has no
+    /// equivalent request field, so this is retained for model guidance and
+    /// deliberately omitted from the upstream JSON.
+    #[serde(skip)]
+    pub max_uses: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GrokWebSearchFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_domains: Option<Vec<String>>,
 }
 
 impl GrokTool {
@@ -116,10 +142,14 @@ impl GrokTool {
             name: None,
             description: None,
             parameters: None,
+            strict: None,
+            filters: None,
+            location: None,
             allowed_x_handles: None,
             excluded_x_handles: None,
             from_date: None,
             to_date: None,
+            max_uses: None,
         }
     }
 
@@ -129,10 +159,14 @@ impl GrokTool {
             name: Some(name.into()),
             description,
             parameters: Some(parameters),
+            strict: None,
+            filters: None,
+            location: None,
             allowed_x_handles: None,
             excluded_x_handles: None,
             from_date: None,
             to_date: None,
+            max_uses: None,
         }
     }
 }
@@ -144,6 +178,7 @@ pub enum GrokToolChoice {
     Required(String),
     None(String),
     Function { r#type: String, name: String },
+    Hosted { r#type: String },
 }
 
 pub fn translate_request(
@@ -156,10 +191,11 @@ pub fn translate_request(
     let text = read_output_format(req).map(|format| GrokText { format });
     let internal_text_request = compaction || text.is_some();
     let mut instructions = parse_system(req.extra.get("system"))?;
-    let mut tools = if compaction {
+    let selected_deferred = selected_deferred_tools(req);
+    let tools = if compaction {
         None
     } else {
-        parse_tools(req.extra.get("tools"))?
+        parse_tools(req.extra.get("tools"), &selected_deferred)?
     };
     let hosted_web_search = tools
         .as_ref()
@@ -167,27 +203,62 @@ pub fn translate_request(
     let dedicated_x_search = tools
         .as_ref()
         .is_some_and(|tools| tools.iter().any(|tool| tool.kind == "x_search"));
-    let x_search_intent = !internal_text_request && requests_x_search(req);
-    let force_x_search = x_search_intent;
-    let force_web_search =
-        !force_x_search && !internal_text_request && hosted_web_search && requests_web_search(req);
-    if force_x_search {
-        let tools = tools.get_or_insert_default();
-        if !tools.iter().any(|tool| tool.kind == "x_search") {
-            tools.push(GrokTool::hosted("x_search"));
-        }
-    }
+    // Prompt text may select a hosted capability that the client actually
+    // declared, but must never grant that capability on its own. An explicit
+    // tool_choice (especially `none`) always takes precedence.
+    let has_explicit_tool_choice = req.extra.contains_key("tool_choice");
+    let force_x_search = !internal_text_request
+        && !has_explicit_tool_choice
+        && dedicated_x_search
+        && requests_x_search(req);
+    let force_web_search = !internal_text_request
+        && !has_explicit_tool_choice
+        && !force_x_search
+        && hosted_web_search
+        && requests_web_search(req);
     if !internal_text_request && hosted_web_search {
         append_guidance(
             &mut instructions,
             "For general web searches, use the hosted web_search tool. Do not use shell commands, HTTP clients, or local tools to search the web.",
         );
     }
-    if !internal_text_request && (dedicated_x_search || force_x_search) {
+    if !internal_text_request && dedicated_x_search {
         append_guidance(
             &mut instructions,
             "For requests to search X or Twitter, use the hosted x_search tool. XSearch accepts a query and supports allowed_x_handles, excluded_x_handles, from_date, and to_date filters. Do not use Bash, curl, HTTP clients, or general web_search for X searches.",
         );
+    }
+    if !internal_text_request {
+        for tool in tools.iter().flatten() {
+            if tool.strict == Some(true)
+                && let Some(name) = tool.name.as_deref()
+            {
+                append_guidance(
+                    &mut instructions,
+                    &format!(
+                        "When calling {name}, emit arguments that match its JSON schema exactly and do not add undeclared properties."
+                    ),
+                );
+            }
+            if let Some(max_uses) = tool.max_uses {
+                append_guidance(
+                    &mut instructions,
+                    &format!(
+                        "Use the hosted {} tool no more than {max_uses} time(s) in this response.",
+                        tool.kind
+                    ),
+                );
+            }
+            if let Some(location) = &tool.location {
+                append_guidance(
+                    &mut instructions,
+                    &format!(
+                        "Prefer hosted {} results relevant to this approximate user location: {}.",
+                        tool.kind, location
+                    ),
+                );
+            }
+        }
     }
     let tool_choice = if compaction {
         None
@@ -219,10 +290,23 @@ pub fn translate_request(
             "When multiple independent function tools are needed, call them together in one response. Serialize only calls that have data dependencies.",
         );
     }
+    validate_hosted_tool_history(&req.messages)?;
     let mut call_ids = HashSet::new();
     let mut input = Vec::new();
     for message in &req.messages {
+        if !call_ids.is_empty() && message.role != "user" {
+            anyhow::bail!("unresolved tool calls must be followed by tool results");
+        }
+        if !call_ids.is_empty() {
+            validate_immediate_tool_results(message)?;
+        }
         parse_message(message, &mut input, &mut call_ids)?;
+        if message.role == "user" && !call_ids.is_empty() {
+            anyhow::bail!("user message did not resolve every pending tool call");
+        }
+    }
+    if !call_ids.is_empty() {
+        anyhow::bail!("request ends with unresolved tool calls");
     }
     let reasoning = if model == "grok-4.5" {
         reasoning_effort.map(|effort| GrokReasoning {
@@ -248,6 +332,293 @@ pub fn translate_request(
         reasoning,
         text,
     })
+}
+
+fn validate_immediate_tool_results(message: &Message) -> anyhow::Result<()> {
+    let blocks = message
+        .content
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("pending tool calls require a tool_result user message"))?;
+    let mut saw_non_result = false;
+    let mut result_count = 0usize;
+    for block in blocks {
+        let is_result = block.get("type").and_then(Value::as_str) == Some("tool_result");
+        if is_result {
+            if saw_non_result {
+                anyhow::bail!("tool_result blocks must precede other user content");
+            }
+            result_count += 1;
+        } else {
+            saw_non_result = true;
+        }
+    }
+    if result_count == 0 {
+        anyhow::bail!("pending tool calls require immediate tool_result blocks");
+    }
+    Ok(())
+}
+
+fn validate_hosted_tool_history(messages: &[Message]) -> anyhow::Result<()> {
+    let mut seen_ids = HashSet::new();
+    let mut pending_custom = HashSet::new();
+    let mut custom_order = Vec::new();
+    let mut pending_hosted = HashMap::new();
+    let mut hosted_order = Vec::new();
+    let mut hosted_mixed_pause = false;
+
+    for (message_index, message) in messages.iter().enumerate() {
+        let expects_custom_results = !pending_custom.is_empty();
+        if expects_custom_results && message.role != "user" {
+            let id = first_pending_tool_id(&custom_order, |id| pending_custom.contains(id));
+            anyhow::bail!(
+                "custom tool use id {id} must be resolved in the immediately following user message"
+            );
+        }
+        let expects_delayed_hosted =
+            hosted_mixed_pause && pending_custom.is_empty() && !pending_hosted.is_empty();
+        if expects_delayed_hosted && message.role != "assistant" {
+            let id = first_pending_tool_id(&hosted_order, |id| pending_hosted.contains_key(id));
+            anyhow::bail!(
+                "delayed hosted tool use id {id} must be resolved at the start of the next assistant message"
+            );
+        }
+
+        let blocks = match &message.content {
+            Value::Array(blocks) => blocks,
+            Value::String(_) => {
+                if expects_custom_results || expects_delayed_hosted {
+                    anyhow::bail!("pending tool results require structured content blocks");
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let mixed_pause_user_message = expects_custom_results && !pending_hosted.is_empty();
+        let mut resolving_delayed_hosted = expects_delayed_hosted;
+        let mut saw_non_custom_result = false;
+
+        for (block_index, block) in blocks.iter().enumerate() {
+            let Some(object) = block.as_object() else {
+                continue;
+            };
+            let Some(kind) = object.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            if mixed_pause_user_message && kind != "tool_result" {
+                anyhow::bail!(
+                    "messages[{message_index}] must contain only client tool_result blocks while hosted tools are paused"
+                );
+            }
+            if expects_custom_results && kind == "tool_result" {
+                if saw_non_custom_result {
+                    anyhow::bail!(
+                        "messages[{message_index}].content[{block_index}] tool_result blocks must precede other content"
+                    );
+                }
+            } else if expects_custom_results {
+                saw_non_custom_result = true;
+            }
+
+            if resolving_delayed_hosted {
+                if !matches!(kind, "web_search_tool_result" | "x_search_tool_result") {
+                    let id =
+                        first_pending_tool_id(&hosted_order, |id| pending_hosted.contains_key(id));
+                    anyhow::bail!(
+                        "delayed hosted tool use id {id} must be resolved before other assistant content"
+                    );
+                }
+                let (id, content) = hosted_result_identity(object, message_index, block_index)?;
+                validate_hosted_result_content(content, message_index, block_index)?;
+                resolve_hosted_result(&mut pending_hosted, id, kind)?;
+                if pending_hosted.is_empty() {
+                    resolving_delayed_hosted = false;
+                    hosted_mixed_pause = false;
+                }
+                continue;
+            }
+
+            match kind {
+                "tool_use" => {
+                    if message.role != "assistant" {
+                        continue;
+                    }
+                    let Some(id) = object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        continue;
+                    };
+                    if !seen_ids.insert(id.to_string()) {
+                        anyhow::bail!("duplicate tool use id: {id}");
+                    }
+                    pending_custom.insert(id.to_string());
+                    custom_order.push(id.to_string());
+                }
+                "server_tool_use" => {
+                    if message.role != "assistant" {
+                        anyhow::bail!(
+                            "messages[{message_index}].content[{block_index}] server_tool_use must have assistant role"
+                        );
+                    }
+                    let id = object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "messages[{message_index}].content[{block_index}].id must be a non-empty string"
+                            )
+                        })?;
+                    if !seen_ids.insert(id.to_string()) {
+                        anyhow::bail!("duplicate server tool use id: {id}");
+                    }
+                    let name = object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "messages[{message_index}].content[{block_index}].name must be a non-empty string"
+                            )
+                        })?;
+                    let expected_result = match name {
+                        "web_search" => "web_search_tool_result",
+                        // Older cg transcripts emitted a private x_search hosted-tool pair. It is
+                        // accepted only as validated history and is never generated downstream.
+                        "x_search" => "x_search_tool_result",
+                        _ => anyhow::bail!("unsupported server tool use name: {name}"),
+                    };
+                    if !object.contains_key("input") {
+                        anyhow::bail!(
+                            "messages[{message_index}].content[{block_index}].input is required"
+                        );
+                    }
+                    pending_hosted.insert(id.to_string(), expected_result.to_string());
+                    hosted_order.push(id.to_string());
+                }
+                "tool_result" => {
+                    if message.role != "user" {
+                        continue;
+                    }
+                    let Some(id) = object
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        continue;
+                    };
+                    if !pending_custom.remove(id) {
+                        anyhow::bail!(
+                            "tool result references an unknown or not-yet-seen tool use id: {id}"
+                        );
+                    }
+                }
+                "web_search_tool_result" | "x_search_tool_result" => {
+                    if message.role != "assistant" {
+                        anyhow::bail!(
+                            "messages[{message_index}].content[{block_index}] {kind} must have assistant role"
+                        );
+                    }
+                    let (id, content) = hosted_result_identity(object, message_index, block_index)?;
+                    validate_hosted_result_content(content, message_index, block_index)?;
+                    resolve_hosted_result(&mut pending_hosted, id, kind)?;
+                }
+                _ => {}
+            }
+        }
+
+        if expects_custom_results && !pending_custom.is_empty() {
+            let id = first_pending_tool_id(&custom_order, |id| pending_custom.contains(id));
+            anyhow::bail!(
+                "custom tool use id {id} must be resolved in the immediately following user message"
+            );
+        }
+        if resolving_delayed_hosted {
+            let id = first_pending_tool_id(&hosted_order, |id| pending_hosted.contains_key(id));
+            anyhow::bail!(
+                "delayed hosted tool use id {id} must be resolved at the start of the next assistant message"
+            );
+        }
+        if message.role == "assistant" && !pending_hosted.is_empty() {
+            if pending_custom.is_empty() {
+                let id = first_pending_tool_id(&hosted_order, |id| pending_hosted.contains_key(id));
+                anyhow::bail!("unresolved server tool use id: {id}");
+            }
+            hosted_mixed_pause = true;
+        }
+    }
+
+    if let Some(id) = custom_order.iter().find(|id| pending_custom.contains(*id)) {
+        anyhow::bail!("unresolved custom tool use id: {id}");
+    }
+    if let Some(id) = hosted_order
+        .iter()
+        .find(|id| pending_hosted.contains_key(*id))
+    {
+        anyhow::bail!("unresolved server tool use id: {id}");
+    }
+    Ok(())
+}
+
+fn first_pending_tool_id(order: &[String], is_pending: impl Fn(&str) -> bool) -> &str {
+    order
+        .iter()
+        .find(|id| is_pending(id))
+        .expect("pending tool ids originate from recorded history")
+}
+
+fn hosted_result_identity(
+    object: &serde_json::Map<String, Value>,
+    message_index: usize,
+    block_index: usize,
+) -> anyhow::Result<(&str, &Value)> {
+    let id = object
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "messages[{message_index}].content[{block_index}].tool_use_id must be a non-empty string"
+            )
+        })?;
+    let content = object.get("content").ok_or_else(|| {
+        anyhow::anyhow!("messages[{message_index}].content[{block_index}].content is required")
+    })?;
+    Ok((id, content))
+}
+
+fn validate_hosted_result_content(
+    content: &Value,
+    message_index: usize,
+    block_index: usize,
+) -> anyhow::Result<()> {
+    if matches!(content, Value::Array(_) | Value::Object(_)) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "messages[{message_index}].content[{block_index}].content must be an array or object"
+        )
+    }
+}
+
+fn resolve_hosted_result(
+    pending: &mut HashMap<String, String>,
+    id: &str,
+    actual_kind: &str,
+) -> anyhow::Result<()> {
+    let Some(expected_kind) = pending.get(id) else {
+        anyhow::bail!(
+            "hosted tool result references an unknown or not-yet-seen server tool use id: {id}"
+        );
+    };
+    if expected_kind != actual_kind {
+        anyhow::bail!(
+            "hosted tool result kind mismatch for {id}: expected {expected_kind}, got {actual_kind}"
+        );
+    }
+    pending.remove(id);
+    Ok(())
 }
 
 fn read_output_format(req: &MessagesRequest) -> Option<GrokTextFormat> {
@@ -380,7 +751,48 @@ fn parse_system(value: Option<&Value>) -> anyhow::Result<Option<String>> {
     }
 }
 
-fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
+fn selected_deferred_tools(req: &MessagesRequest) -> HashSet<String> {
+    let mut selected = HashSet::new();
+    if let Some(name) = req
+        .extra
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .filter(|choice| choice.get("type").and_then(Value::as_str) == Some("tool"))
+        .and_then(|choice| choice.get("name"))
+        .and_then(Value::as_str)
+    {
+        selected.insert(name.to_string());
+    }
+    for message in &req.messages {
+        let Some(blocks) = message.content.as_array() else {
+            continue;
+        };
+        for block in blocks {
+            let Some(children) = block
+                .as_object()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .and_then(|block| block.get("content"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for child in children {
+                if child.get("type").and_then(Value::as_str) == Some("tool_reference")
+                    && let Some(name) = child.get("tool_name").and_then(Value::as_str)
+                    && !name.is_empty()
+                {
+                    selected.insert(name.to_string());
+                }
+            }
+        }
+    }
+    selected
+}
+
+fn parse_tools(
+    value: Option<&Value>,
+    selected_deferred: &HashSet<String>,
+) -> anyhow::Result<Option<Vec<GrokTool>>> {
     let Some(value) = value else { return Ok(None) };
     let tools = value
         .as_array()
@@ -404,37 +816,98 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
                 // and deferred-tool turns into a local APIError.
                 "strict",
                 "defer_loading",
+                "eager_input_streaming",
                 "allowed_callers",
                 "input_examples",
+                "max_uses",
+                "allowed_domains",
+                "blocked_domains",
+                "user_location",
+                "response_inclusion",
             ]
             .contains(&key.as_str())
             {
                 anyhow::bail!("unsupported tool field: {key}");
             }
         }
-        let declared_type = obj.get("type").map(|kind| {
-            kind.as_str()
-                .filter(|kind| !kind.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("tool type is invalid"))
-        });
-        let declared_type = declared_type.transpose()?;
+        let declared_type = match obj.get("type") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(kind)) if !kind.is_empty() => Some(kind.as_str()),
+            Some(_) => anyhow::bail!("tool type is invalid"),
+        };
         if !valid_cache_control(obj.get("cache_control")) {
             anyhow::bail!("unsupported tool cache_control");
         }
-        let name = obj
+        let supplied_name = obj
             .get("name")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("tool name is invalid"))?;
-        if !names.insert(name.to_string()) {
+            .map(|name| {
+                name.as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("tool name is invalid"))
+            })
+            .transpose()?;
+        let is_typed_web_search = declared_type.is_some_and(|kind| kind.starts_with("web_search_"));
+        let canonical_name = if is_typed_web_search || supplied_name == Some("WebSearch") {
+            "web_search"
+        } else if supplied_name == Some("XSearch") {
+            "x_search"
+        } else {
+            supplied_name.ok_or_else(|| anyhow::anyhow!("tool name is invalid"))?
+        };
+        if !names.insert(canonical_name.to_string()) {
             anyhow::bail!("duplicate tool name");
         }
-        if name == "WebSearch" || declared_type.is_some_and(|kind| kind.starts_with("web_search_"))
+        let deferred = match obj.get("defer_loading") {
+            Some(Value::Bool(deferred)) => *deferred,
+            Some(Value::Null) => false,
+            Some(_) => anyhow::bail!("tool defer_loading must be boolean"),
+            None => false,
+        };
+        if let Some(eager) = obj.get("eager_input_streaming")
+            && !eager.is_null()
+            && !eager.is_boolean()
         {
-            out.push(GrokTool::hosted("web_search"));
+            anyhow::bail!("tool eager_input_streaming must be boolean");
+        }
+        let direct_by_default = !matches!(
+            declared_type,
+            Some("web_search_20260209" | "web_search_20260318")
+        );
+        let direct_allowed = direct_caller_allowed(obj.get("allowed_callers"), direct_by_default)?;
+        let selected = selected_deferred.contains(canonical_name)
+            || supplied_name.is_some_and(|name| selected_deferred.contains(name));
+        if !direct_allowed || (deferred && canonical_name != "ToolSearch" && !selected) {
             continue;
         }
-        if name == "XSearch" {
+        if is_typed_web_search || supplied_name == Some("WebSearch") {
+            let mut tool = GrokTool::hosted("web_search");
+            let allowed_domains = parse_string_list(obj.get("allowed_domains"), "allowed_domains")?;
+            let excluded_domains =
+                parse_string_list(obj.get("blocked_domains"), "blocked_domains")?;
+            if allowed_domains.is_some() && excluded_domains.is_some() {
+                anyhow::bail!("web_search cannot combine allowed_domains and blocked_domains");
+            }
+            for (field, values) in [
+                ("allowed_domains", allowed_domains.as_ref()),
+                ("blocked_domains", excluded_domains.as_ref()),
+            ] {
+                if values.is_some_and(|values| values.len() > 5) {
+                    anyhow::bail!("Grok {field} supports at most 5 domains");
+                }
+            }
+            if allowed_domains.is_some() || excluded_domains.is_some() {
+                tool.filters = Some(GrokWebSearchFilters {
+                    allowed_domains,
+                    excluded_domains,
+                });
+            }
+            tool.location = parse_user_location(obj.get("user_location"))?;
+            tool.max_uses = parse_positive_u64(obj.get("max_uses"), "max_uses")?;
+            validate_response_inclusion(obj.get("response_inclusion"), declared_type)?;
+            out.push(tool);
+            continue;
+        }
+        if supplied_name == Some("XSearch") {
             out.push(GrokTool::hosted("x_search"));
             continue;
         }
@@ -443,15 +916,132 @@ fn parse_tools(value: Option<&Value>) -> anyhow::Result<Option<Vec<GrokTool>>> {
             .filter(|value| value.is_object())
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("tool input_schema must be an object"))?;
-        out.push(GrokTool::function(
-            name,
+        let strict = match obj.get("strict") {
+            Some(Value::Bool(strict)) => *strict,
+            Some(Value::Null) => false,
+            Some(_) => anyhow::bail!("tool strict must be boolean"),
+            None => false,
+        };
+        let mut tool = GrokTool::function(
+            canonical_name,
             obj.get("description")
                 .and_then(Value::as_str)
                 .map(str::to_string),
             parameters,
-        ));
+        );
+        tool.strict = strict.then_some(true);
+        out.push(tool);
     }
-    Ok(Some(out))
+    Ok((!out.is_empty()).then_some(out))
+}
+
+fn parse_string_list(value: Option<&Value>, field: &str) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("{field} must be an array"))?;
+    if values.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("{field} entries must be non-empty strings"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn parse_positive_u64(value: Option<&Value>, field: &str) -> anyhow::Result<Option<u64>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("{field} must be a positive integer"))
+}
+
+fn parse_user_location(value: Option<&Value>) -> anyhow::Result<Option<Value>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("user_location must be an object"))?;
+    if object
+        .keys()
+        .any(|key| !["type", "city", "region", "country", "timezone"].contains(&key.as_str()))
+        || object.get("type").and_then(Value::as_str) != Some("approximate")
+    {
+        anyhow::bail!("unsupported user_location");
+    }
+    let mut mapped = serde_json::Map::new();
+    for key in ["city", "region", "country"] {
+        if let Some(value) = object.get(key) {
+            let value = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("user_location {key} must be a non-empty string"))?;
+            mapped.insert(key.into(), Value::String(value.into()));
+        }
+    }
+    if let Some(timezone) = object.get("timezone")
+        && timezone.as_str().is_none_or(str::is_empty)
+    {
+        anyhow::bail!("user_location timezone must be a non-empty string");
+    }
+    Ok((!mapped.is_empty()).then_some(Value::Object(mapped)))
+}
+
+fn direct_caller_allowed(value: Option<&Value>, default: bool) -> anyhow::Result<bool> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    if value.is_null() {
+        return Ok(default);
+    }
+    let callers = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("allowed_callers must be an array"))?;
+    let callers = callers
+        .iter()
+        .map(|caller| {
+            caller
+                .as_str()
+                .filter(|caller| !caller.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("allowed_callers entries must be strings"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(callers.contains(&"direct"))
+}
+
+fn validate_response_inclusion(
+    value: Option<&Value>,
+    declared_type: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(value) = value else { return Ok(()) };
+    if value.is_null() {
+        return Ok(());
+    }
+    if declared_type != Some("web_search_20260318") {
+        anyhow::bail!("response_inclusion is supported by web_search_20260318 only");
+    }
+    if matches!(value.as_str(), Some("full" | "excluded")) {
+        Ok(())
+    } else {
+        anyhow::bail!("response_inclusion must be full or excluded")
+    }
 }
 
 fn parse_tool_choice(
@@ -477,6 +1067,12 @@ fn parse_tool_choice(
                 .keys()
                 .all(|key| matches!(key.as_str(), "type" | "disable_parallel_tool_use")) =>
         {
+            if kind == "any" && tools.is_none_or(|items| items.is_empty()) {
+                anyhow::bail!("tool_choice {kind} requires at least one tool");
+            }
+            if kind == "auto" && tools.is_none_or(|items| items.is_empty()) {
+                return Ok(None);
+            }
             Ok(Some(match kind {
                 "auto" => GrokToolChoice::Auto("auto".into()),
                 "any" => GrokToolChoice::Required("required".into()),
@@ -493,14 +1089,28 @@ fn parse_tool_choice(
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("tool_choice name is invalid"))?;
-            if !tools
-                .is_some_and(|items| items.iter().any(|tool| tool.name.as_deref() == Some(name)))
-            {
+            let matched = tools.and_then(|items| {
+                items.iter().find(|tool| {
+                    tool.name.as_deref() == Some(name)
+                        || tool.kind == name
+                        || matches!(
+                            (tool.kind.as_str(), name),
+                            ("web_search", "WebSearch") | ("x_search", "XSearch")
+                        )
+                })
+            });
+            let Some(tool) = matched else {
                 anyhow::bail!("tool_choice references an unknown tool");
-            }
-            Ok(Some(GrokToolChoice::Function {
-                r#type: "function".into(),
-                name: name.into(),
+            };
+            Ok(Some(if tool.kind == "function" {
+                GrokToolChoice::Function {
+                    r#type: "function".into(),
+                    name: name.into(),
+                }
+            } else {
+                GrokToolChoice::Hosted {
+                    r#type: tool.kind.clone(),
+                }
             }))
         }
         _ => anyhow::bail!("unsupported tool_choice"),
@@ -521,6 +1131,7 @@ fn parse_message(
         _ => anyhow::bail!("message content must be text or blocks"),
     };
     let mut content = Vec::new();
+    let mut tool_result_images = Vec::new();
     for block in blocks {
         let object = block
             .as_object()
@@ -529,13 +1140,18 @@ fn parse_message(
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("content block type is invalid"))?;
+        if message.role == "user" && typ != "tool_result" && !tool_result_images.is_empty() {
+            content.append(&mut tool_result_images);
+        }
         match (message.role.as_str(), typ) {
             (_, "thinking") | (_, "redacted_thinking") => {}
             (_, "text") => {
-                if object
-                    .keys()
-                    .any(|key| !["type", "text", "cache_control"].contains(&key.as_str()))
-                    || !valid_cache_control(object.get("cache_control"))
+                if object.keys().any(|key| {
+                    !["type", "text", "citations", "cache_control"].contains(&key.as_str())
+                }) || !valid_cache_control(object.get("cache_control"))
+                    || object
+                        .get("citations")
+                        .is_some_and(|citations| !citations.is_null() && !citations.is_array())
                 {
                     anyhow::bail!("unsupported text block field");
                 }
@@ -569,12 +1185,13 @@ fn parse_message(
                     anyhow::bail!("unsupported server tool use");
                 }
             }
-            ("assistant", "web_search_tool_result" | "x_search_tool_result")
-            | ("user", "web_search_tool_result" | "x_search_tool_result") => {}
+            ("assistant", "web_search_tool_result" | "x_search_tool_result") => {}
             ("assistant", "tool_use") => {
                 if object.keys().any(|key| {
-                    !["type", "id", "name", "input", "cache_control"].contains(&key.as_str())
+                    !["type", "id", "name", "input", "caller", "cache_control"]
+                        .contains(&key.as_str())
                 }) || !valid_cache_control(object.get("cache_control"))
+                    || !valid_tool_caller(object.get("caller"))
                 {
                     anyhow::bail!("unsupported tool_use field");
                 }
@@ -630,40 +1247,72 @@ fn parse_message(
                 if !calls.remove(id) {
                     anyhow::bail!("tool result references an unknown or resolved tool call");
                 }
-                let value = object
-                    .get("content")
-                    .ok_or_else(|| anyhow::anyhow!("tool result content is required"))?;
-                let output = match value {
-                    Value::String(text) => text.clone(),
-                    Value::Array(parts) => tool_result_parts_to_text(parts)?,
-                    _ => anyhow::bail!("tool result supports text only"),
+                let translated = match object.get("content") {
+                    None | Some(Value::Null) => TranslatedToolResult::default(),
+                    Some(Value::String(text)) => {
+                        if text.len() > MAX_TOOL_RESULT_OUTPUT_BYTES {
+                            anyhow::bail!("tool result output exceeds the size limit");
+                        }
+                        TranslatedToolResult {
+                            output: text.clone(),
+                            images: Vec::new(),
+                        }
+                    }
+                    Some(Value::Array(parts)) => tool_result_parts_to_text(parts)?,
+                    Some(_) => anyhow::bail!("tool result content must be text or an array"),
                 };
                 let output = if object
                     .get("is_error")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
-                    if output.is_empty() {
+                    if translated.output.is_empty() {
                         "[tool execution error]".to_string()
                     } else {
-                        format!("[tool execution error]\n{output}")
+                        format!("[tool execution error]\n{}", translated.output)
                     }
                 } else {
-                    output
+                    translated.output
                 };
+                if output.len().saturating_add(
+                    translated
+                        .images
+                        .iter()
+                        .map(grok_content_part_payload_bytes)
+                        .sum::<usize>(),
+                ) > MAX_TOOL_RESULT_OUTPUT_BYTES
+                {
+                    anyhow::bail!("tool result output exceeds the size limit");
+                }
                 out.push(GrokInputItem::FunctionCallOutput {
                     call_id: id.into(),
                     output,
                 });
+                for image in translated.images {
+                    tool_result_images.push(GrokContentPart::InputText {
+                        text: format!("[image from tool result call_id: {id}]"),
+                    });
+                    tool_result_images.push(image);
+                }
             }
             _ => anyhow::bail!("unsupported content block: {typ}"),
         }
     }
     flush_message(&message.role, &mut content, out);
+    flush_message(&message.role, &mut tool_result_images, out);
     Ok(())
 }
 
-fn parse_image_source(value: Option<&Value>) -> anyhow::Result<(String, Option<u64>)> {
+enum ValidatedImageSource<'a> {
+    Base64 {
+        media_type: &'a str,
+        data: &'a str,
+        estimated_tokens: u64,
+    },
+    Url(&'a str),
+}
+
+fn validate_image_source(value: Option<&Value>) -> anyhow::Result<ValidatedImageSource<'_>> {
     let source = value
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("image source must be an object"))?;
@@ -703,16 +1352,11 @@ fn parse_image_source(value: Option<&Value>) -> anyhow::Result<(String, Option<u
                     }
                 };
 
-            // Build the final request value directly from the borrowed Anthropic
-            // payload. Avoid an intermediate owned base64 String at peak size.
-            let mut image_url = String::with_capacity(
-                "data:".len() + media_type.len() + ";base64,".len() + data.len(),
-            );
-            image_url.push_str("data:");
-            image_url.push_str(media_type);
-            image_url.push_str(";base64,");
-            image_url.push_str(data);
-            Ok((image_url, Some(estimated_tokens)))
+            Ok(ValidatedImageSource::Base64 {
+                media_type,
+                data,
+                estimated_tokens,
+            })
         }
         "url" => {
             if !source
@@ -735,14 +1379,39 @@ fn parse_image_source(value: Option<&Value>) -> anyhow::Result<(String, Option<u
             {
                 anyhow::bail!("image URL must be an HTTP(S) URL without credentials");
             }
-            Ok((raw.to_string(), None))
+            Ok(ValidatedImageSource::Url(raw))
         }
         _ => anyhow::bail!("unsupported image source type"),
     }
 }
 
+fn parse_image_source(value: Option<&Value>) -> anyhow::Result<(String, Option<u64>)> {
+    match validate_image_source(value)? {
+        ValidatedImageSource::Base64 {
+            media_type,
+            data,
+            estimated_tokens,
+        } => {
+            // Build the final request value directly from the borrowed Anthropic
+            // payload. Avoid an intermediate owned base64 String at peak size.
+            let mut image_url = String::with_capacity(
+                "data:".len() + media_type.len() + ";base64,".len() + data.len(),
+            );
+            image_url.push_str("data:");
+            image_url.push_str(media_type);
+            image_url.push_str(";base64,");
+            image_url.push_str(data);
+            Ok((image_url, Some(estimated_tokens)))
+        }
+        ValidatedImageSource::Url(url) => Ok((url.to_string(), None)),
+    }
+}
+
 fn valid_cache_control(value: Option<&Value>) -> bool {
     let Some(value) = value else { return true };
+    if value.is_null() {
+        return true;
+    }
     let Some(object) = value.as_object() else {
         return false;
     };
@@ -753,9 +1422,25 @@ fn valid_cache_control(value: Option<&Value>) -> bool {
             .is_none_or(|ttl| matches!(ttl.as_str(), Some("5m") | Some("1h")))
 }
 
-fn tool_result_parts_to_text(parts: &[Value]) -> anyhow::Result<String> {
-    let mut rendered = String::new();
-    let mut last_was_tool_reference = false;
+fn valid_tool_caller(value: Option<&Value>) -> bool {
+    let Some(value) = value else { return true };
+    value
+        .as_object()
+        .and_then(|caller| caller.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !kind.is_empty())
+}
+
+#[derive(Default)]
+struct TranslatedToolResult {
+    output: String,
+    images: Vec<GrokContentPart>,
+}
+
+fn tool_result_parts_to_text(parts: &[Value]) -> anyhow::Result<TranslatedToolResult> {
+    let mut rendered = Vec::new();
+    let mut images = Vec::new();
+    let mut image_payload_bytes = 0usize;
 
     for part in parts {
         let part = part
@@ -763,10 +1448,12 @@ fn tool_result_parts_to_text(parts: &[Value]) -> anyhow::Result<String> {
             .ok_or_else(|| anyhow::anyhow!("tool result child must be an object"))?;
         match part.get("type").and_then(Value::as_str) {
             Some("text") => {
-                if part
-                    .keys()
-                    .any(|key| !["type", "text", "cache_control"].contains(&key.as_str()))
-                    || !valid_cache_control(part.get("cache_control"))
+                if part.keys().any(|key| {
+                    !["type", "text", "citations", "cache_control"].contains(&key.as_str())
+                }) || !valid_cache_control(part.get("cache_control"))
+                    || part
+                        .get("citations")
+                        .is_some_and(|citations| !citations.is_null() && !citations.is_array())
                 {
                     anyhow::bail!("tool result text child is invalid");
                 }
@@ -774,16 +1461,7 @@ fn tool_result_parts_to_text(parts: &[Value]) -> anyhow::Result<String> {
                     .get("text")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("tool result text is invalid"))?;
-                if last_was_tool_reference
-                    && !rendered.is_empty()
-                    && !rendered.ends_with('\n')
-                    && !text.is_empty()
-                    && !text.starts_with('\n')
-                {
-                    rendered.push('\n');
-                }
-                rendered.push_str(text);
-                last_was_tool_reference = false;
+                append_tool_result_segment(&mut rendered, image_payload_bytes, text)?;
             }
             Some("tool_reference") => {
                 if part
@@ -798,17 +1476,197 @@ fn tool_result_parts_to_text(parts: &[Value]) -> anyhow::Result<String> {
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("tool result tool_name is invalid"))?;
-                if !rendered.is_empty() && !rendered.ends_with('\n') {
-                    rendered.push('\n');
-                }
-                rendered.push_str(&format!("[tool reference: {tool_name}]"));
-                last_was_tool_reference = true;
+                append_tool_result_segment(
+                    &mut rendered,
+                    image_payload_bytes,
+                    &format!("[tool reference: {tool_name}]"),
+                )?;
             }
-            _ => anyhow::bail!("tool result supports text and tool_reference children only"),
+            Some("image") => {
+                if part
+                    .keys()
+                    .any(|key| !["type", "source", "cache_control"].contains(&key.as_str()))
+                    || !valid_cache_control(part.get("cache_control"))
+                {
+                    anyhow::bail!("tool result image child is invalid");
+                }
+                let (image_url, estimated_tokens) = parse_image_source(part.get("source"))?;
+                image_payload_bytes = image_payload_bytes.saturating_add(image_url.len());
+                append_tool_result_segment(
+                    &mut rendered,
+                    image_payload_bytes,
+                    "[image tool result attached as the following user image]",
+                )?;
+                images.push(GrokContentPart::InputImage {
+                    image_url,
+                    estimated_tokens,
+                });
+            }
+            Some("document" | "search_result") => {
+                validate_structured_tool_result_part(part)?;
+                // xAI function outputs are textual. Preserve non-image
+                // structured blocks as compact JSON directly in the final
+                // buffer, without creating a second large serialized copy.
+                append_tool_result_json(&mut rendered, image_payload_bytes, part)?;
+            }
+            _ => anyhow::bail!(
+                "tool result supports text, image, document, search_result, and tool_reference children"
+            ),
         }
     }
 
-    Ok(rendered)
+    Ok(TranslatedToolResult {
+        output: String::from_utf8(rendered).expect("text and JSON serialization are UTF-8"),
+        images,
+    })
+}
+
+fn append_tool_result_segment(
+    rendered: &mut Vec<u8>,
+    image_payload_bytes: usize,
+    segment: &str,
+) -> anyhow::Result<()> {
+    if segment.is_empty() {
+        return Ok(());
+    }
+    let separator = !rendered.is_empty()
+        && !std::str::from_utf8(rendered)
+            .expect("tool result buffer is UTF-8")
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+        && !segment.chars().next().is_some_and(char::is_whitespace);
+    let additional = segment.len() + usize::from(separator);
+    if rendered
+        .len()
+        .saturating_add(image_payload_bytes)
+        .saturating_add(additional)
+        > MAX_TOOL_RESULT_OUTPUT_BYTES
+    {
+        anyhow::bail!("tool result output exceeds the size limit");
+    }
+    if separator {
+        rendered.push(b'\n');
+    }
+    rendered.extend_from_slice(segment.as_bytes());
+    Ok(())
+}
+
+struct BoundedToolResultWriter<'a> {
+    rendered: &'a mut Vec<u8>,
+    max_rendered_bytes: usize,
+}
+
+impl Write for BoundedToolResultWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.rendered.len().saturating_add(bytes.len()) > self.max_rendered_bytes {
+            return Err(std::io::Error::other(
+                "tool result output exceeds the size limit",
+            ));
+        }
+        self.rendered.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn append_tool_result_json(
+    rendered: &mut Vec<u8>,
+    image_payload_bytes: usize,
+    value: &serde_json::Map<String, Value>,
+) -> anyhow::Result<()> {
+    append_tool_result_segment(rendered, image_payload_bytes, "")?;
+    let separator = !rendered.is_empty()
+        && !std::str::from_utf8(rendered)
+            .expect("tool result buffer is UTF-8")
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+    if separator {
+        if rendered
+            .len()
+            .saturating_add(image_payload_bytes)
+            .saturating_add(1)
+            > MAX_TOOL_RESULT_OUTPUT_BYTES
+        {
+            anyhow::bail!("tool result output exceeds the size limit");
+        }
+        rendered.push(b'\n');
+    }
+    let max_rendered_bytes = MAX_TOOL_RESULT_OUTPUT_BYTES
+        .checked_sub(image_payload_bytes)
+        .ok_or_else(|| anyhow::anyhow!("tool result output exceeds the size limit"))?;
+    serde_json::to_writer(
+        BoundedToolResultWriter {
+            rendered,
+            max_rendered_bytes,
+        },
+        value,
+    )
+    .map_err(|_| anyhow::anyhow!("tool result output exceeds the size limit"))?;
+    Ok(())
+}
+
+fn validate_structured_tool_result_part(
+    part: &serde_json::Map<String, Value>,
+) -> anyhow::Result<()> {
+    if !valid_cache_control(part.get("cache_control")) {
+        anyhow::bail!("tool result structured child cache_control is invalid");
+    }
+    match part.get("type").and_then(Value::as_str) {
+        Some("document") => {
+            if part.keys().any(|key| {
+                ![
+                    "type",
+                    "source",
+                    "citations",
+                    "context",
+                    "title",
+                    "cache_control",
+                ]
+                .contains(&key.as_str())
+            }) || !part.get("source").is_some_and(Value::is_object)
+            {
+                anyhow::bail!("tool result document child is invalid");
+            }
+        }
+        Some("search_result") => {
+            if part.keys().any(|key| {
+                ![
+                    "type",
+                    "source",
+                    "title",
+                    "content",
+                    "citations",
+                    "cache_control",
+                ]
+                .contains(&key.as_str())
+            }) || part
+                .get("source")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+                || part
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                || !part.get("content").is_some_and(Value::is_array)
+            {
+                anyhow::bail!("tool result search_result child is invalid");
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn grok_content_part_payload_bytes(part: &GrokContentPart) -> usize {
+    match part {
+        GrokContentPart::InputImage { image_url, .. } => image_url.len(),
+        GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => text.len(),
+    }
 }
 
 fn flush_message(role: &str, content: &mut Vec<GrokContentPart>, out: &mut Vec<GrokInputItem>) {
@@ -1035,6 +1893,117 @@ mod tests {
     }
 
     #[test]
+    fn grok_translation_validates_hosted_history_identity_kind_and_order() {
+        let cases = [
+            (
+                serde_json::json!([
+                    {"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}},
+                    {"type":"x_search_tool_result","tool_use_id":"srv_1","content":[]}
+                ]),
+                "kind mismatch",
+            ),
+            (
+                serde_json::json!([
+                    {"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}},
+                    {"type":"web_search_tool_result","tool_use_id":"srv_other","content":[]}
+                ]),
+                "unknown",
+            ),
+            (
+                serde_json::json!([
+                    {"type":"web_search_tool_result","tool_use_id":"srv_1","content":[]},
+                    {"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}
+                ]),
+                "not-yet-seen",
+            ),
+            (
+                serde_json::json!([
+                    {"type":"server_tool_use","id":"srv_1","name":"web_search"},
+                    {"type":"web_search_tool_result","tool_use_id":"srv_1","content":[]}
+                ]),
+                ".input is required",
+            ),
+            (
+                serde_json::json!([
+                    {"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}},
+                    {"type":"web_search_tool_result","tool_use_id":"srv_1"}
+                ]),
+                ".content is required",
+            ),
+        ];
+        for (content, expected) in cases {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"assistant","content":content}]
+            }))
+            .unwrap();
+            let error = translate_request(&request, "grok-4.5".into())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_translation_accepts_mixed_client_and_server_tool_history() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"query":"rust"}},
+                    {"type":"web_search_tool_result","tool_use_id":"srv_1","content":[]},
+                    {"type":"tool_use","id":"call_1","name":"Read","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":"done"},
+                    {"type":"text","text":"continue"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][0]["type"], "function_call");
+        assert_eq!(translated["input"][1]["type"], "function_call_output");
+        assert!(!translated.to_string().contains("srv_1"));
+    }
+
+    #[test]
+    fn grok_translation_replays_delayed_hosted_result_after_client_tool_pause() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"server_tool_use","id":"srv_1","name":"web_search","input":{"query":"rust"}},
+                    {"type":"tool_use","id":"call_1","name":"Read","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":"done"}
+                ]},
+                {"role":"assistant","content":[
+                    {"type":"web_search_tool_result","tool_use_id":"srv_1","content":[]},
+                    {"type":"text","text":"combined result"}
+                ]},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][0]["type"], "function_call");
+        assert_eq!(translated["input"][1]["type"], "function_call_output");
+        assert_eq!(translated["input"][2]["role"], "assistant");
+        assert_eq!(
+            translated["input"][2]["content"][0]["text"],
+            "combined result"
+        );
+        assert!(!translated.to_string().contains("srv_1"));
+    }
+
+    #[test]
     fn grok_translation_maps_text_and_function_round_trip() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5", "max_tokens":12, "system":"rules",
@@ -1173,7 +2142,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_translation_maps_x_intent_to_required_hosted_x_search() {
+    fn grok_translation_never_injects_undeclared_x_search_from_prompt_text() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
             "messages":[{"role":"user","content":"Search X for recent posts mentioning claude-code-proxy"}],
@@ -1188,8 +2157,8 @@ mod tests {
         let tools = translated["tools"].as_array().unwrap();
         assert!(tools.iter().any(|tool| tool["name"] == "Bash"));
         assert!(tools.iter().any(|tool| tool["type"] == "web_search"));
-        assert!(tools.iter().any(|tool| tool["type"] == "x_search"));
-        assert_eq!(translated["tool_choice"], "required");
+        assert!(!tools.iter().any(|tool| tool["type"] == "x_search"));
+        assert!(translated.get("tool_choice").is_none());
         assert_eq!(translated["parallel_tool_calls"], true);
     }
 
@@ -1419,26 +2388,33 @@ mod tests {
     }
 
     #[test]
-    fn grok_translation_ignores_claude_code_tool_execution_hints() {
+    fn grok_translation_defers_unselected_tools_and_keeps_tool_search_eager() {
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
             "messages":[{"role":"user","content":"inspect in parallel"}],
-            "tools":[{
-                "name":"Workflow",
-                "description":"Run a dynamic workflow",
-                "input_schema":{"type":"object","properties":{"script":{"type":"string"}}},
-                "strict":true,
-                "defer_loading":true,
-                "allowed_callers":["direct", "workflow"],
-                "input_examples":[{"script":"await agent('inspect')"}]
-            }]
+            "tools":[
+                {
+                    "name":"ToolSearch",
+                    "input_schema":{"type":"object","properties":{"query":{"type":"string"}}}
+                },
+                {
+                    "name":"Workflow",
+                    "description":"Run a dynamic workflow",
+                    "input_schema":{"type":"object","properties":{"script":{"type":"string"}}},
+                    "strict":true,
+                    "defer_loading":true,
+                    "allowed_callers":["direct", "workflow"],
+                    "input_examples":[{"script":"await agent('inspect')"}]
+                }
+            ]
         }))
         .unwrap();
 
         let translated =
             serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
         let encoded = translated.to_string();
-        assert!(encoded.contains("Workflow"));
+        assert!(encoded.contains("ToolSearch"));
+        assert!(!encoded.contains("Workflow"));
         assert!(!encoded.contains("defer_loading"));
         assert!(!encoded.contains("allowed_callers"));
         assert!(!encoded.contains("input_examples"));
@@ -1482,5 +2458,492 @@ mod tests {
         assert_eq!(translated["input"][1]["type"], "function_call_output");
         assert_eq!(translated["input"][1]["output"], "result");
         assert!(!translated.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn grok_translation_accepts_empty_and_structured_tool_results_losslessly() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"call_1","name":"Read","input":{}},
+                    {"type":"tool_use","id":"call_2","name":"Read","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1"},
+                    {"type":"tool_result","tool_use_id":"call_2","content":[
+                        {"type":"text","text":"first block"},
+                        {"type":"text","text":"agentId: abc"},
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}},
+                        {"type":"document","source":{"type":"text","media_type":"text/plain","data":"doc"},"title":"note"},
+                        {"type":"search_result","source":"https://example.com","title":"Example","content":[{"type":"text","text":"result"}]}
+                    ]}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][2]["output"], "");
+        let output = translated["input"][3]["output"].as_str().unwrap();
+        assert!(output.starts_with("first block\nagentId: abc\n"));
+        assert!(output.contains("image tool result attached"));
+        assert!(output.contains("\"type\":\"document\""));
+        assert!(output.contains("\"type\":\"search_result\""));
+        assert!(!output.contains("aGVsbG8="));
+        assert!(output.contains("https://example.com"));
+        assert_eq!(translated["input"][4]["type"], "message");
+        assert_eq!(translated["input"][4]["role"], "user");
+        assert_eq!(
+            translated["input"][4]["content"][0]["text"],
+            "[image from tool result call_id: call_2]"
+        );
+        assert_eq!(
+            translated["input"][4]["content"][1]["image_url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn grok_translation_accepts_caller_citations_and_eager_streaming_hints() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[{
+                "name":"lookup",
+                "input_schema":{"type":"object"},
+                "eager_input_streaming":true
+            }],
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"text","text":"cited","citations":[{"type":"char_location","start_char_index":0,"end_char_index":5}]},
+                    {"type":"tool_use","id":"call_1","name":"lookup","input":{},"caller":{"type":"direct"}}
+                ]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1"}]}
+            ]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(!translated.to_string().contains("eager_input_streaming"));
+        assert!(!translated.to_string().contains("citations"));
+        assert!(!translated.to_string().contains("caller"));
+    }
+
+    #[test]
+    fn grok_translation_loads_referenced_deferred_tool_with_strict_schema() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[
+                {"name":"ToolSearch","input_schema":{"type":"object","properties":{"query":{"type":"string"}}}},
+                {
+                    "name":"Workflow",
+                    "defer_loading":true,
+                    "strict":true,
+                    "allowed_callers":["direct","workflow"],
+                    "input_schema":{"type":"object","properties":{"script":{"type":"string"},"timeout":{"type":"integer"}},"required":["script"]}
+                }
+            ],
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_search","name":"ToolSearch","input":{"query":"select:Workflow"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_search","content":[{"type":"tool_reference","tool_name":"Workflow"}]}]},
+                {"role":"user","content":"run it"}
+            ]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        let workflow = translated["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "Workflow")
+            .unwrap();
+        assert!(workflow.get("strict").is_none());
+        assert!(workflow["parameters"].get("additionalProperties").is_none());
+        assert_eq!(
+            workflow["parameters"]["required"],
+            serde_json::json!(["script"])
+        );
+        assert!(!translated.to_string().contains("defer_loading"));
+        assert!(
+            translated["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("match its JSON schema exactly")
+        );
+    }
+
+    #[test]
+    fn grok_translation_omits_tools_that_disallow_direct_callers() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[{
+                "name":"WorkflowOnly",
+                "allowed_callers":["workflow"],
+                "input_schema":{"type":"object"}
+            }],
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert!(translated.get("tools").is_none());
+        assert!(translated.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn grok_translation_maps_current_web_search_configuration() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[{
+                "type":"web_search_20260318",
+                "name":"web_search",
+                "max_uses":2,
+                "allowed_domains":["docs.rs","rust-lang.org"],
+                "user_location":{"type":"approximate","city":"Nanjing","region":"Jiangsu","country":"CN","timezone":"Asia/Shanghai"},
+                "allowed_callers":["direct"],
+                "response_inclusion":"full"
+            }],
+            "tool_choice":{"type":"tool","name":"web_search"},
+            "messages":[{"role":"user","content":"search the web"}]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(
+            translated["tools"],
+            serde_json::json!([{
+                "type":"web_search",
+                "filters":{"allowed_domains":["docs.rs","rust-lang.org"]}
+            }])
+        );
+        assert_eq!(
+            translated["tool_choice"],
+            serde_json::json!({"type":"web_search"})
+        );
+        assert!(
+            translated["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("no more than 2 time(s)")
+        );
+        assert!(
+            translated["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("Nanjing")
+        );
+    }
+
+    #[test]
+    fn grok_translation_respects_none_for_declared_x_search() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[{"name":"XSearch","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"none"},
+            "messages":[{"role":"user","content":"Search X for recent posts"}]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["tool_choice"], "none");
+        assert_eq!(translated["tools"][0]["type"], "x_search");
+    }
+
+    #[test]
+    fn grok_translation_validates_any_and_maps_blocked_domains() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tool_choice":{"type":"any"},
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        assert!(translate_request(&request, "grok-4.5".into()).is_err());
+
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[{
+                "type":"web_search_20260209",
+                "allowed_callers":["direct"],
+                "blocked_domains":["example.com"]
+            }],
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(
+            translated["tools"][0]["filters"]["excluded_domains"],
+            serde_json::json!(["example.com"])
+        );
+    }
+
+    #[test]
+    fn grok_translation_applies_versioned_web_search_caller_defaults() {
+        for version in ["web_search_20260209", "web_search_20260318"] {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "tools":[{"type":version,"name":"web_search"}],
+                "messages":[{"role":"user","content":"hello"}]
+            }))
+            .unwrap();
+            let translated =
+                serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap())
+                    .unwrap();
+            assert!(translated.get("tools").is_none(), "{version}");
+        }
+
+        for (version, callers) in [
+            ("web_search_20250305", None),
+            ("web_search_20260209", Some(serde_json::json!(["direct"]))),
+            ("web_search_20260318", Some(serde_json::json!(["direct"]))),
+        ] {
+            let mut tool = serde_json::json!({"type":version,"name":"web_search"});
+            if let Some(callers) = callers {
+                tool["allowed_callers"] = callers;
+            }
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "tools":[tool],
+                "messages":[{"role":"user","content":"hello"}]
+            }))
+            .unwrap();
+            let translated =
+                serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap())
+                    .unwrap();
+            assert_eq!(translated["tools"][0]["type"], "web_search", "{version}");
+        }
+    }
+
+    #[test]
+    fn grok_translation_accepts_nullable_anthropic_tool_fields() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "system":[{"type":"text","text":"rules","cache_control":null}],
+            "tools":[
+                {
+                    "type":null,
+                    "name":"lookup",
+                    "input_schema":{"type":"object"},
+                    "cache_control":null,
+                    "eager_input_streaming":null
+                },
+                {
+                    "type":"web_search_20250305",
+                    "name":"web_search",
+                    "allowed_domains":null,
+                    "blocked_domains":null,
+                    "max_uses":null,
+                    "user_location":null,
+                    "response_inclusion":null,
+                    "cache_control":null
+                }
+            ],
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"hello","citations":null,"cache_control":null}]},
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{},"cache_control":null}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","cache_control":null,"content":[{"type":"text","text":"ok","citations":null,"cache_control":null}]}]}
+            ]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["tools"].as_array().unwrap().len(), 2);
+        assert!(!translated.to_string().contains("cache_control"));
+        assert!(!translated.to_string().contains("citations"));
+        assert!(!translated.to_string().contains("eager_input_streaming"));
+    }
+
+    #[test]
+    fn grok_translation_rejects_misplaced_eager_streaming_and_response_inclusion() {
+        let top_level: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "eager_input_streaming":true,
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        assert!(translate_request(&top_level, "grok-4.5".into()).is_err());
+
+        let invalid_eager: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[{"name":"lookup","input_schema":{"type":"object"},"eager_input_streaming":"yes"}],
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        assert!(translate_request(&invalid_eager, "grok-4.5".into()).is_err());
+
+        for (version, inclusion) in [
+            ("web_search_20250305", "full"),
+            ("web_search_20260209", "excluded"),
+            ("web_search_20260318", "citations"),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "tools":[{
+                    "type":version,
+                    "name":"web_search",
+                    "allowed_callers":["direct"],
+                    "response_inclusion":inclusion
+                }],
+                "messages":[{"role":"user","content":"hello"}]
+            }))
+            .unwrap();
+            assert!(translate_request(&request, "grok-4.5".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn grok_translation_enforces_immediate_prefix_tool_results() {
+        let trailing: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"user","content":"run it"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{}}]}
+            ]
+        }))
+        .unwrap();
+        assert!(translate_request(&trailing, "grok-4.5".into()).is_err());
+
+        let skipped: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{}}]},
+                {"role":"user","content":"continue without a result"},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"late"}]}
+            ]
+        }))
+        .unwrap();
+        assert!(translate_request(&skipped, "grok-4.5".into()).is_err());
+
+        let text_first: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{}}]},
+                {"role":"user","content":[
+                    {"type":"text","text":"before"},
+                    {"type":"tool_result","tool_use_id":"call_1","content":"result"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert!(translate_request(&text_first, "grok-4.5".into()).is_err());
+
+        let valid: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{}}]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":"result"},
+                    {"type":"text","text":"after"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&valid, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][0]["type"], "function_call");
+        assert_eq!(translated["input"][1]["type"], "function_call_output");
+        assert_eq!(translated["input"][2]["type"], "message");
+        assert_eq!(translated["input"][2]["content"][0]["text"], "after");
+    }
+
+    #[test]
+    fn grok_translation_validates_tool_result_images_and_bounds_text_output() {
+        let invalid_image = request_with_blocks(serde_json::json!([{
+            "type":"tool_result",
+            "tool_use_id":"call_1",
+            "content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"not base64"}}]
+        }]));
+        assert!(translate_request(&invalid_image, "grok-4.5".into()).is_err());
+
+        let oversized = request_with_blocks(serde_json::json!([{
+            "type":"tool_result",
+            "tool_use_id":"call_1",
+            "content":"x".repeat(MAX_TOOL_RESULT_OUTPUT_BYTES + 1)
+        }]));
+        let error = translate_request(&oversized, "grok-4.5".into()).unwrap_err();
+        assert!(error.to_string().contains("size limit"));
+    }
+
+    #[test]
+    fn grok_translation_labels_parallel_tool_result_images_by_call_id() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"call_a","name":"Read","input":{}},
+                    {"type":"tool_use","id":"call_b","name":"Read","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_a","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]},
+                    {"type":"tool_result","tool_use_id":"call_b","content":[{"type":"image","source":{"type":"url","url":"https://example.com/b.png"}}]}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][2]["call_id"], "call_a");
+        assert_eq!(translated["input"][3]["call_id"], "call_b");
+        let content = translated["input"][4]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0]["text"],
+            "[image from tool result call_id: call_a]"
+        );
+        assert_eq!(content[1]["image_url"], "https://example.com/a.png");
+        assert_eq!(
+            content[2]["text"],
+            "[image from tool result call_id: call_b]"
+        );
+        assert_eq!(content[3]["image_url"], "https://example.com/b.png");
+    }
+
+    #[test]
+    fn grok_translation_keeps_tool_result_images_before_trailing_user_text() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"call_1","name":"Read","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":[
+                        {"type":"image","source":{"type":"url","url":"https://example.com/result.png"}}
+                    ]},
+                    {"type":"text","text":"describe this image"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][1]["type"], "function_call_output");
+        let content = translated["input"][2]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0]["text"],
+            "[image from tool result call_id: call_1]"
+        );
+        assert_eq!(content[1]["image_url"], "https://example.com/result.png");
+        assert_eq!(content[2]["text"], "describe this image");
+    }
+
+    #[test]
+    fn grok_translation_rejects_user_role_hosted_search_results() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":[{
+                "type":"web_search_tool_result",
+                "tool_use_id":"srvtoolu_1",
+                "content":[]
+            }]}]
+        }))
+        .unwrap();
+        assert!(translate_request(&request, "grok-4.5".into()).is_err());
     }
 }
