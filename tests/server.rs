@@ -587,7 +587,7 @@ async fn count_tokens_accepts_all_anthropic_tool_result_shapes_for_grok_and_code
             "source": {
                 "type": "base64",
                 "media_type": "image/png",
-                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                "data": "iVBORw0KGgoAAAANSUhEUgAAACAAAAAQCAYAAAB3AH1ZAAAAI0lEQVR4nO3OIQEAAAwEoetfeovxBoGnq1tKQEBAQEBAYB142QD8LgetqmMAAAAASUVORK5CYII="
             }
         }])),
         Some(json!([{

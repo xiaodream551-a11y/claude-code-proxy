@@ -20,6 +20,7 @@ const IMAGE_DECODE_BUFFER_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Base64ImageError {
     Invalid,
+    TooSmall,
     TooLarge,
 }
 
@@ -121,6 +122,12 @@ pub(super) fn validate_and_estimate_base64_image(
 
         let prefix_remaining = IMAGE_METADATA_PREFIX_BYTES.saturating_sub(prefix.len());
         prefix.extend_from_slice(&buffer[..read.min(prefix_remaining)]);
+    }
+
+    if image_dimensions(&prefix).is_some_and(|(width, height)| {
+        width < 8 || height < 8 || width.saturating_mul(height) < 512
+    }) {
+        return Err(Base64ImageError::TooSmall);
     }
 
     Ok(estimate_image_tokens_from_summary(
@@ -360,6 +367,25 @@ mod tests {
     }
 
     #[test]
+    fn streaming_image_validation_rejects_dimensions_below_grok_minimum() {
+        for image in [
+            png_base64(1, 512),
+            png_base64(512, 1),
+            png_base64(7, 73),
+            png_base64(8, 8),
+            png_base64(8, 63),
+        ] {
+            assert_eq!(
+                validate_and_estimate_base64_image(&image, 1024),
+                Err(Base64ImageError::TooSmall)
+            );
+        }
+        for image in [png_base64(8, 64), png_base64(16, 32), png_base64(512, 8)] {
+            assert!(validate_and_estimate_base64_image(&image, 1024).is_ok());
+        }
+    }
+
+    #[test]
     fn jpeg_metadata_beyond_the_bounded_prefix_uses_decoded_size_fallback() {
         let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0xff, 0xff];
         jpeg.resize(2 + 2 + usize::from(u16::MAX), 0);
@@ -416,7 +442,7 @@ mod tests {
             "model": "grok-4.5",
             "messages": [{"role": "user", "content": [{
                 "type":"image",
-                "source":{"type":"base64","media_type":"image/png","data":png_base64(1, 1)}
+                "source":{"type":"base64","media_type":"image/png","data":png_base64(16, 32)}
             }]}]
         }));
         let large = translated_request(json!({

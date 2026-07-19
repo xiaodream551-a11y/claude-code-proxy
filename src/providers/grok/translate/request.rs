@@ -1347,6 +1347,11 @@ fn validate_image_source(value: Option<&Value>) -> anyhow::Result<ValidatedImage
                     Err(super::super::count_tokens::Base64ImageError::Invalid) => {
                         anyhow::bail!("image base64 data is invalid")
                     }
+                    Err(super::super::count_tokens::Base64ImageError::TooSmall) => {
+                        anyhow::bail!(
+                            "Grok images must be at least 8 pixels on each side and 512 total pixels"
+                        )
+                    }
                     Err(super::super::count_tokens::Base64ImageError::TooLarge) => {
                         anyhow::bail!("image exceeds the 20 MiB size limit")
                     }
@@ -1855,6 +1860,7 @@ mod tests {
             serde_json::json!({"type":"base64","media_type":"image/svg+xml","data":"aGVsbG8="}),
             serde_json::json!({"type":"base64","media_type":"image/gif","data":"R0lGODlhAQABAAAAACw="}),
             serde_json::json!({"type":"base64","media_type":"image/webp","data":"UklGRgAAAABXRUJQ"}),
+            serde_json::json!({"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}),
             serde_json::json!({"type":"base64","media_type":"image/png","data":"not base64"}),
             serde_json::json!({"type":"url","url":"file:///tmp/image.png"}),
             serde_json::json!({"type":"url","url":"https://user:pass@example.com/image.png"}),
