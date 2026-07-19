@@ -185,8 +185,25 @@ pub fn parse_output_format(
 }
 
 pub fn validate_message_roles(req: &MessagesRequest) -> Result<(), anyhow::Error> {
+    validate_message_roles_for_provider(req, false)
+}
+
+/// Codex accepts the nested `system` text message emitted by Claude Code's
+/// Ultracode profile. Keep that compatibility provider-local: other providers
+/// continue to accept only the Anthropic `user` and `assistant` roles.
+pub fn validate_codex_message_roles(req: &MessagesRequest) -> Result<(), anyhow::Error> {
+    validate_message_roles_for_provider(req, true)
+}
+
+fn validate_message_roles_for_provider(
+    req: &MessagesRequest,
+    allow_system_text: bool,
+) -> Result<(), anyhow::Error> {
     for (index, message) in req.messages.iter().enumerate() {
-        if !matches!(message.role.as_str(), "user" | "assistant") {
+        let is_nested_system = message.role == "system";
+        if !(matches!(message.role.as_str(), "user" | "assistant")
+            || allow_system_text && is_nested_system)
+        {
             anyhow::bail!(
                 "messages[{index}].role must be user or assistant; system instructions belong in the top-level system field"
             );
@@ -205,6 +222,11 @@ pub fn validate_message_roles(req: &MessagesRequest) -> Result<(), anyhow::Error
                 && !block.get("text").is_some_and(Value::is_string)
             {
                 anyhow::bail!("messages[{index}].content[{block_index}].text must be a string");
+            }
+            if is_nested_system && block.get("type").and_then(Value::as_str) != Some("text") {
+                anyhow::bail!(
+                    "messages[{index}].content[{block_index}] must be a text block for system role"
+                );
             }
         }
     }

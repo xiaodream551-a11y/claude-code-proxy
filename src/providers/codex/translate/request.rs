@@ -12,7 +12,8 @@ use crate::config;
 use crate::providers::translate_shared::{
     ContentBlock, RequestedOutputFormat, flatten_system_text, image_source_to_url,
     is_claude_code_compaction_request, normalize_content, normalize_strict_json_schema,
-    parse_output_format, read_effort, validate_message_roles, validate_tool_reference_provenance,
+    parse_output_format, read_effort, validate_codex_message_roles,
+    validate_tool_reference_provenance,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -417,7 +418,7 @@ pub fn translate_request_with_overrides(
     opts: TranslateOptions,
     overrides: TranslationOverrides,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    validate_message_roles(req)?;
+    validate_codex_message_roles(req)?;
     validate_codex_image_inputs(req)?;
     validate_tool_contract(req)?;
     let output_format = read_output_format(req)?;
@@ -3864,17 +3865,67 @@ mod tests {
     }
 
     #[test]
-    fn translate_rejects_unknown_and_nested_system_message_roles() {
-        for role in ["foo", "system"] {
+    fn translate_accepts_nested_system_text_as_developer_input() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"system","content":"ultracode string instructions"},
+                {"role":"system","content":[{
+                    "type":"text",
+                    "text":"ultracode block instructions",
+                    "cache_control":{"type":"ephemeral"}
+                }]},
+                {"role":"user","content":"hello"}
+            ]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert_eq!(out.input.len(), 3);
+        for (item, expected) in out.input[..2].iter().zip([
+            "ultracode string instructions",
+            "ultracode block instructions",
+        ]) {
+            let ResponsesInputItem::Message { role, content } = item else {
+                panic!("expected nested system message to become a developer message");
+            };
+            assert_eq!(role, "developer");
+            let [ResponsesContentPart::InputText { text }] = content.as_slice() else {
+                panic!("expected exactly one input_text part");
+            };
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[test]
+    fn translate_rejects_unknown_message_roles() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"foo","content":"do not reinterpret me"}]
+        }))
+        .unwrap();
+        let error = translate_request(&req, opts()).unwrap_err().to_string();
+        assert!(error.contains("role must be user or assistant"), "{error}");
+    }
+
+    #[test]
+    fn translate_rejects_non_text_nested_system_blocks() {
+        for block in [
+            json!({"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}),
+            json!({"type":"tool_use","id":"tool_1","name":"Read","input":{}}),
+            json!({"type":"tool_result","tool_use_id":"tool_1","content":"result"}),
+            json!({"type":"thinking","thinking":"private"}),
+            json!({"type":"future_widget","payload":42}),
+        ] {
             let req: MessagesRequest = serde_json::from_value(json!({
                 "model":"gpt-5.6-sol",
-                "messages":[{"role":role,"content":"do not reinterpret me"}]
+                "messages":[{"role":"system","content":[block]}]
             }))
             .unwrap();
             let error = translate_request(&req, opts()).unwrap_err().to_string();
             assert!(
-                error.contains("role must be user or assistant"),
-                "{role}: {error}"
+                error.contains("must be a text block for system role"),
+                "{error}"
             );
         }
     }
