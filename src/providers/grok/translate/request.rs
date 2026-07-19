@@ -612,7 +612,8 @@ fn parse_message(
                         "cache_control",
                     ]
                     .contains(&key.as_str())
-                }) {
+                }) || !valid_cache_control(object.get("cache_control"))
+                {
                     anyhow::bail!("unsupported tool_result field");
                 }
                 if let Some(is_error) = object.get("is_error")
@@ -634,26 +635,7 @@ fn parse_message(
                     .ok_or_else(|| anyhow::anyhow!("tool result content is required"))?;
                 let output = match value {
                     Value::String(text) => text.clone(),
-                    Value::Array(parts) => parts
-                        .iter()
-                        .map(|part| {
-                            let part = part.as_object().ok_or_else(|| {
-                                anyhow::anyhow!("tool result child must be an object")
-                            })?;
-                            if part.get("type").and_then(Value::as_str) != Some("text")
-                                || part.keys().any(|key| {
-                                    !["type", "text", "cache_control"].contains(&key.as_str())
-                                })
-                                || !valid_cache_control(part.get("cache_control"))
-                            {
-                                anyhow::bail!("tool result supports text children only");
-                            }
-                            part.get("text")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| anyhow::anyhow!("tool result text is invalid"))
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?
-                        .join(""),
+                    Value::Array(parts) => tool_result_parts_to_text(parts)?,
                     _ => anyhow::bail!("tool result supports text only"),
                 };
                 let output = if object
@@ -769,6 +751,64 @@ fn valid_cache_control(value: Option<&Value>) -> bool {
         && object
             .get("ttl")
             .is_none_or(|ttl| matches!(ttl.as_str(), Some("5m") | Some("1h")))
+}
+
+fn tool_result_parts_to_text(parts: &[Value]) -> anyhow::Result<String> {
+    let mut rendered = String::new();
+    let mut last_was_tool_reference = false;
+
+    for part in parts {
+        let part = part
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("tool result child must be an object"))?;
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if part
+                    .keys()
+                    .any(|key| !["type", "text", "cache_control"].contains(&key.as_str()))
+                    || !valid_cache_control(part.get("cache_control"))
+                {
+                    anyhow::bail!("tool result text child is invalid");
+                }
+                let text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("tool result text is invalid"))?;
+                if last_was_tool_reference
+                    && !rendered.is_empty()
+                    && !rendered.ends_with('\n')
+                    && !text.is_empty()
+                    && !text.starts_with('\n')
+                {
+                    rendered.push('\n');
+                }
+                rendered.push_str(text);
+                last_was_tool_reference = false;
+            }
+            Some("tool_reference") => {
+                if part
+                    .keys()
+                    .any(|key| !["type", "tool_name", "cache_control"].contains(&key.as_str()))
+                    || !valid_cache_control(part.get("cache_control"))
+                {
+                    anyhow::bail!("tool result tool_reference child is invalid");
+                }
+                let tool_name = part
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("tool result tool_name is invalid"))?;
+                if !rendered.is_empty() && !rendered.ends_with('\n') {
+                    rendered.push('\n');
+                }
+                rendered.push_str(&format!("[tool reference: {tool_name}]"));
+                last_was_tool_reference = true;
+            }
+            _ => anyhow::bail!("tool result supports text and tool_reference children only"),
+        }
+    }
+
+    Ok(rendered)
 }
 
 fn flush_message(role: &str, content: &mut Vec<GrokContentPart>, out: &mut Vec<GrokInputItem>) {
@@ -1233,6 +1273,14 @@ mod tests {
             "model":"grok-4.5", "messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"persistent"}}]}]
         })).unwrap();
         assert!(translate_request(&request, "grok-4.5".into()).is_err());
+
+        let request = request_with_blocks(serde_json::json!([{
+            "type":"tool_result",
+            "tool_use_id":"call_1",
+            "content":"ok",
+            "cache_control":{"type":"persistent"}
+        }]));
+        assert!(translate_request(&request, "grok-4.5".into()).is_err());
     }
 
     fn request_with_blocks(blocks: Value) -> MessagesRequest {
@@ -1268,12 +1316,72 @@ mod tests {
             serde_json::json!({"type":"image","text":"ok"}),
             serde_json::json!({"type":"text","text":1}),
             serde_json::json!({"type":"text","text":"ok","unknown":true}),
+            serde_json::json!({"type":"tool_reference"}),
+            serde_json::json!({"type":"tool_reference","tool_name":""}),
+            serde_json::json!({"type":"tool_reference","tool_name":1}),
+            serde_json::json!({"type":"tool_reference","tool_name":"WebFetch","unknown":true}),
+            serde_json::json!({"type":"tool_reference","tool_name":"WebFetch","cache_control":{"type":"persistent"}}),
         ] {
             let request = request_with_blocks(serde_json::json!([
                 {"type":"tool_result","tool_use_id":"call_1","content":[child]}
             ]));
             assert!(translate_request(&request, "grok-4.5".into()).is_err());
         }
+    }
+
+    #[test]
+    fn grok_translation_maps_tool_reference_results_to_text() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5-high",
+            "messages":[
+                {"role":"assistant","content":[{
+                    "type":"tool_use",
+                    "id":"call_tool_search_1",
+                    "name":"ToolSearch",
+                    "input":{"query":"select:WebFetch"}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"call_tool_search_1",
+                    "content":[
+                        {"type":"tool_reference","tool_name":"mcp__plugin_context7_context7__resolve-library-id"},
+                        {"type":"tool_reference","tool_name":"WebFetch","cache_control":{"type":"ephemeral"}}
+                    ]
+                }]}
+            ]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"][0]["call_id"], "call_tool_search_1");
+        assert_eq!(translated["input"][1]["call_id"], "call_tool_search_1");
+        assert_eq!(
+            translated["input"][1]["output"],
+            "[tool reference: mcp__plugin_context7_context7__resolve-library-id]\n[tool reference: WebFetch]"
+        );
+        assert!(!translated.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn grok_translation_preserves_text_concatenation_around_tool_references() {
+        let request = request_with_blocks(serde_json::json!([{
+            "type":"tool_result",
+            "tool_use_id":"call_1",
+            "content":[
+                {"type":"text","text":"loaded "},
+                {"type":"text","text":"tools"},
+                {"type":"tool_reference","tool_name":"WebFetch"},
+                {"type":"text","text":"\nready"}
+            ]
+        }]));
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(
+            translated["input"][1]["output"],
+            "loaded tools\n[tool reference: WebFetch]\nready"
+        );
     }
 
     #[test]
@@ -1361,7 +1469,7 @@ mod tests {
                     {"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"a"},"cache_control":{"type":"ephemeral","ttl":"1h"}}
                 ]},
                 {"role":"user","content":[
-                    {"type":"tool_result","tool_use_id":"call_1","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","cache_control":{"type":"ephemeral"},"content":[
                         {"type":"text","text":"result","cache_control":{"type":"ephemeral"}}
                     ]}
                 ]}

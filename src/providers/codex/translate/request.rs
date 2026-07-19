@@ -954,6 +954,16 @@ fn tool_result_to_output(content: &Value) -> ResponsesFunctionCallOutput {
                             );
                         }
                     }
+                    Some("tool_reference") => {
+                        let text = b
+                            .get("tool_name")
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.is_empty())
+                            .map(|name| format!("[tool reference: {name}]"))
+                            .unwrap_or_else(|| unsupported_tool_result_block_to_string(b));
+                        text_parts.push(text.clone());
+                        content_parts.push(ResponsesFunctionCallOutputContent::InputText { text });
+                    }
                     Some(other) => {
                         let text = format!("[unsupported content block omitted: {other}]");
                         text_parts.push(text.clone());
@@ -1859,6 +1869,24 @@ mod tests {
                 {"type":"input_text", "text":"[unsupported content block omitted: unknown]"}
             ])
         );
+    }
+
+    #[test]
+    fn tool_result_preserves_tool_reference_names() {
+        let output = tool_result_to_output(&json!([
+            {"type":"tool_reference","tool_name":"mcp__plugin_context7_context7__resolve-library-id"},
+            {"type":"tool_reference","tool_name":"WebFetch"}
+        ]));
+
+        match output {
+            ResponsesFunctionCallOutput::Text(text) => assert_eq!(
+                text,
+                "[tool reference: mcp__plugin_context7_context7__resolve-library-id]\n[tool reference: WebFetch]"
+            ),
+            ResponsesFunctionCallOutput::Content(_) => {
+                panic!("tool references should remain text-only output")
+            }
+        }
     }
 
     #[test]

@@ -513,6 +513,67 @@ async fn count_tokens_routes_to_provider() {
 }
 
 #[tokio::test]
+async fn count_tokens_accepts_tool_reference_results_for_grok_and_codex() {
+    for model in ["grok-4.5-high", "gpt-5.6-sol"] {
+        let app = app(Arc::new(Registry::with_default_alias()));
+        let payload = json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "call_tool_search_1",
+                        "name": "ToolSearch",
+                        "input": {"query": "select:WebFetch"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_tool_search_1",
+                        "content": [{
+                            "type": "tool_reference",
+                            "tool_name": "WebFetch"
+                        }]
+                    }]
+                }
+            ]
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model} rejected ToolSearch result: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            parsed["input_tokens"]
+                .as_u64()
+                .is_some_and(|tokens| tokens > 0),
+            "{model} returned an invalid token count: {parsed}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn context_window_hint_is_removed_before_provider_dispatch() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
