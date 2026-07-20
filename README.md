@@ -232,8 +232,8 @@ agent outside the injected table that names a generic model alias inherits the
 active parent model unless its definition uses a profile-allowed concrete id.
 
 On Unix, symlinking the same binary as `co` and `cg` enables shorter forms. The
-proxy selects the profile from the executable name and then replaces itself
-with Claude Code:
+proxy selects the profile from the executable name and launches Claude Code
+with the corresponding session-scoped settings:
 
 ```sh
 ln -s /path/to/claude-code-proxy ~/.local/bin/co
@@ -241,6 +241,26 @@ ln -s /path/to/claude-code-proxy ~/.local/bin/cg
 co
 cg
 ```
+
+Claude Code currently prints a generic `claude --resume <session-id>` command
+when a session ends. That command does not restore the GPT or Grok proxy
+environment. The profile launcher therefore prints a corrected, copyable
+command after an interactive session exits:
+
+```sh
+co --resume <gpt-session-id>
+cg --resume <grok-session-id>
+```
+
+The portable long forms are
+`claude-code-proxy claude gpt -- --resume <session-id>` and
+`claude-code-proxy claude grok -- --resume <session-id>`; launches that use a
+long form print that same long form on exit. Print/redirected sessions and
+detached `--background` or `--tmux` launches intentionally emit no extra resume
+hint. If `--bare`, `--safe-mode`, `disableAllHooks`, or a hook-restricting
+managed policy disables the capture hook, replace the leading `claude` in
+Claude Code's own hint manually. `/login` only changes first-party Anthropic
+authentication and does not restore the proxy profile.
 
 Minimal manual environment examples are:
 

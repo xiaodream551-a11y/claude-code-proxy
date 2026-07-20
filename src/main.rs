@@ -9,14 +9,16 @@ use claude_code_proxy::{
     tui::{self, MonitorExit, MonitorUiConfig},
 };
 use std::ffi::OsString;
-use std::io::IsTerminal;
-use std::path::Path;
-use std::process::Command;
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CODEX_XHIGH_AS_MAX_HEADER_NAME: &str = "x-ccproxy-codex-xhigh-as-max";
 const CODEX_XHIGH_AS_MAX_HEADER: &str = "x-ccproxy-codex-xhigh-as-max: 1";
+const SESSION_END_HELPER_ARG: &str = "--ccproxy-session-end-hook";
+const MAX_SESSION_END_INPUT_BYTES: u64 = 64 * 1024;
 const EXPLORE_AGENT_DESCRIPTION: &str = "Fast, focused, read-only codebase exploration and search. Use proactively to locate files, trace code paths, understand architecture, and gather evidence before implementation.";
 const EXPLORE_AGENT_PROMPT: &str = "You are a focused codebase exploration agent. Investigate the requested scope without modifying files. Prefer targeted searches and exact paths, trace the relevant control flow, and return concise findings with file and line references. Clearly separate confirmed evidence from inference.";
 const GENERAL_PURPOSE_AGENT_DESCRIPTION: &str = "General-purpose agent for complex, multi-step work that may require investigation, reasoning, implementation, and verification. Use proactively for substantial tasks that do not fit a narrower specialist.";
@@ -89,6 +91,12 @@ enum Commands {
 enum ClaudeProfile {
     Gpt,
     Grok,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeLaunchStyle {
+    Shortcut,
+    Subcommand,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -172,8 +180,12 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
-    if let Some((profile, args)) = claude_profile_from_argv(std::env::args_os()) {
-        return launch_claude(profile, &args);
+    let raw_args = std::env::args_os().collect::<Vec<_>>();
+    if let Some(destination) = session_end_helper_destination_from_argv(&raw_args) {
+        return run_session_end_helper(&destination?);
+    }
+    if let Some((profile, args)) = claude_profile_from_argv(raw_args) {
+        return launch_claude(profile, ClaudeLaunchStyle::Shortcut, &args);
     }
 
     let cli = Cli::parse();
@@ -292,7 +304,9 @@ fn run() -> Result<()> {
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
-        Commands::Claude { profile, args } => launch_claude(profile, &args),
+        Commands::Claude { profile, args } => {
+            launch_claude(profile, ClaudeLaunchStyle::Subcommand, &args)
+        }
     }
 }
 
@@ -310,11 +324,258 @@ fn claude_profile_from_argv(
     Some((profile, args.collect()))
 }
 
-fn launch_claude(profile: ClaudeProfile, args: &[OsString]) -> Result<()> {
+fn session_end_helper_destination_from_argv(args: &[OsString]) -> Option<Result<PathBuf>> {
+    if args.get(1).and_then(|argument| argument.to_str()) != Some(SESSION_END_HELPER_ARG) {
+        return None;
+    }
+    Some(match args {
+        [_, _, destination] => Ok(PathBuf::from(destination)),
+        _ => Err(anyhow::anyhow!(
+            "{SESSION_END_HELPER_ARG} requires exactly one destination path"
+        )),
+    })
+}
+
+fn run_session_end_helper(destination: &Path) -> Result<()> {
+    let stdin = std::io::stdin();
+    write_session_end_capture(destination, stdin.lock())
+}
+
+fn write_session_end_capture(destination: &Path, input: impl Read) -> Result<()> {
+    let mut payload = Vec::new();
+    input
+        .take(MAX_SESSION_END_INPUT_BYTES + 1)
+        .read_to_end(&mut payload)
+        .context("failed to read the SessionEnd hook input")?;
+    if payload.len() as u64 > MAX_SESSION_END_INPUT_BYTES {
+        anyhow::bail!("SessionEnd hook input exceeds {MAX_SESSION_END_INPUT_BYTES} bytes");
+    }
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&payload).context("SessionEnd hook input is not valid JSON")?;
+    if payload
+        .get("hook_event_name")
+        .and_then(|value| value.as_str())
+        != Some("SessionEnd")
+    {
+        anyhow::bail!("hook input is not a SessionEnd event");
+    }
+    let reason = payload
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .context("SessionEnd hook input is missing a string reason")?;
+    if !matches!(reason, "prompt_input_exit" | "other") {
+        anyhow::bail!("SessionEnd reason `{reason}` is not a resumable process exit");
+    }
+    let session_id = payload
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .context("SessionEnd hook input is missing a string session_id")?;
+    let session_id = uuid::Uuid::parse_str(session_id)
+        .context("SessionEnd hook session_id is not a valid UUID")?
+        .to_string();
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(destination)
+        .with_context(|| format!("failed to create session capture {}", destination.display()))?;
+    file.write_all(session_id.as_bytes())
+        .with_context(|| format!("failed to write session capture {}", destination.display()))?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SessionEndCapture {
+    directory: PathBuf,
+    destination: PathBuf,
+}
+
+impl SessionEndCapture {
+    fn new() -> Result<Self> {
+        let directory = create_private_session_directory()?;
+        let destination = directory.join("session-id");
+        Ok(Self {
+            directory,
+            destination,
+        })
+    }
+
+    fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    fn captured_session_id(&self) -> Option<String> {
+        let value = std::fs::read_to_string(&self.destination).ok()?;
+        uuid::Uuid::parse_str(value.trim())
+            .ok()
+            .map(|session_id| session_id.to_string())
+    }
+}
+
+impl Drop for SessionEndCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn create_private_session_directory() -> Result<PathBuf> {
+    for _ in 0..16 {
+        let directory =
+            std::env::temp_dir().join(format!("ccproxy-session-{}", uuid::Uuid::new_v4().simple()));
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        match builder.create(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create private session directory {}",
+                        directory.display()
+                    )
+                });
+            }
+        }
+    }
+    anyhow::bail!("failed to allocate a unique private session directory")
+}
+
+fn should_capture_session_end(
+    args: &[OsString],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    stderr_is_tty: bool,
+) -> bool {
+    stdin_is_tty
+        && stdout_is_tty
+        && stderr_is_tty
+        && !args
+            .iter()
+            .take_while(|argument| argument.as_os_str() != "--")
+            .any(|argument| {
+                let Some(argument) = argument.to_str() else {
+                    return false;
+                };
+                argument == "-p"
+                    || [
+                        "--print",
+                        "--bg",
+                        "--background",
+                        "--bare",
+                        "--safe-mode",
+                        "--tmux",
+                    ]
+                    .into_iter()
+                    .any(|option| {
+                        argument == option
+                            || argument
+                                .strip_prefix(option)
+                                .is_some_and(|suffix| suffix.starts_with('='))
+                    })
+            })
+}
+
+fn session_end_hook_settings(executable: &Path, destination: &Path) -> Result<serde_json::Value> {
+    if !executable.is_absolute() {
+        anyhow::bail!("SessionEnd hook executable must be an absolute path");
+    }
+    let executable = executable
+        .to_str()
+        .context("SessionEnd hook executable path must be valid UTF-8")?;
+    let destination = destination
+        .to_str()
+        .context("SessionEnd hook destination path must be valid UTF-8")?;
+    Ok(serde_json::json!({
+        "SessionEnd": [{
+            "matcher": "prompt_input_exit|other",
+            "hooks": [{
+                "type": "command",
+                "command": executable,
+                "args": [SESSION_END_HELPER_ARG, destination],
+            }],
+        }],
+    }))
+}
+
+fn claude_resume_hint(
+    profile: ClaudeProfile,
+    launch_style: ClaudeLaunchStyle,
+    session_id: &str,
+) -> String {
+    let profile_name = match profile {
+        ClaudeProfile::Gpt => "gpt",
+        ClaudeProfile::Grok => "grok",
+    };
+    let command = match launch_style {
+        ClaudeLaunchStyle::Shortcut => match profile {
+            ClaudeProfile::Gpt => format!("co --resume {session_id}"),
+            ClaudeProfile::Grok => format!("cg --resume {session_id}"),
+        },
+        ClaudeLaunchStyle::Subcommand => {
+            format!("claude-code-proxy claude {profile_name} -- --resume {session_id}")
+        }
+    };
+    format!("Resume this session with: {command}")
+}
+
+fn launch_claude(
+    profile: ClaudeProfile,
+    launch_style: ClaudeLaunchStyle,
+    args: &[OsString],
+) -> Result<()> {
     let loaded = config::load_config();
     let base_url = proxy_client_url(&loaded.bind_address, loaded.port);
-    let mut command = build_claude_command(profile, args, &base_url)?;
+    let capture = should_capture_session_end(
+        args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+    )
+    .then(SessionEndCapture::new)
+    .transpose()?;
+    let Some(capture) = capture else {
+        let command = build_claude_command(profile, args, &base_url)?;
+        return launch_claude_without_capture(command);
+    };
 
+    let executable = std::env::current_exe().context("failed to locate the ccproxy executable")?;
+    let hook = Some((executable.as_path(), capture.destination()));
+    let mut command = build_claude_command_with_session_end_hook(profile, args, &base_url, hook)?;
+    #[cfg(unix)]
+    let status = wait_for_claude_with_signal_forwarding(&mut command)?;
+    #[cfg(not(unix))]
+    let status = command
+        .status()
+        .context("failed to launch local Claude Code")?;
+
+    if let Some(session_id) = capture.captured_session_id() {
+        eprintln!(
+            "\n{}",
+            claude_resume_hint(profile, launch_style, &session_id)
+        );
+    }
+
+    // process::exit does not run destructors. Remove the private capture
+    // directory explicitly before preserving Claude Code's exit status.
+    drop(executable);
+    drop(capture);
+    exit_with_child_status(status);
+}
+
+fn launch_claude_without_capture(mut command: Command) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -328,7 +589,92 @@ fn launch_claude(profile: ClaudeProfile, args: &[OsString]) -> Result<()> {
         let status = command
             .status()
             .context("failed to launch local Claude Code")?;
-        std::process::exit(status.code().unwrap_or(1));
+        exit_with_child_status(status);
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_claude_with_signal_forwarding(command: &mut Command) -> Result<ExitStatus> {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    use signal_hook::iterator::{SignalsInfo, exfiltrator::WithOrigin};
+
+    // Keep the wrapper alive long enough to collect SessionEnd while relaying
+    // externally targeted termination signals to Claude Code. Terminal INT and
+    // QUIT signals already reach both members of the foreground process group,
+    // so origin metadata prevents turning one keypress into two signals. A
+    // process-targeted signal still has sender metadata and is forwarded.
+    let mut signals = SignalsInfo::<WithOrigin>::new([SIGHUP, SIGINT, SIGQUIT, SIGTERM])
+        .context("failed to install Claude Code signal forwarding")?;
+    let signal_handle = signals.handle();
+    let mut child = command
+        .spawn()
+        .context("failed to launch local Claude Code")?;
+    let child_pid = child.id() as libc::pid_t;
+    let forwarder = std::thread::spawn(move || {
+        for origin in signals.forever() {
+            if !should_forward_signal_to_child(origin.signal, origin.process.is_some()) {
+                continue;
+            }
+            // The PID came directly from Child and remains valid until wait
+            // reaps it. A failed forward means the child already exited.
+            unsafe {
+                libc::kill(child_pid, origin.signal);
+            }
+        }
+    });
+    let status = child.wait();
+    signal_handle.close();
+    let _ = forwarder.join();
+    status.context("failed while waiting for local Claude Code")
+}
+
+#[cfg(unix)]
+fn should_forward_signal_to_child(signal: i32, has_sending_process: bool) -> bool {
+    use signal_hook::consts::signal::{SIGINT, SIGQUIT};
+
+    has_sending_process || !matches!(signal, SIGINT | SIGQUIT)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildTermination {
+    Exit(i32),
+    #[cfg(unix)]
+    Signal(i32),
+    Unknown,
+}
+
+fn child_termination(status: &ExitStatus) -> ChildTermination {
+    if let Some(code) = status.code() {
+        return ChildTermination::Exit(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        if let Some(signal) = status.signal() {
+            return ChildTermination::Signal(signal);
+        }
+    }
+    ChildTermination::Unknown
+}
+
+fn exit_with_child_status(status: ExitStatus) -> ! {
+    match child_termination(&status) {
+        ChildTermination::Exit(code) => exit_with_logs(code),
+        #[cfg(unix)]
+        ChildTermination::Signal(signal) => {
+            if !logging::flush(Duration::from_secs(2)) {
+                eprintln!("warning: proxy logs could not be flushed completely");
+            }
+            // Re-raise the child's terminating signal so callers observe a
+            // signaled wrapper, not a lossy synthetic 128+signal exit code.
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+            std::process::exit(128 + signal);
+        }
+        ChildTermination::Unknown => exit_with_logs(1),
     }
 }
 
@@ -337,6 +683,15 @@ fn build_claude_command(
     args: &[OsString],
     base_url: &str,
 ) -> Result<Command> {
+    build_claude_command_with_session_end_hook(profile, args, base_url, None)
+}
+
+fn build_claude_command_with_session_end_hook(
+    profile: ClaudeProfile,
+    args: &[OsString],
+    base_url: &str,
+    session_end_hook: Option<(&Path, &Path)>,
+) -> Result<Command> {
     let profile = profile.config();
     validate_claude_profile_args(profile, args)?;
     let environment = claude_profile_environment(profile, base_url);
@@ -344,7 +699,7 @@ fn build_claude_command(
         .iter()
         .map(|(name, value)| (name.to_string(), serde_json::Value::String(value.clone())))
         .collect::<serde_json::Map<_, _>>();
-    let inline_settings = serde_json::json!({
+    let mut inline_settings = serde_json::json!({
         "env": settings_environment,
         "model": profile.main_model,
         "effortLevel": profile.effort_level,
@@ -352,8 +707,11 @@ fn build_claude_command(
         "availableModels": profile.available_models,
         "enforceAvailableModels": true,
         "fallbackModel": [],
-    })
-    .to_string();
+    });
+    if let Some((executable, destination)) = session_end_hook {
+        inline_settings["hooks"] = session_end_hook_settings(executable, destination)?;
+    }
+    let inline_settings = inline_settings.to_string();
     // CLI agent definitions are replacements, not partial overrides: Claude
     // Code requires both description and prompt. Keep its private built-in
     // `claude` agent untouched because public definitions cannot preserve that
@@ -802,6 +1160,237 @@ mod tests {
             ])
             .is_none()
         );
+    }
+
+    #[test]
+    fn hidden_session_end_helper_is_detected_for_shortcut_argv() {
+        let destination = std::env::temp_dir().join("ccproxy-session-id");
+        let args = [
+            OsString::from("co"),
+            OsString::from(SESSION_END_HELPER_ARG),
+            destination.as_os_str().to_owned(),
+        ];
+
+        assert_eq!(
+            session_end_helper_destination_from_argv(&args)
+                .expect("helper flag should be recognized")
+                .unwrap(),
+            destination
+        );
+    }
+
+    #[test]
+    fn session_end_helper_validates_and_exclusively_writes_uuid() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("session-id");
+        let session_id = "57C7C914-ADA4-4F40-9672-985F950FBB66";
+        let payload = serde_json::json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": session_id,
+            "reason": "prompt_input_exit",
+        })
+        .to_string();
+
+        write_session_end_capture(&destination, payload.as_bytes()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "57c7c914-ada4-4f40-9672-985f950fbb66"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let error = write_session_end_capture(&destination, payload.as_bytes()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create session capture")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "57c7c914-ada4-4f40-9672-985f950fbb66"
+        );
+    }
+
+    #[test]
+    fn session_end_helper_rejects_wrong_event_and_invalid_uuid() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("session-id");
+        let wrong_event = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "57c7c914-ada4-4f40-9672-985f950fbb66",
+        })
+        .to_string();
+        let error = write_session_end_capture(&destination, wrong_event.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("not a SessionEnd event"));
+        assert!(!destination.exists());
+
+        let invalid_uuid = serde_json::json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "not-a-session-id",
+            "reason": "other",
+        })
+        .to_string();
+        let error = write_session_end_capture(&destination, invalid_uuid.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("not a valid UUID"));
+        assert!(!destination.exists());
+
+        let cleared_session = serde_json::json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "57c7c914-ada4-4f40-9672-985f950fbb66",
+            "reason": "clear",
+        })
+        .to_string();
+        let error =
+            write_session_end_capture(&destination, cleared_session.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("not a resumable process exit"));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn session_end_capture_uses_private_directory_and_cleans_it_up() {
+        let directory = {
+            let capture = SessionEndCapture::new().unwrap();
+            let directory = capture.directory.clone();
+            assert!(directory.is_dir());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            directory
+        };
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn session_capture_only_runs_for_interactive_non_print_mode() {
+        assert!(should_capture_session_end(&[], true, true, true));
+        for option in [
+            "-p",
+            "--print",
+            "--bg",
+            "--background",
+            "--bare",
+            "--safe-mode",
+            "--tmux",
+            "--print=true",
+            "--bg=true",
+            "--background=true",
+            "--bare=true",
+            "--safe-mode=true",
+            "--tmux=true",
+        ] {
+            let args = [OsString::from(option), OsString::from("hello")];
+            assert!(!should_capture_session_end(&args, true, true, true));
+        }
+        assert!(should_capture_session_end(
+            &[OsString::from("--backgrounding")],
+            true,
+            true,
+            true
+        ));
+        assert!(!should_capture_session_end(&[], false, true, true));
+        assert!(!should_capture_session_end(&[], true, false, true));
+        assert!(!should_capture_session_end(&[], true, true, false));
+        assert!(should_capture_session_end(
+            &[OsString::from("--"), OsString::from("--print")],
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn session_end_hook_uses_exec_form_with_absolute_current_executable() {
+        let executable = std::env::current_exe().unwrap();
+        assert!(executable.is_absolute());
+        let destination = std::env::temp_dir().join("ccproxy-session-id");
+        let command = build_claude_command_with_session_end_hook(
+            ClaudeProfile::Gpt,
+            &[],
+            "http://127.0.0.1:18765",
+            Some((&executable, &destination)),
+        )
+        .unwrap();
+        let settings = command_inline_settings(&command);
+        let session_end = &settings["hooks"]["SessionEnd"][0];
+        let hook = &session_end["hooks"][0];
+
+        assert_eq!(session_end["matcher"], "prompt_input_exit|other");
+        assert_eq!(hook["type"], "command");
+        assert_eq!(hook["command"], executable.to_str().unwrap());
+        assert_eq!(
+            hook["args"],
+            serde_json::json!([SESSION_END_HELPER_ARG, destination.to_str().unwrap()])
+        );
+    }
+
+    #[test]
+    fn resume_hints_use_the_exact_launch_style() {
+        let session_id = "57c7c914-ada4-4f40-9672-985f950fbb66";
+        assert_eq!(
+            claude_resume_hint(ClaudeProfile::Gpt, ClaudeLaunchStyle::Shortcut, session_id),
+            format!("Resume this session with: co --resume {session_id}")
+        );
+        assert_eq!(
+            claude_resume_hint(ClaudeProfile::Grok, ClaudeLaunchStyle::Shortcut, session_id),
+            format!("Resume this session with: cg --resume {session_id}")
+        );
+        assert_eq!(
+            claude_resume_hint(
+                ClaudeProfile::Gpt,
+                ClaudeLaunchStyle::Subcommand,
+                session_id
+            ),
+            format!(
+                "Resume this session with: claude-code-proxy claude gpt -- --resume {session_id}"
+            )
+        );
+        assert_eq!(
+            claude_resume_hint(
+                ClaudeProfile::Grok,
+                ClaudeLaunchStyle::Subcommand,
+                session_id
+            ),
+            format!(
+                "Resume this session with: claude-code-proxy claude grok -- --resume {session_id}"
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signaled_child_remains_a_signal_termination() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let status = ExitStatus::from_raw(15);
+        assert_eq!(child_termination(&status), ChildTermination::Signal(15));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_group_signals_are_not_forwarded_twice() {
+        use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+
+        assert!(!should_forward_signal_to_child(SIGINT, false));
+        assert!(!should_forward_signal_to_child(SIGQUIT, false));
+        assert!(should_forward_signal_to_child(SIGINT, true));
+        assert!(should_forward_signal_to_child(SIGQUIT, true));
+        assert!(should_forward_signal_to_child(SIGTERM, false));
+        assert!(should_forward_signal_to_child(SIGHUP, false));
     }
 
     #[test]

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Print the correct `co` or `cg` resume command when a Claude Code proxy
+  session ends, preventing resumed GPT and Grok sessions from silently falling
+  back to the first-party Claude runtime.
 - Match Codex CLI 0.144.6 model metadata by using a 272K Claude Code context
   window for GPT-5.6 Sol, Terra, and Luna setup examples.
 - Accept Claude Code's `ultra` effort without an API error, matching Codex CLI's
