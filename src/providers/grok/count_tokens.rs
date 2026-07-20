@@ -449,6 +449,31 @@ mod tests {
     }
 
     #[test]
+    fn count_tokens_accepts_nested_system_and_ignores_cache_control() {
+        let plain = translated_request(json!({
+            "model": "grok-4.5",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "follow rules"}]},
+                {"role": "user", "content": "hello"}
+            ]
+        }));
+        let cached = translated_request(json!({
+            "model": "grok-4.5",
+            "messages": [
+                {"role": "system", "content": [{
+                    "type": "text",
+                    "text": "follow rules",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }]},
+                {"role": "user", "content": "hello"}
+            ]
+        }));
+
+        assert!(count_tokens(&plain) > 0);
+        assert_eq!(count_tokens(&plain), count_tokens(&cached));
+    }
+
+    #[test]
     fn count_tokens_increases_for_more_input() {
         let short = translated_request(json!({
             "model": "grok-4.5",

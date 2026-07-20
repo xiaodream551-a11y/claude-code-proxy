@@ -189,9 +189,14 @@ pub fn validate_message_roles(req: &MessagesRequest) -> Result<(), anyhow::Error
 }
 
 /// Codex accepts the nested `system` text message emitted by Claude Code's
-/// Ultracode profile. Keep that compatibility provider-local: other providers
-/// continue to accept only the Anthropic `user` and `assistant` roles.
+/// Ultracode profile and maps it to developer input.
 pub fn validate_codex_message_roles(req: &MessagesRequest) -> Result<(), anyhow::Error> {
+    validate_message_roles_for_provider(req, true)
+}
+
+/// Grok forwards nested `system` text messages as upstream system input. Keep
+/// non-text system content and unknown roles fail-closed.
+pub fn validate_grok_message_roles(req: &MessagesRequest) -> Result<(), anyhow::Error> {
     validate_message_roles_for_provider(req, true)
 }
 

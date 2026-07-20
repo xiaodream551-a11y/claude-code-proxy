@@ -9,7 +9,8 @@ use serde_json::Value;
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::providers::translate_shared::{
     RequestedOutputFormat, flatten_system_text, is_claude_code_compaction_request,
-    parse_output_format, read_effort, validate_message_roles, validate_tool_reference_provenance,
+    parse_output_format, read_effort, validate_grok_message_roles,
+    validate_tool_reference_provenance,
 };
 
 const MAX_GROK_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -185,7 +186,7 @@ pub fn translate_request(
     model: String,
 ) -> anyhow::Result<GrokResponsesRequest> {
     reject_unknown_top_level(req)?;
-    validate_message_roles(req)?;
+    validate_grok_message_roles(req)?;
     let reasoning_effort = read_effort(req)?;
     let compaction = is_claude_code_compaction_request(req);
     let text = read_output_format(req)?.map(|format| GrokText { format });
@@ -1054,6 +1055,9 @@ fn parse_message(
         Value::Array(items) => items.clone(),
         _ => anyhow::bail!("message content must be text or blocks"),
     };
+    if message.role == "system" && blocks.is_empty() {
+        anyhow::bail!("system message must contain at least one text block");
+    }
     let mut content = Vec::new();
     let mut tool_result_images = Vec::new();
     for block in blocks {
@@ -1070,9 +1074,15 @@ fn parse_message(
         match (message.role.as_str(), typ) {
             (_, "thinking") | (_, "redacted_thinking") => {}
             (_, "text") => {
-                if object.keys().any(|key| {
-                    !["type", "text", "citations", "cache_control"].contains(&key.as_str())
-                }) || !valid_cache_control(object.get("cache_control"))
+                let has_unsupported_field = object.keys().any(|key| {
+                    if message.role == "system" {
+                        !matches!(key.as_str(), "type" | "text" | "cache_control")
+                    } else {
+                        !["type", "text", "citations", "cache_control"].contains(&key.as_str())
+                    }
+                });
+                if has_unsupported_field
+                    || !valid_cache_control(object.get("cache_control"))
                     || object
                         .get("citations")
                         .is_some_and(|citations| !citations.is_null() && !citations.is_array())
@@ -2070,21 +2080,187 @@ mod tests {
     }
 
     #[test]
-    fn grok_translation_rejects_unknown_and_nested_system_message_roles() {
-        for role in ["foo", "system"] {
+    fn grok_translation_preserves_nested_system_text_messages_in_order() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "system":"top-level rules",
+            "messages":[
+                {"role":"system","content":"first nested rules"},
+                {"role":"user","content":"hello"},
+                {"role":"system","content":[
+                    {"type":"text","text":"second nested rules","cache_control":{"type":"ephemeral"}},
+                    {"type":"text","text":"third nested rules"}
+                ]},
+                {"role":"assistant","content":"ack"}
+            ]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["instructions"], "top-level rules");
+        assert_eq!(translated["input"].as_array().unwrap().len(), 4);
+        assert_eq!(translated["input"][0]["role"], "system");
+        assert_eq!(
+            translated["input"][0]["content"][0]["text"],
+            "first nested rules"
+        );
+        assert_eq!(translated["input"][1]["role"], "user");
+        assert_eq!(translated["input"][2]["role"], "system");
+        assert_eq!(
+            translated["input"][2]["content"][0]["text"],
+            "second nested rules"
+        );
+        assert_eq!(
+            translated["input"][2]["content"][1]["text"],
+            "third nested rules"
+        );
+        assert_eq!(translated["input"][3]["role"], "assistant");
+        assert!(!translated.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn grok_translation_preserves_empty_system_string_and_rejects_empty_block_list() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"system","content":""},
+                {"role":"user","content":"hello"}
+            ]
+        }))
+        .unwrap();
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"].as_array().unwrap().len(), 2);
+        assert_eq!(translated["input"][0]["role"], "system");
+        assert_eq!(translated["input"][0]["content"][0]["text"], "");
+
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"system","content":[]}]
+        }))
+        .unwrap();
+        let error = translate_request(&request, "grok-4.5".into())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must contain at least one text block"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn grok_translation_rejects_unknown_message_roles() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"foo","content":"do not reinterpret me"}]
+        }))
+        .unwrap();
+        let error = translate_request(&request, "grok-4.5".into())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("role must be user or assistant"), "{error}");
+    }
+
+    #[test]
+    fn grok_translation_rejects_non_text_nested_system_blocks() {
+        for block in [
+            serde_json::json!({"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}),
+            serde_json::json!({"type":"tool_use","id":"tool_1","name":"Read","input":{}}),
+            serde_json::json!({"type":"tool_result","tool_use_id":"tool_1","content":"result"}),
+            serde_json::json!({"type":"thinking","thinking":"private"}),
+            serde_json::json!({"type":"future_widget","payload":42}),
+        ] {
             let request: MessagesRequest = serde_json::from_value(serde_json::json!({
                 "model":"grok-4.5",
-                "messages":[{"role":role,"content":"do not reinterpret me"}]
+                "messages":[{"role":"system","content":[block]}]
             }))
             .unwrap();
             let error = translate_request(&request, "grok-4.5".into())
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("role must be user or assistant"),
-                "{role}: {error}"
+                error.contains("must be a text block for system role"),
+                "{error}"
             );
         }
+    }
+
+    #[test]
+    fn grok_translation_rejects_invalid_nested_system_text_fields() {
+        for block in [
+            serde_json::json!({
+                "type":"text",
+                "text":"rules",
+                "cache_control":{"type":"persistent"}
+            }),
+            serde_json::json!({"type":"text","text":"rules","citations":[]}),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"system","content":[block]}]
+            }))
+            .unwrap();
+            let error = translate_request(&request, "grok-4.5".into())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unsupported text block field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn grok_translation_keeps_tool_result_adjacency_fail_closed() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"call_1","name":"lookup","input":{}
+                }]},
+                {"role":"system","content":"interposed rules"},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"call_1","content":"ok"
+                }]}
+            ]
+        }))
+        .unwrap();
+
+        let error = translate_request(&request, "grok-4.5".into())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must be resolved in the immediately following user message"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn grok_translation_allows_system_after_tool_result_is_resolved() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"call_1","name":"lookup","input":{}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"call_1","content":"ok"
+                }]},
+                {"role":"system","content":"rules for the next turn"},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .unwrap();
+
+        let translated =
+            serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
+        assert_eq!(translated["input"].as_array().unwrap().len(), 4);
+        assert_eq!(translated["input"][0]["type"], "function_call");
+        assert_eq!(translated["input"][1]["type"], "function_call_output");
+        assert_eq!(translated["input"][2]["role"], "system");
+        assert_eq!(
+            translated["input"][2]["content"][0]["text"],
+            "rules for the next turn"
+        );
+        assert_eq!(translated["input"][3]["role"], "user");
     }
 
     #[test]
