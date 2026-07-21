@@ -307,6 +307,9 @@ pub struct Reducer {
     next_index: usize,
     active: Option<(String, usize)>,
     active_text: String,
+    /// Text closed early (for example when a function call starts before
+    /// `response.output_text.done`) so a late matching snapshot can be accepted.
+    closed_text: Option<String>,
     saw_text_output: bool,
     calls: HashMap<String, ActiveFunctionCall>,
     item_calls: HashMap<String, String>,
@@ -1165,6 +1168,7 @@ impl Reducer {
             self.active = Some((kind.into(), index));
             if kind == "text" {
                 self.active_text.clear();
+                self.closed_text = None;
             }
             out.push(if kind == "thinking" {
                 ReducerEvent::ThinkingStart(index)
@@ -1195,7 +1199,9 @@ impl Reducer {
         Ok(match self.active.take() {
             Some((kind, index)) if kind == "thinking" => vec![ReducerEvent::ThinkingStop(index)],
             Some((_, index)) => {
-                self.active_text.clear();
+                // Keep the streamed text so a late `response.output_text.done` can still
+                // reconcile after Grok opens a tool call mid-message.
+                self.closed_text = Some(std::mem::take(&mut self.active_text));
                 vec![ReducerEvent::TextStop(index)]
             }
             None => vec![],
@@ -1203,11 +1209,26 @@ impl Reducer {
     }
     fn complete_text_snapshot(&mut self, snapshot: &str) -> anyhow::Result<Vec<ReducerEvent>> {
         let suffix = match self.active.as_ref() {
-            Some((kind, _)) if kind == "text" => snapshot.strip_prefix(&self.active_text),
-            _ if !self.saw_text_output => Some(snapshot),
-            _ => None,
-        }
-        .ok_or_else(|| anyhow::anyhow!("completed text snapshot disagrees with streamed deltas"))?;
+            Some((kind, _)) if kind == "text" => snapshot
+                .strip_prefix(&self.active_text)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("completed text snapshot disagrees with streamed deltas")
+                })?,
+            _ if !self.saw_text_output => snapshot,
+            // Grok commonly emits `response.output_item.added(function_call)` before
+            // `response.output_text.done`. The text block is already closed and forwarded;
+            // accept a matching (or strictly extending) snapshot instead of fail-closing.
+            _ => match self.closed_text.as_deref() {
+                Some(closed) => snapshot.strip_prefix(closed).ok_or_else(|| {
+                    anyhow::anyhow!("completed text snapshot disagrees with streamed deltas")
+                })?,
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "completed text snapshot disagrees with streamed deltas"
+                    ));
+                }
+            },
+        };
         if suffix.is_empty() {
             Ok(Vec::new())
         } else {
@@ -2159,6 +2180,58 @@ mod tests {
         let events = reduce_upstream_bytes(input).unwrap();
         assert!(
             matches!(events.last(), Some(ReducerEvent::Finish { stop_reason, .. }) if stop_reason == "tool_use")
+        );
+    }
+
+    #[test]
+    fn late_output_text_done_after_function_call_start_is_accepted() {
+        // Real Grok captures commonly start tools before emitting
+        // `response.output_text.done` for the preceding assistant text.
+        let mut reducer = Reducer::default();
+        let events = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"Hello"}),
+                serde_json::json!({"type":"response.output_text.delta","delta":" world"}),
+                serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"Bash","id":"fc1"}}),
+                serde_json::json!({"type":"response.function_call_arguments.delta","call_id":"c1","delta":"{\"command\":\"ls\"}"}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello world"}),
+                serde_json::json!({"type":"response.function_call_arguments.done","call_id":"c1","arguments":"{\"command\":\"ls\"}"}),
+                serde_json::json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"Bash","id":"fc1","arguments":"{\"command\":\"ls\"}"}}),
+                serde_json::json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1},"output":[
+                    {"type":"message","id":"msg1","content":[{"type":"output_text","text":"Hello world"}]},
+                    {"type":"function_call","call_id":"c1","name":"Bash","id":"fc1","arguments":"{\"command\":\"ls\"}"}
+                ]}}),
+            ])
+            .expect("late matching output_text.done after tool start must not fail closed");
+        assert!(
+            events.iter().any(|event| matches!(event, ReducerEvent::TextDelta(_, text) if text == "Hello")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event, ReducerEvent::ToolStart(_, id, name) if id == "c1" && name == "Bash")),
+            "{events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(ReducerEvent::Finish { stop_reason, .. }) if stop_reason == "tool_use"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn late_output_text_done_after_function_call_start_still_rejects_mismatch() {
+        let mut reducer = Reducer::default();
+        let error = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"Hello"}),
+                serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"Bash","id":"fc1"}}),
+                serde_json::json!({"type":"response.output_text.done","text":"Goodbye"}),
+            ])
+            .expect_err("mismatched late text snapshot must still fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("completed text snapshot disagrees with streamed deltas"),
+            "{error}"
         );
     }
 
