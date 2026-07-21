@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static PROCESS_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct DirResolverEnv {
@@ -10,16 +13,25 @@ pub struct DirResolverEnv {
 
 impl Default for DirResolverEnv {
     fn default() -> Self {
+        // Directory resolution depends on only these variables. Copying the
+        // entire process environment on every log/config lookup made request
+        // hot paths pay for unrelated (and sometimes very large) variables.
+        let env = [
+            "CCP_CONFIG_DIR",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+        ]
+        .into_iter()
+        .filter_map(|key| {
+            std::env::var_os(key)
+                .map(|value| (key.to_string(), value.to_string_lossy().into_owned()))
+        })
+        .collect();
         Self {
             platform: std::env::consts::OS.into(),
-            env: std::env::vars_os()
-                .map(|(key, value)| {
-                    (
-                        key.to_string_lossy().into_owned(),
-                        value.to_string_lossy().into_owned(),
-                    )
-                })
-                .collect(),
+            env,
             home: std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .unwrap_or_else(|_| "/".to_string()),
@@ -100,11 +112,15 @@ pub fn kimi_device_id_file(deps: &DirResolverEnv) -> PathBuf {
 }
 
 pub fn log_file() -> PathBuf {
-    resolve_log_file_for_process(
-        &DirResolverEnv::default(),
-        std::env::current_exe().ok().as_deref(),
-        std::process::id(),
-    )
+    PROCESS_LOG_FILE
+        .get_or_init(|| {
+            resolve_log_file_for_process(
+                &DirResolverEnv::default(),
+                std::env::current_exe().ok().as_deref(),
+                std::process::id(),
+            )
+        })
+        .clone()
 }
 
 fn resolve_log_file_for_process(

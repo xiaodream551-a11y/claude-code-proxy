@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+- Bound opt-in traffic captures with charged-byte and file-count admission
+  quotas, both globally and per request. Every file costs at least one rounded
+  4 KiB unit, existing regular files count after restart without following
+  symlinks, and the initial scan runs off the async worker without holding the
+  global registry lock. Reservations are concurrency-safe and quota exhaustion
+  skips only new diagnostic artifacts; this does not prune or delete any
+  existing capture.
+- Reject missing or zero Anthropic `max_tokens` on `/v1/messages`, non-empty
+  `stop_sequences`, and sampling controls before provider dispatch. Positive
+  Codex output budgets stay accepted for Claude Code compatibility but are
+  omitted because the private gateway rejects every supported Responses
+  output-budget field.
+- Let incoming `service_tier: "standard_only"` suppress local Codex priority,
+  reject incompatible explicit strict schemas instead of silently downgrading
+  them, and treat null `output_config`, effort, and format values as omitted.
+- Preserve Codex structured-output semantics with a request-local SchemaBridge:
+  validate the original and projected schemas, reject unsafe references or
+  ambiguous projections before dispatch, remove only bridge-generated optional
+  nulls, and revalidate completed stream and non-stream JSON before success.
+- Reuse Codex session WebSockets even when response continuation is disabled,
+  reuse a fresh terminal ordering Pong for the immediately following tool turn,
+  keep checked-out sockets under one owner, enable TCP_NODELAY, and switch
+  statusless pre-dispatch Auto failures to HTTP without an artificial retry
+  pause. Explicit WebSocket mode now fails before authentication or model
+  dispatch when an environment proxy would require unsupported HTTP CONNECT.
+- Keep GPT and Grok HTTP/2 connections warm for five-minute interactive pauses,
+  with bounded TCP keepalives, a larger per-host idle pool, and adaptive receive
+  windows for large Claude Code transcripts. Avoid a short HTTP/2 PING timeout
+  that would override the providers' longer network-jitter tolerance.
+- Let `cg` keep its high default through Claude Code settings instead of a
+  hard-coded model alias, so `/effort medium` and `/effort low` now reduce Grok
+  reasoning latency while `grok-4.5-high` remains an explicit locked profile;
+  expose Composer Fast in the same model picker as an opt-in speed choice.
+- Keep local GPT/Grok input-token estimation off the response hot path, run
+  explicit `/count_tokens` work through Tokio's blocking pool, and share a
+  two-slot admission gate with a 30-second overload queue. Use `o200k_base`
+  text tokenization plus fixed compatibility estimates instead of a word-count
+  heuristic, and avoid cloning complete message block arrays during request
+  translation.
+- Avoid whole-environment copies on Codex request configuration, path, and
+  traffic-capture checks, cache the process log path, and skip project
+  filesystem discovery when the monitor is disabled.
+- Commit validated Codex HTTP/WebSocket and Grok terminal events before draining
+  or probing the upstream connection, so a reset, truncated body, or delayed Pong
+  after model completion cannot replace a complete Claude response with an
+  incomplete-stream warning.
+- Fail closed when Codex transport ends after complete-looking tool JSON but
+  before authoritative item and response terminal events. The legacy synthetic
+  `tool_use` terminal is available only behind the explicitly dangerous
+  `unsafeSalvageToolCallOnClose` compatibility switch, and both outcomes are
+  identified in terminal-resolution diagnostics.
+- Send Codex and Grok downstream heartbeats every five seconds by default, with
+  a configurable Codex interval and coverage before Codex's first generation
+  event, so brief upstream or network stalls do not repeatedly trigger Claude
+  Code's connection warning.
 - Print the correct `co` or `cg` resume command when a Claude Code proxy
   session ends, preventing resumed GPT and Grok sessions from silently falling
   back to the first-party Claude runtime.

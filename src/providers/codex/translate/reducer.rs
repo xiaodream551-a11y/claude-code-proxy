@@ -510,6 +510,7 @@ enum BlockState {
         name: String,
         args_accum: String,
         done_snapshot: Option<String>,
+        repair_candidate: Option<String>,
         emitted_args: bool,
     },
 }
@@ -641,10 +642,10 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let mut terminal_type: Option<String> = None;
     let mut continuation_eligible = false;
     let mut incomplete_stop_reason: Option<StopReason> = None;
+    let mut rewrote_output_items = false;
     let mut web_search_requests = 0usize;
     let mut web_search_output_indices = std::collections::HashSet::new();
     let mut _saw_terminal = false;
-    let mut repaired_tool_completion = false;
     let mut event_count = 0usize;
     let mut last_event_type: Option<String> = None;
 
@@ -877,6 +878,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         name: name.clone(),
                         args_accum: String::new(),
                         done_snapshot: None,
+                        repair_candidate: None,
                         emitted_args: false,
                     },
                 );
@@ -1069,7 +1071,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     )));
                 }
             };
-            let mut repaired_read: Option<(usize, String)> = None;
             match state {
                 BlockState::Tool {
                     args_accum,
@@ -1077,6 +1078,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     name,
                     index,
                     call_id,
+                    repair_candidate,
                     ..
                 } => {
                     // The done event is an authoritative boundary. A later
@@ -1097,42 +1099,21 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         });
                     }
 
-                    if let Some(repaired) = repair_whitespace_stalled_read_args(
+                    // Cache a repairable Read snapshot, but do not turn it
+                    // into a committed tool call before authoritative
+                    // output_item.done.
+                    *repair_candidate = repair_whitespace_stalled_read_args(
                         name,
                         args_accum,
                         Some(call_id.as_str()),
-                    ) {
-                        repaired_read = Some((*index, repaired));
-                    } else {
-                        out.push(ReducerEvent::ToolProgress { index: *index });
-                    }
+                    );
+                    out.push(ReducerEvent::ToolProgress { index: *index });
                 }
                 BlockState::Text { .. } => {
                     return Err(protocol_error(format!(
                         "{t} resolved to a message at output_index {output_index}"
                     )));
                 }
-            }
-            if let Some((index, repaired)) = repaired_read {
-                if let Some(mut state) = blocks_by_output_index.remove(&output_index) {
-                    if let BlockState::Tool {
-                        args_accum,
-                        emitted_args,
-                        ..
-                    } = &mut state
-                    {
-                        *args_accum = repaired.clone();
-                        *emitted_args = true;
-                    }
-                    capture_output_item(output_index, &state, &mut output_items_by_index);
-                }
-                out.push(ReducerEvent::ToolDelta {
-                    index,
-                    partial_json: repaired,
-                });
-                out.push(ReducerEvent::ToolStop { index });
-                completed_output_indices.insert(output_index);
-                repaired_tool_completion = true;
             }
             continue;
         }
@@ -1276,23 +1257,29 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 name,
                 call_id,
                 done_snapshot,
+                repair_candidate,
                 emitted_args,
                 index,
                 ..
             } = &mut state
             {
                 let item_snapshot = item_val.get("arguments").and_then(|v| v.as_str());
+                let used_repair_candidate = done_snapshot.is_none()
+                    && item_snapshot.is_none()
+                    && repair_candidate.is_some();
                 let authoritative = done_snapshot
                     .as_deref()
                     .or(item_snapshot)
+                    .or(repair_candidate.as_deref())
                     .unwrap_or(args_accum)
                     .to_string();
-                *args_accum = authoritative;
-
-                if !args_accum.is_empty() {
-                    let sanitized = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
-                    *args_accum = sanitized;
-                }
+                let sanitized = if authoritative.is_empty() {
+                    authoritative.clone()
+                } else {
+                    sanitize_read_args(name, &authoritative, Some(call_id.as_str()))
+                };
+                rewrote_output_items |= used_repair_candidate || sanitized != authoritative;
+                *args_accum = sanitized;
 
                 validate_tool_arguments(name, call_id, args_accum).map_err(|message| {
                     UpstreamStreamError {
@@ -1473,10 +1460,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     }
 
     let open_blocks = describe_open_blocks(&blocks_by_output_index);
-    let unfinished = unfinished_output_indices(&output_identities, &completed_output_indices);
-    let can_finish_repaired_tool_without_terminal =
-        repaired_tool_completion && open_blocks.is_empty() && unfinished.is_empty() && saw_tool_use;
-    if (!_saw_terminal && !can_finish_repaired_tool_without_terminal) || !open_blocks.is_empty() {
+    if !_saw_terminal || !open_blocks.is_empty() {
         let diagnostics = UpstreamStreamDiagnostics {
             event_count,
             last_event_type,
@@ -1511,6 +1495,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     };
 
     let output_items: Vec<ResponsesInputItem> = output_items_by_index.into_values().collect();
+    continuation_eligible &= !rewrote_output_items;
 
     out.push(ReducerEvent::Finish {
         stop_reason,
@@ -2330,8 +2315,8 @@ mod tests {
     }
 
     #[test]
-    fn reduce_repairs_whitespace_stalled_read_args() {
-        let upstream = format!(
+    fn reduce_commits_whitespace_stalled_read_repair_only_after_authoritative_done() {
+        let partial = format!(
             "{}{}",
             sse(
                 "response.output_item.added",
@@ -2346,6 +2331,28 @@ mod tests {
                     "output_index":0,
                     "delta": format!("{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}", " ".repeat(1024))
                 })
+            )
+        );
+        let error = reduce_upstream_bytes(partial.as_bytes()).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("before terminal Codex response event")
+        );
+
+        let upstream = format!(
+            "{}{}{}",
+            partial,
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({"response":{"id":"resp_1","usage":{}}})
             )
         );
         let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
@@ -2438,6 +2445,17 @@ mod tests {
                 json!({
                     "output_index":0,
                     "delta":format!("{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}", " ".repeat(1024))
+                }),
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{
+                        "type":"function_call",
+                        "call_id":"read_1",
+                        "name":"Read"
+                    }
                 }),
             ),
             sse(

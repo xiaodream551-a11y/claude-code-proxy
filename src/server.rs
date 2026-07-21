@@ -6,7 +6,7 @@ use crate::{
     provider::{Provider, RequestByteLease, RequestContext},
     registry::{Registry, normalize_incoming_model},
     session,
-    traffic::{TrafficCaptureOptions, create_traffic_capture},
+    traffic::{TrafficCaptureOptions, create_traffic_capture_async},
 };
 use axum::{
     Json, Router,
@@ -565,6 +565,14 @@ pub fn version_info() -> Value {
         "binarySha256": identity.sha256.as_deref(),
         "configFingerprint": config_fingerprint,
         "configFingerprintScope": "server-routing",
+        "capabilities": {
+            "codexOutputBudget": "unsupported_by_private_gateway",
+            "codexZeroMaxTokens": "rejected_before_dispatch",
+            "codexStructuredOutput": "validated_against_original_schema",
+            "codexUnconfirmedToolCall": "fail_closed_by_default",
+            "nonEmptyStopSequences": "rejected_before_dispatch",
+            "samplingControls": "rejected_before_dispatch",
+        },
     })
 }
 
@@ -863,10 +871,11 @@ async fn dispatch_request_with_id(
         }
     };
 
-    if let Some(project) = project::name_from_request(
-        body.extra.get("system"),
-        body.messages.iter().rev().map(|message| &message.content),
-    ) && let Some(monitor) = state.monitor.as_ref()
+    if let Some(monitor) = state.monitor.as_ref()
+        && let Some(project) = project::name_from_request(
+            body.extra.get("system"),
+            body.messages.iter().rev().map(|message| &message.content),
+        )
     {
         monitor.project_resolved(&req_id, project);
     }
@@ -1049,13 +1058,14 @@ async fn dispatch_request_with_id(
         monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort);
     }
 
-    let traffic = create_traffic_capture(TrafficCaptureOptions {
+    let traffic = create_traffic_capture_async(TrafficCaptureOptions {
         req_id: req_id.clone(),
         session_id: session_id.clone(),
         session_seq: current.as_ref().map(|s| s.seq),
         provider: Some(provider.name().to_string()),
         state_dir_override: None,
     })
+    .await
     .map(Arc::new);
 
     if let Some(capture) = traffic.as_ref() {

@@ -22,6 +22,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::config;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
+use crate::providers::token_count_admission::{self, TokenCountAdmissionError};
 use crate::providers::translate_shared::{
     ImageDecodeAdmissionError, acquire_image_decode_slot, is_claude_code_compaction_request,
     messages_request_contains_base64_image,
@@ -38,7 +39,7 @@ use self::continuation::{
     ContinuationCandidate, abort_continuation, continuation_candidate, record_continuation,
 };
 use self::count_tokens::count_translated_tokens;
-use self::translate::accumulate::accumulate_response_with_traffic;
+use self::translate::accumulate::accumulate_response_with_traffic_and_schema;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request, uses_responses_lite,
@@ -56,7 +57,9 @@ pub(super) const MAX_LIVE_EVENT_BYTES: usize = 1024 * 1024;
 pub(super) const LIVE_EVENT_CHANNEL_CAPACITY: usize = 2;
 const MAX_DOWNSTREAM_QUEUE_BYTES: usize = 2 * 1024 * 1024;
 const DOWNSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
-const DOWNSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const DEFAULT_STREAM_HEARTBEAT: Duration = Duration::from_secs(5);
+const MIN_STREAM_HEARTBEAT: Duration = Duration::from_secs(1);
+const MAX_STREAM_HEARTBEAT: Duration = Duration::from_secs(60);
 const DOWNSTREAM_PING: &[u8] = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
 static LIVE_CONTINUATION_CAPTURE_BYTES: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
     once_cell::sync::Lazy::new(|| {
@@ -67,6 +70,16 @@ static LIVE_CONTINUATION_CAPTURE_BYTES: once_cell::sync::Lazy<Arc<tokio::sync::S
 
 fn translation_overrides() -> TranslationOverrides {
     TranslationOverrides::configured()
+}
+
+fn configured_stream_heartbeat() -> Duration {
+    stream_heartbeat_duration(config::codex_stream_heartbeat_ms(
+        DEFAULT_STREAM_HEARTBEAT.as_millis() as u64,
+    ))
+}
+
+fn stream_heartbeat_duration(configured_ms: u64) -> Duration {
+    Duration::from_millis(configured_ms).clamp(MIN_STREAM_HEARTBEAT, MAX_STREAM_HEARTBEAT)
 }
 #[cfg(test)]
 pub(super) static CODEX_STATE_TEST_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
@@ -139,6 +152,18 @@ impl Provider for CodexProvider {
                 ),
             );
         }
+        let requested_max_tokens =
+            match crate::providers::translate_shared::validate_generation_max_tokens(&body, "Codex")
+            {
+                Ok(max_tokens) => max_tokens,
+                Err(error) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        error.to_string(),
+                    );
+                }
+            };
         let native_web_search = has_hosted_web_search(&body);
         let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
         if let Some(monitor) = ctx.monitor.as_ref() {
@@ -166,6 +191,7 @@ impl Provider for CodexProvider {
             use_responses_lite,
             native_web_search,
             self.client.transport_decision(),
+            requested_max_tokens,
         );
 
         // Check continuation
@@ -184,6 +210,7 @@ impl Provider for CodexProvider {
             monitor.upstream_started(&ctx.req_id);
         }
         if want_stream {
+            let stream_heartbeat = configured_stream_heartbeat();
             return live_stream_response(
                 client,
                 message_id,
@@ -193,6 +220,7 @@ impl Provider for CodexProvider {
                 continuation,
                 provider_started_at,
                 deadline,
+                stream_heartbeat,
             )
             .await;
         }
@@ -211,11 +239,12 @@ impl Provider for CodexProvider {
         if want_stream {
             buffered_stream_response(upstream, &message_id, model, &ctx, turn_id, &translated)
         } else {
-            match accumulate_response_with_traffic(
+            match accumulate_response_with_traffic_and_schema(
                 &upstream.body,
                 &message_id,
                 model,
                 ctx.traffic.as_deref(),
+                translated.schema_bridge.as_deref(),
             ) {
                 Ok(json) => {
                     if let Some(monitor) = ctx.monitor.as_ref() {
@@ -280,7 +309,10 @@ impl Provider for CodexProvider {
             Err(response) => return response,
         };
 
-        let tokens = count_translated_tokens(&translated);
+        let tokens = match count_codex_tokens_bounded(translated).await {
+            Ok(tokens) => tokens,
+            Err(error) => return map_codex_count_tokens_error(error),
+        };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.usage_updated(&ctx.req_id, Some(tokens), None);
         }
@@ -291,6 +323,32 @@ impl Provider for CodexProvider {
             }),
         )
             .into_response()
+    }
+}
+
+async fn count_codex_tokens_bounded(
+    translated: translate::request::ResponsesRequest,
+) -> Result<u64, TokenCountAdmissionError> {
+    token_count_admission::run(move || count_translated_tokens(&translated)).await
+}
+
+fn map_codex_count_tokens_error(error: TokenCountAdmissionError) -> Response {
+    match error {
+        TokenCountAdmissionError::QueueTimeout => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            "Codex token-count admission queue was saturated for 30 seconds",
+        ),
+        TokenCountAdmissionError::Closed => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            "The shared token-count admission gate is unavailable",
+        ),
+        TokenCountAdmissionError::WorkerFailed(error) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            format!("Codex token-count worker failed: {error}"),
+        ),
     }
 }
 
@@ -593,6 +651,7 @@ async fn live_stream_response(
     continuation: ContinuationCandidate,
     provider_started_at: Instant,
     deadline: client::CodexRequestDeadline,
+    stream_heartbeat: Duration,
 ) -> Response {
     let turn_id = continuation.turn_id;
     let transport = client.transport();
@@ -607,6 +666,7 @@ async fn live_stream_response(
             continuation,
             provider_started_at,
             deadline,
+            stream_heartbeat,
         ),
     )
     .await
@@ -632,6 +692,7 @@ async fn live_stream_response_inner(
     continuation: ContinuationCandidate,
     provider_started_at: Instant,
     deadline: client::CodexRequestDeadline,
+    stream_heartbeat: Duration,
 ) -> Response {
     let model = model.to_string();
     let turn_id = continuation.turn_id;
@@ -687,8 +748,7 @@ async fn live_stream_response_inner(
                 }
                 if auto_websocket_attempt && client::should_fallback_to_http(&err) {
                     client::log_auto_http_fallback(&ctx, &err);
-                    let delay = model_retry_backoff
-                        .next_delay(err.replay_safety(), err.retry_after.as_deref())
+                    let delay = client::auto_http_fallback_delay(&err, &mut model_retry_backoff)
                         .expect("replay-safe WebSocket fallback must have a retry delay");
                     if delay.exceeds_budget {
                         abort_continuation(ctx.session_id.as_deref(), turn_id);
@@ -696,7 +756,9 @@ async fn live_stream_response_inner(
                     }
                     drop_live_continuation_for_retry(&mut continuation);
                     active_transport = config::CodexTransport::Http;
-                    sleep(delay.wait_ms).await;
+                    if delay.wait_ms > 0 {
+                        sleep(delay.wait_ms).await;
+                    }
                     continue;
                 }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
@@ -742,7 +804,7 @@ async fn live_stream_response_inner(
             }
         };
 
-        match live_stream_response_once(
+        match live_stream_response_once_with_schema(
             upstream_events,
             message_id.clone(),
             &model,
@@ -751,8 +813,8 @@ async fn live_stream_response_inner(
             LiveContinuationCapture::for_turn(turn_id, &request_body, request_byte_lease.as_ref()),
             provider_started_at,
             deadline,
-            active_transport == config::CodexTransport::Http,
-            DOWNSTREAM_KEEPALIVE_INTERVAL,
+            stream_heartbeat,
+            request_body.schema_bridge.clone(),
         )
         .await
         {
@@ -772,8 +834,7 @@ async fn live_stream_response_inner(
                 }
                 if auto_websocket_attempt && client::should_fallback_to_http(&error) {
                     client::log_auto_http_fallback(&ctx, &error);
-                    let delay = model_retry_backoff
-                        .next_delay(error.replay_safety(), error.retry_after.as_deref())
+                    let delay = client::auto_http_fallback_delay(&error, &mut model_retry_backoff)
                         .expect("replay-safe WebSocket fallback must have a retry delay");
                     if delay.exceeds_budget {
                         abort_continuation(ctx.session_id.as_deref(), turn_id);
@@ -781,7 +842,9 @@ async fn live_stream_response_inner(
                     }
                     drop_live_continuation_for_retry(&mut continuation);
                     active_transport = config::CodexTransport::Http;
-                    sleep(delay.wait_ms).await;
+                    if delay.wait_ms > 0 {
+                        sleep(delay.wait_ms).await;
+                    }
                     continue;
                 }
                 if !replayable_live_start_codex_error(&error) {
@@ -820,8 +883,36 @@ async fn live_stream_response_inner(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn live_stream_response_once(
+    upstream_events: websocket::CodexWebSocketEventReceiver,
+    message_id: String,
+    model: &str,
+    ctx: RequestContext,
+    turn_id: Option<u64>,
+    continuation_capture: Option<LiveContinuationCapture>,
+    provider_started_at: Instant,
+    deadline: client::CodexRequestDeadline,
+    keepalive_delay: Duration,
+) -> LiveStreamStart {
+    live_stream_response_once_with_schema(
+        upstream_events,
+        message_id,
+        model,
+        ctx,
+        turn_id,
+        continuation_capture,
+        provider_started_at,
+        deadline,
+        keepalive_delay,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn live_stream_response_once_with_schema(
     mut upstream_events: websocket::CodexWebSocketEventReceiver,
     message_id: String,
     model: &str,
@@ -830,14 +921,16 @@ async fn live_stream_response_once(
     mut continuation_capture: Option<LiveContinuationCapture>,
     provider_started_at: Instant,
     deadline: client::CodexRequestDeadline,
-    keepalive_from_start: bool,
     keepalive_delay: Duration,
+    schema_bridge: Option<Arc<translate::schema_bridge::SchemaBridge>>,
 ) -> LiveStreamStart {
-    let mut translator = LiveStreamTranslator::new(message_id, model.to_string());
+    let mut translator =
+        LiveStreamTranslator::with_schema_bridge(message_id, model.to_string(), schema_bridge);
     let mut generation_started = false;
-    let mut keepalive_at = keepalive_from_start
-        .then(|| tokio::time::Instant::now().checked_add(keepalive_delay))
-        .flatten();
+    // Start the downstream grace window as soon as either live transport is ready.
+    // Waiting for the first WebSocket generation event can otherwise leave Claude with
+    // no bytes for the full response-start timeout and trigger a false interruption warning.
+    let keepalive_at = tokio::time::Instant::now().checked_add(keepalive_delay);
 
     loop {
         let item = if let Some(at) = keepalive_at {
@@ -847,6 +940,7 @@ async fn live_stream_response_once(
                     // Preserve the original pre-output retry/fallback window for a grace period.
                     // Once the model remains silent beyond it, establish downstream SSE so the
                     // active request does not look hung to Claude or an intermediary.
+                    record_codex_stream_commit(&ctx, generation_started, keepalive_delay);
                     return LiveStreamStart::Response(remaining_live_stream_response(
                         upstream_events,
                         translator,
@@ -856,6 +950,8 @@ async fn live_stream_response_once(
                         continuation_capture,
                         provider_started_at,
                         deadline,
+                        generation_started,
+                        keepalive_delay,
                     ));
                 },
                 item = upstream_events.recv() => item,
@@ -879,14 +975,7 @@ async fn live_stream_response_once(
             }
         };
         log_native_web_search_phase(&ctx, &payload, provider_started_at);
-        if !generation_started && codex_generation_event(&payload) {
-            log_codex_first_event(&ctx, &payload, provider_started_at);
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.generation_started(&ctx.req_id);
-            }
-            generation_started = true;
-            keepalive_at = Some(tokio::time::Instant::now() + keepalive_delay);
-        }
+        record_codex_generation_start(&ctx, &payload, provider_started_at, &mut generation_started);
         if continuation_capture
             .as_mut()
             .is_some_and(|capture| !capture.append(&payload))
@@ -938,6 +1027,11 @@ async fn live_stream_response_once(
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &chunk);
             if terminal {
+                record_codex_terminal_resolution(
+                    &ctx,
+                    "authoritative",
+                    payload.get("type").and_then(serde_json::Value::as_str),
+                );
                 update_live_continuation_from_capture(
                     ctx.session_id.as_deref(),
                     turn_id,
@@ -954,9 +1048,16 @@ async fn live_stream_response_once(
                 continuation_capture,
                 provider_started_at,
                 deadline,
+                generation_started,
+                keepalive_delay,
             ));
         }
         if terminal {
+            record_codex_terminal_resolution(
+                &ctx,
+                "authoritative",
+                payload.get("type").and_then(serde_json::Value::as_str),
+            );
             update_live_continuation_from_capture(
                 ctx.session_id.as_deref(),
                 turn_id,
@@ -984,12 +1085,29 @@ fn codex_generation_event(payload: &serde_json::Value) -> bool {
     )
 }
 
+fn record_codex_generation_start(
+    ctx: &RequestContext,
+    payload: &serde_json::Value,
+    provider_started_at: Instant,
+    generation_started: &mut bool,
+) {
+    if *generation_started || !codex_generation_event(payload) {
+        return;
+    }
+    log_codex_first_event(ctx, payload, provider_started_at);
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        monitor.generation_started(&ctx.req_id);
+    }
+    *generation_started = true;
+}
+
 fn log_codex_request_configuration(
     ctx: &RequestContext,
     request: &translate::request::ResponsesRequest,
     use_responses_lite: bool,
     native_web_search: bool,
     transport: config::CodexTransportDecision,
+    requested_max_tokens: u32,
 ) {
     let service_tier = request.service_tier.as_ref().map(|tier| match tier {
         ServiceTier::Priority => "priority",
@@ -1033,6 +1151,14 @@ fn log_codex_request_configuration(
             (
                 "parallelToolCalls".to_string(),
                 serde_json::json!(request.parallel_tool_calls),
+            ),
+            (
+                "anthropicMaxTokens".to_string(),
+                serde_json::json!(requested_max_tokens),
+            ),
+            (
+                "outputBudgetEnforcement".to_string(),
+                serde_json::json!("unsupported_by_private_codex_gateway"),
             ),
         ])),
     );
@@ -1103,6 +1229,79 @@ fn log_codex_first_event(
             ),
         ])),
     );
+}
+
+fn record_codex_stream_commit(
+    ctx: &RequestContext,
+    generation_started: bool,
+    heartbeat_interval: Duration,
+) {
+    crate::logging::create_logger("codex").info(
+        "stream_committed_before_semantic",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(ctx.req_id)),
+            (
+                "generationStarted".to_string(),
+                serde_json::json!(generation_started),
+            ),
+            (
+                "heartbeatIntervalMs".to_string(),
+                serde_json::json!(heartbeat_interval.as_millis()),
+            ),
+        ])),
+    );
+    if let Some(traffic) = ctx.traffic.as_deref() {
+        traffic.write_json_event(
+            "stream-commit",
+            &serde_json::json!({
+                "committedBeforeSemantic": !generation_started,
+                "generationStarted": generation_started,
+                "heartbeatIntervalMs": heartbeat_interval.as_millis(),
+            }),
+        );
+    }
+}
+
+fn record_codex_terminal_resolution(
+    ctx: &RequestContext,
+    authority: &'static str,
+    source_event: Option<&str>,
+) {
+    crate::logging::create_logger("codex").info(
+        "terminal_resolution",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(ctx.req_id)),
+            ("authority".to_string(), serde_json::json!(authority)),
+            ("sourceEvent".to_string(), serde_json::json!(source_event)),
+        ])),
+    );
+    if let Some(traffic) = ctx.traffic.as_deref() {
+        traffic.write_json_event(
+            "terminal-resolution",
+            &serde_json::json!({
+                "authority": authority,
+                "sourceEvent": source_event,
+            }),
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NonAuthoritativeClose {
+    TransportError,
+    StreamClose,
+}
+
+fn non_authoritative_close_authority(
+    close: NonAuthoritativeClose,
+    unsafe_salvaged: bool,
+) -> &'static str {
+    match (close, unsafe_salvaged) {
+        (NonAuthoritativeClose::TransportError, true) => "unsafe_salvaged_after_transport_error",
+        (NonAuthoritativeClose::TransportError, false) => "failed_closed_after_transport_error",
+        (NonAuthoritativeClose::StreamClose, true) => "unsafe_salvaged_after_stream_close",
+        (NonAuthoritativeClose::StreamClose, false) => "failed_closed_after_stream_close",
+    }
 }
 
 fn translate_live_stream_payload(
@@ -1256,6 +1455,8 @@ fn remaining_live_stream_response(
     continuation_capture: Option<LiveContinuationCapture>,
     provider_started_at: Instant,
     deadline: client::CodexRequestDeadline,
+    generation_started: bool,
+    heartbeat_interval: Duration,
 ) -> Response {
     remaining_live_stream_response_with_heartbeat(
         upstream_events,
@@ -1266,7 +1467,8 @@ fn remaining_live_stream_response(
         continuation_capture,
         provider_started_at,
         deadline,
-        DOWNSTREAM_KEEPALIVE_INTERVAL,
+        generation_started,
+        heartbeat_interval,
     )
 }
 
@@ -1280,6 +1482,7 @@ fn remaining_live_stream_response_with_heartbeat(
     mut continuation_capture: Option<LiveContinuationCapture>,
     provider_started_at: Instant,
     deadline: client::CodexRequestDeadline,
+    mut generation_started: bool,
     heartbeat_interval: Duration,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<BudgetedLiveChunk, std::io::Error>>(
@@ -1387,6 +1590,12 @@ fn remaining_live_stream_response_with_heartbeat(
             match item {
                 Ok(payload) => {
                     log_native_web_search_phase(&ctx, &payload, provider_started_at);
+                    record_codex_generation_start(
+                        &ctx,
+                        &payload,
+                        provider_started_at,
+                        &mut generation_started,
+                    );
                     if continuation_capture
                         .as_mut()
                         .is_some_and(|capture| !capture.append(&payload))
@@ -1416,6 +1625,11 @@ fn remaining_live_stream_response_with_heartbeat(
                         send_chunk_or_stop!(chunk);
                     }
                     if terminal {
+                        record_codex_terminal_resolution(
+                            &ctx,
+                            "authoritative",
+                            payload.get("type").and_then(serde_json::Value::as_str),
+                        );
                         update_live_continuation_from_capture(
                             ctx.session_id.as_deref(),
                             turn_id,
@@ -1426,13 +1640,31 @@ fn remaining_live_stream_response_with_heartbeat(
                 }
                 Err(err) => {
                     abort_continuation(ctx.session_id.as_deref(), turn_id);
-                    let chunk =
-                        translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
+                    let chunk = translator.finish_after_closed_completed_tool_call(
+                        config::codex_unsafe_salvage_tool_call_on_close(),
+                        ctx.traffic.as_deref(),
+                    );
                     if !chunk.is_empty() {
+                        record_codex_terminal_resolution(
+                            &ctx,
+                            non_authoritative_close_authority(
+                                NonAuthoritativeClose::TransportError,
+                                true,
+                            ),
+                            None,
+                        );
                         record_live_stream_progress(&ctx, &chunk);
                         send_chunk_or_stop!(chunk);
                         return;
                     }
+                    record_codex_terminal_resolution(
+                        &ctx,
+                        non_authoritative_close_authority(
+                            NonAuthoritativeClose::TransportError,
+                            false,
+                        ),
+                        None,
+                    );
                     let error_type = codex_stream_error_type(&err);
                     let chunk = translator.error_chunk(
                         codex_error_message(&err),
@@ -1449,12 +1681,25 @@ fn remaining_live_stream_response_with_heartbeat(
         }
 
         abort_continuation(ctx.session_id.as_deref(), turn_id);
-        let chunk = translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
+        let chunk = translator.finish_after_closed_completed_tool_call(
+            config::codex_unsafe_salvage_tool_call_on_close(),
+            ctx.traffic.as_deref(),
+        );
         if !chunk.is_empty() {
+            record_codex_terminal_resolution(
+                &ctx,
+                non_authoritative_close_authority(NonAuthoritativeClose::StreamClose, true),
+                None,
+            );
             record_live_stream_progress(&ctx, &chunk);
             send_chunk_or_stop!(chunk);
             return;
         }
+        record_codex_terminal_resolution(
+            &ctx,
+            non_authoritative_close_authority(NonAuthoritativeClose::StreamClose, false),
+            None,
+        );
         let chunk = translator.error_chunk(
             "WebSocket connection closed before terminal Codex response event",
             "api_error",
@@ -1599,6 +1844,22 @@ fn update_continuation_from_upstream(
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
 ) {
+    // The upstream response id refers to the raw structured JSON, while the
+    // SchemaBridge may remove synthetic nulls before Claude Code records its
+    // transcript. Reusing that id against a normalized transcript would make
+    // the continuation prefix semantically inconsistent. Keep these turns on
+    // the safe full-context path.
+    if request_body.schema_bridge.is_some() {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "reason".to_string(),
+            serde_json::Value::String("structured_output_schema_bridge".to_string()),
+        );
+        crate::logging::create_logger("codex")
+            .debug("Codex continuation was not recorded", Some(fields));
+        abort_continuation(session_id, turn_id);
+        return;
+    }
     match finish_metadata_from_upstream(upstream_body) {
         Ok(Some(finish)) if finish.continuation_eligible => {
             record_continuation(
@@ -1624,6 +1885,15 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     }
 
     match err.status {
+        400 if err.detail.as_deref()
+            == Some(client::CODEX_WEBSOCKET_ENV_PROXY_UNSUPPORTED_DETAIL) =>
+        {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                err.message.as_str(),
+            )
+        }
         401 | 403 => json_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -1798,6 +2068,62 @@ mod tests {
     use http_body_util::BodyExt;
     use std::time::Duration;
 
+    #[test]
+    fn stream_heartbeat_is_clamped_to_safe_bounds() {
+        assert_eq!(stream_heartbeat_duration(1), MIN_STREAM_HEARTBEAT);
+        assert_eq!(stream_heartbeat_duration(5_000), DEFAULT_STREAM_HEARTBEAT);
+        assert_eq!(stream_heartbeat_duration(120_000), MAX_STREAM_HEARTBEAT);
+    }
+
+    #[tokio::test]
+    async fn count_tokens_admission_errors_map_to_retryable_503_or_worker_500() {
+        let saturated = token_count_admission::run_with(
+            Arc::new(tokio::sync::Semaphore::new(0)),
+            Duration::from_millis(10),
+            || 1_u64,
+        )
+        .await
+        .expect_err("a pool with no permits must time out");
+        assert!(matches!(saturated, TokenCountAdmissionError::QueueTimeout));
+        assert_eq!(
+            map_codex_count_tokens_error(saturated).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let failed = token_count_admission::run_with(
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Duration::from_secs(1),
+            || -> u64 { panic!("synthetic token-count worker failure") },
+        )
+        .await
+        .expect_err("a panicking blocking worker must return JoinError");
+        assert!(matches!(failed, TokenCountAdmissionError::WorkerFailed(_)));
+        assert_eq!(
+            map_codex_count_tokens_error(failed).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn non_authoritative_close_records_fail_closed_or_explicitly_unsafe_authority() {
+        assert_eq!(
+            non_authoritative_close_authority(NonAuthoritativeClose::TransportError, false),
+            "failed_closed_after_transport_error"
+        );
+        assert_eq!(
+            non_authoritative_close_authority(NonAuthoritativeClose::StreamClose, false),
+            "failed_closed_after_stream_close"
+        );
+        assert_eq!(
+            non_authoritative_close_authority(NonAuthoritativeClose::TransportError, true),
+            "unsafe_salvaged_after_transport_error"
+        );
+        assert_eq!(
+            non_authoritative_close_authority(NonAuthoritativeClose::StreamClose, true),
+            "unsafe_salvaged_after_stream_close"
+        );
+    }
+
     fn live_test_context() -> RequestContext {
         RequestContext {
             req_id: "live-retry-test".to_string(),
@@ -1828,6 +2154,196 @@ mod tests {
             TranslationOverrides::default(),
         )
         .unwrap()
+    }
+
+    fn structured_continuation_test_request() -> translate::request::ResponsesRequest {
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "return status"}],
+            "output_config": {"format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "note": {"type": "string"}
+                    },
+                    "required": ["status"],
+                    "additionalProperties": false
+                }
+            }}
+        }))
+        .unwrap();
+        translate_request_with_overrides(
+            &body,
+            TranslateOptions {
+                session_id: Some("structured-continuation-test".to_string()),
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: false,
+            },
+            TranslationOverrides::default(),
+        )
+        .unwrap()
+    }
+
+    fn structured_validation_test_bridge() -> Arc<translate::schema_bridge::SchemaBridge> {
+        Arc::new(
+            translate::schema_bridge::SchemaBridge::build(&serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "ok":{"type":"boolean"},
+                    "reason":{"type":"string"}
+                },
+                "required":["ok"],
+                "additionalProperties":false
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn invalid_structured_stream_events() -> Vec<serde_json::Value> {
+        let text = r#"{"ok":"wrong","reason":null}"#;
+        vec![
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_structured"}
+            }),
+            serde_json::json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "item_id":"msg_structured",
+                "delta":text
+            }),
+            serde_json::json!({
+                "type":"response.output_text.done",
+                "output_index":0,
+                "item_id":"msg_structured",
+                "text":text
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_structured"}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"resp_structured","usage":{}}
+            }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn structured_validation_failure_before_first_chunk_returns_http_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        for event in invalid_structured_stream_events() {
+            tx.send(Ok(event)).await.unwrap();
+        }
+        drop(tx);
+
+        let start = live_stream_response_once_with_schema(
+            rx,
+            "msg_structured".to_string(),
+            "gpt-5.6-sol",
+            live_test_context(),
+            None,
+            None,
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(1_000),
+            Duration::from_secs(1),
+            Some(structured_validation_test_bridge()),
+        )
+        .await;
+        let LiveStreamStart::Response(response) = start else {
+            panic!("invalid structured output must not be retried");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("wrong"));
+        assert!(!body.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn structured_validation_failure_after_heartbeat_is_in_band_sse_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let start = live_stream_response_once_with_schema(
+            rx,
+            "msg_structured".to_string(),
+            "gpt-5.6-sol",
+            live_test_context(),
+            None,
+            None,
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(1_000),
+            Duration::from_millis(1),
+            Some(structured_validation_test_bridge()),
+        )
+        .await;
+        let LiveStreamStart::Response(response) = start else {
+            panic!("heartbeat should commit a downstream response");
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for event in invalid_structured_stream_events() {
+            tx.send(Ok(event)).await.unwrap();
+        }
+        drop(tx);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("event: ping"));
+        assert!(body.contains("event: error"));
+        assert!(!body.contains("wrong"));
+        assert!(!body.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn structured_output_turn_does_not_record_inconsistent_continuation() {
+        let _state_guard = CODEX_STATE_TEST_LOCK.lock().await;
+        let session_id = "structured-continuation-test";
+        let request = structured_continuation_test_request();
+        assert!(request.schema_bridge.is_some());
+        let candidate = continuation_candidate(Some(session_id), &request, true);
+        let turn_id = candidate
+            .turn_id
+            .expect("continuation turn should register");
+        let upstream = [
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_up"}
+            }),
+            serde_json::json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "delta":"{\"status\":\"ok\",\"note\":null}"
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_up"}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{"id":"resp_structured","usage":{}}
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+
+        update_continuation_from_upstream(
+            Some(session_id),
+            Some(turn_id),
+            &request,
+            upstream.as_bytes(),
+        );
+        assert!(!continuation::has_continuation_for_tests(session_id));
     }
 
     #[test]
@@ -2173,8 +2689,7 @@ mod tests {
                 None,
                 Instant::now(),
                 client::CodexRequestDeadline::from_timeout_ms(10_000),
-                false,
-                DOWNSTREAM_KEEPALIVE_INTERVAL,
+                DEFAULT_STREAM_HEARTBEAT,
             )
             .await,
             LiveStreamStart::Retry { .. }
@@ -2206,8 +2721,7 @@ mod tests {
             None,
             Instant::now(),
             client::CodexRequestDeadline::from_timeout_ms(10_000),
-            false,
-            DOWNSTREAM_KEEPALIVE_INTERVAL,
+            DEFAULT_STREAM_HEARTBEAT,
         )
         .await
         {
@@ -2244,7 +2758,6 @@ mod tests {
                 None,
                 Instant::now(),
                 client::CodexRequestDeadline::from_timeout_ms(10_000),
-                false,
                 Duration::from_millis(20),
             ),
         )
@@ -2275,34 +2788,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_http_headers_start_ping_grace_before_the_first_body_event() {
+    async fn live_transport_starts_ping_grace_before_the_first_upstream_event() {
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(1);
         let response = tokio::time::timeout(
             Duration::from_millis(250),
             live_stream_response_once(
                 upstream_rx,
-                "msg_http_silent".to_string(),
+                "msg_live_silent".to_string(),
                 "gpt-5.6-sol",
                 live_test_context(),
                 None,
                 None,
                 Instant::now(),
                 client::CodexRequestDeadline::from_timeout_ms(10_000),
-                true,
                 Duration::from_millis(20),
             ),
         )
         .await
-        .expect("HTTP headers should start the downstream ping grace");
+        .expect("the live transport should start the downstream ping grace");
         let response = match response {
             LiveStreamStart::Response(response) => response,
-            LiveStreamStart::Retry { .. } => panic!("silent HTTP body should become a live stream"),
+            LiveStreamStart::Retry { .. } => {
+                panic!("a silent upstream should become a live stream")
+            }
         };
         let mut body = response.into_body();
         let first = tokio::time::timeout(Duration::from_millis(100), body.frame())
             .await
-            .expect("HTTP transport ping should be ready")
-            .expect("stream ended before HTTP transport ping")
+            .expect("live transport ping should be ready")
+            .expect("stream ended before the live transport ping")
             .unwrap()
             .into_data()
             .unwrap();
@@ -2311,7 +2825,78 @@ mod tests {
         drop(body);
         tokio::time::timeout(Duration::from_millis(100), upstream_tx.closed())
             .await
-            .expect("dropping the HTTP response should cancel its upstream body");
+            .expect("dropping the response should cancel its upstream body");
+    }
+
+    #[tokio::test]
+    async fn first_generation_event_after_initial_ping_starts_monitor_timing() {
+        let monitor = crate::monitor::MonitorHandle::new(10);
+        monitor.request_started(
+            "live-retry-test",
+            None,
+            None,
+            crate::monitor::EndpointKind::Messages,
+        );
+        let mut ctx = live_test_context();
+        ctx.monitor = Some(monitor.clone());
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(1);
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            live_stream_response_once(
+                upstream_rx,
+                "msg_ping_then_generation".to_string(),
+                "gpt-5.6-sol",
+                ctx,
+                None,
+                None,
+                Instant::now(),
+                client::CodexRequestDeadline::from_timeout_ms(10_000),
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("initial downstream ping should establish the live response");
+        let response = match response {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { .. } => {
+                panic!("a silent upstream should become a live stream")
+            }
+        };
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_millis(100), body.frame())
+            .await
+            .expect("initial ping should be ready")
+            .expect("stream ended before the initial ping")
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(first.as_ref(), DOWNSTREAM_PING);
+
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_after_ping", "status": "in_progress"}
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if monitor.snapshot().active.iter().any(|request| {
+                    request.request_id == "live-retry-test"
+                        && request.generation_started_at.is_some()
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first generation event after a ping was not recorded");
+
+        drop(body);
+        tokio::time::timeout(Duration::from_millis(250), upstream_tx.closed())
+            .await
+            .expect("dropping the response should cancel its upstream body");
     }
 
     #[tokio::test]
@@ -2343,7 +2928,6 @@ mod tests {
                 None,
                 Instant::now(),
                 client::CodexRequestDeadline::from_timeout_ms(10_000),
-                false,
                 Duration::from_millis(20),
             ),
         )
@@ -2383,7 +2967,6 @@ mod tests {
                 None,
                 Instant::now(),
                 client::CodexRequestDeadline::from_timeout_ms(10_000),
-                false,
                 Duration::from_secs(1),
             )
             .await,
@@ -2404,6 +2987,7 @@ mod tests {
             None,
             Instant::now(),
             client::CodexRequestDeadline::from_timeout_ms(1_000),
+            true,
             Duration::from_millis(20),
         );
 
@@ -2490,6 +3074,7 @@ mod tests {
             None,
             Instant::now(),
             client::CodexRequestDeadline::from_timeout_ms(100),
+            true,
             Duration::from_millis(20),
         );
 
@@ -2524,6 +3109,8 @@ mod tests {
             None,
             Instant::now(),
             client::CodexRequestDeadline::from_timeout_ms(10_000),
+            true,
+            DEFAULT_STREAM_HEARTBEAT,
         );
         let mut body = response.into_body();
 
@@ -2565,6 +3152,8 @@ mod tests {
             None,
             Instant::now(),
             client::CodexRequestDeadline::from_timeout_ms(100),
+            true,
+            DEFAULT_STREAM_HEARTBEAT,
         );
         let body = response.into_body();
 

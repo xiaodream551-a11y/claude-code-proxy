@@ -29,7 +29,7 @@ pub const DEFAULT_HEADER_TIMEOUT_MS: u64 = 60_000;
 pub const DEFAULT_FIRST_BYTE_TIMEOUT_MS: u64 = 60_000;
 pub const DEFAULT_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_TOTAL_TIMEOUT_MS: u64 = 540_000;
-pub const DEFAULT_STREAM_HEARTBEAT_MS: u64 = 15_000;
+pub const DEFAULT_STREAM_HEARTBEAT_MS: u64 = 5_000;
 const MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub type GrokByteStream =
@@ -262,6 +262,16 @@ impl PreparedGrokRequest {
 
     fn clone_body(&self) -> Bytes {
         self.body.clone()
+    }
+
+    /// Cheap hot-path fallback for observability when upstream usage is absent.
+    /// Exact local counting is reserved for `/count_tokens`; model requests must
+    /// not wait for tokenizer work before exposing an already-started response.
+    pub(super) fn approximate_input_tokens(&self) -> u64 {
+        u64::try_from(self.body.len())
+            .unwrap_or(u64::MAX)
+            .div_ceil(4)
+            .max(1)
     }
 
     fn len(&self) -> usize {
@@ -571,10 +581,8 @@ impl GrokResponse {
 impl GrokClient {
     pub fn new(base_url: String, client_version: String) -> anyhow::Result<Self> {
         let timeouts = GrokTimeouts::configured();
-        let mut client_builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(Duration::from_millis(timeouts.connect_ms));
+        let mut client_builder =
+            crate::upstream_http::model_client_builder(Duration::from_millis(timeouts.connect_ms));
         if crate::oauth_http::is_loopback_url(&base_url) {
             client_builder = client_builder.no_proxy();
         }
@@ -597,13 +605,10 @@ impl GrokClient {
         auth: GrokAuthManager<crate::auth::FileAuthStore<StoredAuth>>,
     ) -> anyhow::Result<Self> {
         let client = Arc::new(
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .retry(reqwest::retry::never())
+            crate::upstream_http::model_client_builder(Duration::from_millis(timeouts.connect_ms))
                 // Unit tests use loopback fault servers and must not inherit the
                 // host's macOS/system proxy configuration.
                 .no_proxy()
-                .connect_timeout(Duration::from_millis(timeouts.connect_ms))
                 .build()?,
         );
         Ok(Self::with_shared(
@@ -1881,12 +1886,13 @@ mod tests {
     }
 
     #[test]
-    fn configured_timeouts_match_defaults() {
+    fn configured_timeouts_and_heartbeat_match_defaults() {
         let timeouts = GrokTimeouts::default();
         assert_eq!(timeouts.connect_ms, 10_000);
         assert_eq!(timeouts.header_ms, 60_000);
         assert_eq!(timeouts.first_byte_ms, 60_000);
         assert_eq!(timeouts.body_idle_ms, 300_000);
+        assert_eq!(DEFAULT_STREAM_HEARTBEAT_MS, 5_000);
     }
 
     #[test]

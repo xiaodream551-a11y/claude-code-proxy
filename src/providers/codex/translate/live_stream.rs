@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
@@ -13,6 +14,7 @@ use super::reducer::{
     resolve_semantic_output_index, stop_reason_for_incomplete_response, unfinished_output_indices,
     validate_output_item_done, validate_tool_arguments,
 };
+use super::schema_bridge::SchemaBridge;
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
 const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
@@ -30,6 +32,7 @@ enum LiveBlock {
         name: String,
         args_accum: String,
         done_snapshot: Option<String>,
+        repair_candidate: Option<String>,
         emitted_args: bool,
     },
 }
@@ -80,12 +83,21 @@ pub struct LiveStreamTranslator {
     web_searches: Vec<LiveWebSearch>,
     web_search_results: Vec<LiveWebSearchResult>,
     deferred_text: Vec<(usize, String)>,
+    schema_bridge: Option<Arc<SchemaBridge>>,
     upstream_input_bytes: usize,
     finished: bool,
 }
 
 impl LiveStreamTranslator {
     pub fn new(message_id: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::with_schema_bridge(message_id, model, None)
+    }
+
+    pub(crate) fn with_schema_bridge(
+        message_id: impl Into<String>,
+        model: impl Into<String>,
+        schema_bridge: Option<Arc<SchemaBridge>>,
+    ) -> Self {
         Self {
             message_id: message_id.into(),
             model: model.into(),
@@ -104,6 +116,7 @@ impl LiveStreamTranslator {
             web_searches: Vec::new(),
             web_search_results: Vec::new(),
             deferred_text: Vec::new(),
+            schema_bridge,
             upstream_input_bytes: 0,
             finished: false,
         }
@@ -265,10 +278,11 @@ impl LiveStreamTranslator {
 
     pub fn finish_after_closed_completed_tool_call(
         &mut self,
+        unsafe_salvage_enabled: bool,
         traffic: Option<&TrafficCapture>,
     ) -> Vec<u8> {
         let mut out = Vec::new();
-        if self.finished || !self.saw_tool_use {
+        if !unsafe_salvage_enabled || self.finished || !self.saw_tool_use {
             return out;
         }
 
@@ -283,12 +297,12 @@ impl LiveStreamTranslator {
             return out;
         }
 
-        // A flaky transport can close after the model has sent a complete JSON
-        // function call but before `response.output_item.done` or the terminal
-        // response event. The tool block has already crossed the downstream
-        // replay boundary, so retrying the whole request could duplicate a tool
-        // invocation. Validate every remaining block transactionally and, when
-        // they are all complete tools, finish the Anthropic stream instead.
+        // Dangerous compatibility mode only: a flaky transport can close after
+        // complete-looking JSON but before authoritative item/response terminal
+        // events. Validate every remaining block transactionally before
+        // synthesizing the legacy success terminal. Callers must leave this
+        // disabled by default because valid JSON alone does not prove the model
+        // committed that tool call.
         let mut prepared = Vec::with_capacity(self.blocks_by_output_index.len());
         for output_index in self.blocks_by_output_index.keys().copied() {
             let Ok(Some(arguments)) = self.prepare_tool_arguments(output_index, None) else {
@@ -438,7 +452,7 @@ impl LiveStreamTranslator {
                 self.close_thinking(traffic, out);
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
-                let deferred = !self.web_searches.is_empty();
+                let deferred = self.schema_bridge.is_some() || !self.web_searches.is_empty();
                 self.blocks_by_output_index.insert(
                     output_index,
                     LiveBlock::Text {
@@ -485,6 +499,7 @@ impl LiveStreamTranslator {
                         name: name.clone(),
                         args_accum: String::new(),
                         done_snapshot: None,
+                        repair_candidate: None,
                         emitted_args: false,
                     },
                 );
@@ -682,8 +697,8 @@ impl LiveStreamTranslator {
     fn tool_delta(
         &mut self,
         payload: &serde_json::Value,
-        traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
+        _traffic: Option<&TrafficCapture>,
+        _out: &mut Vec<u8>,
     ) -> Result<(), String> {
         let event = "response.function_call_arguments.delta";
         let output_index = self.semantic_output_index(payload, event)?;
@@ -701,13 +716,12 @@ impl LiveStreamTranslator {
         if delta.is_empty() {
             return Ok(());
         }
-        let mut repaired_read: Option<(usize, String)> = None;
         let Some(LiveBlock::Tool {
-            index,
             call_id,
             name,
             args_accum,
             done_snapshot,
+            repair_candidate,
             ..
         }) = self.blocks_by_output_index.get_mut(&output_index)
         else {
@@ -728,38 +742,11 @@ impl LiveStreamTranslator {
                 "Buffered {name} tool arguments exceeded safe limits"
             ));
         }
-        if let Some(repaired) =
-            repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
-        {
-            repaired_read = Some((*index, repaired));
-        }
-
-        if let Some((index, repaired)) = repaired_read {
-            self.blocks_by_output_index.remove(&output_index);
-            self.completed_output_indices.insert(output_index);
-            self.emit(
-                traffic,
-                out,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": repaired
-                    }
-                }),
-            );
-            self.emit(
-                traffic,
-                out,
-                "content_block_stop",
-                &serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": index,
-                }),
-            );
-        }
+        // A repairable snapshot is not proof that the model committed the
+        // tool call. Cache it for a later authoritative output_item.done, or
+        // for the explicitly unsafe transport-close compatibility path.
+        *repair_candidate =
+            repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()));
         Ok(())
     }
 
@@ -940,6 +927,7 @@ impl LiveStreamTranslator {
             call_id,
             args_accum,
             done_snapshot,
+            repair_candidate,
             emitted_args,
             ..
         }) = self.blocks_by_output_index.get(&output_index)
@@ -947,11 +935,12 @@ impl LiveStreamTranslator {
             return Ok(None);
         };
 
-        // Prefer the explicit arguments-done snapshot, then the completed item
-        // snapshot, and only fall back to accumulated deltas for truncated streams.
+        // Prefer authoritative snapshots. A cached repair is committed only
+        // after output_item.done, or by the explicit unsafe-close caller.
         let mut arguments = done_snapshot
             .as_deref()
             .or(final_args)
+            .or(repair_candidate.as_deref())
             .unwrap_or(args_accum)
             .to_string();
         if !arguments.is_empty() {
@@ -1182,8 +1171,6 @@ impl LiveStreamTranslator {
             ));
         }
         self.close_thinking(traffic, out);
-        self.emit_web_searches(traffic, out);
-        self.ensure_message_start(traffic, out);
         let usage = payload.get("response").map(parse_codex_usage);
         let stop_reason =
             if let Some(reason) = stop_reason_for_incomplete_response(payload, event_type) {
@@ -1193,7 +1180,36 @@ impl LiveStreamTranslator {
             } else {
                 STOP_END_TURN
             };
+        if stop_reason == STOP_END_TURN {
+            self.normalize_deferred_structured_text()?;
+        }
+        self.emit_web_searches(traffic, out);
+        self.ensure_message_start(traffic, out);
         self.emit_finish(stop_reason, usage, traffic, out);
+        Ok(())
+    }
+
+    fn normalize_deferred_structured_text(&mut self) -> Result<(), String> {
+        let Some(bridge) = self.schema_bridge.as_ref() else {
+            return Ok(());
+        };
+        if self.deferred_text.len() != 1 {
+            return Err(format!(
+                "Codex structured output expected exactly one completed text block, found {}",
+                self.deferred_text.len()
+            ));
+        }
+        let (normalized_text, elided_null_properties) = {
+            let normalized = bridge
+                .normalize_completed_text(&self.deferred_text[0].1)
+                .map_err(|error| format!("Codex structured output validation failed: {error}"))?;
+            (
+                normalized.text.into_owned(),
+                normalized.elided_null_properties,
+            )
+        };
+        self.deferred_text[0].1 = normalized_text;
+        let _ = elided_null_properties;
         Ok(())
     }
 
@@ -1521,6 +1537,41 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    fn optional_reason_schema_bridge() -> Arc<SchemaBridge> {
+        Arc::new(
+            SchemaBridge::build(&json!({
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "reason": {"type": "string"}
+                },
+                "required": ["ok"],
+                "additionalProperties": false
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn structured_text_events(text: &str) -> [serde_json::Value; 3] {
+        [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": text
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+        ]
+    }
+
     #[test]
     fn emits_text_delta_before_terminal_event() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
@@ -1552,6 +1603,75 @@ mod tests {
         assert!(out.contains("text_delta"));
         assert!(out.contains("hello"));
         assert!(!out.contains("message_stop"));
+    }
+
+    #[test]
+    fn structured_text_is_buffered_until_terminal_and_optional_null_is_elided() {
+        let mut translator = LiveStreamTranslator::with_schema_bridge(
+            "msg_1",
+            "gpt-5.6-sol",
+            Some(optional_reason_schema_bridge()),
+        );
+        let mut before_terminal = Vec::new();
+        for event in structured_text_events(r#"{"ok":true,"reason":null}"#) {
+            before_terminal.extend(translator.accept(&event, None).unwrap());
+        }
+        assert!(before_terminal.is_empty());
+
+        let terminal = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_1", "usage": {}}
+                }),
+                None,
+            )
+            .unwrap();
+        let values = crate::anthropic::sse::try_parse_sse_events(&terminal)
+            .unwrap()
+            .into_iter()
+            .map(|event| serde_json::from_str::<serde_json::Value>(&event.data).unwrap())
+            .collect::<Vec<_>>();
+        let text_deltas = values
+            .iter()
+            .filter(|value| value["delta"]["type"] == "text_delta")
+            .filter_map(|value| value["delta"]["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(text_deltas, vec![r#"{"ok":true}"#]);
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value["type"] == "message_stop")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_structured_text_emits_error_without_success_terminal() {
+        let mut translator = LiveStreamTranslator::with_schema_bridge(
+            "msg_1",
+            "gpt-5.6-sol",
+            Some(optional_reason_schema_bridge()),
+        );
+        for event in structured_text_events(r#"{"ok":"wrong","reason":null}"#) {
+            assert!(translator.accept(&event, None).unwrap().is_empty());
+        }
+
+        let error = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_1", "usage": {}}
+                }),
+                None,
+            )
+            .expect_err("invalid structured output must fail before a success terminal");
+        let rendered =
+            String::from_utf8(translator.error_chunk(&error, "api_error", None)).unwrap();
+        assert!(rendered.contains("event: error"));
+        assert!(!rendered.contains("message_stop"));
+        assert!(!rendered.contains("wrong"));
     }
 
     #[test]
@@ -2484,7 +2604,7 @@ mod tests {
     }
 
     #[test]
-    fn read_stall_closes_only_read_and_preserves_parallel_peer() {
+    fn read_stall_waits_for_authoritative_done_and_preserves_parallel_peer() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
         let mut out = Vec::new();
         for event in [
@@ -2513,7 +2633,7 @@ mod tests {
         }
 
         let before_peer_done = String::from_utf8(out.clone()).unwrap();
-        assert!(before_peer_done.contains("/tmp/a"));
+        assert!(!before_peer_done.contains("/tmp/a"));
         assert!(!before_peer_done.contains("echo peer"));
         assert!(!before_peer_done.contains("message_stop"));
         assert!(!translator.is_finished());
@@ -2535,6 +2655,15 @@ mod tests {
                 }
             }),
             json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type":"function_call",
+                    "call_id":"read_1",
+                    "name":"Read"
+                }
+            }),
+            json!({
                 "type": "response.completed",
                 "response": {"id": "resp_1", "usage": {}}
             }),
@@ -2543,6 +2672,7 @@ mod tests {
         }
 
         let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("/tmp/a"));
         assert!(rendered.contains("echo peer"));
         assert_eq!(rendered.matches("event: content_block_stop").count(), 2);
         assert_eq!(rendered.matches("event: message_stop").count(), 1);
@@ -2660,7 +2790,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_whitespace_stalled_read_args_without_finishing_message() {
+    fn caches_whitespace_stalled_read_repair_until_authoritative_done() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
         let mut out = Vec::new();
         out.extend(
@@ -2688,13 +2818,39 @@ mod tests {
                 .unwrap(),
         );
         let rendered = String::from_utf8(out.clone()).unwrap();
-        assert!(rendered.contains(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#));
+        assert!(!rendered.contains("input_json_delta"));
+        assert!(!rendered.contains("content_block_stop"));
         assert!(!rendered.contains(r#""stop_reason":"tool_use""#));
         assert!(!rendered.contains("message_stop"));
         assert!(!translator.is_finished());
 
-        out.extend(translator.finish_after_closed_completed_tool_call(None));
+        out.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {"type":"function_call","call_id":"call_1","name":"Read"}
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
+        out.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.completed",
+                        "response": {"id":"resp_1","usage":{}}
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
         let rendered = String::from_utf8(out).unwrap();
+        assert_eq!(rendered.matches("input_json_delta").count(), 1);
+        assert!(rendered.contains(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#));
+        assert_eq!(rendered.matches("event: content_block_stop").count(), 1);
         assert!(rendered.contains(r#""stop_reason":"tool_use""#));
         assert!(rendered.contains("message_stop"));
         assert!(translator.is_finished());
@@ -2728,7 +2884,7 @@ mod tests {
         ] {
             out.extend(translator.accept(&event, None).unwrap());
         }
-        out.extend(translator.finish_after_closed_completed_tool_call(None));
+        out.extend(translator.finish_after_closed_completed_tool_call(true, None));
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("content_block_start"));
         assert!(rendered.contains("input_json_delta"));
@@ -2738,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn finishes_complete_tool_arguments_when_stream_closes_before_item_done() {
+    fn complete_tool_json_without_authoritative_terminal_fails_closed_by_default() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
         let mut out = Vec::new();
         for event in [
@@ -2756,7 +2912,45 @@ mod tests {
             out.extend(translator.accept(&event, None).unwrap());
         }
 
-        out.extend(translator.finish_after_closed_completed_tool_call(None));
+        assert!(
+            translator
+                .finish_after_closed_completed_tool_call(false, None)
+                .is_empty()
+        );
+        out.extend(translator.error_chunk(
+            "upstream closed without authoritative terminal events",
+            "api_error",
+            None,
+        ));
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("content_block_start"));
+        assert!(rendered.contains("event: error"));
+        assert!(!rendered.contains("input_json_delta"));
+        assert!(!rendered.contains(r#""stop_reason":"tool_use""#));
+        assert!(!rendered.contains("message_stop"));
+        assert!(translator.is_finished());
+    }
+
+    #[test]
+    fn unsafe_opt_in_finishes_complete_tool_json_before_item_done() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let mut out = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"function_call","call_id":"call_1","name":"Workflow"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"script\":\"const result = await agent('inspect');\"}"
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+
+        out.extend(translator.finish_after_closed_completed_tool_call(true, None));
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("content_block_start"));
         assert!(rendered.contains("input_json_delta"));
@@ -2785,7 +2979,7 @@ mod tests {
             out.extend(translator.accept(&event, None).unwrap());
         }
 
-        out.extend(translator.finish_after_closed_completed_tool_call(None));
+        out.extend(translator.finish_after_closed_completed_tool_call(true, None));
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("input_json_delta"));
         assert!(rendered.contains("/tmp/a"));
@@ -2820,7 +3014,7 @@ mod tests {
 
         assert!(
             translator
-                .finish_after_closed_completed_tool_call(None)
+                .finish_after_closed_completed_tool_call(true, None)
                 .is_empty()
         );
         assert!(!translator.is_finished());
@@ -2874,7 +3068,7 @@ mod tests {
 
             assert!(
                 translator
-                    .finish_after_closed_completed_tool_call(None)
+                    .finish_after_closed_completed_tool_call(true, None)
                     .is_empty(),
                 "transport-close salvage accepted unfinished {label}"
             );

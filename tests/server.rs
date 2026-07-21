@@ -148,6 +148,18 @@ async fn version_reports_build_and_runtime_identity() {
         digest.update(&buffer[..read]);
     }
     assert_eq!(body["binarySha256"], hex::encode(digest.finalize()));
+    assert_eq!(
+        body["capabilities"]["codexOutputBudget"],
+        "unsupported_by_private_gateway"
+    );
+    assert_eq!(
+        body["capabilities"]["codexStructuredOutput"],
+        "validated_against_original_schema"
+    );
+    assert_eq!(
+        body["capabilities"]["codexUnconfirmedToolCall"],
+        "fail_closed_by_default"
+    );
 }
 
 #[tokio::test]

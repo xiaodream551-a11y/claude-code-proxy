@@ -145,8 +145,10 @@ impl ClaudeProfile {
             },
             Self::Grok => ClaudeProfileConfig {
                 name: "Grok",
-                main_model: "grok-4.5-high",
-                fable_model: "grok-4.5-high",
+                // Keep high as the profile default, but do not bake it into the
+                // model id: Claude Code's /effort setting must remain effective.
+                main_model: "grok-4.5",
+                fable_model: "grok-4.5",
                 opus_model: "grok-4.5-high",
                 sonnet_model: "grok-4.5-high",
                 haiku_model: "grok-4.5-medium",
@@ -157,7 +159,12 @@ impl ClaudeProfile {
                 general_purpose_effort: "high",
                 plan_effort: "high",
                 promote_codex_xhigh_to_max: false,
-                available_models: &["grok-4.5", "grok-4.5-high", "grok-4.5-medium"],
+                available_models: &[
+                    "grok-4.5",
+                    "grok-4.5-high",
+                    "grok-4.5-medium",
+                    "grok-composer-2.5-fast",
+                ],
             },
         }
     }
@@ -1471,7 +1478,7 @@ mod tests {
         let settings = command_inline_settings(&command);
         let agents = command_inline_agents(&command);
         assert_complete_inline_agents(&agents);
-        assert_eq!(settings["model"], "grok-4.5-high");
+        assert_eq!(settings["model"], "grok-4.5");
         assert_eq!(settings["effortLevel"], "high");
         assert_eq!(settings["ultracode"], false);
         assert_eq!(agents["Explore"]["model"], "grok-4.5-medium");
@@ -1486,8 +1493,19 @@ mod tests {
                 .iter()
                 .any(|model| model == "grok-4.5-medium")
         );
+        assert!(
+            settings["availableModels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| model == "grok-composer-2.5-fast")
+        );
         assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "500000");
-        assert_eq!(command_env(&command, "ANTHROPIC_MODEL"), "grok-4.5-high");
+        assert_eq!(command_env(&command, "ANTHROPIC_MODEL"), "grok-4.5");
+        assert_eq!(
+            command_env(&command, "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+            "grok-4.5"
+        );
         assert_eq!(
             command_env(&command, "ANTHROPIC_DEFAULT_OPUS_MODEL"),
             "grok-4.5-high"

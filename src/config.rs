@@ -18,6 +18,10 @@ fn environment() -> HashMap<String, String> {
         .collect()
 }
 
+fn environment_value(key: &str) -> Option<String> {
+    std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasProvider {
     Codex,
@@ -93,6 +97,8 @@ struct CodexConfig {
     pub user_agent: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "unsafeSalvageToolCallOnClose")]
+    pub unsafe_salvage_tool_call_on_close: Option<bool>,
     #[serde(rename = "serviceTier")]
     pub service_tier: Option<String>,
     #[serde(rename = "responsesLite")]
@@ -116,6 +122,8 @@ struct CodexConfig {
     pub body_idle_timeout_ms: Option<u64>,
     #[serde(rename = "totalTimeoutMs")]
     pub total_timeout_ms: Option<u64>,
+    #[serde(rename = "streamHeartbeatMs")]
+    pub stream_heartbeat_ms: Option<u64>,
     #[serde(rename = "websocketResponseStartTimeoutMs")]
     pub websocket_response_start_timeout_ms: Option<u64>,
     #[serde(rename = "websocketIdleTimeoutMs")]
@@ -498,6 +506,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_PARALLEL_TOOLS") {
         out.push("CCP_CODEX_PARALLEL_TOOLS (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_UNSAFE_SALVAGE_TOOL_CALL_ON_CLOSE") {
+        out.push("CCP_CODEX_UNSAFE_SALVAGE_TOOL_CALL_ON_CLOSE (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_CONNECT_TIMEOUT_MS") {
         out.push("CCP_CODEX_CONNECT_TIMEOUT_MS (env)".to_string());
     }
@@ -512,6 +523,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_CODEX_TOTAL_TIMEOUT_MS") {
         out.push("CCP_CODEX_TOTAL_TIMEOUT_MS (env)".to_string());
+    }
+    if env.contains_key("CCP_CODEX_STREAM_HEARTBEAT_MS") {
+        out.push("CCP_CODEX_STREAM_HEARTBEAT_MS (env)".to_string());
     }
     if env.contains_key("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS") {
         out.push("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS (env)".to_string());
@@ -550,6 +564,11 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             if let Some(parallel_tools) = codex.parallel_tools {
                 out.push(format!("codex.parallelTools: {parallel_tools}"));
             }
+            if let Some(unsafe_salvage) = codex.unsafe_salvage_tool_call_on_close {
+                out.push(format!(
+                    "codex.unsafeSalvageToolCallOnClose: {unsafe_salvage}"
+                ));
+            }
             if codex
                 .reasoning_summary
                 .as_deref()
@@ -571,6 +590,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(timeout_ms) = codex.total_timeout_ms {
                 out.push(format!("codex.totalTimeoutMs: {timeout_ms}"));
+            }
+            if let Some(heartbeat_ms) = codex.stream_heartbeat_ms {
+                out.push(format!("codex.streamHeartbeatMs: {heartbeat_ms}"));
             }
             if let Some(timeout_ms) = codex.websocket_response_start_timeout_ms {
                 out.push(format!(
@@ -936,8 +958,7 @@ pub fn codex_user_agent(default: &str) -> String {
 }
 
 pub fn codex_previous_response_id() -> bool {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
+    if let Some(raw) = environment_value("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
     let config_dir = paths::config_dir();
@@ -950,10 +971,23 @@ pub fn codex_previous_response_id() -> bool {
     false
 }
 
+/// Re-enables the legacy heuristic that turns complete-looking tool JSON into
+/// a successful tool-use response after the upstream closes without an
+/// authoritative terminal. This is intentionally strict opt-in: only the
+/// literal environment value `true` enables it.
+pub fn codex_unsafe_salvage_tool_call_on_close() -> bool {
+    if let Some(raw) = environment_value("CCP_CODEX_UNSAFE_SALVAGE_TOOL_CALL_ON_CLOSE") {
+        return raw.eq_ignore_ascii_case("true");
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.codex)
+        .and_then(|codex| codex.unsafe_salvage_tool_call_on_close)
+        .unwrap_or(false)
+}
+
 pub fn codex_service_tier() -> Option<String> {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
-        return Some(raw.clone());
+    if let Some(raw) = environment_value("CCP_CODEX_SERVICE_TIER") {
+        return Some(raw);
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
@@ -997,9 +1031,8 @@ pub fn codex_parallel_tools() -> bool {
 }
 
 pub fn codex_effort() -> Option<String> {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_CODEX_EFFORT") {
-        return Some(raw.clone());
+    if let Some(raw) = environment_value("CCP_CODEX_EFFORT") {
+        return Some(raw);
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
@@ -1011,12 +1044,10 @@ pub fn codex_effort() -> Option<String> {
 }
 
 pub fn codex_reasoning_summary() -> Option<String> {
-    let env = environment();
-    if let Some(raw) = env
-        .get("CCP_CODEX_REASONING_SUMMARY")
-        .filter(|raw| !raw.is_empty())
+    if let Some(raw) =
+        environment_value("CCP_CODEX_REASONING_SUMMARY").filter(|raw| !raw.is_empty())
     {
-        return Some(raw.clone());
+        return Some(raw);
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
@@ -1029,9 +1060,8 @@ pub fn codex_reasoning_summary() -> Option<String> {
 }
 
 pub fn codex_model() -> Option<String> {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_CODEX_MODEL") {
-        return Some(raw.clone());
+    if let Some(raw) = environment_value("CCP_CODEX_MODEL") {
+        return Some(raw);
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
@@ -1110,6 +1140,14 @@ pub fn codex_total_timeout_ms(default: u64) -> u64 {
     )
 }
 
+pub fn codex_stream_heartbeat_ms(default: u64) -> u64 {
+    codex_positive_u64(
+        "CCP_CODEX_STREAM_HEARTBEAT_MS",
+        |codex| codex.stream_heartbeat_ms,
+        default,
+    )
+}
+
 pub fn codex_websocket_idle_timeout_ms(default: u64) -> u64 {
     codex_positive_u64(
         "CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS",
@@ -1160,25 +1198,36 @@ pub struct CodexTransportDecision {
     requested: CodexTransport,
     effective: CodexTransport,
     reason: &'static str,
+    explicit_websocket_environment_proxy_unsupported: bool,
 }
 
 impl CodexTransportDecision {
-    fn resolve(requested: CodexTransport, system_proxy_intercepts_upstream: bool) -> Self {
+    pub(crate) fn resolve(
+        requested: CodexTransport,
+        system_proxy_intercepts_upstream: bool,
+        environment_proxy_intercepts_upstream: bool,
+    ) -> Self {
+        let explicit_websocket_environment_proxy_unsupported =
+            requested == CodexTransport::WebSocket && environment_proxy_intercepts_upstream;
         if requested == CodexTransport::Auto && system_proxy_intercepts_upstream {
             Self {
                 requested,
                 effective: CodexTransport::Http,
                 reason: "system_proxy",
+                explicit_websocket_environment_proxy_unsupported,
             }
         } else {
             Self {
                 requested,
                 effective: requested,
-                reason: if requested == CodexTransport::Auto {
+                reason: if explicit_websocket_environment_proxy_unsupported {
+                    "environment_proxy_unsupported"
+                } else if requested == CodexTransport::Auto {
                     "automatic"
                 } else {
                     "explicit"
                 },
+                explicit_websocket_environment_proxy_unsupported,
             }
         }
     }
@@ -1194,6 +1243,10 @@ impl CodexTransportDecision {
     pub fn reason(self) -> &'static str {
         self.reason
     }
+
+    pub fn explicit_websocket_environment_proxy_unsupported(self) -> bool {
+        self.explicit_websocket_environment_proxy_unsupported
+    }
 }
 
 fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
@@ -1205,11 +1258,24 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
     }
 }
 
+fn codex_proxy_match_uri(upstream: &str) -> Option<http::Uri> {
+    let mut url = url::Url::parse(upstream).ok()?;
+    let http_scheme = match url.scheme() {
+        "ws" => Some("http"),
+        "wss" => Some("https"),
+        _ => None,
+    };
+    if let Some(http_scheme) = http_scheme {
+        url.set_scheme(http_scheme).ok()?;
+    }
+    url.as_str().parse().ok()
+}
+
 fn codex_system_proxy_intercepts_upstream(upstream: &str) -> bool {
     if crate::oauth_http::is_loopback_url(upstream) {
         return false;
     }
-    let Ok(uri) = upstream.parse::<http::Uri>() else {
+    let Some(uri) = codex_proxy_match_uri(upstream) else {
         return false;
     };
     hyper_util::client::proxy::matcher::Matcher::from_system()
@@ -1217,10 +1283,21 @@ fn codex_system_proxy_intercepts_upstream(upstream: &str) -> bool {
         .is_some()
 }
 
+fn codex_environment_proxy_intercepts_upstream(upstream: &str) -> bool {
+    if crate::oauth_http::is_loopback_url(upstream) {
+        return false;
+    }
+    let Some(uri) = codex_proxy_match_uri(upstream) else {
+        return false;
+    };
+    hyper_util::client::proxy::matcher::Matcher::from_env()
+        .intercept(&uri)
+        .is_some()
+}
+
 fn requested_codex_transport() -> CodexTransport {
-    let env = environment();
-    if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
-        && let Some(transport) = parse_codex_transport(raw)
+    if let Some(raw) = environment_value("CCP_CODEX_TRANSPORT")
+        && let Some(transport) = parse_codex_transport(&raw)
     {
         return transport;
     }
@@ -1249,7 +1326,13 @@ pub(crate) fn codex_transport_decision_for_url(upstream: &str) -> CodexTransport
     let requested = requested_codex_transport();
     let system_proxy_intercepts_upstream =
         requested == CodexTransport::Auto && codex_system_proxy_intercepts_upstream(upstream);
-    CodexTransportDecision::resolve(requested, system_proxy_intercepts_upstream)
+    let environment_proxy_intercepts_upstream = requested == CodexTransport::WebSocket
+        && codex_environment_proxy_intercepts_upstream(upstream);
+    CodexTransportDecision::resolve(
+        requested,
+        system_proxy_intercepts_upstream,
+        environment_proxy_intercepts_upstream,
+    )
 }
 
 pub fn codex_transport() -> CodexTransport {
@@ -1320,14 +1403,20 @@ mod tests {
         "CCP_CONFIG_DIR",
         "CCP_LOG_VERBOSE",
         "CCP_LOG_STDERR",
+        "CCP_CODEX_MODEL",
+        "CCP_CODEX_SERVICE_TIER",
+        "CCP_CODEX_EFFORT",
+        "CCP_CODEX_PREVIOUS_RESPONSE_ID",
         "CCP_CODEX_REASONING_SUMMARY",
         "CCP_CODEX_RESPONSES_LITE",
         "CCP_CODEX_PARALLEL_TOOLS",
+        "CCP_CODEX_UNSAFE_SALVAGE_TOOL_CALL_ON_CLOSE",
         "CCP_CODEX_CONNECT_TIMEOUT_MS",
         "CCP_CODEX_HEADER_TIMEOUT_MS",
         "CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS",
         "CCP_CODEX_BODY_IDLE_TIMEOUT_MS",
         "CCP_CODEX_TOTAL_TIMEOUT_MS",
+        "CCP_CODEX_STREAM_HEARTBEAT_MS",
         "CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS",
         "CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS",
         "CCP_CODEX_MAX_IDLE_WEBSOCKETS",
@@ -1538,14 +1627,64 @@ mod tests {
 
     #[test]
     fn codex_transport_uses_http_when_system_proxy_intercepts() {
-        let automatic = CodexTransportDecision::resolve(CodexTransport::Auto, true);
+        let automatic = CodexTransportDecision::resolve(CodexTransport::Auto, true, false);
         assert_eq!(automatic.requested(), CodexTransport::Auto);
         assert_eq!(automatic.effective(), CodexTransport::Http);
         assert_eq!(automatic.reason(), "system_proxy");
+        assert!(!automatic.explicit_websocket_environment_proxy_unsupported());
 
-        let explicit = CodexTransportDecision::resolve(CodexTransport::WebSocket, true);
+        let explicit = CodexTransportDecision::resolve(CodexTransport::WebSocket, true, false);
         assert_eq!(explicit.effective(), CodexTransport::WebSocket);
         assert_eq!(explicit.reason(), "explicit");
+        assert!(!explicit.explicit_websocket_environment_proxy_unsupported());
+    }
+
+    #[test]
+    fn codex_explicit_websocket_detects_environment_proxy() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+        let _proxy = EnvGuard::set("HTTPS_PROXY", "http://127.0.0.1:18080");
+        let _no_proxy = EnvGuard::set("NO_PROXY", "");
+
+        let decision = codex_transport_decision();
+        assert_eq!(decision.requested(), CodexTransport::WebSocket);
+        assert_eq!(decision.effective(), CodexTransport::WebSocket);
+        assert_eq!(decision.reason(), "environment_proxy_unsupported");
+        assert!(decision.explicit_websocket_environment_proxy_unsupported());
+
+        let websocket_decision =
+            codex_transport_decision_for_url("wss://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(websocket_decision.reason(), "environment_proxy_unsupported");
+        assert!(websocket_decision.explicit_websocket_environment_proxy_unsupported());
+    }
+
+    #[test]
+    fn codex_explicit_websocket_environment_proxy_honors_no_proxy_and_loopback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+        let _proxy = EnvGuard::set("HTTPS_PROXY", "http://127.0.0.1:18080");
+        let _no_proxy = EnvGuard::set("NO_PROXY", "chatgpt.com");
+
+        let excluded = codex_transport_decision();
+        assert_eq!(excluded.reason(), "explicit");
+        assert!(!excluded.explicit_websocket_environment_proxy_unsupported());
+
+        let websocket_excluded =
+            codex_transport_decision_for_url("wss://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(websocket_excluded.reason(), "explicit");
+        assert!(!websocket_excluded.explicit_websocket_environment_proxy_unsupported());
+
+        let _all_proxy = EnvGuard::set("ALL_PROXY", "http://127.0.0.1:18081");
+        let _no_proxy = EnvGuard::set("NO_PROXY", "");
+        let loopback = codex_transport_decision_for_url("ws://127.0.0.1:18765/responses");
+        assert_eq!(loopback.reason(), "explicit");
+        assert!(!loopback.explicit_websocket_environment_proxy_unsupported());
     }
 
     #[test]
@@ -1735,6 +1874,35 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_tool_close_salvage_is_strict_opt_in_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(!codex_unsafe_salvage_tool_call_on_close());
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"unsafeSalvageToolCallOnClose":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_unsafe_salvage_tool_call_on_close());
+
+        {
+            let _unsafe_env = EnvGuard::set("CCP_CODEX_UNSAFE_SALVAGE_TOOL_CALL_ON_CLOSE", "1");
+            assert!(!codex_unsafe_salvage_tool_call_on_close());
+        }
+        {
+            let _unsafe_env = EnvGuard::set("CCP_CODEX_UNSAFE_SALVAGE_TOOL_CALL_ON_CLOSE", "true");
+            assert!(codex_unsafe_salvage_tool_call_on_close());
+            let summary = config_override_summary_lines(&load_config());
+            assert!(summary.iter().any(|line| {
+                line.contains("CCP_CODEX_UNSAFE_SALVAGE_TOOL_CALL_ON_CLOSE (env)")
+            }));
+        }
+    }
+
+    #[test]
     fn codex_reasoning_summary_env_overrides_config_and_empty_falls_through() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _cleared_env = clear_env();
@@ -1756,13 +1924,56 @@ mod tests {
     }
 
     #[test]
+    fn codex_hot_path_environment_values_remain_dynamic_and_override_file_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"model":"file-model","serviceTier":"flex","effort":"medium","reasoningSummary":"auto","previousResponseId":true,"transport":"http"}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(codex_model().as_deref(), Some("file-model"));
+        assert_eq!(codex_service_tier().as_deref(), Some("flex"));
+        assert_eq!(codex_effort().as_deref(), Some("medium"));
+        assert_eq!(codex_reasoning_summary().as_deref(), Some("auto"));
+        assert!(codex_previous_response_id());
+        assert_eq!(requested_codex_transport(), CodexTransport::Http);
+
+        {
+            let _model = EnvGuard::set("CCP_CODEX_MODEL", "env-model");
+            let _tier = EnvGuard::set("CCP_CODEX_SERVICE_TIER", "priority");
+            let _effort = EnvGuard::set("CCP_CODEX_EFFORT", "high");
+            let _summary = EnvGuard::set("CCP_CODEX_REASONING_SUMMARY", "detailed");
+            let _continuation = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "false");
+            let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+            assert_eq!(codex_model().as_deref(), Some("env-model"));
+            assert_eq!(codex_service_tier().as_deref(), Some("priority"));
+            assert_eq!(codex_effort().as_deref(), Some("high"));
+            assert_eq!(codex_reasoning_summary().as_deref(), Some("detailed"));
+            assert!(!codex_previous_response_id());
+            assert_eq!(requested_codex_transport(), CodexTransport::WebSocket);
+        }
+
+        assert_eq!(codex_model().as_deref(), Some("file-model"));
+        assert_eq!(codex_service_tier().as_deref(), Some("flex"));
+        assert_eq!(codex_effort().as_deref(), Some("medium"));
+        assert_eq!(codex_reasoning_summary().as_deref(), Some("auto"));
+        assert!(codex_previous_response_id());
+        assert_eq!(requested_codex_transport(), CodexTransport::Http);
+    }
+
+    #[test]
     fn codex_timeouts_read_config_and_env() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _cleared_env = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"connectTimeoutMs":11000,"headerTimeoutMs":22000,"httpFirstByteTimeoutMs":33000,"bodyIdleTimeoutMs":130000,"totalTimeoutMs":150000,"websocketResponseStartTimeoutMs":45000,"websocketIdleTimeoutMs":180000,"maxIdleWebSockets":64,"idleWebSocketTtlMs":240000}}"#,
+            r#"{"codex":{"connectTimeoutMs":11000,"headerTimeoutMs":22000,"httpFirstByteTimeoutMs":33000,"bodyIdleTimeoutMs":130000,"totalTimeoutMs":150000,"streamHeartbeatMs":6000,"websocketResponseStartTimeoutMs":45000,"websocketIdleTimeoutMs":180000,"maxIdleWebSockets":64,"idleWebSocketTtlMs":240000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -1772,6 +1983,7 @@ mod tests {
         assert_eq!(codex_http_first_byte_timeout_ms(1), 33_000);
         assert_eq!(codex_body_idle_timeout_ms(1), 130_000);
         assert_eq!(codex_total_timeout_ms(1), 150_000);
+        assert_eq!(codex_stream_heartbeat_ms(1), 6_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(1), 45_000);
         assert_eq!(codex_websocket_idle_timeout_ms(1), 180_000);
         assert_eq!(codex_max_idle_websockets(1), 64);
@@ -1782,6 +1994,7 @@ mod tests {
         let _first_byte_env = EnvGuard::set("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS", "27000");
         let _body_idle_env = EnvGuard::set("CCP_CODEX_BODY_IDLE_TIMEOUT_MS", "100000");
         let _total_env = EnvGuard::set("CCP_CODEX_TOTAL_TIMEOUT_MS", "120000");
+        let _heartbeat_env = EnvGuard::set("CCP_CODEX_STREAM_HEARTBEAT_MS", "7000");
         let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "12000");
         let _idle_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_IDLE_TIMEOUT_MS", "90000");
         let _pool_cap_env = EnvGuard::set("CCP_CODEX_MAX_IDLE_WEBSOCKETS", "32");
@@ -1791,6 +2004,7 @@ mod tests {
         assert_eq!(codex_http_first_byte_timeout_ms(1), 27_000);
         assert_eq!(codex_body_idle_timeout_ms(1), 100_000);
         assert_eq!(codex_total_timeout_ms(1), 120_000);
+        assert_eq!(codex_stream_heartbeat_ms(1), 7_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(1), 12_000);
         assert_eq!(codex_websocket_idle_timeout_ms(1), 90_000);
         assert_eq!(codex_max_idle_websockets(1), 32);
@@ -1824,7 +2038,7 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"connectTimeoutMs":0,"headerTimeoutMs":0,"httpFirstByteTimeoutMs":0,"bodyIdleTimeoutMs":0,"totalTimeoutMs":0,"websocketResponseStartTimeoutMs":0,"websocketIdleTimeoutMs":0,"maxIdleWebSockets":0,"idleWebSocketTtlMs":0}}"#,
+            r#"{"codex":{"connectTimeoutMs":0,"headerTimeoutMs":0,"httpFirstByteTimeoutMs":0,"bodyIdleTimeoutMs":0,"totalTimeoutMs":0,"streamHeartbeatMs":0,"websocketResponseStartTimeoutMs":0,"websocketIdleTimeoutMs":0,"maxIdleWebSockets":0,"idleWebSocketTtlMs":0}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -1834,6 +2048,7 @@ mod tests {
         let _body_idle_env = EnvGuard::set("CCP_CODEX_BODY_IDLE_TIMEOUT_MS", "invalid");
         let _start_env = EnvGuard::set("CCP_CODEX_WEBSOCKET_RESPONSE_START_TIMEOUT_MS", "invalid");
         let _total_env = EnvGuard::set("CCP_CODEX_TOTAL_TIMEOUT_MS", "invalid");
+        let _heartbeat_env = EnvGuard::set("CCP_CODEX_STREAM_HEARTBEAT_MS", "invalid");
         let _pool_cap_env = EnvGuard::set("CCP_CODEX_MAX_IDLE_WEBSOCKETS", "invalid");
         let _pool_ttl_env = EnvGuard::set("CCP_CODEX_IDLE_WEBSOCKET_TTL_MS", "invalid");
 
@@ -1842,6 +2057,7 @@ mod tests {
         assert_eq!(codex_http_first_byte_timeout_ms(60_000), 60_000);
         assert_eq!(codex_body_idle_timeout_ms(300_000), 300_000);
         assert_eq!(codex_total_timeout_ms(540_000), 540_000);
+        assert_eq!(codex_stream_heartbeat_ms(5_000), 5_000);
         assert_eq!(codex_websocket_response_start_timeout_ms(45_000), 45_000);
         assert_eq!(codex_websocket_idle_timeout_ms(180_000), 180_000);
         assert_eq!(codex_max_idle_websockets(128), 128);
@@ -1855,7 +2071,7 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"codex":{"connectTimeoutMs":15000,"headerTimeoutMs":60000,"httpFirstByteTimeoutMs":60000,"bodyIdleTimeoutMs":300000}}"#,
+            r#"{"codex":{"connectTimeoutMs":15000,"headerTimeoutMs":60000,"httpFirstByteTimeoutMs":60000,"bodyIdleTimeoutMs":300000,"streamHeartbeatMs":5000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -1881,9 +2097,15 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("codex.bodyIdleTimeoutMs"))
         );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("codex.streamHeartbeatMs"))
+        );
 
         let _connect_env = EnvGuard::set("CCP_CODEX_CONNECT_TIMEOUT_MS", "12000");
         let _first_byte_env = EnvGuard::set("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS", "30000");
+        let _heartbeat_env = EnvGuard::set("CCP_CODEX_STREAM_HEARTBEAT_MS", "4000");
         let summary = config_override_summary_lines(&loaded);
         assert!(
             summary
@@ -1894,6 +2116,11 @@ mod tests {
             summary
                 .iter()
                 .any(|line| line.contains("CCP_CODEX_HTTP_FIRST_BYTE_TIMEOUT_MS (env)"))
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("CCP_CODEX_STREAM_HEARTBEAT_MS (env)"))
         );
     }
 
@@ -1949,7 +2176,7 @@ mod tests {
         assert_eq!(grok_first_byte_timeout_ms(60_000), 60_000);
         assert_eq!(grok_body_idle_timeout_ms(300_000), 300_000);
         assert_eq!(grok_total_timeout_ms(540_000), 540_000);
-        assert_eq!(grok_stream_heartbeat_ms(15_000), 15_000);
+        assert_eq!(grok_stream_heartbeat_ms(5_000), 5_000);
     }
 
     #[test]
@@ -1959,7 +2186,7 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"grok":{"connectTimeoutMs":10000,"headerTimeoutMs":60000,"firstByteTimeoutMs":60000,"bodyIdleTimeoutMs":300000,"totalTimeoutMs":540000,"streamHeartbeatMs":15000}}"#,
+            r#"{"grok":{"connectTimeoutMs":10000,"headerTimeoutMs":60000,"firstByteTimeoutMs":60000,"bodyIdleTimeoutMs":300000,"totalTimeoutMs":540000,"streamHeartbeatMs":5000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());

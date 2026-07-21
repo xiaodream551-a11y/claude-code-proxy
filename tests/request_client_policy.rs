@@ -18,6 +18,7 @@ fn codex_and_grok_reqwest_clients_disable_library_retries() {
     for provider in ["codex", "grok"] {
         rust_sources_under(&manifest.join("src/providers").join(provider), &mut sources);
     }
+    sources.push(manifest.join("src/upstream_http.rs"));
 
     let mut builders = 0;
     for path in sources {

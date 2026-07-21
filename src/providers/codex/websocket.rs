@@ -149,6 +149,60 @@ impl std::fmt::Display for CodexWebSocketError {
 
 struct PoolEntry {
     ws: Arc<AsyncMutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    valid: AtomicBool,
+    fresh_probe: FreshProbeCredit,
+}
+
+impl PoolEntry {
+    fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        Self {
+            ws: Arc::new(AsyncMutex::new(ws)),
+            valid: AtomicBool::new(true),
+            fresh_probe: FreshProbeCredit::default(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::Acquire)
+    }
+
+    fn invalidate(&self) {
+        self.valid.store(false, Ordering::Release);
+    }
+
+    fn mark_terminal_probe_success(&self) {
+        self.fresh_probe.mark(Instant::now());
+    }
+
+    fn consume_fresh_probe(&self, max_age: Duration) -> bool {
+        self.fresh_probe.consume(Instant::now(), max_age)
+    }
+}
+
+#[derive(Default)]
+struct FreshProbeCredit {
+    validated_at: Mutex<Option<Instant>>,
+}
+
+impl FreshProbeCredit {
+    fn mark(&self, validated_at: Instant) {
+        *self
+            .validated_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(validated_at);
+    }
+
+    fn consume(&self, now: Instant, max_age: Duration) -> bool {
+        let validated_at = self
+            .validated_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        validated_at.is_some_and(|validated_at| {
+            now.checked_duration_since(validated_at)
+                .is_some_and(|age| age <= max_age)
+        })
+    }
 }
 
 struct IdlePoolEntry {
@@ -255,6 +309,9 @@ fn now_ms() -> u64 {
 
 pub fn clear_codex_websocket_pool_for_tests() {
     let mut guard = WS_POOL.lock().unwrap();
+    for idle in guard.values() {
+        idle.connection.invalidate();
+    }
     guard.clear();
     drop(guard);
     WS_CIRCUIT_BREAKER.lock().unwrap().entries.clear();
@@ -298,7 +355,9 @@ pub(super) fn record_codex_websocket_success(key: &str) {
 
 pub fn invalidate_codex_websocket_pool_key(session_id: &str) {
     let mut guard = WS_POOL.lock().unwrap();
-    guard.remove(session_id);
+    if let Some(idle) = guard.remove(session_id) {
+        idle.connection.invalidate();
+    }
 }
 
 pub fn invalidate_codex_websocket_pool_turn(session_id: &str, turn_id: Option<u64>) {
@@ -308,6 +367,10 @@ pub fn invalidate_codex_websocket_pool_turn(session_id: &str, turn_id: Option<u6
 }
 
 fn invalidate_pool_entry(session_id: &str, entry: &Arc<PoolEntry>) {
+    // The entry may already have been checked out by the next turn while this turn's
+    // post-terminal barrier is still running. Mark it invalid before touching the map so the
+    // next owner cannot send a continuation request after it acquires the socket lock.
+    entry.invalidate();
     let mut guard = WS_POOL.lock().unwrap();
     if guard
         .get(session_id)
@@ -332,7 +395,8 @@ fn pool_take_for_turn(key: &str, turn_id: Option<u64>) -> Option<Arc<PoolEntry>>
     super::continuation::if_current_turn(Some(key), turn_id, || {
         let mut guard = WS_POOL.lock().ok()?;
         let idle = guard.remove(key)?;
-        if idle_pool_entry_expired(&idle, now_ms(), idle_ttl_ms) {
+        if idle_pool_entry_expired(&idle, now_ms(), idle_ttl_ms) || !idle.connection.is_valid() {
+            idle.connection.invalidate();
             return None;
         }
         Some(idle.connection)
@@ -346,6 +410,9 @@ fn pool_insert_for_turn(key: String, entry: Arc<PoolEntry>, turn_id: Option<u64>
 }
 
 fn pool_insert(key: String, entry: Arc<PoolEntry>) {
+    if !entry.is_valid() {
+        return;
+    }
     let config = WebSocketPoolConfig::configured();
     let now = now_ms();
     {
@@ -371,7 +438,14 @@ fn reap_idle_pool(
     now_ms: u64,
     config: WebSocketPoolConfig,
 ) {
-    pool.retain(|_, entry| !idle_pool_entry_expired(entry, now_ms, config.idle_ttl_ms));
+    pool.retain(|_, entry| {
+        let retain = entry.connection.is_valid()
+            && !idle_pool_entry_expired(entry, now_ms, config.idle_ttl_ms);
+        if !retain {
+            entry.connection.invalidate();
+        }
+        retain
+    });
     while pool.len() > config.max_idle_entries {
         let Some(oldest_key) = pool
             .iter()
@@ -384,7 +458,9 @@ fn reap_idle_pool(
         else {
             break;
         };
-        pool.remove(&oldest_key);
+        if let Some(entry) = pool.remove(&oldest_key) {
+            entry.connection.invalidate();
+        }
     }
 }
 
@@ -604,7 +680,16 @@ pub async fn codex_websocket_request(
                 return Err(err);
             }
         };
-        if let Err(err) = probe_pooled_connection(&mut ws_guard, timeouts.pool_probe_ms).await {
+        if !entry.is_valid() {
+            return Err(pool_healthcheck_error(
+                "connection was invalidated while waiting for its previous turn".to_string(),
+            ));
+        }
+        let freshly_probed =
+            entry.consume_fresh_probe(Duration::from_millis(timeouts.pool_probe_ms));
+        if !freshly_probed
+            && let Err(err) = probe_pooled_connection(&mut ws_guard, timeouts.pool_probe_ms).await
+        {
             invalidate_pool_owner(pool_key, Some(&entry));
             log_websocket_pool_refresh(ctx, &err.message);
             return Err(err);
@@ -670,9 +755,7 @@ pub async fn codex_websocket_request(
         connect_with_timeout(&ws_url, headers, timeouts.connect_ms).await?;
 
     // New connection path (not pooled or pool miss)
-    let entry = Arc::new(PoolEntry {
-        ws: Arc::new(AsyncMutex::new(ws_stream)),
-    });
+    let entry = Arc::new(PoolEntry::new(ws_stream));
 
     // Send the request
     let msg = Message::Text(body_json);
@@ -786,9 +869,7 @@ pub async fn codex_websocket_event_stream(
         entry
     } else {
         let (ws_stream, _) = connect_with_timeout(&ws_url, headers, timeouts.connect_ms).await?;
-        Arc::new(PoolEntry {
-            ws: Arc::new(AsyncMutex::new(ws_stream)),
-        })
+        Arc::new(PoolEntry::new(ws_stream))
     };
 
     if let Some(tc) = traffic.as_deref() {
@@ -824,7 +905,18 @@ pub async fn codex_websocket_event_stream(
                     return;
                 }
             };
+            if !entry.is_valid() {
+                let err = pool_healthcheck_error(
+                    "connection was invalidated while waiting for its previous turn".to_string(),
+                );
+                log_websocket_pool_refresh(&ctx, &err.message);
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
+            let freshly_probed = used_pooled
+                && entry.consume_fresh_probe(Duration::from_millis(timeouts.pool_probe_ms));
             if used_pooled
+                && !freshly_probed
                 && let Err(err) =
                     probe_pooled_connection(&mut ws_guard, timeouts.pool_probe_ms).await
             {
@@ -852,17 +944,18 @@ pub async fn codex_websocket_event_stream(
                 timeouts,
                 pool_key.as_deref(),
                 Some(&entry),
+                turn_id,
                 traffic,
                 tx,
             )
             .await;
 
-            if let Some(key) = pool_key.as_deref() {
-                if reusable {
-                    pool_insert_for_turn(key.to_string(), entry.clone(), turn_id);
-                } else {
-                    invalidate_pool_entry(key, &entry);
-                }
+            // A reusable connection is published exactly once, at the terminal
+            // event before it is forwarded downstream. Publishing it again here
+            // can race with an immediate next turn that has already checked out
+            // the same Arc, falsely marking an active socket as idle.
+            if !reusable && let Some(key) = pool_key.as_deref() {
+                invalidate_pool_entry(key, &entry);
             }
         };
         tokio::select! {
@@ -1160,6 +1253,15 @@ fn log_websocket_pool_refresh(ctx: &RequestContext, reason: &str) {
     crate::logging::create_logger("codex").info("websocket_pool_refresh", Some(fields));
 }
 
+fn log_websocket_terminal_probe_failure(error: &CodexError) {
+    let fields = serde_json::Map::from_iter([
+        ("reason".into(), serde_json::json!(error.message)),
+        ("detail".into(), serde_json::json!(error.detail)),
+    ]);
+    crate::logging::create_logger("codex")
+        .warn("websocket_terminal_pool_probe_failed", Some(fields));
+}
+
 fn write_websocket_metadata_capture(
     traffic: &TrafficCapture,
     ws_url: &str,
@@ -1266,7 +1368,9 @@ async fn connect_with_timeout(
         max_frame_size: Some(super::MAX_LIVE_EVENT_BYTES),
         ..WebSocketConfig::default()
     };
-    let connect_fut = connect_async_with_config(request, Some(websocket_config), false);
+    // Model request and Ping/Pong frames are small and latency-sensitive. Disable
+    // Nagle so a direct Linux/WSL connection does not wait for a delayed ACK.
+    let connect_fut = connect_async_with_config(request, Some(websocket_config), true);
     tokio::time::timeout(Duration::from_millis(connect_timeout_ms), connect_fut)
         .await
         .map_err(|_| CodexError {
@@ -1557,9 +1661,18 @@ async fn collect_ws_events(
                         traffic,
                         |_| Ok(()),
                     )
-                    .await
-                    .inspect_err(|_| invalidate_pool_owner(pool_key, pool_entry))?;
-                    let connection_reusable = barrier == WebSocketPingBarrierOutcome::MatchingPong;
+                    .await;
+                    // The terminal payload is authoritative for the response. A failed
+                    // post-terminal probe only means this socket is unsafe to reuse; it must not
+                    // turn an otherwise complete response into a transport error.
+                    let connection_reusable =
+                        matches!(&barrier, Ok(WebSocketPingBarrierOutcome::MatchingPong));
+                    if connection_reusable && let Some(entry) = pool_entry {
+                        entry.mark_terminal_probe_success();
+                    }
+                    if let Err(error) = &barrier {
+                        log_websocket_terminal_probe_failure(error);
+                    }
                     if !connection_reusable {
                         invalidate_pool_owner(pool_key, pool_entry);
                     }
@@ -1619,6 +1732,7 @@ async fn stream_ws_events(
     timeouts: CodexWebSocketTimeouts,
     pool_key: Option<&str>,
     pool_entry: Option<&Arc<PoolEntry>>,
+    turn_id: Option<u64>,
     traffic: Option<Arc<TrafficCapture>>,
     tx: mpsc::Sender<Result<serde_json::Value, CodexError>>,
 ) -> bool {
@@ -1706,7 +1820,21 @@ async fn stream_ws_events(
                         .await;
                     break;
                 }
-                let mut terminal_connection_reusable = false;
+                let terminal_kind_reusable =
+                    terminal_kind.is_some_and(super::events::CodexTerminalKind::is_reusable);
+                if terminal_kind_reusable && let (Some(key), Some(entry)) = (pool_key, pool_entry) {
+                    // Publish the still-locked connection as a busy reservation before Claude
+                    // sees message_stop. An immediate next turn can check it out and wait for this
+                    // turn's bounded ordering probe instead of racing onto a fresh socket.
+                    pool_insert_for_turn(key.to_string(), entry.clone(), turn_id);
+                }
+                // Forward the authoritative terminal event before probing the connection. Claude
+                // can finish the response immediately even if a weak network drops the socket
+                // during the subsequent pool-reuse check.
+                if tx.send(Ok(parsed)).await.is_err() {
+                    invalidate_pool_owner(pool_key, pool_entry);
+                    break;
+                }
                 if terminal {
                     let barrier = confirm_terminal_ordering_barrier(
                         ws,
@@ -1719,27 +1847,18 @@ async fn stream_ws_events(
                         },
                     )
                     .await;
-                    match barrier {
-                        Ok(WebSocketPingBarrierOutcome::MatchingPong) => {
-                            terminal_connection_reusable = true;
-                        }
-                        Ok(WebSocketPingBarrierOutcome::OrderedClose) => {
-                            invalidate_pool_owner(pool_key, pool_entry);
-                        }
-                        Err(error) => {
-                            invalidate_pool_owner(pool_key, pool_entry);
-                            let _ = tx.send(Err(error)).await;
-                            break;
-                        }
+                    let connection_reusable =
+                        matches!(&barrier, Ok(WebSocketPingBarrierOutcome::MatchingPong));
+                    if connection_reusable && let Some(entry) = pool_entry {
+                        entry.mark_terminal_probe_success();
                     }
-                }
-                if tx.send(Ok(parsed)).await.is_err() {
-                    invalidate_pool_owner(pool_key, pool_entry);
-                    break;
-                }
-                if terminal {
-                    reusable = terminal_connection_reusable
-                        && terminal_kind.is_some_and(super::events::CodexTerminalKind::is_reusable);
+                    if let Err(error) = &barrier {
+                        log_websocket_terminal_probe_failure(error);
+                    }
+                    if !connection_reusable {
+                        invalidate_pool_owner(pool_key, pool_entry);
+                    }
+                    reusable = connection_reusable && terminal_kind_reusable;
                     break;
                 }
             }
@@ -1819,9 +1938,7 @@ mod tests {
         idle_since_ms: u64,
     ) -> IdlePoolEntry {
         IdlePoolEntry {
-            connection: Arc::new(PoolEntry {
-                ws: Arc::new(AsyncMutex::new(stream)),
-            }),
+            connection: Arc::new(PoolEntry::new(stream)),
             idle_since_ms,
         }
     }
@@ -1836,6 +1953,24 @@ mod tests {
             monitor: None,
             request_byte_lease: None,
         }
+    }
+
+    fn continuation_request(
+        messages: &[&str],
+    ) -> super::super::translate::request::ResponsesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": messages.iter().map(|text| serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}]
+            })).collect::<Vec<_>>(),
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {}
+        }))
+        .unwrap()
     }
 
     async fn buffered_terminal_while_peer_stays_open(event: &'static str) -> CodexResponse {
@@ -2087,6 +2222,51 @@ mod tests {
 
         assert_eq!(response.status, 503);
         assert!(String::from_utf8_lossy(&response.body).contains("response.error"));
+    }
+
+    #[tokio::test]
+    async fn buffered_terminal_survives_pool_probe_timeout() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        let pool_key = "buffered-terminal-probe-timeout";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.done","response":{"id":"resp_probe_timeout"}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let mut timeouts = test_timeouts(1_000, 1_000);
+        timeouts.pool_probe_ms = 50;
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            codex_websocket_request(
+                &format!("http://{addr}/responses"),
+                &HeaderMap::new(),
+                &serde_json::json!({"type":"response.create","input":[]}),
+                &test_context(),
+                None,
+                Some(pool_key),
+                timeouts,
+                None,
+            ),
+        )
+        .await
+        .expect("a pool probe timeout must not stall the completed response")
+        .expect("a pool probe timeout must not replace the terminal response");
+
+        assert_eq!(response.status, 200);
+        assert!(String::from_utf8_lossy(&response.body).contains("response.done"));
+        assert!(!codex_websocket_pool_contains_for_tests(pool_key));
+        server.abort();
+        clear_codex_websocket_pool_for_tests();
     }
 
     #[tokio::test]
@@ -2347,8 +2527,16 @@ mod tests {
             .await
             .unwrap();
         let (tx, mut rx) = mpsc::channel(super::super::LIVE_EVENT_CHANNEL_CAPACITY);
-        let reusable =
-            stream_ws_events(&mut ws, test_timeouts(1_000, 1_000), None, None, None, tx).await;
+        let reusable = stream_ws_events(
+            &mut ws,
+            test_timeouts(1_000, 1_000),
+            None,
+            None,
+            None,
+            None,
+            tx,
+        )
+        .await;
         let mut items = Vec::new();
         while let Some(item) = rx.recv().await {
             items.push(item);
@@ -2359,7 +2547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_barrier_forwards_terminal_only_after_matching_pong() {
+    async fn matching_terminal_barrier_keeps_connection_reusable() {
         let (reusable, items) = run_live_terminal_barrier(TerminalBarrierPeer::Clean).await;
         assert!(reusable);
         assert_eq!(items.len(), 1);
@@ -2386,31 +2574,373 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_barrier_rejects_cross_frame_semantic_tail_before_terminal_is_forwarded() {
+    async fn post_terminal_semantic_tail_invalidates_connection_but_preserves_terminal() {
         let (reusable, items) = run_live_terminal_barrier(TerminalBarrierPeer::SemanticTail).await;
         assert!(!reusable);
         assert_eq!(items.len(), 1);
-        let error = items[0].as_ref().unwrap_err();
         assert_eq!(
-            error.detail.as_deref(),
-            Some(WEBSOCKET_TERMINAL_BARRIER_DETAIL)
+            items[0]
+                .as_ref()
+                .unwrap()
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("response.completed")
         );
-        assert!(error.message.contains("response.output_text.delta"));
-        assert!(!is_retryable_transport_detail(error.detail.as_deref()));
     }
 
     #[tokio::test]
-    async fn terminal_barrier_timeout_fails_closed_without_replay_or_pool_reuse() {
+    async fn terminal_barrier_timeout_invalidates_connection_but_preserves_terminal() {
         let (reusable, items) = run_live_terminal_barrier(TerminalBarrierPeer::Silent).await;
         assert!(!reusable);
         assert_eq!(items.len(), 1);
-        let error = items[0].as_ref().unwrap_err();
+        assert_eq!(
+            items[0]
+                .as_ref()
+                .unwrap()
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("response.completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_terminal_is_forwarded_before_the_pool_probe_finishes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp_early","usage":{}}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(super::super::LIVE_EVENT_CHANNEL_CAPACITY);
+        let mut timeouts = test_timeouts(1_000, 1_000);
+        timeouts.pool_probe_ms = 500;
+        let producer = tokio::spawn(async move {
+            stream_ws_events(&mut ws, timeouts, None, None, None, None, tx).await
+        });
+
+        let terminal = tokio::time::timeout(Duration::from_millis(250), rx.recv())
+            .await
+            .expect("terminal must be forwarded before the 500ms pool probe timeout")
+            .expect("terminal event was missing")
+            .expect("terminal event became a transport error");
+        assert_eq!(
+            terminal.get("type").and_then(serde_json::Value::as_str),
+            Some("response.completed")
+        );
+        assert!(
+            !producer.is_finished(),
+            "the pool probe should still be pending when terminal is forwarded"
+        );
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), producer)
+                .await
+                .expect("pool probe did not finish within its bounded timeout")
+                .unwrap()
+        );
+        assert!(rx.recv().await.is_none(), "no error may follow a terminal");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn immediate_next_full_context_turn_keeps_checked_out_socket_out_of_idle_pool() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_probe_tx, release_probe_rx) = tokio::sync::oneshot::channel();
+        let (second_request_tx, second_request_rx) = tokio::sync::oneshot::channel();
+        let (release_second_terminal_tx, release_second_terminal_rx) =
+            tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut requests = 0_u8;
+            let mut pings = 0_u8;
+            let mut first_terminal_probe = Some(release_probe_rx);
+            let mut second_request_tx = Some(second_request_tx);
+            let mut release_second_terminal_rx = Some(release_second_terminal_rx);
+            while let Some(frame) = ws.next().await {
+                match frame.unwrap() {
+                    Message::Ping(payload) => {
+                        pings += 1;
+                        if let Some(release) = first_terminal_probe.take() {
+                            release.await.unwrap();
+                        }
+                        ws.send(Message::Pong(payload)).await.unwrap();
+                        if requests == 2 {
+                            return (requests, pings);
+                        }
+                    }
+                    Message::Text(text) => {
+                        requests += 1;
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        match requests {
+                            1 => {
+                                assert!(request.get("previous_response_id").is_none());
+                                ws.send(Message::Text(
+                                    r#"{"type":"response.completed","response":{"id":"resp_busy_1","usage":{}}}"#.into(),
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                            2 => {
+                                assert!(request.get("previous_response_id").is_none());
+                                let _ = second_request_tx.take().unwrap().send(());
+                                release_second_terminal_rx.take().unwrap().await.unwrap();
+                                ws.send(Message::Text(
+                                    r#"{"type":"response.completed","response":{"id":"resp_busy_2","usage":{}}}"#.into(),
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                            _ => panic!("unexpected full-context retry on the same turn"),
+                        }
+                    }
+                    Message::Close(_) => return (requests, pings),
+                    Message::Pong(_) | Message::Frame(_) => {}
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+            (requests, pings)
+        });
+
+        let session_id = "immediate-terminal-busy-reservation";
+        let first_request = continuation_request(&["first"]);
+        let first = super::super::continuation::continuation_candidate(
+            Some(session_id),
+            &first_request,
+            false,
+        );
+        let mut ctx = test_context();
+        ctx.session_id = Some(session_id.to_string());
+        let mut timeouts = test_timeouts(1_000, 1_000);
+        timeouts.pool_probe_ms = 500;
+        let first_wire =
+            super::super::client::build_websocket_request(&first_request, Some(&first));
+        let mut first_events = codex_websocket_event_stream(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &first_wire,
+            &ctx,
+            None,
+            Some(session_id),
+            timeouts,
+            Some(&first),
+        )
+        .await
+        .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_millis(250), first_events.recv())
+            .await
+            .expect("first terminal must be forwarded before its probe")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+        assert!(codex_websocket_pool_contains_for_tests(session_id));
+
+        let second_request = continuation_request(&["first", "second"]);
+        let second = super::super::continuation::continuation_candidate(
+            Some(session_id),
+            &second_request,
+            false,
+        );
+        assert!(second.previous_response_id.is_none());
+        let second_wire =
+            super::super::client::build_websocket_request(&second_request, Some(&second));
+        let mut second_events = codex_websocket_event_stream(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &second_wire,
+            &ctx,
+            None,
+            Some(session_id),
+            timeouts,
+            Some(&second),
+        )
+        .await
+        .expect("the next turn must check out the busy reservation");
+        assert!(!codex_websocket_pool_contains_for_tests(session_id));
+        release_probe_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), second_request_rx)
+            .await
+            .expect("the next turn did not reuse the released socket")
+            .unwrap();
+        assert!(
+            !codex_websocket_pool_contains_for_tests(session_id),
+            "the previous worker must not re-publish a socket already checked out by this turn"
+        );
+        release_second_terminal_tx.send(()).unwrap();
+        let terminal = tokio::time::timeout(Duration::from_millis(500), second_events.recv())
+            .await
+            .expect("second terminal timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal["response"]["id"], "resp_busy_2");
+        assert!(codex_websocket_pool_contains_for_tests(session_id));
+        assert_eq!(
+            server.await.unwrap(),
+            (2, 2),
+            "each completed turn needs one ordering Ping, but the fresh first-turn Pong must avoid a redundant checkout Ping"
+        );
+
+        drop(first_events);
+        drop(second_events);
+        clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
+    }
+
+    #[test]
+    fn terminal_probe_credit_is_one_shot_and_expires() {
+        let credit = FreshProbeCredit::default();
+        let now = Instant::now();
+
+        credit.mark(now);
+        assert!(credit.consume(now, Duration::from_secs(1)));
+        assert!(!credit.consume(now, Duration::from_secs(1)));
+
+        credit.mark(now - Duration::from_secs(2));
+        assert!(!credit.consume(now, Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn checked_out_busy_reservation_is_rejected_when_terminal_probe_fails() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_probe_tx, release_probe_rx) = tokio::sync::oneshot::channel();
+        let (unexpected_request_tx, unexpected_request_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut first_request = true;
+            let mut release_probe_rx = Some(release_probe_rx);
+            let mut unexpected_request_tx = Some(unexpected_request_tx);
+            while let Some(frame) = ws.next().await {
+                let Ok(frame) = frame else {
+                    break;
+                };
+                match frame {
+                    Message::Text(_) if first_request => {
+                        first_request = false;
+                        ws.send(Message::Text(
+                            r#"{"type":"response.completed","response":{"id":"resp_bad_probe","usage":{}}}"#.into(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    Message::Text(_) => {
+                        let _ = unexpected_request_tx.take().unwrap().send(());
+                    }
+                    Message::Ping(_) if release_probe_rx.is_some() => {
+                        release_probe_rx.take().unwrap().await.unwrap();
+                        ws.send(Message::Text(
+                            r#"{"type":"response.output_text.delta","delta":"late"}"#.into(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    Message::Ping(payload) => {
+                        ws.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    Message::Close(_) => break,
+                    Message::Pong(_) | Message::Frame(_) => {}
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        });
+
+        let session_id = "failed-terminal-busy-reservation";
+        let first_request = continuation_request(&["first"]);
+        let first = super::super::continuation::continuation_candidate(
+            Some(session_id),
+            &first_request,
+            true,
+        );
+        let mut ctx = test_context();
+        ctx.session_id = Some(session_id.to_string());
+        let mut timeouts = test_timeouts(1_000, 1_000);
+        timeouts.pool_probe_ms = 500;
+        let first_wire =
+            super::super::client::build_websocket_request(&first_request, Some(&first));
+        let mut first_events = codex_websocket_event_stream(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &first_wire,
+            &ctx,
+            None,
+            Some(session_id),
+            timeouts,
+            Some(&first),
+        )
+        .await
+        .unwrap();
+        let terminal = first_events.recv().await.unwrap().unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+
+        super::super::continuation::record_continuation(
+            Some(session_id),
+            first.turn_id,
+            &first_request,
+            Some("resp_bad_probe"),
+            &[],
+        );
+        let second_request = continuation_request(&["first", "second"]);
+        let second = super::super::continuation::continuation_candidate(
+            Some(session_id),
+            &second_request,
+            true,
+        );
+        let second_wire =
+            super::super::client::build_websocket_request(&second_request, Some(&second));
+        let mut second_events = codex_websocket_event_stream(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &second_wire,
+            &ctx,
+            None,
+            Some(session_id),
+            timeouts,
+            Some(&second),
+        )
+        .await
+        .expect("the next turn must take the busy reservation before probe failure");
+        release_probe_tx.send(()).unwrap();
+
+        let error = tokio::time::timeout(Duration::from_millis(500), second_events.recv())
+            .await
+            .expect("invalidated reservation did not wake its next owner")
+            .unwrap()
+            .expect_err("an invalidated reservation must not carry a continuation request");
         assert_eq!(
             error.detail.as_deref(),
-            Some(WEBSOCKET_TERMINAL_BARRIER_DETAIL)
+            Some(WEBSOCKET_POOL_HEALTHCHECK_DETAIL)
         );
-        assert!(error.message.contains("no matching Pong"));
-        assert!(!super::super::client::is_retryable_transport_error(error));
+        let unexpected_request =
+            tokio::time::timeout(Duration::from_millis(100), unexpected_request_rx).await;
+        assert!(
+            !matches!(unexpected_request, Ok(Ok(()))),
+            "the next continuation request reached the invalid socket"
+        );
+
+        drop(first_events);
+        drop(second_events);
+        server.abort();
+        clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
     }
 
     #[tokio::test]
@@ -2531,9 +3061,7 @@ mod tests {
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let entry = Arc::new(PoolEntry {
-            ws: Arc::new(AsyncMutex::new(ws)),
-        });
+        let entry = Arc::new(PoolEntry::new(ws));
         WS_POOL.lock().unwrap().insert(
             "cancel-session".to_string(),
             IdlePoolEntry {
@@ -2724,9 +3252,7 @@ mod tests {
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let entry = Arc::new(PoolEntry {
-            ws: Arc::new(AsyncMutex::new(ws)),
-        });
+        let entry = Arc::new(PoolEntry::new(ws));
         WS_POOL.lock().unwrap().insert(
             "malformed-session".to_string(),
             IdlePoolEntry {
@@ -2743,6 +3269,7 @@ mod tests {
                 test_timeouts(1_000, 1_000),
                 Some("malformed-session"),
                 Some(&entry),
+                None,
                 None,
                 tx,
             )
@@ -2816,9 +3343,7 @@ mod tests {
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let entry = Arc::new(PoolEntry {
-            ws: Arc::new(AsyncMutex::new(ws)),
-        });
+        let entry = Arc::new(PoolEntry::new(ws));
         WS_POOL.lock().unwrap().insert(
             "malformed-buffered-session".to_string(),
             IdlePoolEntry {

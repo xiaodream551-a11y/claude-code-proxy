@@ -27,6 +27,7 @@ use crate::anthropic::{
 };
 use crate::monitor::MonitorHandle;
 use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
+use crate::providers::token_count_admission::{self, TokenCountAdmissionError};
 use crate::retry::sleep;
 use crate::{registry::GROK_MODELS, traffic::StreamTrafficCapture};
 
@@ -104,6 +105,15 @@ impl Provider for GrokProvider {
                 error.to_string(),
             );
         }
+        if let Err(error) =
+            crate::providers::translate_shared::validate_generation_max_tokens(&body, "Grok")
+        {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            );
+        }
         let mut translated =
             match translate_request_for_provider(body, resolved.model.clone()).await {
                 Ok(value) => value,
@@ -129,7 +139,36 @@ impl Provider for GrokProvider {
                     })
             })
             .unwrap_or_default();
-        let estimated_input_tokens = count_tokens::count_tokens(&translated);
+        let reasoning_effort = translated
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.effort.clone());
+        let parallel_tool_calls = translated.parallel_tool_calls;
+        if let Some(monitor) = &ctx.monitor {
+            monitor.model_resolved(&ctx.req_id, &resolved.model);
+            monitor.upstream_started(&ctx.req_id);
+        }
+
+        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline_and_req_id(
+            deadline,
+            ctx.req_id.clone(),
+        )));
+        let prepared = match PreparedGrokRequest::new(&translated, ctx.traffic.is_some()) {
+            Ok(prepared) => Arc::new(prepared),
+            Err(error) => return map_error(error),
+        };
+        // This value is only an observability fallback when upstream usage is
+        // unavailable. Keep exact tokenizer work off the model-response hot
+        // path so ready response headers and stream bytes are never delayed.
+        let estimated_input_tokens = prepared.approximate_input_tokens();
+        let upstream = match self
+            .client
+            .post_prepared_with_retry(&prepared, ctx.traffic.clone(), retry.clone())
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return map_error(error),
+        };
         crate::logging::create_logger("grok").info(
             "request_configuration",
             Some(serde_json::Map::from_iter([
@@ -137,17 +176,12 @@ impl Provider for GrokProvider {
                 ("model".into(), serde_json::json!(resolved.model)),
                 (
                     "reasoningEffort".into(),
-                    serde_json::json!(
-                        translated
-                            .reasoning
-                            .as_ref()
-                            .map(|reasoning| reasoning.effort.as_str())
-                    ),
+                    serde_json::json!(reasoning_effort),
                 ),
                 ("transport".into(), serde_json::json!("http")),
                 (
                     "parallelToolCalls".into(),
-                    serde_json::json!(translated.parallel_tool_calls),
+                    serde_json::json!(parallel_tool_calls),
                 ),
                 (
                     "functionToolCount".into(),
@@ -163,27 +197,6 @@ impl Provider for GrokProvider {
                 ),
             ])),
         );
-        if let Some(monitor) = &ctx.monitor {
-            monitor.model_resolved(&ctx.req_id, &resolved.model);
-            monitor.upstream_started(&ctx.req_id);
-        }
-
-        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline_and_req_id(
-            deadline,
-            ctx.req_id.clone(),
-        )));
-        let prepared = match PreparedGrokRequest::new(&translated, ctx.traffic.is_some()) {
-            Ok(prepared) => Arc::new(prepared),
-            Err(error) => return map_error(error),
-        };
-        let upstream = match self
-            .client
-            .post_prepared_with_retry(&prepared, ctx.traffic.clone(), retry.clone())
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return map_error(error),
-        };
 
         if stream {
             let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
@@ -246,7 +259,12 @@ impl Provider for GrokProvider {
             Ok(value) => value,
             Err(response) => return response,
         };
-        let tokens = count_tokens::count_tokens(&translated);
+        let tokens =
+            match token_count_admission::run(move || count_tokens::count_tokens(&translated)).await
+            {
+                Ok(tokens) => tokens,
+                Err(error) => return map_grok_count_tokens_error(error),
+            };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.usage_updated(&ctx.req_id, Some(tokens), None);
         }
@@ -257,6 +275,26 @@ impl Provider for GrokProvider {
             }),
         )
             .into_response()
+    }
+}
+
+fn map_grok_count_tokens_error(error: TokenCountAdmissionError) -> Response {
+    match error {
+        TokenCountAdmissionError::QueueTimeout => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            "Grok token-count admission queue was saturated for 30 seconds",
+        ),
+        TokenCountAdmissionError::Closed => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            "The shared token-count admission gate is unavailable",
+        ),
+        TokenCountAdmissionError::WorkerFailed(error) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            format!("Grok token-count worker failed: {error}"),
+        ),
     }
 }
 
@@ -523,7 +561,6 @@ where
         usage: None,
         terminal_status: None,
         upstream_incomplete_reason: None,
-        pending_terminal: None,
         estimated_input_tokens,
         monitor,
         req_id,
@@ -682,7 +719,6 @@ struct GrokStreamState {
     usage: Option<translate::reducer::GrokUsage>,
     terminal_status: Option<translate::reducer::GrokTerminal>,
     upstream_incomplete_reason: Option<String>,
-    pending_terminal: Option<GrokPendingTerminal>,
     estimated_input_tokens: Option<u64>,
     monitor: Option<MonitorHandle>,
     req_id: String,
@@ -695,14 +731,6 @@ struct GrokStreamState {
     deadline: GrokRequestDeadline,
     heartbeat_interval: Duration,
     next_heartbeat: tokio::time::Instant,
-}
-
-struct GrokPendingTerminal {
-    translator: StreamTranslator,
-    bytes: Vec<u8>,
-    semantic_output: bool,
-    terminal_status: Option<translate::reducer::GrokTerminal>,
-    stop_reason: Option<String>,
 }
 
 impl GrokStreamState {
@@ -762,30 +790,11 @@ impl GrokStreamState {
                     return Some(ping);
                 }
                 Ok(GrokStreamPoll::End) => {
-                    if self.decoder.finish().is_err() {
-                        if self.pending_terminal.is_some() {
-                            return Some(self.fail_at("decoder", "incomplete_stream"));
-                        }
+                    if self.decoder.finish().is_err() || !self.reducer.finished() {
                         match self.begin_rebuild(
                             client::GrokError::stream_transport(
                                 client::GrokErrorStage::Stream,
-                                "Grok stream closed with an incomplete SSE frame",
-                            ),
-                            "decoder",
-                            "incomplete_stream",
-                        ) {
-                            Ok(()) => continue,
-                            Err(bytes) => return Some(bytes),
-                        }
-                    }
-                    if self.pending_terminal.is_some() {
-                        return self.commit_pending_terminal();
-                    }
-                    if !self.reducer.finished() {
-                        match self.begin_rebuild(
-                            client::GrokError::stream_transport(
-                                client::GrokErrorStage::Stream,
-                                "Grok stream closed before a terminal event",
+                                "Grok stream closed before a complete terminal event",
                             ),
                             "decoder",
                             "incomplete_stream",
@@ -798,15 +807,10 @@ impl GrokStreamState {
                     self.finish_capture(true);
                     return None;
                 }
-                Err(error) => {
-                    if self.pending_terminal.is_some() {
-                        return Some(self.fail_mapped(error, "transport", "terminal_drain"));
-                    }
-                    match self.begin_rebuild(error, "transport", "upstream_stream") {
-                        Ok(()) => continue,
-                        Err(bytes) => return Some(bytes),
-                    }
-                }
+                Err(error) => match self.begin_rebuild(error, "transport", "upstream_stream") {
+                    Ok(()) => continue,
+                    Err(bytes) => return Some(bytes),
+                },
             };
 
             if cumulative_stream_size_exceeded(self.bytes, chunk.len()) {
@@ -875,12 +879,6 @@ impl GrokStreamState {
                     }
                 }
             };
-            if self.pending_terminal.is_some() {
-                if reduced.is_empty() {
-                    continue;
-                }
-                return Some(self.fail_at("reducer", "post_terminal_output"));
-            }
             let usage = reduced.iter().find_map(|event| match event {
                 translate::reducer::ReducerEvent::Usage(usage) => Some(usage.clone()),
                 _ => None,
@@ -897,20 +895,14 @@ impl GrokStreamState {
             });
             let semantic_output = reduced.iter().any(|event| event.is_semantic());
             let finished = self.reducer.finished();
-            let mut terminal_translator = None;
-            let out = if finished {
-                let mut translator = self.translator.clone();
-                let bytes = match translator.render(reduced) {
-                    Ok(bytes) => bytes,
-                    Err(_) => return Some(self.fail_at("render", "invalid_event")),
-                };
-                terminal_translator = Some(translator);
-                bytes
-            } else {
-                match self.translator.render(reduced) {
-                    Ok(bytes) => bytes,
-                    Err(_) => return Some(self.fail_at("render", "invalid_event")),
-                }
+            // A terminal event is the upstream protocol's commit point. All fully decoded events
+            // from this push batch have already passed reducer validation, so a partial frame left
+            // in the decoder is only an unclassifiable post-terminal tail. Ignoring it makes the
+            // outcome independent of arbitrary HTTP chunk boundaries while a fully decoded
+            // semantic tail in this same batch is still rejected above.
+            let out = match self.translator.render(reduced) {
+                Ok(bytes) => bytes,
+                Err(_) => return Some(self.fail_at("render", "invalid_event")),
             };
             let upstream_incomplete_reason = self.reducer.incomplete_reason().map(str::to_owned);
             if let Some(usage) = usage {
@@ -928,15 +920,18 @@ impl GrokStreamState {
                 self.upstream_incomplete_reason = upstream_incomplete_reason;
             }
             if finished {
-                self.pending_terminal = Some(GrokPendingTerminal {
-                    translator: terminal_translator.expect("terminal renderer must be staged"),
-                    bytes: out,
-                    semantic_output,
-                    terminal_status,
-                    stop_reason,
-                });
-                self.schedule_next_heartbeat();
-                continue;
+                self.terminal = true;
+                if semantic_output {
+                    self.downstream_emitted = true;
+                    self.semantic_output_pending_enqueue = !out.is_empty();
+                }
+                let outcome = terminal_status
+                    .map(translate::reducer::GrokTerminal::outcome)
+                    .unwrap_or("completed");
+                self.log_stream_terminal(outcome, stop_reason.as_deref(), None, None);
+                self.capture_downstream(&out);
+                self.finish_capture(true);
+                return (!out.is_empty()).then_some(out);
             }
             if !out.is_empty() {
                 if semantic_output {
@@ -948,27 +943,6 @@ impl GrokStreamState {
                 return Some(out);
             }
         }
-    }
-
-    fn commit_pending_terminal(&mut self) -> Option<Vec<u8>> {
-        let pending = self
-            .pending_terminal
-            .take()
-            .expect("pending terminal must exist");
-        self.translator = pending.translator;
-        self.terminal = true;
-        if pending.semantic_output {
-            self.downstream_emitted = true;
-            self.semantic_output_pending_enqueue = !pending.bytes.is_empty();
-        }
-        let outcome = pending
-            .terminal_status
-            .map(translate::reducer::GrokTerminal::outcome)
-            .unwrap_or("completed");
-        self.log_stream_terminal(outcome, pending.stop_reason.as_deref(), None, None);
-        self.capture_downstream(&pending.bytes);
-        self.finish_capture(true);
-        (!pending.bytes.is_empty()).then_some(pending.bytes)
     }
 
     async fn next_upstream_chunk(&mut self) -> Result<GrokStreamPoll, GrokError> {
@@ -1120,7 +1094,6 @@ impl GrokStreamState {
         self.usage = None;
         self.terminal_status = None;
         self.upstream_incomplete_reason = None;
-        self.pending_terminal = None;
         self.error_sent = false;
         self.terminal = false;
     }
@@ -1134,7 +1107,6 @@ impl GrokStreamState {
     }
 
     fn fail(&mut self, stage: &str, kind: &str, error: Option<&GrokError>) -> Vec<u8> {
-        self.pending_terminal = None;
         self.error_sent = true;
         if self.usage.is_none() {
             self.usage = self.reducer.usage().cloned();
@@ -1483,6 +1455,33 @@ mod tests {
 
     use super::client::{GrokErrorStage, GrokTimeouts};
     use super::*;
+
+    #[tokio::test]
+    async fn count_tokens_admission_errors_map_to_retryable_503_or_worker_500() {
+        let saturated = token_count_admission::run_with(
+            Arc::new(tokio::sync::Semaphore::new(0)),
+            Duration::from_millis(10),
+            || 1_u64,
+        )
+        .await
+        .expect_err("a gate with no permits must time out");
+        assert_eq!(
+            map_grok_count_tokens_error(saturated).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let failed = token_count_admission::run_with(
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Duration::from_secs(1),
+            || -> u64 { panic!("synthetic Grok token-count worker failure") },
+        )
+        .await
+        .expect_err("a panicking blocking worker must return JoinError");
+        assert_eq!(
+            map_grok_count_tokens_error(failed).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn cumulative_stream_byte_limit_accepts_boundary_and_rejects_next_byte() {
@@ -2164,7 +2163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_tail_in_a_later_chunk_rejects_the_staged_terminal() {
+    async fn semantic_tail_after_a_complete_terminal_is_not_polled() {
         let upstream = futures_util::stream::iter(vec![
             Ok(Bytes::from_static(
                 b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
@@ -2185,39 +2184,59 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("event: error"), "{body}");
         assert!(!body.contains("UNSAFE_TAIL"), "{body}");
-        assert!(!body.contains("event: message_stop"), "{body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
     }
 
     #[tokio::test]
-    async fn incomplete_sse_tail_after_terminal_is_not_reported_as_success() {
-        let upstream = futures_util::stream::iter(vec![
-            Ok(Bytes::from_static(
-                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
-            )),
-            Ok(Bytes::from_static(
-                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"truncated",
-            )),
-        ]);
-        let response = stream_body(
-            upstream,
-            "msg_incomplete_tail".into(),
-            "grok-4.5".into(),
-            None,
-            "req_incomplete_tail".into(),
-            None,
-            None,
+    async fn terminal_with_partial_tail_is_chunk_boundary_invariant() {
+        const TERMINAL: &[u8] =
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+        const PARTIAL_TAIL: &[u8] =
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"truncated";
+
+        let same_chunk = vec![Bytes::from([TERMINAL, PARTIAL_TAIL].concat())];
+        let split_chunks = vec![
+            Bytes::from_static(TERMINAL),
+            Bytes::from_static(PARTIAL_TAIL),
+        ];
+        assert_eq!(
+            same_chunk.iter().flatten().copied().collect::<Vec<_>>(),
+            split_chunks.iter().flatten().copied().collect::<Vec<_>>()
         );
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(body.contains("event: error"), "{body}");
-        assert!(!body.contains("event: message_stop"), "{body}");
+        for (case, chunks) in [("same_chunk", same_chunk), ("next_chunk", split_chunks)] {
+            let upstream = futures_util::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(Ok::<Bytes, client::GrokError>)
+                    .collect::<Vec<_>>(),
+            );
+            let response = stream_body(
+                upstream,
+                format!("msg_incomplete_tail_{case}"),
+                "grok-4.5".into(),
+                None,
+                format!("req_incomplete_tail_{case}"),
+                None,
+                None,
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+
+            assert!(!body.contains("event: error"), "case={case}: {body}");
+            assert_eq!(
+                body.matches("event: message_stop").count(),
+                1,
+                "case={case}: {body}"
+            );
+            assert!(!body.contains("truncated"), "case={case}: {body}");
+        }
     }
 
     #[tokio::test]
-    async fn post_terminal_rate_limit_telemetry_drains_before_one_terminal_render() {
+    async fn post_terminal_rate_limit_telemetry_does_not_delay_terminal_render() {
         let upstream = futures_util::stream::iter(vec![
             Ok(Bytes::from_static(
                 b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
@@ -2243,7 +2262,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_output_streams_early_but_terminal_waits_for_upstream_eof() {
+    async fn transport_reset_after_terminal_keeps_the_completed_response() {
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"complete\"}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n",
+            )),
+            Err(client::GrokError::stream_transport(
+                client::GrokErrorStage::Stream,
+                "reset after terminal",
+            )),
+        ]);
+        let response = stream_body(
+            upstream,
+            "msg_terminal_reset".into(),
+            "grok-4.5".into(),
+            None,
+            "req_terminal_reset".into(),
+            None,
+            None,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("complete"), "{body}");
+        assert!(!body.contains("event: error"), "{body}");
+        assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
+    }
+
+    #[tokio::test]
+    async fn semantic_output_streams_early_and_terminal_does_not_wait_for_upstream_eof() {
         let (tx, rx) = mpsc::channel(2);
         let response = stream_body(
             ChannelStream(rx),
@@ -2278,16 +2328,9 @@ mod tests {
         )))
         .await
         .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), body.frame())
-                .await
-                .is_err(),
-            "terminal must remain staged until upstream EOF"
-        );
-        drop(tx);
         let terminal = tokio::time::timeout(Duration::from_millis(250), body.frame())
             .await
-            .expect("downstream completion timed out")
+            .expect("downstream completion waited for upstream EOF")
             .expect("downstream completion was missing")
             .expect("downstream completion frame failed")
             .into_data()
@@ -2300,9 +2343,12 @@ mod tests {
         assert!(
             tokio::time::timeout(Duration::from_millis(250), body.frame())
                 .await
-                .expect("downstream EOF was not delivered after upstream EOF")
+                .expect("downstream EOF was not delivered after the terminal event")
                 .is_none()
         );
+        tokio::time::timeout(Duration::from_millis(250), tx.closed())
+            .await
+            .expect("terminal completion must cancel the upstream body");
     }
 
     #[tokio::test]

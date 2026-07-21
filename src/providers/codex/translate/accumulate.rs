@@ -3,9 +3,10 @@ use serde_json::Value;
 use crate::traffic::TrafficCapture;
 
 use super::reducer::{
-    AnthropicUsage, ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic,
+    AnthropicUsage, ReducerEvent, STOP_END_TURN, UpstreamStreamError, map_codex_usage_to_anthropic,
     reduce_upstream_bytes,
 };
+use super::schema_bridge::SchemaBridge;
 use super::web_search_compat::{WebSearchCompatContent, build_web_search_compat_blocks};
 
 pub fn accumulate_response(
@@ -21,6 +22,16 @@ pub fn accumulate_response_with_traffic(
     message_id: &str,
     model: &str,
     traffic: Option<&TrafficCapture>,
+) -> Result<Value, anyhow::Error> {
+    accumulate_response_with_traffic_and_schema(upstream, message_id, model, traffic, None)
+}
+
+pub(crate) fn accumulate_response_with_traffic_and_schema(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+    schema_bridge: Option<&SchemaBridge>,
 ) -> Result<Value, anyhow::Error> {
     let events = match reduce_upstream_bytes(upstream) {
         Ok(events) => events,
@@ -136,6 +147,43 @@ pub fn accumulate_response_with_traffic(
             }
             _ => {}
         }
+    }
+
+    if let Some(bridge) = schema_bridge
+        && stop_reason.as_deref() == Some(STOP_END_TURN)
+    {
+        let text_block_indices = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| {
+                matches!(&block.kind, BlockKind::Text { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if text_block_indices.len() != 1 {
+            anyhow::bail!(
+                "Codex structured output expected exactly one completed text block, found {}",
+                text_block_indices.len()
+            );
+        }
+        let block_index = text_block_indices[0];
+        let BlockKind::Text { text } = &blocks[block_index].kind else {
+            unreachable!("text block index was selected above")
+        };
+        let (normalized_text, elided_null_properties) = {
+            let normalized = bridge.normalize_completed_text(text).map_err(|error| {
+                anyhow::anyhow!("Codex structured output validation failed: {error}")
+            })?;
+            (
+                normalized.text.into_owned(),
+                normalized.elided_null_properties,
+            )
+        };
+        if let BlockKind::Text { text } = &mut blocks[block_index].kind {
+            *text = normalized_text.clone();
+        }
+        deferred_text_parts.clear();
+        deferred_text_parts.push(normalized_text);
+        let _ = elided_null_properties;
     }
 
     let text_from_deferred: String = deferred_text_parts.join("");
@@ -290,6 +338,49 @@ mod tests {
         )
     }
 
+    fn optional_reason_schema_bridge() -> SchemaBridge {
+        SchemaBridge::build(&json!({
+            "type": "object",
+            "properties": {
+                "ok": {"type": "boolean"},
+                "reason": {"type": "string"}
+            },
+            "required": ["ok"],
+            "additionalProperties": false
+        }))
+        .unwrap()
+    }
+
+    fn completed_text_response(text: &str) -> String {
+        format!(
+            "{}{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.output_text.delta",
+                json!({"output_index":0,"delta":text})
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}
+                })
+            ),
+        )
+    }
+
     #[test]
     fn accumulate_text_response() {
         let upstream = format!(
@@ -325,6 +416,43 @@ mod tests {
         assert_eq!(response["content"][0]["type"], "text");
         assert_eq!(response["content"][0]["text"], "Hello world");
         assert_eq!(response["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn structured_response_elides_only_synthetic_optional_null() {
+        let upstream = completed_text_response(r#"{"ok":true,"reason":null}"#);
+        let bridge = optional_reason_schema_bridge();
+        let response = accumulate_response_with_traffic_and_schema(
+            upstream.as_bytes(),
+            "msg_1",
+            "gpt-5.6-sol",
+            None,
+            Some(&bridge),
+        )
+        .unwrap();
+
+        assert_eq!(response["content"][0]["text"], r#"{"ok":true}"#);
+        assert_eq!(response["stop_reason"], STOP_END_TURN);
+    }
+
+    #[test]
+    fn structured_response_fails_closed_when_output_is_invalid() {
+        let upstream = completed_text_response(r#"{"ok":"wrong","reason":null}"#);
+        let bridge = optional_reason_schema_bridge();
+        let error = accumulate_response_with_traffic_and_schema(
+            upstream.as_bytes(),
+            "msg_1",
+            "gpt-5.6-sol",
+            None,
+            Some(&bridge),
+        )
+        .expect_err("invalid structured output must not become a successful response");
+
+        assert!(
+            error
+                .to_string()
+                .contains("structured output validation failed")
+        );
     }
 
     #[test]

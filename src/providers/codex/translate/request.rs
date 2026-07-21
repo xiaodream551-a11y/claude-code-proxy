@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -11,13 +12,14 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
     ContentBlock, RequestedOutputFormat, flatten_system_text, image_source_to_url,
-    is_claude_code_compaction_request, normalize_content, normalize_strict_json_schema,
-    parse_output_format, read_effort, validate_codex_message_roles,
+    is_claude_code_compaction_request, normalize_content, parse_output_format, read_effort,
+    validate_alternate_provider_fields, validate_codex_message_roles,
     validate_tool_reference_provenance,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
+use super::schema_bridge::SchemaBridge;
 
 const PARALLEL_TOOL_GUIDANCE: &str = "When multiple independent function tools are needed, call them together in one response. Serialize only calls that have data dependencies.";
 const MAX_CODEX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -112,6 +114,10 @@ pub struct ResponsesRequest {
     pub text: ResponsesText,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponsesReasoning>,
+    /// Request-local response validator/normalizer. This must never cross the
+    /// Codex wire boundary; only `text.format.schema` is serialized upstream.
+    #[serde(skip)]
+    pub(crate) schema_bridge: Option<Arc<SchemaBridge>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,10 +424,11 @@ pub fn translate_request_with_overrides(
     opts: TranslateOptions,
     overrides: TranslationOverrides,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    validate_alternate_provider_fields(req, "Codex")?;
     validate_codex_message_roles(req)?;
     validate_codex_image_inputs(req)?;
     validate_tool_contract(req)?;
-    let output_format = read_output_format(req)?;
+    let (output_format, schema_bridge) = read_output_format(req)?;
     let mut instructions = flatten_system_text(req.extra.get("system"));
     let tool_plan = read_tools(req)?;
     let input = build_input(req, &tool_plan.deferred);
@@ -467,6 +474,7 @@ pub fn translate_request_with_overrides(
         service_tier: None,
         prompt_cache_key: None,
         reasoning: None,
+        schema_bridge,
     };
 
     if opts.use_responses_lite {
@@ -540,7 +548,15 @@ pub fn translate_request_with_overrides(
         out.prompt_cache_key = Some(sid);
     }
 
-    let service_tier = resolve_service_tier(opts.service_tier, overrides.service_tier.as_deref())?;
+    // Anthropic's `standard_only` is a hard caller constraint. Omitting the
+    // OpenAI service_tier is the standard-lane representation and must override
+    // a local `-fast` alias or priority configuration.
+    let service_tier =
+        if req.extra.get("service_tier").and_then(Value::as_str) == Some("standard_only") {
+            None
+        } else {
+            resolve_service_tier(opts.service_tier, overrides.service_tier.as_deref())?
+        };
     if let Some(ref tier) = service_tier {
         out.service_tier = Some(tier.clone());
     }
@@ -611,11 +627,13 @@ fn append_web_search_request_guidance(req: &MessagesRequest, instructions: &mut 
     }
 }
 
-fn read_output_format(req: &MessagesRequest) -> anyhow::Result<Option<ResponsesTextFormat>> {
+fn read_output_format(
+    req: &MessagesRequest,
+) -> anyhow::Result<(Option<ResponsesTextFormat>, Option<Arc<SchemaBridge>>)> {
     let Some(format) = parse_output_format(req)? else {
-        return Ok(None);
+        return Ok((None, None));
     };
-    let format = match format {
+    let (format, schema_bridge) = match format {
         RequestedOutputFormat::JsonSchema { name, schema } => {
             if name.len() > 64
                 || !name
@@ -626,16 +644,20 @@ fn read_output_format(req: &MessagesRequest) -> anyhow::Result<Option<ResponsesT
                     "output_config.format.name must contain only ASCII letters, digits, underscores, or hyphens and be at most 64 characters"
                 );
             }
-            ResponsesTextFormat::JsonSchema {
-                name: name.to_string(),
-                schema: normalize_strict_json_schema(schema),
-                strict: Some(true),
-            }
+            let bridge = Arc::new(SchemaBridge::build(schema)?);
+            (
+                ResponsesTextFormat::JsonSchema {
+                    name: name.to_string(),
+                    schema: bridge.upstream_schema().clone(),
+                    strict: Some(true),
+                },
+                Some(bridge),
+            )
         }
-        RequestedOutputFormat::JsonObject => ResponsesTextFormat::JsonObject,
-        RequestedOutputFormat::Text => ResponsesTextFormat::Text,
+        RequestedOutputFormat::JsonObject => (ResponsesTextFormat::JsonObject, None),
+        RequestedOutputFormat::Text => (ResponsesTextFormat::Text, None),
     };
-    Ok(Some(format))
+    Ok((Some(format), schema_bridge))
 }
 
 fn validate_codex_image_inputs(req: &MessagesRequest) -> Result<(), anyhow::Error> {
@@ -1722,7 +1744,12 @@ fn read_tools(req: &MessagesRequest) -> Result<ToolPlan, anyhow::Error> {
             let description = codex_tool_description(&name, description);
             let parameters = codex_tool_parameters(&name, parameters);
             let strict_requested = tool.get("strict").and_then(Value::as_bool) == Some(true);
-            let strict = strict_requested && strict_schema_is_supported(&parameters);
+            if strict_requested && !strict_schema_is_supported(&parameters) {
+                anyhow::bail!(
+                    "tool {name} requested strict=true, but its input_schema cannot be represented by the Codex strict function schema; make every declared property required and set additionalProperties=false, or remove strict=true"
+                );
+            }
+            let strict = strict_requested;
             ResponsesTool::Function(ResponsesFunctionTool {
                 kind: "function".to_string(),
                 name: name.clone(),
@@ -3297,7 +3324,30 @@ mod tests {
     }
 
     #[test]
-    fn explicit_strict_preserves_optional_fields_and_degrades_when_incompatible() {
+    fn explicit_strict_rejects_incompatible_schema_instead_of_downgrading() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"run"}],
+            "tools":[
+                {
+                    "name":"OptionalField",
+                    "strict":true,
+                    "input_schema":{
+                        "type":"object",
+                        "properties":{"value":{"type":"string"}},
+                        "additionalProperties":false
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+        let error = translate_request(&req, opts()).unwrap_err().to_string();
+        assert!(error.contains("tool OptionalField requested strict=true"));
+        assert!(error.contains("make every declared property required"));
+    }
+
+    #[test]
+    fn explicit_strict_is_preserved_only_for_compatible_schema() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model":"gpt-5.6-sol",
             "messages":[{"role":"user", "content":"run"}],
@@ -3313,27 +3363,13 @@ mod tests {
                     }
                 },
                 {
-                    "name":"OptionalField",
-                    "strict":true,
+                    "name":"NotRequested",
+                    "strict":false,
                     "input_schema":{
                         "type":"object",
                         "properties":{"value":{"type":"string"}},
                         "additionalProperties":false
                     }
-                },
-                {
-                    "name":"NotRequested",
-                    "strict":false,
-                    "input_schema":{
-                        "type":"object",
-                        "properties":{},
-                        "additionalProperties":false
-                    }
-                },
-                {
-                    "name":"EmptyStrict",
-                    "strict":true,
-                    "input_schema":{"type":"object"}
                 }
             ]
         }))
@@ -3349,16 +3385,12 @@ mod tests {
                 ResponsesTool::WebSearch(_) => false,
             })
             .collect();
-        assert_eq!(strict_values, [true, false, false, false]);
+        assert_eq!(strict_values, [true, false]);
         let ResponsesTool::Function(optional) = &out.tools.as_ref().unwrap()[1] else {
             panic!("expected function tool");
         };
         assert!(optional.parameters.get("required").is_none());
         assert_eq!(optional.parameters["additionalProperties"], false);
-        let ResponsesTool::Function(empty) = &out.tools.as_ref().unwrap()[3] else {
-            panic!("expected function tool");
-        };
-        assert_eq!(empty.parameters, json!({"type":"object"}));
     }
 
     #[test]
@@ -3496,6 +3528,30 @@ mod tests {
         let out = translate_request(&req, opts()).unwrap();
         let value = serde_json::to_value(out).unwrap();
         assert!(value.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn request_standard_only_overrides_local_priority_tier() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "max_tokens":4096,
+            "messages":[{"role":"user", "content":"hello"}],
+            "service_tier":"standard_only"
+        }))
+        .unwrap();
+        let mut options = opts();
+        options.service_tier = Some(ServiceTier::Priority);
+        let translated = translate_request_with_overrides(
+            &req,
+            options,
+            TranslationOverrides {
+                service_tier: Some("priority".to_string()),
+                effort: None,
+                reasoning_summary: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(translated.service_tier, None);
     }
 
     #[test]
@@ -3814,12 +3870,14 @@ mod tests {
         } else {
             panic!("expected JsonSchema format");
         }
+        assert!(out.schema_bridge.is_some());
+        let serialized = serde_json::to_value(&out).unwrap();
+        assert!(serialized.get("schema_bridge").is_none());
     }
 
     #[test]
     fn translate_rejects_malformed_output_formats() {
         for (case, output_config) in [
-            ("non-object output_config", json!(null)),
             ("non-object format", json!({"format":[]})),
             ("missing type", json!({"format":{}})),
             ("unknown type", json!({"format":{"type":"json_schmea"}})),
@@ -3862,6 +3920,19 @@ mod tests {
         }))
         .unwrap();
         assert!(translate_request(&effort_only, opts()).is_ok());
+    }
+
+    #[test]
+    fn null_output_config_is_treated_as_omitted() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user","content":"hello"}],
+            "output_config":null
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(out.text.format.is_none());
+        assert!(out.schema_bridge.is_none());
     }
 
     #[test]

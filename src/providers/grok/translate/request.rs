@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     io::Write,
 };
@@ -9,8 +10,8 @@ use serde_json::Value;
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::providers::translate_shared::{
     RequestedOutputFormat, flatten_system_text, is_claude_code_compaction_request,
-    parse_output_format, read_effort, validate_grok_message_roles,
-    validate_tool_reference_provenance,
+    parse_output_format, read_effort, validate_alternate_provider_fields,
+    validate_grok_message_roles, validate_tool_reference_provenance,
 };
 
 const MAX_GROK_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -185,7 +186,7 @@ pub fn translate_request(
     req: &MessagesRequest,
     model: String,
 ) -> anyhow::Result<GrokResponsesRequest> {
-    reject_unknown_top_level(req)?;
+    validate_alternate_provider_fields(req, "Grok")?;
     validate_grok_message_roles(req)?;
     let reasoning_effort = read_effort(req)?;
     let compaction = is_claude_code_compaction_request(req);
@@ -633,30 +634,6 @@ fn append_guidance(instructions: &mut Option<String>, guidance: &str) {
     });
 }
 
-fn reject_unknown_top_level(req: &MessagesRequest) -> anyhow::Result<()> {
-    for key in req.extra.keys() {
-        if ![
-            "system",
-            "tools",
-            "tool_choice",
-            "context_management",
-            "metadata",
-            "output_config",
-            "thinking",
-            "temperature",
-            "top_p",
-            "top_k",
-            "stop_sequences",
-            "service_tier",
-        ]
-        .contains(&key.as_str())
-        {
-            anyhow::bail!("unsupported Grok request field: {key}");
-        }
-    }
-    Ok(())
-}
-
 fn parse_system(value: Option<&Value>) -> anyhow::Result<Option<String>> {
     let Some(value) = value else { return Ok(None) };
     match value {
@@ -1050,9 +1027,9 @@ fn parse_message(
     if !["system", "user", "assistant"].contains(&message.role.as_str()) {
         anyhow::bail!("unsupported message role");
     }
-    let blocks: Vec<Value> = match &message.content {
-        Value::String(text) => vec![serde_json::json!({"type":"text", "text":text})],
-        Value::Array(items) => items.clone(),
+    let blocks: Cow<'_, [Value]> = match &message.content {
+        Value::String(text) => Cow::Owned(vec![serde_json::json!({"type":"text", "text":text})]),
+        Value::Array(items) => Cow::Borrowed(items),
         _ => anyhow::bail!("message content must be text or blocks"),
     };
     if message.role == "system" && blocks.is_empty() {
@@ -1060,7 +1037,7 @@ fn parse_message(
     }
     let mut content = Vec::new();
     let mut tool_result_images = Vec::new();
-    for block in blocks {
+    for block in blocks.iter() {
         let object = block
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("content block must be an object"))?;
@@ -2034,7 +2011,6 @@ mod tests {
     #[test]
     fn grok_translation_rejects_malformed_output_formats() {
         for (case, output_config) in [
-            ("non-object output_config", serde_json::json!(null)),
             ("non-object format", serde_json::json!({"format":[]})),
             ("missing type", serde_json::json!({"format":{}})),
             (

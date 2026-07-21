@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
 use base64::Engine as _;
+use tiktoken_rs::o200k_base_singleton;
 
 use super::translate::request::{GrokContentPart, GrokInputItem, GrokResponsesRequest};
 
@@ -31,7 +32,7 @@ pub fn count_tokens(request: &GrokResponsesRequest) -> u64 {
     let instructions = request
         .instructions
         .as_deref()
-        .map(approx_token_count)
+        .map(text_token_count)
         .unwrap_or(0);
     let input: u64 = request.input.iter().map(count_input_item).sum();
     let tools: u64 = request
@@ -40,13 +41,7 @@ pub fn count_tokens(request: &GrokResponsesRequest) -> u64 {
         .unwrap_or_default()
         .iter()
         .map(|tool| {
-            tool.name.as_deref().map(approx_token_count).unwrap_or(0)
-                + tool
-                    .description
-                    .as_deref()
-                    .map(approx_token_count)
-                    .unwrap_or(0)
-                + approx_token_count(&serde_json::to_string(&tool.parameters).unwrap_or_default())
+            text_token_count(&serde_json::to_string(tool).unwrap_or_default())
                 + TOOL_OVERHEAD_TOKENS
         })
         .sum();
@@ -55,7 +50,7 @@ pub fn count_tokens(request: &GrokResponsesRequest) -> u64 {
         + input
         + tools
         + request.input.len() as u64 * MESSAGE_OVERHEAD_TOKENS
-        + approx_token_count(&request.model))
+        + text_token_count(&request.model))
     .max(1)
 }
 
@@ -65,7 +60,7 @@ fn count_input_item(item: &GrokInputItem) -> u64 {
             .iter()
             .map(|part| match part {
                 GrokContentPart::InputText { text } | GrokContentPart::OutputText { text } => {
-                    approx_token_count(text)
+                    text_token_count(text)
                 }
                 GrokContentPart::InputImage {
                     image_url,
@@ -75,20 +70,20 @@ fn count_input_item(item: &GrokInputItem) -> u64 {
             .sum(),
         GrokInputItem::FunctionCall {
             name, arguments, ..
-        } => approx_token_count(name) + approx_token_count(arguments),
-        GrokInputItem::FunctionCallOutput { output, .. } => approx_token_count(output),
+        } => text_token_count(name) + text_token_count(arguments),
+        GrokInputItem::FunctionCallOutput { output, .. } => text_token_count(output),
     }
 }
 
 fn estimate_image_tokens(image_url: &str) -> u64 {
     let Some((metadata, encoded)) = image_url.split_once(',') else {
-        return IMAGE_OVERHEAD_TOKENS + approx_token_count(image_url);
+        return IMAGE_OVERHEAD_TOKENS + text_token_count(image_url);
     };
     let Some(media_type) = metadata
         .strip_prefix("data:")
         .and_then(|metadata| metadata.strip_suffix(";base64"))
     else {
-        return IMAGE_OVERHEAD_TOKENS + approx_token_count(image_url);
+        return IMAGE_OVERHEAD_TOKENS + text_token_count(image_url);
     };
     validate_and_estimate_base64_image(encoded, usize::MAX, media_type)
         .unwrap_or(IMAGE_OVERHEAD_TOKENS)
@@ -299,26 +294,8 @@ fn validate_jpeg_framing(bytes: &[u8]) -> Result<(), Base64ImageError> {
     Err(Base64ImageError::Invalid)
 }
 
-fn approx_token_count(text: &str) -> u64 {
-    if text.is_empty() {
-        return 0;
-    }
-    let mut count = 0;
-    let mut in_word = false;
-    for character in text.chars() {
-        if character.is_alphanumeric() || character == '-' || character == '_' {
-            if !in_word {
-                count += 1;
-                in_word = true;
-            }
-        } else {
-            in_word = false;
-            if !character.is_whitespace() {
-                count += 1;
-            }
-        }
-    }
-    count.max(1)
+fn text_token_count(text: &str) -> u64 {
+    u64::try_from(o200k_base_singleton().count_with_special_tokens(text)).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -449,6 +426,19 @@ mod tests {
     }
 
     #[test]
+    fn text_count_uses_o200k_for_cjk_code_and_punctuation() {
+        let text = "修复工具调用：fn main() { println!(\"你好\"); }";
+        let expected =
+            u64::try_from(o200k_base_singleton().count_with_special_tokens(text)).unwrap();
+
+        assert_eq!(text_token_count(text), expected);
+        assert!(
+            expected > 4,
+            "CJK/code text must not collapse to word count"
+        );
+    }
+
+    #[test]
     fn count_tokens_accepts_nested_system_and_ignores_cache_control() {
         let plain = translated_request(json!({
             "model": "grok-4.5",
@@ -487,6 +477,31 @@ mod tests {
         }));
 
         assert!(count_tokens(&long) > count_tokens(&short));
+    }
+
+    #[test]
+    fn count_tokens_includes_hosted_tool_filters() {
+        let plain = translated_request(json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "find docs"}],
+            "tools": [{
+                "type": "web_search_20260318",
+                "name": "web_search",
+                "allowed_callers": ["direct"]
+            }]
+        }));
+        let filtered = translated_request(json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "find docs"}],
+            "tools": [{
+                "type": "web_search_20260318",
+                "name": "web_search",
+                "allowed_callers": ["direct"],
+                "allowed_domains": ["docs.rs", "rust-lang.org"]
+            }]
+        }));
+
+        assert!(count_tokens(&filtered) > count_tokens(&plain));
     }
 
     #[test]

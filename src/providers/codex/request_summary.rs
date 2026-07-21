@@ -257,6 +257,7 @@ mod tests {
                 format: None,
             },
             reasoning: None,
+            schema_bridge: None,
         };
         let summary = summarize_codex_request_size(&req);
         assert_eq!(summary.input_item_count, 1);
