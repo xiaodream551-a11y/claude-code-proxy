@@ -858,6 +858,23 @@ impl GrokStreamState {
                         .downcast_ref::<translate::reducer::GrokUpstreamFailure>()
                         .cloned()
                     else {
+                        let detail = error.to_string();
+                        crate::logging::create_logger("grok").info(
+                            "stream_reducer_error",
+                            Some(serde_json::Map::from_iter([
+                                ("reqId".into(), serde_json::json!(self.req_id)),
+                                ("model".into(), serde_json::json!(self.model)),
+                                ("stage".into(), serde_json::json!("reducer")),
+                                ("kind".into(), serde_json::json!("invalid_event")),
+                                ("message".into(), serde_json::json!(detail)),
+                                ("bytes".into(), serde_json::json!(self.bytes)),
+                                ("chunks".into(), serde_json::json!(self.chunks)),
+                                (
+                                    "downstreamEmitted".into(),
+                                    serde_json::json!(self.downstream_emitted),
+                                ),
+                            ])),
+                        );
                         return Some(self.fail_at("reducer", "invalid_event"));
                     };
                     let status =
