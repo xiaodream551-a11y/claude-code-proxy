@@ -8,6 +8,10 @@
   and then surfaced `Server error mid-response`. Log the concrete Grok reducer
   error behind `stream_reducer_error` instead of only the generic invalid-stream
   message.
+- Put Grok parallel tool-calling policy at the front of translated instructions
+  and strengthen it for Claude Code: prefer multiple dedicated tools over one
+  mega-Bash script, and keep independent calls in the same response so the
+  client can run them concurrently.
 - Bound opt-in traffic captures with charged-byte and file-count admission
   quotas, both globally and per request. Every file costs at least one rounded
   4 KiB unit, existing regular files count after restart without following
