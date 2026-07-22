@@ -22,9 +22,8 @@ const MAX_TOOL_RESULT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const PARALLEL_FUNCTION_TOOL_GUIDANCE: &str = "\
 You can call multiple tools in one response. When several independent tools are needed, \
 emit all of them together so the client can run them concurrently. Serialize only tools \
-that truly depend on earlier results. Prefer dedicated tools such as Read, Grep, Glob, \
-and Edit over one large Bash script that combines independent lookups. Keep each Bash \
-command focused and avoid packing unrelated work into a single shell script.";
+that truly depend on earlier results.";
+const CLAUDE_CODE_DEDICATED_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "Edit"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
@@ -231,10 +230,11 @@ pub fn translate_request(
         .map(|tools| tools.iter().filter(|tool| tool.kind == "function").count())
         .unwrap_or(0);
     // Keep high-priority tool-calling policy ahead of the (often very large) Claude Code
-    // system prompt so Grok does not bury it under session context and then serialize every
-    // lookup into one Bash script.
+    // system prompt so Grok does not bury it under session context and serialize independent
+    // calls. Mention dedicated tools or Bash only when they survived request filtering.
     if !internal_text_request && parallel_tool_calls == Some(true) && function_tool_count >= 2 {
-        prepend_guidance(&mut instructions, PARALLEL_FUNCTION_TOOL_GUIDANCE);
+        let guidance = parallel_function_tool_guidance(tools.as_deref().unwrap_or_default());
+        prepend_guidance(&mut instructions, &guidance);
     }
     let hosted_web_search = tools
         .as_ref()
@@ -645,6 +645,32 @@ fn prepend_guidance(instructions: &mut Option<String>, guidance: &str) {
         Some(existing) if !existing.is_empty() => format!("{guidance}\n\n{existing}"),
         _ => guidance.into(),
     });
+}
+
+fn parallel_function_tool_guidance(tools: &[GrokTool]) -> String {
+    let declared = tools
+        .iter()
+        .filter(|tool| tool.kind == "function")
+        .filter_map(|tool| tool.name.as_deref())
+        .collect::<HashSet<_>>();
+    let dedicated = CLAUDE_CODE_DEDICATED_TOOLS
+        .into_iter()
+        .filter(|name| declared.contains(name))
+        .collect::<Vec<_>>();
+    let has_bash = declared.contains("Bash");
+
+    let mut guidance = PARALLEL_FUNCTION_TOOL_GUIDANCE.to_owned();
+    if has_bash && !dedicated.is_empty() {
+        guidance.push_str(" Prefer the declared dedicated tools (");
+        guidance.push_str(&dedicated.join(", "));
+        guidance.push_str(") over one large Bash script that combines independent lookups.");
+    }
+    if has_bash {
+        guidance.push_str(
+            " Keep each Bash command focused and avoid packing unrelated work into a single shell script.",
+        );
+    }
+    guidance
 }
 
 fn parse_system(value: Option<&Value>) -> anyhow::Result<Option<String>> {
@@ -1678,8 +1704,13 @@ mod tests {
         assert_eq!(translated["parallel_tool_calls"], true);
         let instructions = translated["instructions"].as_str().unwrap();
         assert!(instructions.starts_with(PARALLEL_FUNCTION_TOOL_GUIDANCE));
-        assert!(instructions.contains("Prefer dedicated tools"));
         assert!(instructions.contains("emit all of them together"));
+        for undeclared in ["Read", "Grep", "Glob", "Edit", "Bash"] {
+            assert!(
+                !instructions.contains(undeclared),
+                "parallel guidance mentioned undeclared tool {undeclared}: {instructions}"
+            );
+        }
     }
 
     #[test]
@@ -1700,11 +1731,63 @@ mod tests {
         let instructions = translated.instructions.unwrap();
         assert!(instructions.starts_with(PARALLEL_FUNCTION_TOOL_GUIDANCE));
         assert!(instructions.contains("SESSION CONTEXT"));
+        assert!(instructions.contains("declared dedicated tools (Read, Grep)"));
+        assert!(instructions.contains("one large Bash script"));
+        assert!(instructions.contains("Keep each Bash command focused"));
+        assert!(!instructions.contains("Glob"));
+        assert!(!instructions.contains("Edit"));
         let guidance_end = PARALLEL_FUNCTION_TOOL_GUIDANCE.len();
         assert!(
             instructions[guidance_end..].contains("SESSION CONTEXT"),
             "session context should remain after the parallel-tool policy"
         );
+    }
+
+    #[test]
+    fn grok_parallel_tool_guidance_uses_only_final_non_deferred_tools() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[
+                {"name":"Read","input_schema":{"type":"object"}},
+                {"name":"Grep","input_schema":{"type":"object"}},
+                {"name":"Bash","defer_loading":true,"input_schema":{"type":"object"}}
+            ],
+            "messages":[{"role":"user","content":"inspect the repo"}]
+        }))
+        .unwrap();
+
+        let translated = translate_request(&request, "grok-4.5".into()).unwrap();
+        assert!(
+            translated
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.name.as_deref() != Some("Bash"))
+        );
+        let instructions = translated.instructions.unwrap();
+        assert!(instructions.starts_with(PARALLEL_FUNCTION_TOOL_GUIDANCE));
+        assert!(!instructions.contains("Bash"));
+        assert!(!instructions.contains("Glob"));
+        assert!(!instructions.contains("Edit"));
+    }
+
+    #[test]
+    fn grok_parallel_tool_guidance_respects_explicit_disable() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "tools":[
+                {"name":"Read","input_schema":{"type":"object"}},
+                {"name":"Grep","input_schema":{"type":"object"}}
+            ],
+            "tool_choice":{"type":"auto","disable_parallel_tool_use":true},
+            "messages":[{"role":"user","content":"inspect the repo"}]
+        }))
+        .unwrap();
+
+        let translated = translate_request(&request, "grok-4.5".into()).unwrap();
+        assert_eq!(translated.parallel_tool_calls, Some(false));
+        assert!(translated.instructions.is_none());
     }
 
     #[test]
