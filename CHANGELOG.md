@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.24-preview.1 (2026-07-22)
+
 - Enforce Codex and Grok response tool policy in live and buffered paths:
   reject undeclared or forbidden function/hosted calls, a second call in
   serial mode, and successful responses that omit a required or named tool.
