@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v0.1.23-preview.1 (2026-07-22)
+## v0.1.23 (2026-07-22)
 
 - Accept Grok streams that open function calls before a matching late
   `response.output_text.done`, which previously failed closed as
