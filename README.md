@@ -256,12 +256,14 @@ only see sessions created by the same profile. Existing history under
 transcripts cannot be classified reliably by launcher after the fact.
 
 On first use, each profile receives a private snapshot of the current user
-settings, permissions, plugins, skills, hooks, and global state. The snapshot
-keeps user-scoped MCP definitions such as Brave Search but removes every prior
-`lastSessionId`; it never copies transcript, prompt-history, task, or other
-session directories. Later `/config`, plugin, and MCP changes stay inside the
-active profile and cannot race with the other profile or plain Claude. Apply a
-shared configuration change to both profiles explicitly when needed. Because
+settings, permissions, plugin metadata, skills, hooks, and global state. The
+snapshot keeps user-scoped MCP definitions such as Brave Search but removes
+every prior `lastSessionId`; it never copies transcript, prompt-history, task,
+or other session directories. Later profile configuration changes stay inside
+the active profile. Installed plugin files can still be referenced from
+Claude's user-level plugin cache when its metadata contains absolute paths;
+this does not merge the profiles' transcript or prompt-history storage. Apply
+a shared configuration change to both profiles explicitly when needed. Because
 the launcher owns this boundary, an externally supplied `CLAUDE_CONFIG_DIR` is
 rejected with an actionable error instead of being silently ignored.
 
