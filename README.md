@@ -679,6 +679,7 @@ sequenceDiagram
 | --------------------------------------------------- | --------------------------- |
 | [`serve`](#serve)                                   | Start the proxy and monitor |
 | [`demo`](#demo)                                     | Open the TUI with mock data |
+| [`diagnostics`](#diagnostics)                       | Collect or upload metadata-only diagnostics |
 | `claude gpt -- <args>` / `claude grok -- <args>`    | Launch a coherent GPT or Grok Claude Code profile |
 | `codex auth login` / `device` / `status` / `logout` | Codex OAuth management      |
 | `kimi  auth login` / `status` / `logout`            | Kimi OAuth management       |
@@ -738,6 +739,79 @@ claude-code-proxy demo
 
 Use the normal monitor shortcuts and resize the terminal to inspect wide and
 compact request layouts.
+
+---
+
+### `diagnostics`
+
+Creates a small, metadata-only archive that can be sent from Linux or WSL2 to a
+development machine when a failure is easier to reproduce there than locally.
+Collection is local and upload is always a separate, explicit command.
+
+```sh
+# Read the normal platform state directory and write under diagnostics/ there.
+claude-code-proxy diagnostics collect --machine-label wsl-laptop
+
+# Narrow a report to the request-id response header shown for a failed request.
+claude-code-proxy diagnostics collect --request-id REQUEST_ID --last-lines 10000
+
+# Choose paths explicitly, useful for an isolated WSL installation.
+claude-code-proxy diagnostics collect \
+  --state-dir "$HOME/.local/state/claude-code-proxy" \
+  --output /tmp/ccproxy-diagnostics.tar.gz
+```
+
+Every archive contains exactly `manifest.json`, `events.jsonl`, and
+`environment.json`. The collector uses a fixed event and field allowlist. It
+records lifecycle metadata such as provider/model routing, status and elapsed
+time, retry or timeout classification, stream interruption, tool-block
+start/completion/interruption, and whether a later client `tool_result` was
+marked as an error. A completed tool block means that ccproxy emitted a
+complete block into the downstream response; it does not prove that Claude
+Code received or executed the tool.
+
+The bundle excludes prompts, message content, tool arguments and results, raw
+error text, session ids, credentials, configuration, `traffic/`, `errors/`, and
+the original `proxy.log`. Dynamic upstream error text is reduced to a bounded
+classification and fingerprint. There is deliberately no option to add raw
+traffic or error captures to a diagnostic bundle.
+
+ccproxy can observe API tool blocks and the `tool_result` that Claude Code later
+sends back. It cannot see a Brave Search MCP process's own TCP connection,
+timeout, stderr, or crash because that connection runs between Claude Code and
+the MCP server. Diagnose that part with Claude Code/MCP logs separately; do not
+attach those raw logs to this bundle without reviewing them yourself.
+
+Upload uses the local OpenSSH `sftp` client. Put the development machine's port,
+key, and host-key policy in `~/.ssh/config`; this works the same way inside WSL2,
+whose SSH config is separate from Windows and must be configured in the Linux
+home directory. The remote directory must already exist and be absolute.
+
+```sshconfig
+Host ccproxy-dev
+  HostName 192.0.2.10
+  User developer
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+```sh
+# Prompts on a terminal before uploading.
+claude-code-proxy diagnostics upload /tmp/ccproxy-diagnostics.tar.gz \
+  --host ccproxy-dev \
+  --remote-dir /srv/ccproxy-diagnostics
+
+# Scripts and other non-interactive shells must opt in explicitly.
+claude-code-proxy diagnostics upload /tmp/ccproxy-diagnostics.tar.gz \
+  --host ccproxy-dev \
+  --remote-dir /srv/ccproxy-diagnostics \
+  --yes
+```
+
+Before transfer, the command validates the three members and rebuilds a fresh,
+canonical ccproxy `metadata-only` archive, so unvalidated trailing bytes or
+extra gzip data are never uploaded. It uploads to a temporary name and then
+renames it over SFTP, so an interrupted connection does not leave a
+final-looking partial file. No background or automatic upload is performed.
 
 ---
 

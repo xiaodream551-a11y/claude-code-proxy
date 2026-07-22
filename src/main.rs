@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use claude_code_proxy::{
-    config, logging,
+    config,
+    diagnostics::{
+        CollectOptions, UploadTarget, collect_bundle, inspect_bundle, upload_bundle_sftp,
+    },
+    logging,
     monitor::MonitorHandle,
     paths,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
@@ -20,6 +24,7 @@ const CODEX_XHIGH_AS_MAX_HEADER_NAME: &str = "x-ccproxy-codex-xhigh-as-max";
 const CODEX_XHIGH_AS_MAX_HEADER: &str = "x-ccproxy-codex-xhigh-as-max: 1";
 const SESSION_END_HELPER_ARG: &str = "--ccproxy-session-end-hook";
 const MAX_SESSION_END_INPUT_BYTES: u64 = 64 * 1024;
+const MAX_DIAGNOSTIC_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 const CLAUDE_PROFILE_ROOT_DIR: &str = ".claude-ccproxy";
 const CLAUDE_PROFILE_LOCK_FILE: &str = ".ccproxy-profile.lock";
 const CLAUDE_PROFILE_INITIALIZED_FILE: &str = ".ccproxy-profile-initialized";
@@ -98,6 +103,11 @@ enum Commands {
     Grok {
         #[command(subcommand)]
         command: ProviderGroup,
+    },
+    /// Collect or manually upload a metadata-only diagnostic bundle
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCommand,
     },
     /// Launch Claude Code with a model-specific proxy profile
     Claude {
@@ -203,6 +213,45 @@ enum ProviderGroup {
     Auth {
         #[command(subcommand)]
         command: claude_code_proxy::provider::AuthCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DiagnosticsCommand {
+    /// Collect sanitized proxy events into a local metadata-only archive
+    Collect {
+        /// Proxy state directory containing proxy.log and its rotations
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Destination .tar.gz path
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Include only events for this request id
+        #[arg(long)]
+        request_id: Option<String>,
+        /// Optional non-identifying label such as wsl-laptop
+        #[arg(long)]
+        machine_label: Option<String>,
+        /// Maximum number of sanitized events retained
+        #[arg(long, default_value_t = 10_000)]
+        last_lines: usize,
+    },
+    /// Upload a validated metadata-only bundle over OpenSSH SFTP
+    Upload {
+        /// Local diagnostic .tar.gz bundle
+        bundle: PathBuf,
+        /// SSH host or alias (port and key come from ~/.ssh/config)
+        #[arg(long)]
+        host: String,
+        /// Optional SSH user
+        #[arg(long)]
+        user: Option<String>,
+        /// Existing absolute directory on the development machine
+        #[arg(long)]
+        remote_dir: String,
+        /// Skip the interactive upload confirmation
+        #[arg(long, action = ArgAction::SetTrue)]
+        yes: bool,
     },
 }
 
@@ -339,8 +388,90 @@ fn run() -> Result<()> {
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
+        Commands::Diagnostics { command } => run_diagnostics(command),
         Commands::Claude { profile, args } => {
             launch_claude(profile, ClaudeLaunchStyle::Subcommand, &args)
+        }
+    }
+}
+
+fn run_diagnostics(command: DiagnosticsCommand) -> Result<()> {
+    match command {
+        DiagnosticsCommand::Collect {
+            state_dir,
+            output,
+            request_id,
+            machine_label,
+            last_lines,
+        } => {
+            let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+            let output = output.unwrap_or_else(|| {
+                state_dir.join("diagnostics").join(format!(
+                    "ccproxy-diagnostics-{}.tar.gz",
+                    uuid::Uuid::new_v4()
+                ))
+            });
+            let report = collect_bundle(&CollectOptions {
+                state_dir,
+                output,
+                max_input_bytes: MAX_DIAGNOSTIC_INPUT_BYTES,
+                max_lines: last_lines,
+                request_id,
+                machine_label,
+            })?;
+            println!("Diagnostic bundle: {}", report.bundle_path.display());
+            println!(
+                "Sanitized events: {} (skipped: {}, truncated: {})",
+                report.event_count, report.skipped_count, report.truncated
+            );
+            println!("Bundle bytes: {}", report.bundle_bytes);
+            println!("Privacy: metadata-only; no raw traffic, prompts, or tool content");
+            Ok(())
+        }
+        DiagnosticsCommand::Upload {
+            bundle,
+            host,
+            user,
+            remote_dir,
+            yes,
+        } => {
+            if !yes && !std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "refusing a non-interactive upload without --yes; inspect the bundle and retry explicitly"
+                );
+            }
+            let summary = inspect_bundle(&bundle)?;
+            let target = UploadTarget::new(host, user, remote_dir)?;
+            if !yes {
+                eprintln!(
+                    "Validated bundle {}: {} events, {} bytes, privacy={}, members=3",
+                    summary.bundle_id, summary.event_count, summary.bytes, summary.privacy_level,
+                );
+                let destination = target.user().map_or_else(
+                    || target.host().to_string(),
+                    |user| format!("{user}@{}", target.host()),
+                );
+                eprint!(
+                    "Upload canonical metadata-only bundle to {destination}:{}? [y/N] ",
+                    target.remote_dir(),
+                );
+                std::io::stderr()
+                    .flush()
+                    .context("failed to display upload confirmation")?;
+                let mut answer = String::new();
+                std::io::stdin()
+                    .read_line(&mut answer)
+                    .context("failed to read upload confirmation")?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    anyhow::bail!("diagnostic upload cancelled");
+                }
+            }
+            let report = upload_bundle_sftp(&bundle, &target)?;
+            println!(
+                "Diagnostic bundle uploaded as {} ({} bytes)",
+                report.remote_name, report.size_bytes
+            );
+            Ok(())
         }
     }
 }

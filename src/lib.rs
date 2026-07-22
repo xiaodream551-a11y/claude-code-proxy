@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod auth;
 pub mod config;
+pub mod diagnostics;
 pub mod logging;
 pub mod monitor;
 pub(crate) mod oauth_http;

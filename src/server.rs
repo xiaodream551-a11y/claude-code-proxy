@@ -871,6 +871,10 @@ async fn dispatch_request_with_id(
         }
     };
 
+    if !count_tokens {
+        log_client_tool_results(&log, &req_id, &body);
+    }
+
     if let Some(monitor) = state.monitor.as_ref()
         && let Some(project) = project::name_from_request(
             body.extra.get("system"),
@@ -1293,6 +1297,8 @@ fn monitor_response_body(
         log_context,
         status,
         sse_detector: is_event_stream.then(SseErrorDetector::default),
+        open_tool_blocks: HashMap::new(),
+        provisionally_closed_tool_blocks: HashMap::new(),
         _permits: permits,
         terminal: false,
     };
@@ -1347,13 +1353,24 @@ struct ResponseBodyLifecycle {
     log_context: ResponseLogContext,
     status: StatusCode,
     sse_detector: Option<SseErrorDetector>,
+    open_tool_blocks: HashMap<u64, ToolBlockTrace>,
+    provisionally_closed_tool_blocks: HashMap<u64, ToolBlockTrace>,
     _permits: RequestPermits,
     terminal: bool,
 }
 
 impl ResponseBodyLifecycle {
     fn detect_sse_error(&mut self, bytes: &[u8]) -> Option<String> {
-        self.sse_detector.as_mut()?.push(bytes)
+        let (error, tool_events) = {
+            let detector = self.sse_detector.as_mut()?;
+            let error = detector.push(bytes);
+            let tool_events = detector.take_tool_events();
+            (error, tool_events)
+        };
+        for event in tool_events {
+            self.observe_tool_event(event);
+        }
+        error
     }
 
     fn completed(&mut self) {
@@ -1361,6 +1378,7 @@ impl ResponseBodyLifecycle {
             return;
         }
         self.terminal = true;
+        self.interrupt_open_tools("response_eof");
         self.guard.completed(self.status);
         log_request_completed(&self.log_context, self.status);
     }
@@ -1370,8 +1388,62 @@ impl ResponseBodyLifecycle {
             return;
         }
         self.terminal = true;
+        self.interrupt_open_tools(if in_band_sse {
+            "in_band_sse_error"
+        } else {
+            "response_body_error"
+        });
         self.guard.failed(self.status, error.clone());
         log_stream_failed(&self.log_context, self.status, &error, in_band_sse);
+    }
+
+    fn observe_tool_event(&mut self, event: SseToolEvent) {
+        match event {
+            SseToolEvent::Started(tool) => {
+                if let Some(previous) = self.provisionally_closed_tool_blocks.remove(&tool.index) {
+                    log_tool_block_event(
+                        &self.log_context,
+                        "tool_block_interrupted",
+                        &previous,
+                        Some("index_reused"),
+                    );
+                }
+                if let Some(previous) = self.open_tool_blocks.insert(tool.index, tool.clone()) {
+                    log_tool_block_event(
+                        &self.log_context,
+                        "tool_block_interrupted",
+                        &previous,
+                        Some("index_reused"),
+                    );
+                }
+                log_tool_block_event(&self.log_context, "tool_block_started", &tool, None);
+            }
+            SseToolEvent::Stopped { index } => {
+                if let Some(tool) = self.open_tool_blocks.remove(&index) {
+                    self.provisionally_closed_tool_blocks.insert(index, tool);
+                }
+            }
+            SseToolEvent::MessageStopped => {
+                let completed = std::mem::take(&mut self.provisionally_closed_tool_blocks);
+                for (_, tool) in completed {
+                    log_tool_block_event(&self.log_context, "tool_block_completed", &tool, None);
+                }
+                self.interrupt_open_tools("message_stop_before_block_stop");
+            }
+        }
+    }
+
+    fn interrupt_open_tools(&mut self, reason: &'static str) {
+        let open = std::mem::take(&mut self.open_tool_blocks);
+        let provisional = std::mem::take(&mut self.provisionally_closed_tool_blocks);
+        for (_, tool) in open.into_iter().chain(provisional) {
+            log_tool_block_event(
+                &self.log_context,
+                "tool_block_interrupted",
+                &tool,
+                Some(reason),
+            );
+        }
     }
 }
 
@@ -1379,8 +1451,178 @@ impl Drop for ResponseBodyLifecycle {
     fn drop(&mut self) {
         if !self.terminal {
             self.terminal = true;
+            self.interrupt_open_tools("downstream_dropped");
             self.guard.abandoned("Downstream response body was dropped");
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolBlockTrace {
+    index: u64,
+    tool_kind: String,
+    tool_name: Option<String>,
+    call_id_hash: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SseToolEvent {
+    Started(ToolBlockTrace),
+    Stopped { index: u64 },
+    MessageStopped,
+}
+
+fn log_tool_block_event(
+    ctx: &ResponseLogContext,
+    message: &'static str,
+    tool: &ToolBlockTrace,
+    reason: Option<&'static str>,
+) {
+    let mut fields = serde_json::Map::from_iter([
+        ("reqId".to_string(), json!(ctx.req_id)),
+        ("provider".to_string(), json!(ctx.provider)),
+        ("model".to_string(), json!(ctx.model)),
+        ("index".to_string(), json!(tool.index)),
+        ("toolKind".to_string(), json!(tool.tool_kind)),
+        ("toolName".to_string(), json!(tool.tool_name)),
+        ("callIdHash".to_string(), json!(tool.call_id_hash)),
+        (
+            "elapsedMs".to_string(),
+            json!(ctx.started_at.elapsed().as_millis()),
+        ),
+    ]);
+    if let Some(reason) = reason {
+        fields.insert("interruptReason".to_string(), json!(reason));
+    }
+    ctx.log.info(message, Some(fields));
+}
+
+fn safe_tool_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(
+        value
+            .chars()
+            .take(128)
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
+    )
+}
+
+fn diagnostic_identifier_hash(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(hex::encode(Sha256::digest(value.as_bytes()))[..16].to_string())
+}
+
+#[derive(Default)]
+struct DiagnosticByteCounter(u64);
+
+impl Write for DiagnosticByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_value_size(value: &Value) -> u64 {
+    let mut counter = DiagnosticByteCounter::default();
+    if serde_json::to_writer(&mut counter, value).is_ok() {
+        counter.0
+    } else {
+        0
+    }
+}
+
+fn log_client_tool_results(
+    log: &Logger,
+    req_id: &str,
+    request: &crate::anthropic::schema::MessagesRequest,
+) {
+    let Some((message_index, message)) = request.messages.iter().enumerate().next_back() else {
+        return;
+    };
+    let Some(blocks) = message.content.as_array() else {
+        return;
+    };
+    for (block_index, block) in blocks.iter().enumerate() {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let Some(call_id_hash) = block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .and_then(diagnostic_identifier_hash)
+        else {
+            continue;
+        };
+        let content = block.get("content").unwrap_or(&Value::Null);
+        log.info(
+            "client_tool_result",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(req_id)),
+                ("messageIndex".to_string(), json!(message_index)),
+                ("blockIndex".to_string(), json!(block_index)),
+                ("callIdHash".to_string(), json!(call_id_hash)),
+                (
+                    "isError".to_string(),
+                    json!(
+                        block
+                            .get("is_error")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    ),
+                ),
+                (
+                    "contentBytes".to_string(),
+                    json!(serialized_value_size(content)),
+                ),
+            ])),
+        );
+    }
+}
+
+fn sse_tool_event(payload: &Value) -> Option<SseToolEvent> {
+    match payload.get("type").and_then(Value::as_str)? {
+        "content_block_start" => {
+            let index = payload.get("index").and_then(Value::as_u64)?;
+            let block = payload.get("content_block")?.as_object()?;
+            let tool_kind = block.get("type").and_then(Value::as_str)?;
+            if !matches!(tool_kind, "tool_use" | "server_tool_use") {
+                return None;
+            }
+            Some(SseToolEvent::Started(ToolBlockTrace {
+                index,
+                tool_kind: tool_kind.to_string(),
+                tool_name: block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .and_then(safe_tool_name),
+                call_id_hash: block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(diagnostic_identifier_hash),
+            }))
+        }
+        "content_block_stop" => Some(SseToolEvent::Stopped {
+            index: payload.get("index").and_then(Value::as_u64)?,
+        }),
+        "message_stop" => Some(SseToolEvent::MessageStopped),
+        _ => None,
     }
 }
 
@@ -1395,6 +1637,7 @@ struct SseErrorDetector {
     discard_line: bool,
     discard_event: bool,
     skip_lf: bool,
+    tool_events: Vec<SseToolEvent>,
 }
 
 impl SseErrorDetector {
@@ -1446,6 +1689,10 @@ impl SseErrorDetector {
         None
     }
 
+    fn take_tool_events(&mut self) -> Vec<SseToolEvent> {
+        std::mem::take(&mut self.tool_events)
+    }
+
     fn process_line(&mut self, line: &str) -> Option<String> {
         if line.is_empty() {
             return self.finish_event();
@@ -1487,6 +1734,9 @@ impl SseErrorDetector {
         }
 
         let payload = serde_json::from_str::<Value>(&data).ok();
+        if let Some(tool_event) = payload.as_ref().and_then(sse_tool_event) {
+            self.tool_events.push(tool_event);
+        }
         let is_error = event.as_deref() == Some("error")
             || payload
                 .as_ref()
@@ -2357,6 +2607,103 @@ mod tests {
             .expect("CR-only SSE must dispatch an error event");
 
         assert_eq!(error, "cr deadline");
+    }
+
+    #[test]
+    fn sse_tool_lifecycle_keeps_only_safe_metadata() {
+        let mut detector = SseErrorDetector::default();
+        assert!(
+            detector
+                .push(
+                    b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-secret-123\",\"name\":\"Brave Search; bad\",\"input\":{\"query\":\"CANARY_PROMPT\"}}}\n\n",
+                )
+                .is_none()
+        );
+
+        let events = detector.take_tool_events();
+        assert_eq!(events.len(), 1);
+        let SseToolEvent::Started(tool) = &events[0] else {
+            panic!("expected a tool start event");
+        };
+        assert_eq!(tool.index, 2);
+        assert_eq!(tool.tool_kind, "tool_use");
+        assert_eq!(tool.tool_name.as_deref(), Some("Brave_Search__bad"));
+        assert_eq!(tool.call_id_hash.as_deref().map(str::len), Some(16));
+        assert_ne!(tool.call_id_hash.as_deref(), Some("call-secret-123"));
+        let serialized = serde_json::to_string(&format!("{tool:?}")).unwrap();
+        assert!(!serialized.contains("CANARY_PROMPT"));
+
+        assert!(
+            detector
+                .push(
+                    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"CANARY_ARGUMENT\\\"}\"}}\n\n",
+                )
+                .is_none()
+        );
+        assert!(detector.take_tool_events().is_empty());
+
+        assert!(
+            detector
+                .push(
+                    b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+                )
+                .is_none()
+        );
+        assert_eq!(
+            detector.take_tool_events(),
+            vec![SseToolEvent::Stopped { index: 2 }]
+        );
+
+        assert!(
+            detector
+                .push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                .is_none()
+        );
+        assert_eq!(
+            detector.take_tool_events(),
+            vec![SseToolEvent::MessageStopped]
+        );
+    }
+
+    #[test]
+    fn tool_stop_is_provisional_until_a_clean_message_stop() {
+        fn lifecycle(req_id: &str) -> ResponseBodyLifecycle {
+            let monitor = started_monitor(req_id);
+            ResponseBodyLifecycle {
+                guard: request_guard(monitor, req_id),
+                log_context: response_log_context(req_id),
+                status: StatusCode::OK,
+                sse_detector: Some(SseErrorDetector::default()),
+                open_tool_blocks: HashMap::new(),
+                provisionally_closed_tool_blocks: HashMap::new(),
+                _permits: RequestPermits::default(),
+                terminal: false,
+            }
+        }
+
+        let tool = ToolBlockTrace {
+            index: 2,
+            tool_kind: "tool_use".to_string(),
+            tool_name: Some("brave_search".to_string()),
+            call_id_hash: Some("1234abcd".to_string()),
+        };
+
+        let mut failed = lifecycle("provisional-tool-failure");
+        failed.observe_tool_event(SseToolEvent::Started(tool.clone()));
+        failed.observe_tool_event(SseToolEvent::Stopped { index: 2 });
+        assert!(failed.open_tool_blocks.is_empty());
+        assert_eq!(failed.provisionally_closed_tool_blocks.get(&2), Some(&tool));
+        failed.failed("upstream closed".to_string(), true);
+        assert!(failed.provisionally_closed_tool_blocks.is_empty());
+
+        let mut completed = lifecycle("provisional-tool-success");
+        completed.observe_tool_event(SseToolEvent::Started(tool));
+        completed.observe_tool_event(SseToolEvent::Stopped { index: 2 });
+        completed.observe_tool_event(SseToolEvent::MessageStopped);
+        assert!(completed.open_tool_blocks.is_empty());
+        assert!(completed.provisionally_closed_tool_blocks.is_empty());
+        completed.completed();
     }
 
     #[test]

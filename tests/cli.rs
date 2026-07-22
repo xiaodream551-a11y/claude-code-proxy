@@ -2,6 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::env;
+use std::io::Read;
 use tempfile::TempDir;
 
 #[test]
@@ -75,6 +76,112 @@ fn help_discovers_serverless_tui_demo() -> Result<(), Box<dyn std::error::Error>
         .success()
         .stdout(contains("demo"))
         .stdout(contains("mock data and no proxy server"));
+    Ok(())
+}
+
+#[test]
+fn help_discovers_metadata_only_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
+    Command::cargo_bin("claude-code-proxy")?
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(contains("diagnostics"))
+        .stdout(contains("metadata-only"));
+
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["diagnostics", "collect", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--last-lines"))
+        .stdout(contains("--request-id"))
+        .stdout(contains("--machine-label"))
+        .stdout(contains("traffic").not());
+    Ok(())
+}
+
+#[test]
+fn diagnostics_collect_writes_only_fixed_metadata_members() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = TempDir::new()?;
+    let state_dir = temp.path().join("state");
+    std::fs::create_dir_all(&state_dir)?;
+    let output = temp.path().join("bundle.tar.gz");
+    let secret = "PROMPT_AND_TOOL_ARGUMENT_MUST_NOT_ESCAPE";
+    std::fs::write(
+        state_dir.join("proxy.log"),
+        format!(
+            concat!(
+                "{{\"t\":\"2026-07-22T10:00:00Z\",\"level\":\"info\",",
+                "\"service\":\"server\",\"msg\":\"request_completed\",",
+                "\"fields\":{{\"reqId\":\"req-safe\",\"provider\":\"codex\",",
+                "\"model\":\"gpt-5.6-sol\",\"status\":200,\"ms\":42,",
+                "\"prompt\":\"{}\"}}}}\n"
+            ),
+            secret
+        ),
+    )?;
+
+    Command::cargo_bin("claude-code-proxy")?
+        .args([
+            "diagnostics",
+            "collect",
+            "--state-dir",
+            state_dir.to_str().ok_or("non-UTF-8 state path")?,
+            "--output",
+            output.to_str().ok_or("non-UTF-8 output path")?,
+            "--request-id",
+            "req-safe",
+            "--machine-label",
+            "wsl-test",
+            "--last-lines",
+            "100",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("metadata-only"));
+
+    let archive_file = std::fs::File::open(&output)?;
+    let decoder = flate2::read::GzDecoder::new(archive_file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut members = Vec::new();
+    let mut contents = String::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        members.push(entry.path()?.to_string_lossy().into_owned());
+        entry.read_to_string(&mut contents)?;
+    }
+    members.sort();
+    assert_eq!(
+        members,
+        ["environment.json", "events.jsonl", "manifest.json"]
+    );
+    assert!(contents.contains("reqIdHash"));
+    assert!(!contents.contains("req-safe"));
+    assert!(contents.contains("wsl-test"));
+    assert!(!contents.contains(secret));
+    Ok(())
+}
+
+#[test]
+fn diagnostics_upload_requires_yes_when_non_interactive() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = TempDir::new()?;
+    let bundle = temp.path().join("bundle.tar.gz");
+    std::fs::write(&bundle, b"not inspected after confirmation guard")?;
+
+    Command::cargo_bin("claude-code-proxy")?
+        .args([
+            "diagnostics",
+            "upload",
+            bundle.to_str().ok_or("non-UTF-8 bundle path")?,
+            "--host",
+            "ccproxy-dev",
+            "--remote-dir",
+            "/srv/ccproxy-diagnostics",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("non-interactive upload without --yes"));
     Ok(())
 }
 
