@@ -9,6 +9,7 @@ use claude_code_proxy::{
     tui::{self, MonitorExit, MonitorUiConfig},
 };
 use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -19,6 +20,26 @@ const CODEX_XHIGH_AS_MAX_HEADER_NAME: &str = "x-ccproxy-codex-xhigh-as-max";
 const CODEX_XHIGH_AS_MAX_HEADER: &str = "x-ccproxy-codex-xhigh-as-max: 1";
 const SESSION_END_HELPER_ARG: &str = "--ccproxy-session-end-hook";
 const MAX_SESSION_END_INPUT_BYTES: u64 = 64 * 1024;
+const CLAUDE_PROFILE_ROOT_DIR: &str = ".claude-ccproxy";
+const CLAUDE_PROFILE_LOCK_FILE: &str = ".ccproxy-profile.lock";
+const CLAUDE_PROFILE_INITIALIZED_FILE: &str = ".ccproxy-profile-initialized";
+const CLAUDE_PROFILE_MANAGED_ENV: &str = "CCP_CLAUDE_PROFILE_MANAGED";
+const CLAUDE_SHARED_CONFIG_ENTRIES: &[&str] = &[
+    "CLAUDE.md",
+    "agents",
+    "channels",
+    "commands",
+    "hooks",
+    "keybindings.json",
+    "output-styles",
+    "plugins",
+    "rules",
+    "settings.json",
+    "settings.local.json",
+    "skills",
+    "themes",
+    "workflows",
+];
 const EXPLORE_AGENT_DESCRIPTION: &str = "Fast, focused, read-only codebase exploration and search. Use proactively to locate files, trace code paths, understand architecture, and gather evidence before implementation.";
 const EXPLORE_AGENT_PROMPT: &str = "You are a focused codebase exploration agent. Investigate the requested scope without modifying files. Prefer targeted searches and exact paths, trace the relevant control flow, and return concise findings with file and line references. Clearly separate confirmed evidence from inference.";
 const GENERAL_PURPOSE_AGENT_DESCRIPTION: &str = "General-purpose agent for complex, multi-step work that may require investigation, reasoning, implementation, and verification. Use proactively for substantial tasks that do not fit a narrower specialist.";
@@ -118,6 +139,13 @@ struct ClaudeProfileConfig {
 }
 
 impl ClaudeProfile {
+    fn storage_name(self) -> &'static str {
+        match self {
+            Self::Gpt => "gpt",
+            Self::Grok => "grok",
+        }
+    }
+
     fn config(self) -> ClaudeProfileConfig {
         match self {
             Self::Gpt => ClaudeProfileConfig {
@@ -538,11 +566,407 @@ fn claude_resume_hint(
     format!("Resume this session with: {command}")
 }
 
+fn claude_home_directory() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .context("HOME/USERPROFILE is required to isolate Claude Code profile history")?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        anyhow::bail!(
+            "HOME/USERPROFILE must be absolute to isolate Claude Code profile history: {}",
+            home.display()
+        );
+    }
+    Ok(home)
+}
+
+fn claude_profile_config_directory(home: &Path, profile: ClaudeProfile) -> PathBuf {
+    home.join(CLAUDE_PROFILE_ROOT_DIR)
+        .join(profile.storage_name())
+}
+
+fn prepare_claude_profile_config(profile: ClaudeProfile) -> Result<PathBuf> {
+    let home = claude_home_directory()?;
+    let inherited_config = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty());
+    let managed_parent =
+        std::env::var_os(CLAUDE_PROFILE_MANAGED_ENV).as_deref() == Some(std::ffi::OsStr::new("1"));
+    if let Some(inherited_config) = inherited_config {
+        let inherited_config = PathBuf::from(inherited_config);
+        let is_managed_profile = [ClaudeProfile::Gpt, ClaudeProfile::Grok]
+            .into_iter()
+            .map(|candidate| claude_profile_config_directory(&home, candidate))
+            .any(|candidate| candidate == inherited_config);
+        if !managed_parent || !is_managed_profile {
+            anyhow::bail!(
+                "CLAUDE_CONFIG_DIR={} cannot be combined with co/cg history isolation; unset it or run `claude` directly for that custom identity",
+                inherited_config.display()
+            );
+        }
+    }
+
+    let shared_directory = home.join(".claude");
+    let shared_state_file = home.join(".claude.json");
+    let profile_root = home.join(CLAUDE_PROFILE_ROOT_DIR);
+    let profile_directory = claude_profile_config_directory(&home, profile);
+
+    create_private_directory(&profile_root)?;
+    create_private_directory(&profile_directory)?;
+
+    let lock_path = profile_directory.join(CLAUDE_PROFILE_LOCK_FILE);
+    let lock = open_private_lock_file(&lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock).with_context(|| {
+        format!(
+            "failed to lock Claude Code profile directory {}",
+            profile_directory.display()
+        )
+    })?;
+
+    let result = prepare_claude_profile_config_locked(
+        &shared_directory,
+        &shared_state_file,
+        &profile_directory,
+    );
+    let unlock_result = fs2::FileExt::unlock(&lock).with_context(|| {
+        format!(
+            "failed to unlock Claude Code profile directory {}",
+            profile_directory.display()
+        )
+    });
+    result?;
+    unlock_result?;
+    Ok(profile_directory)
+}
+
+fn prepare_claude_profile_config_locked(
+    shared_directory: &Path,
+    shared_state_file: &Path,
+    profile_directory: &Path,
+) -> Result<()> {
+    validate_profile_snapshot_paths(profile_directory)?;
+    let initialized = profile_directory.join(CLAUDE_PROFILE_INITIALIZED_FILE);
+    if regular_file_exists(&initialized)? {
+        return Ok(());
+    }
+
+    for entry in CLAUDE_SHARED_CONFIG_ENTRIES {
+        let source = shared_directory.join(entry);
+        let destination = profile_directory.join(entry);
+        copy_claude_config_entry_if_present(&source, &destination)?;
+    }
+
+    if let Some(shared_state) = read_optional_json_file(shared_state_file)? {
+        seed_claude_profile_state(&shared_state, &profile_directory.join(".claude.json"))?;
+    }
+    write_private_file_if_absent(&initialized, b"v1\n")
+}
+
+fn validate_profile_snapshot_paths(profile_directory: &Path) -> Result<()> {
+    for entry in CLAUDE_SHARED_CONFIG_ENTRIES.iter().copied().chain([
+        ".claude.json",
+        "file-history",
+        "history.jsonl",
+        "jobs",
+        "plans",
+        "projects",
+        "session-env",
+        "sessions",
+        "tasks",
+    ]) {
+        let path = profile_directory.join(entry);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "isolated Claude Code profile entry must not be a symlink: {}; move it aside and retry",
+                    path.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn regular_file_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => anyhow::bail!("expected a regular file at {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "private Claude Code profile path must not be a symlink: {}",
+                path.display()
+            );
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            anyhow::bail!(
+                "private Claude Code profile path is not a directory: {}",
+                path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create private directory {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure private directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn open_private_lock_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("failed to open profile lock {}", path.display()))
+}
+
+fn read_optional_json_file(path: &Path) -> Result<Option<serde_json::Value>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    Ok(Some(value))
+}
+
+fn seed_claude_profile_state(shared_state: &serde_json::Value, destination: &Path) -> Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_file() => return Ok(()),
+        Ok(_) => anyhow::bail!(
+            "isolated Claude Code state must be a regular file: {}",
+            destination.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", destination.display()));
+        }
+    }
+
+    let mut profile_state = shared_state.clone();
+    remove_project_last_session_ids(&mut profile_state);
+    let mut bytes = serde_json::to_vec_pretty(&profile_state)
+        .context("failed to serialize the isolated Claude Code profile state")?;
+    bytes.push(b'\n');
+    write_private_file_if_absent(destination, &bytes)
+}
+
+fn remove_project_last_session_ids(value: &mut serde_json::Value) {
+    let Some(projects) = value
+        .get_mut("projects")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for project in projects.values_mut() {
+        if let Some(project) = project.as_object_mut() {
+            project.remove("lastSessionId");
+        }
+    }
+}
+
+fn write_private_file_if_absent(path: &Path, bytes: &[u8]) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => return Ok(()),
+        Ok(_) => anyhow::bail!(
+            "private file path is not a regular file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+    let temporary = private_temporary_path(path)?;
+    write_private_file(&temporary, bytes)?;
+    let linked = match fs::hard_link(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to atomically initialize Claude Code state {}",
+                path.display()
+            )
+        }),
+    };
+    let _ = fs::remove_file(&temporary);
+    linked
+}
+
+fn private_temporary_path(destination: &Path) -> Result<PathBuf> {
+    let parent = destination
+        .parent()
+        .with_context(|| format!("{} has no parent directory", destination.display()))?;
+    Ok(parent.join(format!(".ccproxy-{}.tmp", uuid::Uuid::new_v4().simple())))
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create private file {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write private file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync private file {}", path.display()))?;
+    Ok(())
+}
+
+fn copy_claude_config_entry_if_present(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = match fs::metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", source.display()));
+        }
+    };
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "private Claude Code config snapshot must not be a symlink: {}",
+                destination.display()
+            );
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", destination.display()));
+        }
+    }
+    if metadata.is_dir() {
+        let temporary = private_temporary_path(destination)?;
+        if let Err(error) = copy_claude_config_directory(source, &temporary, &mut Vec::new()) {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+        publish_config_snapshot(&temporary, destination, true)
+    } else {
+        let temporary = private_temporary_path(destination)?;
+        fs::copy(source, &temporary)
+            .with_context(|| format!("failed to copy Claude Code config {}", source.display()))?;
+        publish_config_snapshot(&temporary, destination, false)
+    }
+}
+
+fn publish_config_snapshot(temporary: &Path, destination: &Path, is_directory: bool) -> Result<()> {
+    let result = if is_directory {
+        match fs::rename(temporary, destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to publish Claude Code config snapshot {}",
+                    destination.display()
+                )
+            }),
+        }
+    } else {
+        match fs::hard_link(temporary, destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to publish Claude Code config snapshot {}",
+                    destination.display()
+                )
+            }),
+        }
+    };
+    if temporary.exists() {
+        if is_directory {
+            let _ = fs::remove_dir_all(temporary);
+        } else {
+            let _ = fs::remove_file(temporary);
+        }
+    }
+    result
+}
+
+fn copy_claude_config_directory(
+    source: &Path,
+    destination: &Path,
+    ancestors: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let canonical = fs::canonicalize(source)
+        .with_context(|| format!("failed to resolve Claude Code config {}", source.display()))?;
+    if ancestors.contains(&canonical) {
+        anyhow::bail!(
+            "Claude Code config contains a directory symlink cycle at {}",
+            source.display()
+        );
+    }
+    ancestors.push(canonical);
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", source.display()))?;
+        let child_source = entry.path();
+        let child_destination = destination.join(entry.file_name());
+        let metadata = fs::metadata(&child_source)
+            .with_context(|| format!("failed to inspect {}", child_source.display()))?;
+        if metadata.is_dir() {
+            copy_claude_config_directory(&child_source, &child_destination, ancestors)?;
+        } else {
+            fs::copy(&child_source, &child_destination).with_context(|| {
+                format!(
+                    "failed to copy Claude Code config {}",
+                    child_source.display()
+                )
+            })?;
+        }
+    }
+    ancestors.pop();
+    Ok(())
+}
+
 fn launch_claude(
     profile: ClaudeProfile,
     launch_style: ClaudeLaunchStyle,
     args: &[OsString],
 ) -> Result<()> {
+    validate_claude_profile_args(profile.config(), args)?;
+    let profile_config = prepare_claude_profile_config(profile)?;
     let loaded = config::load_config();
     let base_url = proxy_client_url(&loaded.bind_address, loaded.port);
     let capture = should_capture_session_end(
@@ -554,13 +978,20 @@ fn launch_claude(
     .then(SessionEndCapture::new)
     .transpose()?;
     let Some(capture) = capture else {
-        let command = build_claude_command(profile, args, &base_url)?;
+        let command = build_claude_command_for_profile_config(
+            profile,
+            args,
+            &base_url,
+            &profile_config,
+            None,
+        )?;
         return launch_claude_without_capture(command);
     };
 
     let executable = std::env::current_exe().context("failed to locate the ccproxy executable")?;
     let hook = Some((executable.as_path(), capture.destination()));
-    let mut command = build_claude_command_with_session_end_hook(profile, args, &base_url, hook)?;
+    let mut command =
+        build_claude_command_for_profile_config(profile, args, &base_url, &profile_config, hook)?;
     #[cfg(unix)]
     let status = wait_for_claude_with_signal_forwarding(&mut command)?;
     #[cfg(not(unix))]
@@ -685,6 +1116,7 @@ fn exit_with_child_status(status: ExitStatus) -> ! {
     }
 }
 
+#[cfg(test)]
 fn build_claude_command(
     profile: ClaudeProfile,
     args: &[OsString],
@@ -693,15 +1125,34 @@ fn build_claude_command(
     build_claude_command_with_session_end_hook(profile, args, base_url, None)
 }
 
+#[cfg(test)]
 fn build_claude_command_with_session_end_hook(
     profile: ClaudeProfile,
     args: &[OsString],
     base_url: &str,
     session_end_hook: Option<(&Path, &Path)>,
 ) -> Result<Command> {
+    let home = claude_home_directory()?;
+    let profile_config = claude_profile_config_directory(&home, profile);
+    build_claude_command_for_profile_config(
+        profile,
+        args,
+        base_url,
+        &profile_config,
+        session_end_hook,
+    )
+}
+
+fn build_claude_command_for_profile_config(
+    profile: ClaudeProfile,
+    args: &[OsString],
+    base_url: &str,
+    profile_config_directory: &Path,
+    session_end_hook: Option<(&Path, &Path)>,
+) -> Result<Command> {
     let profile = profile.config();
     validate_claude_profile_args(profile, args)?;
-    let environment = claude_profile_environment(profile, base_url);
+    let environment = claude_profile_environment(profile, base_url, profile_config_directory);
     let settings_environment = environment
         .iter()
         .map(|(name, value)| (name.to_string(), serde_json::Value::String(value.clone())))
@@ -754,9 +1205,8 @@ fn build_claude_command_with_session_end_hook(
         .arg("--settings")
         .arg(inline_settings)
         .arg("--agents")
-        .arg(inline_agents)
-        .args(args)
-        .envs(environment);
+        .arg(inline_agents);
+    command.args(args).envs(environment);
     Ok(command)
 }
 
@@ -845,8 +1295,14 @@ fn validate_profile_model(profile: ClaudeProfileConfig, model: &str, option: &st
 fn claude_profile_environment(
     profile: ClaudeProfileConfig,
     base_url: &str,
+    profile_config_directory: &Path,
 ) -> Vec<(&'static str, String)> {
     let mut environment = vec![
+        (CLAUDE_PROFILE_MANAGED_ENV, "1".to_string()),
+        (
+            "CLAUDE_CONFIG_DIR",
+            profile_config_directory.to_string_lossy().into_owned(),
+        ),
         ("ANTHROPIC_BASE_URL", base_url.to_string()),
         ("ANTHROPIC_AUTH_TOKEN", "unused".to_string()),
         ("ANTHROPIC_MODEL", profile.main_model.to_string()),
@@ -1159,6 +1615,178 @@ mod tests {
     }
 
     #[test]
+    fn claude_profiles_resolve_distinct_history_directories() {
+        let home = Path::new("/home/tester");
+
+        assert_eq!(
+            claude_profile_config_directory(home, ClaudeProfile::Gpt),
+            PathBuf::from("/home/tester/.claude-ccproxy/gpt")
+        );
+        assert_eq!(
+            claude_profile_config_directory(home, ClaudeProfile::Grok),
+            PathBuf::from("/home/tester/.claude-ccproxy/grok")
+        );
+    }
+
+    #[test]
+    fn profile_initialization_copies_config_but_not_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join(".claude");
+        let profile = temp.path().join(".claude-ccproxy/gpt");
+        fs::create_dir_all(shared.join("skills/example")).unwrap();
+        fs::create_dir_all(shared.join("projects/example")).unwrap();
+        fs::write(shared.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        fs::write(
+            shared.join("skills/example/SKILL.md"),
+            "shared skill content",
+        )
+        .unwrap();
+        fs::write(shared.join("history.jsonl"), "legacy prompt\n").unwrap();
+        fs::write(
+            shared.join("projects/example/legacy-session.jsonl"),
+            "legacy transcript\n",
+        )
+        .unwrap();
+        let shared_state_file = temp.path().join(".claude.json");
+        fs::write(
+            &shared_state_file,
+            serde_json::json!({
+                "hasCompletedOnboarding": true,
+                "mcpServers": {
+                    "brave-search": {
+                        "command": "/usr/bin/true",
+                        "env": {"lastSessionId": "mcp-value-must-survive"}
+                    }
+                },
+                "projects": {
+                    "/workspace": {
+                        "hasTrustDialogAccepted": true,
+                        "lastSessionId": "57c7c914-ada4-4f40-9672-985f950fbb66"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        create_private_directory(&profile).unwrap();
+
+        prepare_claude_profile_config_locked(&shared, &shared_state_file, &profile).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(profile.join("settings.json")).unwrap(),
+            r#"{"theme":"dark"}"#
+        );
+        assert_eq!(
+            fs::read_to_string(profile.join("skills/example/SKILL.md")).unwrap(),
+            "shared skill content"
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                !fs::symlink_metadata(profile.join("settings.json"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(
+                !fs::symlink_metadata(profile.join("skills"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        assert!(!profile.join("history.jsonl").exists());
+        assert!(!profile.join("projects").exists());
+
+        let profile_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(profile.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(profile_state["hasCompletedOnboarding"], true);
+        assert_eq!(
+            profile_state["projects"]["/workspace"]["hasTrustDialogAccepted"],
+            true
+        );
+        assert_eq!(
+            profile_state["mcpServers"]["brave-search"]["command"],
+            "/usr/bin/true"
+        );
+        assert_eq!(
+            profile_state["mcpServers"]["brave-search"]["env"]["lastSessionId"],
+            "mcp-value-must-survive"
+        );
+        assert!(
+            profile_state["projects"]["/workspace"]
+                .get("lastSessionId")
+                .is_none()
+        );
+
+        fs::write(shared.join("settings.json"), r#"{"theme":"light"}"#).unwrap();
+        fs::write(&shared_state_file, "not valid JSON").unwrap();
+        fs::write(
+            profile.join(".claude.json"),
+            r#"{"profileLocalState":"keep"}"#,
+        )
+        .unwrap();
+        fs::write(profile.join("history.jsonl"), "gpt-only prompt\n").unwrap();
+        prepare_claude_profile_config_locked(&shared, &shared_state_file, &profile).unwrap();
+        assert_eq!(
+            fs::read_to_string(profile.join(".claude.json")).unwrap(),
+            r#"{"profileLocalState":"keep"}"#
+        );
+        assert_eq!(
+            fs::read_to_string(profile.join("history.jsonl")).unwrap(),
+            "gpt-only prompt\n"
+        );
+        assert_eq!(
+            fs::read_to_string(profile.join("settings.json")).unwrap(),
+            r#"{"theme":"dark"}"#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_snapshot_dereferences_source_symlinks_and_rejects_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join(".claude");
+        let profile = temp.path().join(".claude-ccproxy/gpt");
+        let external_settings = temp.path().join("shared-settings.json");
+        fs::create_dir_all(&shared).unwrap();
+        create_private_directory(&profile).unwrap();
+        fs::write(&external_settings, r#"{"theme":"dark"}"#).unwrap();
+        symlink(&external_settings, shared.join("settings.json")).unwrap();
+
+        prepare_claude_profile_config_locked(
+            &shared,
+            &temp.path().join("missing-state.json"),
+            &profile,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(profile.join("settings.json")).unwrap(),
+            r#"{"theme":"dark"}"#
+        );
+        assert!(
+            !fs::symlink_metadata(profile.join("settings.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let other_profile = temp.path().join(".claude-ccproxy/grok");
+        create_private_directory(&other_profile).unwrap();
+        symlink(&external_settings, other_profile.join("settings.json")).unwrap();
+        let error = prepare_claude_profile_config_locked(
+            &shared,
+            &temp.path().join("missing-state.json"),
+            &other_profile,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must not be a symlink"));
+    }
+
+    #[test]
     fn normal_binary_name_does_not_select_profile_shortcut() {
         assert!(
             claude_profile_from_argv([
@@ -1425,6 +2053,15 @@ mod tests {
         assert_eq!(settings["ultracode"], true);
         assert_eq!(settings["enforceAvailableModels"], true);
         assert_eq!(settings["fallbackModel"], serde_json::json!([]));
+        assert!(
+            PathBuf::from(command_env(&command, "CLAUDE_CONFIG_DIR"))
+                .ends_with(".claude-ccproxy/gpt")
+        );
+        assert_eq!(
+            settings["env"]["CLAUDE_CONFIG_DIR"],
+            command_env(&command, "CLAUDE_CONFIG_DIR")
+        );
+        assert_eq!(command_env(&command, CLAUDE_PROFILE_MANAGED_ENV), "1");
         assert_eq!(agents["Explore"]["model"], "gpt-5.6-luna");
         assert_eq!(agents["Explore"]["effort"], "medium");
         assert_eq!(agents["Plan"]["model"], "gpt-5.6-terra");
@@ -1481,6 +2118,10 @@ mod tests {
         assert_eq!(settings["model"], "grok-4.5");
         assert_eq!(settings["effortLevel"], "high");
         assert_eq!(settings["ultracode"], false);
+        assert!(
+            PathBuf::from(command_env(&command, "CLAUDE_CONFIG_DIR"))
+                .ends_with(".claude-ccproxy/grok")
+        );
         assert_eq!(agents["Explore"]["model"], "grok-4.5-medium");
         assert_eq!(agents["Explore"]["effort"], "medium");
         assert_eq!(agents["Plan"]["model"], "grok-4.5-high");
