@@ -2854,6 +2854,7 @@ mod tests {
             },
             reasoning: None,
             schema_bridge: None,
+            hosted_web_search_max_uses: None,
         }
     }
 
@@ -5601,6 +5602,7 @@ mod tests {
             },
             reasoning: None,
             schema_bridge: None,
+            hosted_web_search_max_uses: None,
         };
         let payload = build_websocket_request(&req, None);
         assert_eq!(

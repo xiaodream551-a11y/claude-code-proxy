@@ -36,12 +36,15 @@ use self::client::{
     GrokByteStream, GrokError, GrokRequestDeadline, GrokRetryState, PreparedGrokRequest,
 };
 #[cfg(test)]
+use self::translate::accumulate::accumulate_response_with_traffic;
+#[cfg(test)]
 use self::translate::request::GrokResponsesRequest;
 use self::translate::{
-    accumulate::accumulate_response_with_traffic,
+    accumulate::accumulate_response_with_traffic_and_tool_policy,
     model_allowlist::{assert_allowed_model, resolve_model_request},
     request::{GrokReasoning, translate_request},
     stream::{SseDecoder, StreamTranslator, stream_ping},
+    tool_policy::ToolCallPolicy,
 };
 
 const GROK_DOWNSTREAM_CHANNEL_CAPACITY: usize = 3;
@@ -124,6 +127,7 @@ impl Provider for GrokProvider {
                 effort: effort.into(),
             });
         }
+        let tool_policy = ToolCallPolicy::from_request(&translated);
         let (function_tool_count, hosted_tool_count) = translated
             .tools
             .as_ref()
@@ -144,6 +148,10 @@ impl Provider for GrokProvider {
             .as_ref()
             .map(|reasoning| reasoning.effort.clone());
         let parallel_tool_calls = translated.parallel_tool_calls;
+        let tool_choice = translated
+            .tool_choice
+            .as_ref()
+            .and_then(|choice| serde_json::to_value(choice).ok());
         if let Some(monitor) = &ctx.monitor {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
             monitor.upstream_started(&ctx.req_id);
@@ -183,6 +191,7 @@ impl Provider for GrokProvider {
                     "parallelToolCalls".into(),
                     serde_json::json!(parallel_tool_calls),
                 ),
+                ("toolChoice".into(), serde_json::json!(tool_choice)),
                 (
                     "functionToolCount".into(),
                     serde_json::json!(function_tool_count),
@@ -210,7 +219,7 @@ impl Provider for GrokProvider {
                 )
                 .with_request_byte_lease(ctx.request_byte_lease.clone()),
             );
-            stream_body_with_policy(
+            stream_body_with_policies(
                 upstream.into_stream(),
                 message_id,
                 requested,
@@ -218,6 +227,7 @@ impl Provider for GrokProvider {
                 ctx.req_id.clone(),
                 ctx.traffic.clone(),
                 reconnect,
+                tool_policy,
                 deadline,
                 configured_stream_heartbeat(),
             )
@@ -232,11 +242,12 @@ impl Provider for GrokProvider {
             )
             .await
             {
-                Ok(upstream_bytes) => finish_non_streaming_message(
+                Ok(upstream_bytes) => finish_non_streaming_message_with_tool_policy(
                     &upstream_bytes,
                     &requested,
                     estimated_input_tokens,
                     &ctx,
+                    &tool_policy,
                 ),
                 Err(error) => {
                     write_error(ctx.traffic.as_deref(), "body_read", "transport");
@@ -351,17 +362,35 @@ async fn translate_request_for_provider(
     })
 }
 
+#[cfg(test)]
 fn finish_non_streaming_message(
     upstream_bytes: &[u8],
     requested: &str,
     estimated_input_tokens: u64,
     ctx: &RequestContext,
 ) -> Response {
-    match accumulate_response_with_traffic(
+    finish_non_streaming_message_with_tool_policy(
+        upstream_bytes,
+        requested,
+        estimated_input_tokens,
+        ctx,
+        &ToolCallPolicy::permissive(),
+    )
+}
+
+fn finish_non_streaming_message_with_tool_policy(
+    upstream_bytes: &[u8],
+    requested: &str,
+    estimated_input_tokens: u64,
+    ctx: &RequestContext,
+    tool_policy: &ToolCallPolicy,
+) -> Response {
+    match accumulate_response_with_traffic_and_tool_policy(
         upstream_bytes,
         &format!("msg_{}", uuid::Uuid::new_v4().simple()),
         requested,
         ctx.traffic.as_deref(),
+        tool_policy,
     ) {
         Ok(value) => {
             if let Some(traffic) = ctx.traffic.as_ref() {
@@ -524,6 +553,7 @@ fn configured_stream_heartbeat() -> Duration {
     .clamp(MIN_STREAM_HEARTBEAT, MAX_STREAM_HEARTBEAT)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn stream_body_with_policy<S>(
     upstream: S,
@@ -533,6 +563,36 @@ fn stream_body_with_policy<S>(
     req_id: String,
     traffic: Option<Arc<crate::traffic::TrafficCapture>>,
     reconnect: Option<GrokReconnectContext>,
+    deadline: GrokRequestDeadline,
+    heartbeat_interval: Duration,
+) -> Response
+where
+    S: Stream<Item = Result<Bytes, client::GrokError>> + Unpin + Send + 'static,
+{
+    stream_body_with_policies(
+        upstream,
+        message_id,
+        model,
+        monitor,
+        req_id,
+        traffic,
+        reconnect,
+        ToolCallPolicy::permissive(),
+        deadline,
+        heartbeat_interval,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_body_with_policies<S>(
+    upstream: S,
+    message_id: String,
+    model: String,
+    monitor: Option<MonitorHandle>,
+    req_id: String,
+    traffic: Option<Arc<crate::traffic::TrafficCapture>>,
+    reconnect: Option<GrokReconnectContext>,
+    tool_policy: ToolCallPolicy,
     deadline: GrokRequestDeadline,
     heartbeat_interval: Duration,
 ) -> Response
@@ -549,7 +609,8 @@ where
     let state = GrokStreamState {
         upstream: Box::pin(upstream),
         decoder: SseDecoder::default(),
-        reducer: translate::reducer::Reducer::default(),
+        reducer: translate::reducer::Reducer::with_tool_policy(tool_policy.clone()),
+        tool_policy,
         translator: StreamTranslator::new(message_id.clone(), model.clone()),
         message_id,
         model,
@@ -557,6 +618,7 @@ where
         error_sent: false,
         downstream_emitted: false,
         semantic_output_pending_enqueue: false,
+        hosted_side_effect_started: false,
         attempt_bytes: 0,
         usage: None,
         terminal_status: None,
@@ -704,10 +766,38 @@ fn send_reserved_grok_terminal(
     }
 }
 
+fn grok_event_starts_hosted_side_effect(value: &serde_json::Value) -> bool {
+    let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    match event_type {
+        "response.web_search_call.in_progress"
+        | "response.web_search_call.searching"
+        | "response.web_search_call.completed"
+        | "response.x_search_call.in_progress"
+        | "response.x_search_call.searching"
+        | "response.x_search_call.completed"
+        | "response.custom_tool_call_input.delta"
+        | "response.custom_tool_call_input.done" => true,
+        "response.output_item.added" | "response.output_item.done" => value
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "web_search_call" | "x_search_call" | "custom_tool_call"
+                )
+            }),
+        _ => false,
+    }
+}
+
 struct GrokStreamState {
     upstream: GrokByteStream,
     decoder: SseDecoder,
     reducer: translate::reducer::Reducer,
+    tool_policy: ToolCallPolicy,
     translator: StreamTranslator,
     message_id: String,
     model: String,
@@ -715,6 +805,9 @@ struct GrokStreamState {
     error_sent: bool,
     downstream_emitted: bool,
     semantic_output_pending_enqueue: bool,
+    /// Logical-request replay barrier. Unlike reducer state, this must survive any attempt reset:
+    /// observing a hosted search means a retry could repeat a real external action and its cost.
+    hosted_side_effect_started: bool,
     attempt_bytes: u64,
     usage: Option<translate::reducer::GrokUsage>,
     terminal_status: Option<translate::reducer::GrokTerminal>,
@@ -747,6 +840,21 @@ impl GrokStreamState {
         if !std::mem::take(&mut self.semantic_output_pending_enqueue) {
             return;
         }
+        if let Some(reconnect) = self.reconnect.as_mut() {
+            reconnect.replay.take();
+            reconnect.request_byte_lease.take();
+        }
+    }
+
+    fn observe_hosted_side_effects(&mut self, values: &[serde_json::Value]) {
+        if self.hosted_side_effect_started
+            || !values.iter().any(grok_event_starts_hosted_side_effect)
+        {
+            return;
+        }
+        self.hosted_side_effect_started = true;
+        // Nothing after this point may replay the model request. Release the large prepared body
+        // and its admission lease immediately instead of retaining them until stream teardown.
         if let Some(reconnect) = self.reconnect.as_mut() {
             reconnect.replay.take();
             reconnect.request_byte_lease.take();
@@ -847,6 +955,11 @@ impl GrokStreamState {
                 }
                 values.push(value);
             }
+
+            // A retryable failure in the same decoded batch rolls reducer state back. Observe the
+            // irreversible hosted boundary first so that transaction rollback can never reopen the
+            // logical request's replay window.
+            self.observe_hosted_side_effects(&values);
 
             // Validate and render the entire decoded chunk transactionally. In particular, a
             // terminal followed by text/tool/unknown data in the same chunk must not leak the
@@ -996,7 +1109,10 @@ impl GrokStreamState {
         fail_stage: &'static str,
         fail_kind: &'static str,
     ) -> Result<(), Vec<u8>> {
-        if self.downstream_emitted || !error.permits_model_replay() {
+        if self.downstream_emitted
+            || self.hosted_side_effect_started
+            || !error.permits_model_replay()
+        {
             return Err(self.fail_mapped(error, fail_stage, fail_kind));
         }
         let Some(reconnect) = self.reconnect.as_ref() else {
@@ -1105,7 +1221,7 @@ impl GrokStreamState {
     fn reset_attempt(&mut self, upstream: GrokByteStream) {
         self.upstream = upstream;
         self.decoder = SseDecoder::default();
-        self.reducer = translate::reducer::Reducer::default();
+        self.reducer = translate::reducer::Reducer::with_tool_policy(self.tool_policy.clone());
         self.translator = StreamTranslator::new(self.message_id.clone(), self.model.clone());
         self.attempt_bytes = 0;
         self.usage = None;
@@ -1513,6 +1629,46 @@ mod tests {
     }
 
     #[test]
+    fn hosted_side_effect_detection_is_conservative_and_specific() {
+        for value in [
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"web_search_call","id":"ws1"}
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{"type":"x_search_call","id":"xs1"}
+            }),
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"custom_tool_call","name":"x_search","id":"xs2"}
+            }),
+            serde_json::json!({
+                "type":"response.web_search_call.searching",
+                "item_id":"ws1"
+            }),
+            serde_json::json!({
+                "type":"response.custom_tool_call_input.delta",
+                "item_id":"xs2",
+                "delta":"{}"
+            }),
+        ] {
+            assert!(grok_event_starts_hosted_side_effect(&value), "{value}");
+        }
+
+        for value in [
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"function_call","call_id":"c1","name":"Read"}
+            }),
+            serde_json::json!({"type":"response.reasoning_text.delta","delta":"draft"}),
+            serde_json::json!({"type":"response.failed","response":{}}),
+        ] {
+            assert!(!grok_event_starts_hosted_side_effect(&value), "{value}");
+        }
+    }
+
+    #[test]
     fn base64_image_detection_finds_direct_and_nested_tool_result_images() {
         for content in [
             serde_json::json!([{
@@ -1873,6 +2029,109 @@ mod tests {
             reasoning: None,
             text: None,
         }
+    }
+
+    fn response_tool_policy(tool_choice: serde_json::Value) -> ToolCallPolicy {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user","content":"use tools"}],
+            "tools":[{"name":"Read","input_schema":{"type":"object"}}],
+            "tool_choice":tool_choice
+        }))
+        .unwrap();
+        let translated =
+            translate_request(&request, "grok-4.5".into()).expect("test request must translate");
+        ToolCallPolicy::from_request(&translated)
+    }
+
+    #[tokio::test]
+    async fn production_stream_wrapper_applies_request_tool_policy() {
+        let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"Read\"}}\n\n",
+        ))]);
+        let response = stream_body_with_policies(
+            upstream,
+            "msg_1".into(),
+            "grok-4.5".into(),
+            None,
+            "req_1".into(),
+            None,
+            None,
+            response_tool_policy(serde_json::json!({"type":"none"})),
+            GrokRequestDeadline::after(Duration::from_secs(1)),
+            Duration::from_secs(1),
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("tool_use"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn production_non_stream_wrapper_applies_request_tool_policy() {
+        let ctx = RequestContext {
+            req_id: "req_1".into(),
+            session_id: None,
+            session_seq: None,
+            provider: "grok".into(),
+            traffic: None,
+            monitor: None,
+            request_byte_lease: None,
+        };
+        let upstream = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"Read\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"arguments\":\"{}\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{}}}\n\n";
+        let response = finish_non_streaming_message_with_tool_policy(
+            upstream,
+            "grok-4.5",
+            1,
+            &ctx,
+            &response_tool_policy(serde_json::json!({"type":"none"})),
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    #[tokio::test]
+    async fn production_live_rejects_cross_kind_downstream_tool_id_collision_before_rendering() {
+        let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws1\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"srvtoolu_ws1\",\"name\":\"Read\"}}\n\n",
+        ))]);
+        let response = stream_body_with_policy(
+            upstream,
+            "msg_collision".into(),
+            "grok-4.5".into(),
+            None,
+            "req_collision".into(),
+            None,
+            None,
+            GrokRequestDeadline::after(Duration::from_secs(1)),
+            Duration::from_secs(1),
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("content_block_start"), "{body}");
+        assert!(!body.contains("server_tool_use"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn production_non_stream_rejects_cross_kind_downstream_tool_id_collision() {
+        let ctx = RequestContext {
+            req_id: "req_collision".into(),
+            session_id: None,
+            session_seq: None,
+            provider: "grok".into(),
+            traffic: None,
+            monitor: None,
+            request_byte_lease: None,
+        };
+        let upstream = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws1\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"srvtoolu_ws1\",\"name\":\"Read\"}}\n\n";
+        let response = finish_non_streaming_message(upstream, "grok-4.5", 1, &ctx);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
     }
 
     fn prepared_request(capture_body: bool) -> Arc<PreparedGrokRequest> {
@@ -2450,6 +2709,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_side_effect_releases_replay_material_before_downstream_output() {
+        let (client, _temp) = test_client(
+            "http://127.0.0.1:1/v1",
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let client = Arc::new(client);
+        let request = prepared_request(false);
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let client_weak = Arc::downgrade(&client);
+        let request_weak = Arc::downgrade(&request);
+        let retry_weak = Arc::downgrade(&retry);
+        let request_byte_budget = Arc::new(Semaphore::new(1));
+        let request_byte_lease =
+            RequestByteLease::new(request_byte_budget.clone().try_acquire_owned().unwrap(), 1);
+        let reconnect = Some(
+            GrokReconnectContext::new(client, request, None, retry, 1)
+                .with_request_byte_lease(Some(request_byte_lease)),
+        );
+
+        let (tx, rx) = mpsc::channel(1);
+        let response = stream_body_with_policy(
+            ChannelStream(rx),
+            "msg_hosted_release".into(),
+            "grok-4.5".into(),
+            None,
+            "req_hosted_release".into(),
+            None,
+            reconnect,
+            GrokRequestDeadline::after(Duration::from_secs(5)),
+            Duration::from_secs(1),
+        );
+        let body = response.into_body();
+        tx.send(Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\n",
+        )))
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while request_weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hosted boundary must release replay-only state promptly");
+        assert_eq!(client_weak.strong_count(), 0);
+        assert_eq!(request_weak.strong_count(), 0);
+        assert!(request_byte_budget.try_acquire_owned().is_ok());
+        assert!(retry_weak.upgrade().is_some());
+
+        drop(body);
+        tokio::time::timeout(Duration::from_millis(250), tx.closed())
+            .await
+            .expect("dropping downstream must cancel the upstream producer");
+    }
+
+    #[tokio::test]
     async fn dropped_downstream_body_finalizes_partial_capture() {
         let temp = TempDir::new().unwrap();
         let traffic = Arc::new(test_capture(temp.path().join("traffic")));
@@ -2896,6 +3218,77 @@ mod tests {
         assert_eq!(body.matches("event: message_start").count(), 1, "{body}");
         assert!(!body.contains("capacity exhausted"), "{body}");
         assert!(body.contains("event: message_stop"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn same_batch_hosted_side_effect_and_retryable_failure_never_rebuilds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+            else {
+                return false;
+            };
+            let _ = read_complete_http_request(&mut stream).await;
+            let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"incorrect replay\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            true
+        });
+
+        let (client, _temp) = test_client(
+            &format!("http://{addr}/v1"),
+            GrokTimeouts {
+                connect_ms: 500,
+                header_ms: 500,
+                first_byte_ms: 500,
+                body_idle_ms: 500,
+            },
+        )
+        .await;
+        let deadline = GrokRequestDeadline::after(Duration::from_secs(2));
+        let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+        let reconnect = Some(GrokReconnectContext::new(
+            Arc::new(client),
+            prepared_request(false),
+            None,
+            retry,
+            1,
+        ));
+        let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"capacity after search\"},\"retry_after\":0}}\n\n",
+        ))]);
+
+        let body = stream_body_with_policy(
+            upstream,
+            "msg_hosted_barrier".into(),
+            "grok-4.5".into(),
+            None,
+            "req_hosted_barrier".into(),
+            None,
+            reconnect,
+            deadline,
+            Duration::from_millis(20),
+        )
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+        let body = String::from_utf8_lossy(&body);
+
+        assert!(
+            !server.await.unwrap(),
+            "hosted side effect must close replay material"
+        );
+        assert!(body.contains("event: error"), "{body}");
+        assert!(body.contains("capacity after search"), "{body}");
+        assert!(!body.contains("incorrect replay"), "{body}");
     }
 
     #[tokio::test]

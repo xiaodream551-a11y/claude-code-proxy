@@ -202,6 +202,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
 
 pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> {
     let mut first_failure = None;
+    let mut hosted_side_effect_started = false;
     // Malformed protocol bytes must never become the reason to replay a model
     // request. The reducer will surface the decode failure to the caller.
     for event in parse_codex_sse_events(body).ok()? {
@@ -211,6 +212,10 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
         let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
             continue;
         };
+        if starts_hosted_side_effect(&payload) {
+            hosted_side_effect_started = true;
+            first_failure = None;
+        }
         if CodexTerminalKind::from_payload(&payload).is_some_and(|kind| {
             matches!(
                 kind,
@@ -226,12 +231,36 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
         }
         if let Some(failure) = classify_event_failure(&payload)
             && failure.retryable()
+            && !hosted_side_effect_started
             && first_failure.is_none()
         {
             first_failure = Some(failure);
         }
     }
-    first_failure
+    (!hosted_side_effect_started)
+        .then_some(first_failure)
+        .flatten()
+}
+
+/// Once Codex exposes a hosted search lifecycle event, replaying the logical
+/// request may repeat an external search even when no Anthropic bytes were
+/// emitted yet. Keep this separate from downstream stream commitment.
+pub(crate) fn starts_hosted_side_effect(payload: &Value) -> bool {
+    match payload.get("type").and_then(Value::as_str) {
+        Some(
+            "response.web_search_call.in_progress"
+            | "response.web_search_call.searching"
+            | "response.web_search_call.completed",
+        ) => true,
+        Some("response.output_item.added" | "response.output_item.done") => {
+            payload
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+                == Some("web_search_call")
+        }
+        _ => false,
+    }
 }
 
 /// Strict Codex SSE parsing with the protocol's one allowed stream-start BOM.
@@ -451,6 +480,20 @@ mod tests {
             first_retryable_failure(body).map(|failure| failure.status),
             Some(429)
         );
+    }
+
+    #[test]
+    fn hosted_side_effect_blocks_buffered_model_replay() {
+        for hosted in [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1"}}"#,
+            r#"{"type":"response.web_search_call.searching","output_index":0}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1"}}"#,
+        ] {
+            let body = format!(
+                "data: {hosted}\n\ndata: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"status\":503,\"message\":\"busy\"}}}}}}\n\n"
+            );
+            assert!(first_retryable_failure(body.as_bytes()).is_none());
+        }
     }
 
     #[test]

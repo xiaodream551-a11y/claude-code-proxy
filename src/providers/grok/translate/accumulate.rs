@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
-use super::reducer::{GrokUsage, ReducerEvent, parse_function_arguments, reduce_upstream_bytes};
+use super::reducer::{
+    GrokUsage, ReducerEvent, parse_function_arguments, reduce_upstream_bytes_with_tool_policy,
+};
 use super::stream::anthropic_usage;
+use super::tool_policy::ToolCallPolicy;
 use crate::traffic::TrafficCapture;
 use serde_json::Value;
 
@@ -18,6 +21,22 @@ pub fn accumulate_response_with_traffic(
     message_id: &str,
     model: &str,
     traffic: Option<&TrafficCapture>,
+) -> anyhow::Result<Value> {
+    accumulate_response_with_traffic_and_tool_policy(
+        upstream,
+        message_id,
+        model,
+        traffic,
+        &ToolCallPolicy::permissive(),
+    )
+}
+
+pub(crate) fn accumulate_response_with_traffic_and_tool_policy(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+    tool_policy: &ToolCallPolicy,
 ) -> anyhow::Result<Value> {
     let mut capture = traffic.map(TrafficCapture::stream_capture);
     let mut decoder = super::stream::SseDecoder::default();
@@ -53,7 +72,7 @@ pub fn accumulate_response_with_traffic(
     let mut output = 0;
     let mut reported_usage: Option<GrokUsage> = None;
     let mut web_search_requests = 0;
-    let reduced = match reduce_upstream_bytes(upstream) {
+    let reduced = match reduce_upstream_bytes_with_tool_policy(upstream, tool_policy) {
         Ok(events) => events,
         Err(error) => {
             let usage = error.usage().cloned();
@@ -211,6 +230,31 @@ fn finish_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_tool_policy(tool_choice: serde_json::Value) -> ToolCallPolicy {
+        let request: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"user","content":"use tools"}],
+                "tools":[{"name":"Read","input_schema":{"type":"object"}}],
+                "tool_choice":tool_choice
+            }))
+            .unwrap();
+        let translated = super::super::request::translate_request(&request, "grok-4.5".into())
+            .expect("test request must translate");
+        ToolCallPolicy::from_request(&translated)
+    }
+
+    #[test]
+    fn accumulate_rejects_a_function_forbidden_by_the_request_policy() {
+        let policy = response_tool_policy(serde_json::json!({"type":"none"}));
+        let upstream = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"Read\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"arguments\":\"{}\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{}}}\n\n";
+        let error = accumulate_response_with_traffic_and_tool_policy(
+            upstream, "msg_1", "grok-4.5", None, &policy,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tool_choice forbids"), "{error}");
+    }
 
     fn streaming_final_usage(upstream: &[u8]) -> Value {
         let bytes =

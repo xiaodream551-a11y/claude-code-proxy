@@ -450,10 +450,13 @@ profile marker does not promote compaction to `max`. An explicit global
 Claude Code's hosted `web_search_20250305` tool is translated to Codex's native
 Responses `web_search` tool with live external web access and non-empty native
 domain filters. Forced searches use Codex's required `allowed_tools` form so
-structured filters remain active. Codex does not expose a hosted-search limit,
-so the Claude tool's `max_uses` value is not enforced. Codex hosted search calls
-are emitted back to Claude Code as Anthropic `server_tool_use` and
-`web_search_tool_result` blocks with
+structured filters remain active. Codex does not expose a wire-level
+hosted-search limit, so the proxy supplies best-effort model guidance and also
+enforces the Claude tool's `max_uses` while accepting the response. An upstream
+search beyond the limit makes the response fail closed before that call is
+emitted, but this cannot undo provider-side work already performed. Codex
+hosted search calls are emitted back to Claude Code as Anthropic
+`server_tool_use` and `web_search_tool_result` blocks with
 `usage.server_tool_use.web_search_requests` so Claude Code can account for
 completed searches.
 
@@ -539,12 +542,20 @@ POST outcome ambiguous and therefore terminate without replaying the model
 request.
 Claude Code reasoning effort is forwarded as Responses `reasoning.effort` for
 Grok 4.5; `xhigh`, `max`, and `ultra` are capped at Grok's supported `high`
-level.
-Claude Code's `WebSearch` uses Grok's hosted general web search. Requests to
-search X use Grok's hosted `x_search` tool, with citations and search usage
-reported in Claude Code. Function tools explicitly enable parallel calls unless
-Claude disables them; Web/X search intent keeps the other Read, Bash, MCP, and
-function tools available so independent work can be emitted in the same turn.
+level. Composer has no reliable request-level effort mapping, so a request that
+supplies `output_config.effort` for `grok-composer-2.5-fast` is rejected before
+dispatch instead of silently dropping the control.
+An explicit Anthropic `web_search_...` tool uses Grok's hosted general web
+search, and explicit `type: "x_search"` maps to hosted X search. A tool named
+`WebSearch` or `XSearch` with no `type`, or with `type: "function"`, remains a
+client function with its schema intact. Because hosted `x_search` has no
+observable Anthropic tool block, it cannot be forced or satisfy a required
+X-only response; those cases fail closed instead of returning an empty
+successful turn. Hosted `max_uses` is enforced while accepting the response;
+as with Codex, this cannot undo provider-side work already performed. Function
+tools explicitly enable parallel calls unless Claude disables them; Web/X
+search intent keeps the other Read, Bash, MCP, and function tools available so
+independent work can be emitted in the same turn.
 
 Authentication uses browser OAuth with S256 PKCE through `auth.x.ai` and an
 ephemeral loopback callback. Headless hosts can use the OAuth device-code flow
@@ -978,8 +989,8 @@ Windows, and at
 | `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`; `ultra` is sent as wire-level `max`)                                  |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
 | `CCP_CODEX_SERVICE_TIER`         | `codex.serviceTier`        | unset                                             | Force all Codex requests to this service tier (`fast`/`priority`, `flex`; `fast` is sent upstream as `priority`)                                                                  |
-| `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it                     |
-| `CCP_CODEX_PARALLEL_TOOLS`       | `codex.parallelTools`      | `false`                                           | While Responses Lite is enabled, opt eligible GPT-5.6 Sol/Terra requests with at least two ordinary function tools into the full Responses shape; Luna and internal or constrained requests stay on Lite |
+| `CCP_CODEX_RESPONSES_LITE`       | `codex.responsesLite`      | `true`                                            | Use the official GPT-5.6 Responses Lite request shape; set `false` to use the full Responses shape and permit parallel tool calls when the account supports it; Luna is Lite-only and is rejected rather than silently changed to another model |
+| `CCP_CODEX_PARALLEL_TOOLS`       | `codex.parallelTools`      | `false`                                           | While Responses Lite is enabled, opt eligible GPT-5.6 Sol/Terra requests with at least one directly callable function tool into the full Responses shape, including repeated calls to one tool and named tool choices; Luna and internal or constrained requests stay on Lite |
 | `CCP_CODEX_BASE_URL`             | `codex.baseUrl`            | `https://chatgpt.com/backend-api/codex/responses` | Override the Codex Responses endpoint                                                                                                                                             |
 | `CCP_CODEX_TRANSPORT`            | `codex.transport`          | `auto` (resolves to `http` when a system proxy intercepts the upstream) | Codex transport: live `websocket`, incremental HTTP SSE with `http`, or WebSocket-first fallback plus an origin-wide breaker in `auto`                                         |
 | `CCP_CODEX_CONNECT_TIMEOUT_MS`   | `codex.connectTimeoutMs`   | `15000`                                           | Maximum time to establish the Codex HTTP TCP/TLS connection, including an HTTP fallback selected by `auto`                                                                       |
@@ -1053,6 +1064,10 @@ plus explicit upstream retry responses 429/500/502/503/504/529, can consume the
 current request's retry budget. A timeout or reset after an HTTP POST or
 WebSocket request frame may mean the model already ran, so it is never replayed,
 even when no Anthropic semantic output was emitted.
+An upstream hosted-search added, in-progress, searching, completed, or done
+event is also a replay barrier: after observing one, Codex will not retry,
+reconnect, or switch transports even if no Anthropic content block has yet been
+emitted.
 Both Codex live transports emit a standard Anthropic `ping` after 5 seconds
 without visible output, including while waiting for the first generation event.
 HTTP SSE is decoded incrementally, so cancellation closes the upstream socket
@@ -1149,7 +1164,9 @@ stream. This protocol check never deduplicates answer text or emoji. The
 four-attempt wire cap applies to model `/responses` requests, while any authentication retry
 consumes a transient slot and therefore reduces the remaining model retries. If
 a Grok stream fails after any Anthropic text or tool event has been sent, the
-proxy returns a stream error without replaying the request. Grok has no
+proxy returns a stream error without replaying the request. Starting a hosted
+web or X search closes the same replay window before downstream semantic output,
+so reconnect cannot repeat the external search. Grok has no
 `previous_response_id` continuation and never silently falls back to another
 provider. The configurable total budget is capped at 24 hours; values at or above
 the caller's own timeout lose the useful guarantee that the proxy fails first.
@@ -1501,12 +1518,15 @@ within the active profile family.
 - **Codex — Responses Lite parallel tools:** GPT-5.6 Lite models follow the native
   Codex behavior and disable parallel tool emission. Existing parallel tool history
   still replays correctly. Set `codex.parallelTools` to `true` to move only eligible
-  GPT-5.6 Sol/Terra requests with at least two ordinary function tools to the full
-  Responses shape. Compaction, structured-output, single-tool, parallel-disabled,
-  and Luna requests remain on Lite. Set `codex.responsesLite` to `false` to retain
-  the existing behavior of forcing the full Responses shape for all GPT-5.6
-  requests. Full-lane GPT-5.6 availability is account-dependent, so restore the
-  default if the upstream reports model not found.
+  GPT-5.6 Sol/Terra requests with at least one directly callable function tool to
+  the full Responses shape. This includes independent repeated calls to the same
+  tool and named tool choices. Compaction, structured-output, tool-choice-none,
+  parallel-disabled, function-tool-free, and Luna requests remain on Lite. Set
+  `codex.responsesLite` to `false` to force the full Responses shape for GPT-5.6
+  requests. Luna is Lite-only, so a Luna or Haiku request that requires the full
+  lane is rejected locally with an actionable error rather than being silently
+  changed to Sol. Other full-lane GPT-5.6 availability is account-dependent, so
+  restore the default if the upstream reports model not found.
 - **Codex — HTTP transport:** live requests are translated incrementally and
   support prompt cancellation. Non-streaming Anthropic requests still accumulate
   the upstream SSE response before returning one JSON document.
@@ -1533,6 +1553,18 @@ within the active profile family.
 - **Codex — strict function tools:** an explicit `strict: true` tool whose input
   schema cannot be represented without weakening the contract returns HTTP 400
   before model dispatch instead of silently becoming non-strict.
+- **Codex — response tool policy:** live and buffered responses reject undeclared
+  function or hosted calls, calls forbidden by `tool_choice`, and successful
+  terminals that omit a required or named tool. They also reject a second tool
+  call when parallel use is disabled and hosted calls beyond `max_uses`.
+  Hosted-search IDs must be non-empty and are mapped without collisions across
+  function and hosted blocks; live mixed hosted/function content keeps monotonic
+  block indexes. Incomplete and failed terminals keep their upstream failure
+  semantics without flushing never-emitted deferred tool blocks.
+- **Grok — response tool policy:** the same allowlist, `tool_choice`, required
+  terminal, serial-call, and per-kind hosted `max_uses` limits are enforced after
+  translation, including tools removed by deferred-loading or direct-caller
+  rules. Function and hosted calls share one downstream tool-use ID namespace.
 - **GPT/Grok — request controls:** unknown fields, malformed compatibility
   metadata, fixed thinking budgets, disabled reasoning, sampling controls, and
   non-empty stop sequences fail before dispatch. Claude Code's current adaptive

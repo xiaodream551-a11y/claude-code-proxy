@@ -21,7 +21,7 @@ use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
 use super::schema_bridge::SchemaBridge;
 
-const PARALLEL_TOOL_GUIDANCE: &str = "When multiple independent function tools are needed, call them together in one response. Serialize only calls that have data dependencies.";
+const PARALLEL_TOOL_GUIDANCE: &str = "Emit independent function calls together in one response, including multiple independent calls to the same tool. Parallelize read-only operations when they have no data dependencies; serialize dependent calls and calls with overlapping side effects.";
 const MAX_CODEX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CODEX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
 const MAX_CODEX_IMAGE_DECODE_BYTES: usize = 64 * 1024 * 1024;
@@ -118,6 +118,11 @@ pub struct ResponsesRequest {
     /// Codex wire boundary; only `text.format.schema` is serialized upstream.
     #[serde(skip)]
     pub(crate) schema_bridge: Option<Arc<SchemaBridge>>,
+    /// Anthropic's hosted-search budget has no Codex wire equivalent. Retain
+    /// the effective request-local limit so response validation can enforce it
+    /// before accepting an upstream hosted call.
+    #[serde(skip)]
+    pub(crate) hosted_web_search_max_uses: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,23 +391,67 @@ fn resolve_service_tier(
     }
 }
 
-/// Hosted tools (web_search) are rejected by the Responses Lite lane, which
-/// only supports function and custom tools. Requests carrying them must use
-/// the full Responses API.
+/// Hosted tools (web_search) are rejected by the Responses Lite lane. Count
+/// only tools that this turn actually exposes: eager, loaded deferred, or
+/// explicitly forced tools.
 pub fn has_hosted_web_search(req: &MessagesRequest) -> bool {
+    has_effective_direct_tool(req, is_supported_web_search_type)
+}
+
+/// Whether this turn exposes at least one function tool that the model may
+/// call directly. Deferred tools count only after a validated history has
+/// loaded them, or when the request explicitly forces that tool.
+pub(in crate::providers::codex) fn has_parallel_callable_function(req: &MessagesRequest) -> bool {
+    if !parallel_tool_calls_enabled(req) {
+        return false;
+    }
+
+    has_effective_direct_tool(req, |tool_type| !is_supported_web_search_type(tool_type))
+}
+
+fn has_effective_direct_tool(req: &MessagesRequest, accepts_type: impl Fn(&str) -> bool) -> bool {
+    let forced_name = forced_tool_name(req);
+    let loaded_deferred = loaded_deferred_tool_names(req);
     req.extra
         .get("tools")
-        .and_then(|v| v.as_array())
+        .and_then(Value::as_array)
         .is_some_and(|tools| {
             tools.iter().any(|tool| {
-                tool.get("type")
+                let tool_type = tool
+                    .get("type")
                     .and_then(Value::as_str)
-                    .is_some_and(|tool_type| {
-                        is_supported_web_search_type(tool_type)
-                            && tool_allows_direct_calls(tool, tool_type)
-                    })
+                    .unwrap_or("function");
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    return false;
+                };
+                if name.is_empty()
+                    || !accepts_type(tool_type)
+                    || !tool_allows_direct_calls(tool, tool_type)
+                {
+                    return false;
+                }
+
+                let deferred = tool
+                    .get("defer_loading")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                !deferred || forced_name == Some(name) || loaded_deferred.contains(name)
             })
         })
+}
+
+fn loaded_deferred_tool_names(req: &MessagesRequest) -> HashSet<&str> {
+    req.messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|block| block.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_reference"))
+        .filter_map(|block| block.get("tool_name").and_then(Value::as_str))
+        .collect()
 }
 
 fn is_supported_web_search_type(tool_type: &str) -> bool {
@@ -433,6 +482,17 @@ pub fn translate_request_with_overrides(
     let tool_plan = read_tools(req)?;
     let input = build_input(req, &tool_plan.deferred);
     validate_effective_tool_choice(req, &tool_plan, &input)?;
+    let parallel_function_available = tool_plan.initial.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| matches!(tool, ResponsesTool::Function(_)))
+    }) || input.iter().any(|item| {
+        matches!(
+            item,
+            ResponsesInputItem::AdditionalTools { tools, .. }
+                if tools.iter().any(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        )
+    });
     let hosted_web_search_available = tool_plan.initial.as_ref().is_some_and(|tools| {
         tools
             .iter()
@@ -444,7 +504,10 @@ pub fn translate_request_with_overrides(
                 if tools.iter().any(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search"))
         )
     });
-    if hosted_web_search_available {
+    let hosted_web_search_max_uses = hosted_web_search_available
+        .then(|| effective_web_search_max_uses(req))
+        .flatten();
+    if hosted_web_search_available && hosted_tool_guidance_allowed(req) {
         append_web_search_request_guidance(req, &mut instructions);
     }
     let tools = tool_plan.initial;
@@ -475,6 +538,7 @@ pub fn translate_request_with_overrides(
         prompt_cache_key: None,
         reasoning: None,
         schema_bridge,
+        hosted_web_search_max_uses,
     };
 
     if opts.use_responses_lite {
@@ -510,19 +574,18 @@ pub fn translate_request_with_overrides(
             prefix.extend(out.input);
             out.input = prefix;
         }
-    } else if let Some(tools) = tools
-        && !tools.is_empty()
-    {
+    } else {
         if out.parallel_tool_calls
-            && tools
-                .iter()
-                .filter(|tool| matches!(tool, ResponsesTool::Function(_)))
-                .count()
-                >= 2
+            && parallel_function_available
+            && function_tool_guidance_allowed(req)
         {
             append_instruction(&mut out.instructions, PARALLEL_TOOL_GUIDANCE);
         }
-        out.tools = Some(tools);
+        if let Some(tools) = tools
+            && !tools.is_empty()
+        {
+            out.tools = Some(tools);
+        }
     }
 
     if hosted_web_search_available && let Some(include) = &mut out.include {
@@ -602,11 +665,23 @@ fn append_web_search_request_guidance(req: &MessagesRequest, instructions: &mut 
     let Some(tools) = req.extra.get("tools").and_then(Value::as_array) else {
         return;
     };
+    let forced_name = forced_tool_name(req);
+    let loaded_deferred = loaded_deferred_tool_names(req);
     for tool in tools {
         let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
             continue;
         };
         if !is_supported_web_search_type(tool_type) || !tool_allows_direct_calls(tool, tool_type) {
+            continue;
+        }
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let deferred = tool
+            .get("defer_loading")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if deferred && forced_name != Some(name) && !loaded_deferred.contains(name) {
             continue;
         }
         if let Some(max_uses) = tool.get("max_uses").and_then(Value::as_u64) {
@@ -625,6 +700,40 @@ fn append_web_search_request_guidance(req: &MessagesRequest, instructions: &mut 
         // hosted-tool callers here, while direct calls are always returned in
         // full, so both `full` and `excluded` safely map to direct full output.
     }
+}
+
+fn effective_web_search_max_uses(req: &MessagesRequest) -> Option<u64> {
+    if !hosted_tool_guidance_allowed(req) {
+        return None;
+    }
+    let forced_name = forced_tool_name(req);
+    let loaded_deferred = loaded_deferred_tool_names(req);
+    req.extra
+        .get("tools")
+        .and_then(Value::as_array)
+        .and_then(|tools| {
+            tools.iter().find(|tool| {
+                let tool_type = tool
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("function");
+                let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                    return false;
+                };
+                if !is_supported_web_search_type(tool_type)
+                    || !tool_allows_direct_calls(tool, tool_type)
+                {
+                    return false;
+                }
+                let deferred = tool
+                    .get("defer_loading")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                !deferred || forced_name == Some(name) || loaded_deferred.contains(name)
+            })
+        })
+        .and_then(|tool| tool.get("max_uses"))
+        .and_then(Value::as_u64)
 }
 
 fn read_output_format(
@@ -1784,6 +1893,38 @@ fn forced_tool_name(req: &MessagesRequest) -> Option<&str> {
         .flatten()
 }
 
+fn tool_choice_forbids_tools(req: &MessagesRequest) -> bool {
+    match req.extra.get("tool_choice") {
+        Some(Value::String(mode)) => mode == "none",
+        Some(Value::Object(choice)) => choice.get("type").and_then(Value::as_str) == Some("none"),
+        _ => false,
+    }
+}
+
+fn forced_tool_type(req: &MessagesRequest) -> Option<&str> {
+    let forced = forced_tool_name(req)?;
+    req.extra
+        .get("tools")?
+        .as_array()?
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(forced))
+        .map(|tool| {
+            tool.get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("function")
+        })
+}
+
+fn hosted_tool_guidance_allowed(req: &MessagesRequest) -> bool {
+    !tool_choice_forbids_tools(req)
+        && forced_tool_type(req).is_none_or(is_supported_web_search_type)
+}
+
+fn function_tool_guidance_allowed(req: &MessagesRequest) -> bool {
+    !tool_choice_forbids_tools(req)
+        && forced_tool_type(req).is_none_or(|tool_type| !is_supported_web_search_type(tool_type))
+}
+
 fn tool_allows_direct_calls(tool: &Value, tool_type: &str) -> bool {
     let direct_by_default = !matches!(tool_type, "web_search_20260209" | "web_search_20260318");
     match tool.get("allowed_callers") {
@@ -1958,12 +2099,17 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
 }
 
 fn parallel_tool_calls_enabled(req: &MessagesRequest) -> bool {
-    !req.extra
-        .get("tool_choice")
-        .and_then(Value::as_object)
-        .and_then(|choice| choice.get("disable_parallel_tool_use"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    match req.extra.get("tool_choice") {
+        Some(Value::String(mode)) => mode != "none",
+        Some(Value::Object(choice)) => {
+            choice.get("type").and_then(Value::as_str) != Some("none")
+                && !choice
+                    .get("disable_parallel_tool_use")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }
+        _ => true,
+    }
 }
 
 enum CodexInputBlock {
@@ -2585,6 +2731,14 @@ mod tests {
             }
             let req: MessagesRequest = serde_json::from_value(body).unwrap();
             let out = translate_request(&req, opts()).unwrap();
+            assert_eq!(out.hosted_web_search_max_uses, Some(3));
+            assert!(
+                !serde_json::to_value(&out)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .contains_key("hosted_web_search_max_uses")
+            );
             let ResponsesTool::WebSearch(tool) = &out.tools.as_ref().unwrap()[0] else {
                 panic!("expected hosted web search for {version}");
             };
@@ -2839,6 +2993,10 @@ mod tests {
             let out = translate_request(&req, opts()).unwrap();
             let value = serde_json::to_value(out).unwrap();
             assert_eq!(value["tool_choice"], expected);
+            assert_eq!(
+                value["parallel_tool_calls"],
+                Value::Bool(anthropic != "none")
+            );
         }
     }
 
@@ -2857,15 +3015,12 @@ mod tests {
     }
 
     #[test]
-    fn full_lane_guides_independent_parallel_function_calls() {
+    fn full_lane_guides_single_tool_parallel_function_calls() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
             "system": "Follow repository rules.",
             "messages": [{"role":"user", "content":"inspect both"}],
-            "tools": [
-                {"name":"read_first", "input_schema":{"type":"object"}},
-                {"name":"read_second", "input_schema":{"type":"object"}}
-            ]
+            "tools": [{"name":"Read", "input_schema":{"type":"object"}}]
         }))
         .unwrap();
 
@@ -2873,7 +3028,83 @@ mod tests {
         assert!(out.parallel_tool_calls);
         let instructions = out.instructions.unwrap();
         assert!(instructions.starts_with("Follow repository rules."));
-        assert!(instructions.contains("call them together in one response"));
+        assert!(instructions.contains("multiple independent calls to the same tool"));
+        assert!(instructions.contains("overlapping side effects"));
+    }
+
+    #[test]
+    fn forced_function_keeps_same_tool_parallel_guidance_unless_disabled() {
+        for (disabled, expect_parallel) in [(false, true), (true, false)] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.5",
+                "messages": [{"role":"user", "content":"read both"}],
+                "tools": [{"name":"Read", "input_schema":{"type":"object"}}],
+                "tool_choice": {
+                    "type":"tool",
+                    "name":"Read",
+                    "disable_parallel_tool_use":disabled
+                }
+            }))
+            .unwrap();
+
+            let out = translate_request(&req, opts()).unwrap();
+            assert_eq!(out.parallel_tool_calls, expect_parallel);
+            assert_eq!(out.instructions.is_some(), expect_parallel);
+        }
+    }
+
+    #[test]
+    fn tool_choice_none_suppresses_parallel_guidance() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "system": "Answer directly.",
+            "messages": [{"role":"user", "content":"do not use tools"}],
+            "tools": [{"name":"Read", "input_schema":{"type":"object"}}],
+            "tool_choice": {"type":"none"}
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(!out.parallel_tool_calls);
+        assert_eq!(out.instructions.as_deref(), Some("Answer directly."));
+    }
+
+    #[test]
+    fn generated_tool_guidance_is_scoped_to_the_forced_choice() {
+        for (choice, expect_parallel, expect_hosted) in [
+            (json!({"type":"none"}), false, false),
+            (json!({"type":"tool", "name":"web_search"}), false, true),
+            (json!({"type":"tool", "name":"Read"}), true, false),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.5",
+                "system":"Follow repository rules.",
+                "messages":[{"role":"user", "content":"inspect"}],
+                "tools":[
+                    {"name":"Read", "input_schema":{"type":"object"}},
+                    {
+                        "type":"web_search_20250305",
+                        "name":"web_search",
+                        "max_uses":2
+                    }
+                ],
+                "tool_choice":choice
+            }))
+            .unwrap();
+
+            let out = translate_request(&req, opts()).unwrap();
+            let instructions = out.instructions.as_deref().unwrap();
+            assert_eq!(
+                instructions.contains("multiple independent calls to the same tool"),
+                expect_parallel,
+                "{instructions}"
+            );
+            assert_eq!(
+                instructions.contains("Best-effort compatibility limit"),
+                expect_hosted,
+                "{instructions}"
+            );
+        }
     }
 
     #[test]
@@ -2949,6 +3180,52 @@ mod tests {
         }))
         .unwrap();
         assert!(!has_hosted_web_search(&without));
+    }
+
+    #[test]
+    fn deferred_hosted_web_search_is_effective_only_when_forced_or_loaded() {
+        let tools = json!([
+            {"name":"ToolSearch", "input_schema":{"type":"object"}},
+            {
+                "type":"web_search_20260318",
+                "name":"web_search",
+                "defer_loading":true,
+                "allowed_callers":["direct"]
+            }
+        ]);
+        let unreferenced: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"find it"}],
+            "tools":tools
+        }))
+        .unwrap();
+        assert!(!has_hosted_web_search(&unreferenced));
+
+        let forced: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"find it"}],
+            "tools":tools,
+            "tool_choice":{"type":"tool", "name":"web_search"}
+        }))
+        .unwrap();
+        assert!(has_hosted_web_search(&forced));
+
+        let loaded: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[{
+                    "type":"tool_use", "id":"search_1", "name":"ToolSearch", "input":{}
+                }]},
+                {"role":"user", "content":[{
+                    "type":"tool_result", "tool_use_id":"search_1", "content":[{
+                        "type":"tool_reference", "tool_name":"web_search"
+                    }]
+                }]}
+            ],
+            "tools":tools
+        }))
+        .unwrap();
+        assert!(has_hosted_web_search(&loaded));
     }
 
     #[test]

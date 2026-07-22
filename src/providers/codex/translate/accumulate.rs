@@ -3,10 +3,11 @@ use serde_json::Value;
 use crate::traffic::TrafficCapture;
 
 use super::reducer::{
-    AnthropicUsage, ReducerEvent, STOP_END_TURN, UpstreamStreamError, map_codex_usage_to_anthropic,
-    reduce_upstream_bytes,
+    AnthropicUsage, FinishMetadata, ReducerEvent, STOP_END_TURN, UpstreamStreamError,
+    map_codex_usage_to_anthropic, reduce_upstream_bytes_with_tool_policy,
 };
 use super::schema_bridge::SchemaBridge;
+use super::tool_policy::ToolCallPolicy;
 use super::web_search_compat::{WebSearchCompatContent, build_web_search_compat_blocks};
 
 pub fn accumulate_response(
@@ -33,7 +34,44 @@ pub(crate) fn accumulate_response_with_traffic_and_schema(
     traffic: Option<&TrafficCapture>,
     schema_bridge: Option<&SchemaBridge>,
 ) -> Result<Value, anyhow::Error> {
-    let events = match reduce_upstream_bytes(upstream) {
+    accumulate_response_with_traffic_schema_and_tool_policy(
+        upstream,
+        message_id,
+        model,
+        traffic,
+        schema_bridge,
+        &ToolCallPolicy::permissive(),
+    )
+}
+
+pub(crate) fn accumulate_response_with_traffic_schema_and_tool_policy(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+    schema_bridge: Option<&SchemaBridge>,
+    tool_policy: &ToolCallPolicy,
+) -> Result<Value, anyhow::Error> {
+    accumulate_response_with_traffic_schema_tool_policy_and_metadata(
+        upstream,
+        message_id,
+        model,
+        traffic,
+        schema_bridge,
+        tool_policy,
+    )
+    .map(|(response, _)| response)
+}
+
+pub(crate) fn accumulate_response_with_traffic_schema_tool_policy_and_metadata(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+    schema_bridge: Option<&SchemaBridge>,
+    tool_policy: &ToolCallPolicy,
+) -> Result<(Value, Option<FinishMetadata>), anyhow::Error> {
+    let mut events = match reduce_upstream_bytes_with_tool_policy(upstream, tool_policy) {
         Ok(events) => events,
         Err(err) => {
             write_reducer_error_capture(traffic, &err);
@@ -48,6 +86,7 @@ pub(crate) fn accumulate_response_with_traffic_and_schema(
     let mut blocks: Vec<AccumulatedBlock> = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut usage: Option<AnthropicUsage> = None;
+    let mut finish_metadata: Option<FinishMetadata> = None;
     let mut web_search_events: Vec<ReducerEvent> = Vec::new();
     let mut deferred_text_parts: Vec<String> = Vec::new();
 
@@ -71,7 +110,7 @@ pub(crate) fn accumulate_response_with_traffic_and_schema(
         kind: BlockKind,
     }
 
-    for event in &events {
+    for event in &mut events {
         match event {
             ReducerEvent::WebSearch { .. } => {
                 web_search_events.push(event.clone());
@@ -137,13 +176,21 @@ pub(crate) fn accumulate_response_with_traffic_and_schema(
             }
             ReducerEvent::Finish {
                 stop_reason: sr,
+                continuation_eligible,
                 usage: u,
                 web_search_requests,
+                response_id,
+                output_items,
                 ..
             } => {
                 stop_reason = Some(sr.to_string());
                 let ws = Some(*web_search_requests).filter(|n| *n > 0);
                 usage = Some(map_codex_usage_to_anthropic(u, ws));
+                finish_metadata = Some(FinishMetadata {
+                    continuation_eligible: *continuation_eligible,
+                    response_id: response_id.take(),
+                    output_items: std::mem::take(output_items),
+                });
             }
             _ => {}
         }
@@ -302,7 +349,7 @@ pub(crate) fn accumulate_response_with_traffic_and_schema(
         "usage": usage.unwrap_or_default(),
     });
 
-    Ok(response)
+    Ok((response, finish_metadata))
 }
 
 fn write_reducer_error_capture(traffic: Option<&TrafficCapture>, err: &UpstreamStreamError) {
@@ -416,6 +463,26 @@ mod tests {
         assert_eq!(response["content"][0]["type"], "text");
         assert_eq!(response["content"][0]["text"], "Hello world");
         assert_eq!(response["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn accumulator_returns_finish_metadata_from_the_same_reduction() {
+        let upstream = completed_text_response("Hello world");
+        let (response, finish) = accumulate_response_with_traffic_schema_tool_policy_and_metadata(
+            upstream.as_bytes(),
+            "msg_1",
+            "gpt-5.6-sol",
+            None,
+            None,
+            &ToolCallPolicy::permissive(),
+        )
+        .unwrap();
+
+        assert_eq!(response["content"][0]["text"], "Hello world");
+        let finish = finish.expect("completed response should carry finish metadata");
+        assert!(finish.continuation_eligible);
+        assert_eq!(finish.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(finish.output_items.len(), 1);
     }
 
     #[test]

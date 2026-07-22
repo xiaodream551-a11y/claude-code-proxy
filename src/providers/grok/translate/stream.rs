@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::reducer::{GrokUsage, Reducer, ReducerEvent};
+use super::tool_policy::ToolCallPolicy;
 use crate::anthropic::sse::{SseEvent, encode_sse_event};
 
 pub const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
@@ -111,9 +112,17 @@ pub struct LiveStreamTranslator {
 
 impl LiveStreamTranslator {
     pub fn new(message_id: String, model: String) -> Self {
+        Self::with_tool_policy(message_id, model, ToolCallPolicy::permissive())
+    }
+
+    pub(crate) fn with_tool_policy(
+        message_id: String,
+        model: String,
+        tool_policy: ToolCallPolicy,
+    ) -> Self {
         Self {
             decoder: SseDecoder::default(),
-            reducer: Reducer::default(),
+            reducer: Reducer::with_tool_policy(tool_policy),
             renderer: StreamTranslator::new(message_id, model),
         }
     }
@@ -235,8 +244,22 @@ pub fn translate_stream_bytes(
     message_id: &str,
     model: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    translate_stream_bytes_with_tool_policy(
+        upstream,
+        message_id,
+        model,
+        &ToolCallPolicy::permissive(),
+    )
+}
+
+pub(crate) fn translate_stream_bytes_with_tool_policy(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    tool_policy: &ToolCallPolicy,
+) -> anyhow::Result<Vec<u8>> {
     let mut decoder = SseDecoder::default();
-    let mut reducer = Reducer::default();
+    let mut reducer = Reducer::with_tool_policy(tool_policy.clone());
     let mut translator = StreamTranslator::new(message_id.into(), model.into());
     let values = decoder
         .push(upstream)?
@@ -417,6 +440,56 @@ pub(super) fn anthropic_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_tool_policy(
+        tools: serde_json::Value,
+        tool_choice: serde_json::Value,
+    ) -> ToolCallPolicy {
+        let request: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"user","content":"use tools"}],
+                "tools":tools,
+                "tool_choice":tool_choice
+            }))
+            .unwrap();
+        let translated = super::super::request::translate_request(&request, "grok-4.5".into())
+            .expect("test request must translate");
+        ToolCallPolicy::from_request(&translated)
+    }
+
+    #[test]
+    fn live_stream_rejects_a_tool_forbidden_by_the_request_policy_before_rendering() {
+        let policy = response_tool_policy(
+            serde_json::json!([{"name":"Read","input_schema":{"type":"object"}}]),
+            serde_json::json!({"type":"none"}),
+        );
+        let mut live =
+            LiveStreamTranslator::with_tool_policy("msg_1".into(), "grok-4.5".into(), policy);
+        let error = live
+            .push(b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"Read\"}}\n\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("tool_choice forbids"), "{error}");
+    }
+
+    #[test]
+    fn buffered_stream_rejects_success_without_a_required_tool() {
+        let policy = response_tool_policy(
+            serde_json::json!([{"name":"Read","input_schema":{"type":"object"}}]),
+            serde_json::json!({"type":"any"}),
+        );
+        let error = translate_stream_bytes_with_tool_policy(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{}}}\n\n",
+            "msg_1",
+            "grok-4.5",
+            &policy,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("required by tool_choice"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn decoder_accepts_every_boundary_and_line_ending() {

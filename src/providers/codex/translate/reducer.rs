@@ -6,7 +6,8 @@ use super::super::events::validate_terminal_snapshot_status;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
-use super::web_search_compat::WebSearchResult;
+use super::tool_policy::ToolCallPolicy;
+use super::web_search_compat::{WebSearchResult, server_tool_use_id_from_codex_web_search_id};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutputItemKind {
@@ -73,7 +74,11 @@ pub(super) fn parse_output_item_added(
     let kind = OutputItemKind::from_str(raw_kind).ok_or_else(|| {
         format!("unsupported Codex output item type {raw_kind:?} at output_index {output_index}")
     })?;
-    let item_id = optional_non_empty_string(item, "id", "output item id")?;
+    let item_id = if kind == OutputItemKind::WebSearchCall {
+        Some(required_non_empty_string(item, "id", "web search item id")?)
+    } else {
+        optional_non_empty_string(item, "id", "output item id")?
+    };
     let (call_id, name) = if kind == OutputItemKind::FunctionCall {
         (
             Some(required_non_empty_string(
@@ -217,6 +222,48 @@ pub(super) fn unfinished_output_indices(
         .collect();
     unfinished.sort_unstable();
     unfinished
+}
+
+pub(super) fn completed_tool_counts(
+    identities: &std::collections::HashMap<usize, OutputItemIdentity>,
+    completed: &std::collections::HashSet<usize>,
+) -> (usize, usize) {
+    identities
+        .iter()
+        .filter(|(output_index, _)| completed.contains(output_index))
+        .fold(
+            (0, 0),
+            |(function_calls, hosted_calls), (_, identity)| match identity.kind {
+                OutputItemKind::FunctionCall => (function_calls + 1, hosted_calls),
+                OutputItemKind::WebSearchCall => (function_calls, hosted_calls + 1),
+                OutputItemKind::Reasoning | OutputItemKind::Message => {
+                    (function_calls, hosted_calls)
+                }
+            },
+        )
+}
+
+pub(super) fn registered_tool_count(
+    identities: &std::collections::HashMap<usize, OutputItemIdentity>,
+) -> usize {
+    identities
+        .values()
+        .filter(|identity| {
+            matches!(
+                identity.kind,
+                OutputItemKind::FunctionCall | OutputItemKind::WebSearchCall
+            )
+        })
+        .count()
+}
+
+pub(super) fn registered_hosted_tool_count(
+    identities: &std::collections::HashMap<usize, OutputItemIdentity>,
+) -> usize {
+    identities
+        .values()
+        .filter(|identity| identity.kind == OutputItemKind::WebSearchCall)
+        .count()
 }
 
 pub(super) fn validate_output_item_done<'a>(
@@ -594,7 +641,14 @@ fn emit_signature_only_reasoning(
 pub fn finish_metadata_from_upstream(
     input: &[u8],
 ) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
-    let events = reduce_upstream_bytes(input)?;
+    finish_metadata_from_upstream_with_tool_policy(input, &ToolCallPolicy::permissive())
+}
+
+pub(crate) fn finish_metadata_from_upstream_with_tool_policy(
+    input: &[u8],
+    tool_policy: &ToolCallPolicy,
+) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
+    let events = reduce_upstream_bytes_with_tool_policy(input, tool_policy)?;
     Ok(events.into_iter().rev().find_map(|event| match event {
         ReducerEvent::Finish {
             continuation_eligible,
@@ -611,6 +665,13 @@ pub fn finish_metadata_from_upstream(
 }
 
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+    reduce_upstream_bytes_with_tool_policy(input, &ToolCallPolicy::permissive())
+}
+
+pub(crate) fn reduce_upstream_bytes_with_tool_policy(
+    input: &[u8],
+    tool_policy: &ToolCallPolicy,
+) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
     let sse_events = super::super::events::parse_codex_sse_events(input).map_err(|message| {
         UpstreamStreamError {
             kind: UpstreamErrorKind::Failed,
@@ -629,6 +690,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         std::collections::HashMap::new();
     let mut call_id_to_output_index: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut downstream_tool_ids = std::collections::HashSet::new();
     let mut output_identities: std::collections::HashMap<usize, OutputItemIdentity> =
         std::collections::HashMap::new();
     let mut completed_output_indices = std::collections::HashSet::new();
@@ -645,6 +707,8 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let mut rewrote_output_items = false;
     let mut web_search_requests = 0usize;
     let mut web_search_output_indices = std::collections::HashSet::new();
+    let mut web_search_anthropic_indices: std::collections::HashMap<usize, (usize, usize)> =
+        std::collections::HashMap::new();
     let mut _saw_terminal = false;
     let mut event_count = 0usize;
     let mut last_event_type: Option<String> = None;
@@ -809,7 +873,46 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         if t == "response.output_item.added" {
             let (output_index, item, identity) =
                 parse_output_item_added(&p).map_err(protocol_error)?;
+            if identity.kind == OutputItemKind::FunctionCall {
+                tool_policy
+                    .validate_function_name(
+                        identity.name.as_deref().expect("validated function name"),
+                    )
+                    .map_err(protocol_error)?;
+            } else if identity.kind == OutputItemKind::WebSearchCall {
+                tool_policy
+                    .validate_hosted_call(registered_hosted_tool_count(&output_identities))
+                    .map_err(protocol_error)?;
+            }
+            if matches!(
+                identity.kind,
+                OutputItemKind::FunctionCall | OutputItemKind::WebSearchCall
+            ) {
+                tool_policy
+                    .validate_next_tool_call(registered_tool_count(&output_identities))
+                    .map_err(protocol_error)?;
+            }
             let item_type = identity.kind;
+            let downstream_tool_id = match identity.kind {
+                OutputItemKind::FunctionCall => identity.call_id.clone(),
+                OutputItemKind::WebSearchCall => Some(
+                    server_tool_use_id_from_codex_web_search_id(
+                        identity
+                            .item_id
+                            .as_deref()
+                            .expect("validated web search item id"),
+                    )
+                    .map_err(protocol_error)?,
+                ),
+                OutputItemKind::Reasoning | OutputItemKind::Message => None,
+            };
+            if let Some(id) = downstream_tool_id.as_deref()
+                && downstream_tool_ids.contains(id)
+            {
+                return Err(protocol_error(format!(
+                    "Codex produced duplicate downstream tool use id {id:?}"
+                )));
+            }
             register_output_item(
                 output_index,
                 identity,
@@ -818,6 +921,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 &mut call_id_to_output_index,
             )
             .map_err(protocol_error)?;
+            if let Some(id) = downstream_tool_id {
+                downstream_tool_ids.insert(id);
+            }
 
             if item_type == OutputItemKind::Reasoning {
                 reasoning_by_output_index
@@ -827,6 +933,11 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 continue;
             }
             if item_type == OutputItemKind::WebSearchCall {
+                let index = anthropic_index;
+                anthropic_index += 1;
+                let result_index = anthropic_index;
+                anthropic_index += 1;
+                web_search_anthropic_indices.insert(output_index, (index, result_index));
                 out.push(ReducerEvent::Progress);
                 continue;
             }
@@ -1224,13 +1335,21 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         "duplicate web search completion at output_index {output_index}"
                     )));
                 }
-                let idx = anthropic_index;
-                anthropic_index += 1;
-                let result_index = anthropic_index;
-                anthropic_index += 1;
+                let (idx, result_index) = web_search_anthropic_indices
+                    .remove(&output_index)
+                    .ok_or_else(|| {
+                        protocol_error(format!(
+                            "{t} references missing web search indices at output_index {output_index}"
+                        ))
+                    })?;
                 web_search_requests += 1;
-                let id_val = item_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let id = server_tool_use_id_from_codex_web_search_id(id_val);
+                let id = server_tool_use_id_from_codex_web_search_id(
+                    identity
+                        .item_id
+                        .as_deref()
+                        .expect("validated web search item id"),
+                )
+                .map_err(protocol_error)?;
                 let query = web_search_query(item_val);
                 let sources = web_search_sources(item_val);
                 out.push(ReducerEvent::WebSearch {
@@ -1326,6 +1445,15 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     "{t} arrived with unfinished Codex output items at output_index(es) {unfinished:?}"
                 )));
             }
+            let terminal_stop_reason = stop_reason_for_incomplete_response(&p, &t);
+            if (t == "response.completed" || t == "response.done") && terminal_stop_reason.is_none()
+            {
+                let (completed_function_calls, completed_hosted_calls) =
+                    completed_tool_counts(&output_identities, &completed_output_indices);
+                tool_policy
+                    .validate_success_terminal(completed_function_calls, completed_hosted_calls)
+                    .map_err(protocol_error)?;
+            }
             _saw_terminal = true;
             terminal_type = Some(t.clone());
             response_id = p
@@ -1334,7 +1462,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             final_usage = p.get("response").map(parse_codex_usage);
-            incomplete_stop_reason = stop_reason_for_incomplete_response(&p, &t);
+            incomplete_stop_reason = terminal_stop_reason;
             continuation_eligible = (t == "response.completed" || t == "response.done")
                 && incomplete_stop_reason.is_none();
             continue;
@@ -1729,20 +1857,6 @@ fn web_search_sources(item: &serde_json::Value) -> Vec<WebSearchResult> {
     results
 }
 
-fn server_tool_use_id_from_codex_web_search_id(id: &str) -> String {
-    let suffix: String = id
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("srvtoolu_{suffix}")
-}
-
 fn upstream_failure_kind(payload: &serde_json::Value, message: &str) -> UpstreamErrorKind {
     let status = payload
         .get("status")
@@ -1871,6 +1985,7 @@ pub struct WebSearchUsage {
 
 #[cfg(test)]
 mod tests {
+    use super::super::request::{ResponsesRequest, ResponsesToolChoice, ResponsesToolChoiceMode};
     use super::*;
     use serde_json::json;
 
@@ -1878,6 +1993,209 @@ mod tests {
         let mut obj = payload.as_object().cloned().unwrap_or_default();
         obj.insert("type".into(), json!(type_name));
         format!("data: {}\n\n", serde_json::to_string(&obj).unwrap())
+    }
+
+    fn response_tool_policy(
+        function_names: &[&str],
+        hosted_web_search: bool,
+        tool_choice: ResponsesToolChoice,
+    ) -> ToolCallPolicy {
+        response_tool_policy_with_parallel(function_names, hosted_web_search, tool_choice, true)
+    }
+
+    fn response_tool_policy_with_parallel(
+        function_names: &[&str],
+        hosted_web_search: bool,
+        tool_choice: ResponsesToolChoice,
+        parallel_tool_calls: bool,
+    ) -> ToolCallPolicy {
+        let mut tools: Vec<serde_json::Value> = function_names
+            .iter()
+            .map(|name| {
+                json!({
+                    "type": "function",
+                    "name": name,
+                    "parameters": {"type": "object"},
+                    "strict": false
+                })
+            })
+            .collect();
+        if hosted_web_search {
+            tools.push(json!({
+                "type": "web_search",
+                "external_web_access": true,
+                "search_content_types": ["text"]
+            }));
+        }
+        let mut request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": [],
+            "tools": tools,
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": parallel_tool_calls,
+            "text": {}
+        }))
+        .unwrap();
+        request.tool_choice = Some(tool_choice);
+        ToolCallPolicy::from_request(&request)
+    }
+
+    #[test]
+    fn buffered_tool_policy_matches_live_fail_closed_behavior() {
+        let hosted = sse(
+            "response.output_item.added",
+            json!({
+                "output_index": 0,
+                "item": {"type": "web_search_call", "id": "search_1"}
+            }),
+        );
+        let none = response_tool_policy(
+            &[],
+            true,
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None),
+        );
+        let error = reduce_upstream_bytes_with_tool_policy(hosted.as_bytes(), &none).unwrap_err();
+        assert!(error.message.contains("tool_choice forbids"));
+
+        let required = response_tool_policy(
+            &["Read"],
+            false,
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required),
+        );
+        let terminal = sse(
+            "response.completed",
+            json!({
+                "response": {
+                    "id": "resp_empty",
+                    "status": "completed",
+                    "incomplete_details": null,
+                    "usage": {}
+                }
+            }),
+        );
+        let error =
+            reduce_upstream_bytes_with_tool_policy(terminal.as_bytes(), &required).unwrap_err();
+        assert!(error.message.contains("required by tool_choice"));
+    }
+
+    #[test]
+    fn buffered_tool_policy_allows_declared_parallel_calls() {
+        let upstream = format!(
+            "{}{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 3,
+                    "item": {"type": "function_call", "call_id": "call_read", "name": "Read"}
+                })
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 7,
+                    "item": {"type": "function_call", "call_id": "call_bash", "name": "Bash"}
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index": 7,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_bash",
+                        "name": "Bash",
+                        "arguments": "{\"command\":\"pwd\"}"
+                    }
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index": 3,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_read",
+                        "name": "Read",
+                        "arguments": "{\"file_path\":\"/tmp/a\"}"
+                    }
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "response": {
+                        "id": "resp_parallel",
+                        "status": "completed",
+                        "incomplete_details": null,
+                        "usage": {}
+                    }
+                })
+            )
+        );
+        let policy = response_tool_policy(
+            &["Read", "Bash"],
+            false,
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
+        );
+        let events = reduce_upstream_bytes_with_tool_policy(upstream.as_bytes(), &policy).unwrap();
+        let tool_starts = events
+            .iter()
+            .filter(|event| matches!(event, ReducerEvent::ToolStart { .. }))
+            .count();
+        assert_eq!(tool_starts, 2);
+        assert!(matches!(
+            events.last(),
+            Some(ReducerEvent::Finish {
+                stop_reason: STOP_TOOL_USE,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn buffered_tool_policy_rejects_multiple_calls_when_parallel_is_disabled() {
+        let policy = response_tool_policy_with_parallel(
+            &["Read"],
+            true,
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
+            false,
+        );
+        for second in [
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":1,
+                    "item":{"type":"function_call", "call_id":"call_2", "name":"Read"}
+                }),
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":1,
+                    "item":{"type":"web_search_call", "id":"search_1"}
+                }),
+            ),
+        ] {
+            let upstream = format!(
+                "{}{}",
+                sse(
+                    "response.output_item.added",
+                    json!({
+                        "output_index":0,
+                        "item":{"type":"function_call", "call_id":"call_1", "name":"Read"}
+                    }),
+                ),
+                second
+            );
+            let error =
+                reduce_upstream_bytes_with_tool_policy(upstream.as_bytes(), &policy).unwrap_err();
+            assert!(
+                error.message.contains("parallel_tool_calls is false"),
+                "{}",
+                error.message
+            );
+        }
     }
 
     #[test]
@@ -2597,6 +2915,74 @@ mod tests {
         } else {
             panic!("expected Finish");
         }
+    }
+
+    #[test]
+    fn buffered_web_search_ids_are_required_and_cross_tool_unique() {
+        let missing = sse(
+            "response.output_item.added",
+            json!({"output_index":0,"item":{"type":"web_search_call"}}),
+        );
+        let error = reduce_upstream_bytes(missing.as_bytes()).unwrap_err();
+        assert!(error.message.contains("web search item id"));
+
+        let collision = [
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1"}
+                }),
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":1,
+                    "item":{"type":"function_call","call_id":"srvtoolu_ws_1","name":"Read"}
+                }),
+            ),
+        ]
+        .concat();
+        let error = reduce_upstream_bytes(collision.as_bytes()).unwrap_err();
+        assert!(error.message.contains("duplicate downstream tool use id"));
+    }
+
+    #[test]
+    fn buffered_hosted_max_uses_rejects_the_next_call() {
+        let mut request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "input":[],
+            "tools":[{"type":"web_search","external_web_access":true,"search_content_types":["text"]}],
+            "tool_choice":"auto",
+            "store":false,
+            "stream":true,
+            "parallel_tool_calls":true,
+            "text":{}
+        }))
+        .unwrap();
+        request.hosted_web_search_max_uses = Some(1);
+        let policy = ToolCallPolicy::from_request(&request);
+        let upstream = [
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1"}
+                }),
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":1,
+                    "item":{"type":"web_search_call","id":"ws_2"}
+                }),
+            ),
+        ]
+        .concat();
+
+        let error =
+            reduce_upstream_bytes_with_tool_policy(upstream.as_bytes(), &policy).unwrap_err();
+        assert!(error.message.contains("max_uses"));
     }
 
     #[test]

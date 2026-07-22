@@ -4,8 +4,10 @@ use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
 
 use super::reducer::{
-    ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic, reduce_upstream_bytes,
+    ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic,
+    reduce_upstream_bytes_with_tool_policy,
 };
+use super::tool_policy::ToolCallPolicy;
 use super::web_search_compat::build_web_search_compat_blocks;
 
 #[allow(dead_code)]
@@ -246,6 +248,22 @@ fn is_content_event(event: &ReducerEvent) -> bool {
     )
 }
 
+fn content_event_index(event: &ReducerEvent) -> Option<usize> {
+    match event {
+        ReducerEvent::ThinkingStart { index }
+        | ReducerEvent::ThinkingDelta { index, .. }
+        | ReducerEvent::ThinkingSignature { index, .. }
+        | ReducerEvent::ThinkingStop { index }
+        | ReducerEvent::TextStart { index }
+        | ReducerEvent::TextDelta { index, .. }
+        | ReducerEvent::TextStop { index }
+        | ReducerEvent::ToolStart { index, .. }
+        | ReducerEvent::ToolDelta { index, .. }
+        | ReducerEvent::ToolStop { index } => Some(*index),
+        _ => None,
+    }
+}
+
 pub fn translate_stream_bytes(
     upstream: &[u8],
     message_id: &str,
@@ -260,7 +278,23 @@ pub fn translate_stream_bytes_with_traffic(
     model: &str,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let events = match reduce_upstream_bytes(upstream) {
+    translate_stream_bytes_with_traffic_and_tool_policy(
+        upstream,
+        message_id,
+        model,
+        traffic,
+        &ToolCallPolicy::permissive(),
+    )
+}
+
+pub(crate) fn translate_stream_bytes_with_traffic_and_tool_policy(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+    tool_policy: &ToolCallPolicy,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let events = match reduce_upstream_bytes_with_tool_policy(upstream, tool_policy) {
         Ok(events) => events,
         Err(err) => {
             write_reducer_error_capture(traffic, &err);
@@ -275,15 +309,30 @@ pub fn translate_stream_bytes_with_traffic(
     let mut out = Vec::new();
     let mut message_started = false;
     let mut open_blocks: BTreeMap<usize, OpenBlock> = BTreeMap::new();
-    let mut web_search_events: Vec<ReducerEvent> = Vec::new();
+    let mut web_search_events: Vec<ReducerEvent> = events
+        .iter()
+        .filter(|event| matches!(event, ReducerEvent::WebSearch { .. }))
+        .cloned()
+        .collect();
+    web_search_events.sort_by_key(|event| match event {
+        ReducerEvent::WebSearch { index, .. } => *index,
+        _ => unreachable!("filtered to web search events"),
+    });
+    let first_web_search_index = web_search_events.first().and_then(|event| match event {
+        ReducerEvent::WebSearch { index, .. } => Some(*index),
+        _ => None,
+    });
     let mut deferred_content_events: Vec<ReducerEvent> = Vec::new();
 
     for event in &events {
         if matches!(event, ReducerEvent::WebSearch { .. }) {
-            web_search_events.push(event.clone());
             continue;
         }
-        if !web_search_events.is_empty() && is_content_event(event) {
+        if is_content_event(event)
+            && first_web_search_index.is_some_and(|first_index| {
+                content_event_index(event).is_some_and(|index| index >= first_index)
+            })
+        {
             deferred_content_events.push(event.clone());
             continue;
         }
@@ -308,6 +357,9 @@ pub fn translate_stream_bytes_with_traffic(
                 web_search_requests,
                 ..
             } => {
+                deferred_content_events.sort_by_key(|event| {
+                    content_event_index(event).expect("deferred event is a content event")
+                });
                 // Emit web search compat blocks
                 if !web_search_events.is_empty() {
                     let text_from_deferred: String = deferred_content_events

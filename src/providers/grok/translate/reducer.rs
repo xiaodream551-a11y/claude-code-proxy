@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use super::stream::SseDecoder;
 use crate::providers::translate_shared::{JsonObjectError, parse_json_object};
 
+use super::tool_policy::ToolCallPolicy;
+
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_INCOMPLETE_TOOL_CALLS: usize = 128;
 const MAX_TOTAL_TOOL_ITEMS: usize = 256;
@@ -303,13 +305,14 @@ impl std::error::Error for GrokUpstreamFailure {}
 
 #[derive(Clone, Default)]
 pub struct Reducer {
+    tool_policy: ToolCallPolicy,
     sequence: SequenceState,
     next_index: usize,
     active: Option<(String, usize)>,
     active_text: String,
-    /// Text closed specifically by a function call before `response.output_text.done`, kept
-    /// for one exact late-snapshot reconciliation.
-    pending_function_text: Option<String>,
+    /// Text closed by a tool boundary before `response.output_text.done`, kept for one exact
+    /// late-snapshot reconciliation.
+    pending_tool_boundary_text: Option<String>,
     saw_text_output: bool,
     calls: HashMap<String, ActiveFunctionCall>,
     item_calls: HashMap<String, String>,
@@ -320,6 +323,7 @@ pub struct Reducer {
     completed_hosted_inputs: HashSet<String>,
     completed_hosted_calls: HashMap<String, CompletedHostedCall>,
     tool_item_ids: HashSet<String>,
+    downstream_tool_use_ids: HashSet<String>,
     total_tool_items: usize,
     pending_citations: Vec<Value>,
     web_search_requests: u64,
@@ -389,6 +393,13 @@ enum HostedPhase {
 }
 
 impl Reducer {
+    pub(crate) fn with_tool_policy(tool_policy: ToolCallPolicy) -> Self {
+        Self {
+            tool_policy,
+            ..Self::default()
+        }
+    }
+
     pub fn push(&mut self, value: Value) -> anyhow::Result<Vec<ReducerEvent>> {
         let typ = value
             .get("type")
@@ -508,6 +519,10 @@ impl Reducer {
                         let id =
                             optional_non_empty_identity(item.get("id"), "hosted tool call id")?
                                 .ok_or_else(|| anyhow::anyhow!("hosted tool call lacks id"))?;
+                        let downstream_id = hosted_downstream_tool_use_id(id);
+                        if self.downstream_tool_use_ids.contains(&downstream_id) {
+                            anyhow::bail!("duplicate downstream Anthropic tool-use id");
+                        }
                         if self.hosted_calls.contains_key(id)
                             || self.completed_hosted_calls.contains_key(id)
                         {
@@ -523,6 +538,21 @@ impl Reducer {
                             anyhow::bail!("too many incomplete hosted tool calls");
                         }
                         let (item_kind, search_kind) = hosted_search_identity(item, item_type)?;
+                        let prior_kind_calls = self
+                            .hosted_calls
+                            .values()
+                            .filter(|call| call.search_kind == search_kind)
+                            .count()
+                            + self
+                                .completed_hosted_calls
+                                .values()
+                                .filter(|call| call.search_kind == search_kind)
+                                .count();
+                        self.tool_policy.validate_hosted_call(
+                            search_kind.name(),
+                            self.total_tool_items,
+                            prior_kind_calls,
+                        )?;
                         self.hosted_calls.insert(
                             id.into(),
                             ActiveHostedCall {
@@ -532,6 +562,7 @@ impl Reducer {
                                 input: String::new(),
                             },
                         );
+                        self.downstream_tool_use_ids.insert(downstream_id);
                         self.tool_item_ids.insert(id.into());
                         self.total_tool_items += 1;
                         Ok(vec![])
@@ -547,6 +578,11 @@ impl Reducer {
                             .and_then(Value::as_str)
                             .filter(|v| !v.is_empty())
                             .ok_or_else(|| anyhow::anyhow!("function call name is invalid"))?;
+                        if self.downstream_tool_use_ids.contains(id) {
+                            anyhow::bail!("duplicate downstream Anthropic tool-use id");
+                        }
+                        self.tool_policy
+                            .validate_function_call(name, self.total_tool_items)?;
                         if self.calls.contains_key(id) || self.completed_calls.contains_key(id) {
                             anyhow::bail!("duplicate function call id");
                         }
@@ -565,9 +601,10 @@ impl Reducer {
                         {
                             anyhow::bail!("duplicate output tool item id");
                         }
-                        let mut out = self.close_active_for_function_call()?;
+                        let mut out = self.close_active_for_tool_boundary()?;
                         let index = self.next_index;
                         self.next_index += 1;
+                        self.downstream_tool_use_ids.insert(id.into());
                         self.calls.insert(
                             id.into(),
                             ActiveFunctionCall {
@@ -655,9 +692,9 @@ impl Reducer {
                     .transpose()?
                     .unwrap_or_default();
                 out.extend(self.close_kind("text")?);
-                // A done event consumes any snapshot retained when a function call closed the
+                // A done event consumes any snapshot retained when a tool boundary closed the
                 // text early. Do not let a duplicate done event reopen the text.
-                self.pending_function_text = None;
+                self.pending_tool_boundary_text = None;
                 Ok(out)
             }
             "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
@@ -772,13 +809,38 @@ impl Reducer {
                     anyhow::bail!("hosted tool call is incomplete");
                 }
                 let snapshot_text = self.validate_terminal_snapshot(response)?;
+                if typ == "response.completed" {
+                    let completed_visible_hosted_calls = self
+                        .completed_hosted_calls
+                        .values()
+                        .filter(|call| call.search_kind == HostedSearchKind::Web)
+                        .count();
+                    let completed_hidden_x_calls = self
+                        .completed_hosted_calls
+                        .values()
+                        .filter(|call| call.search_kind == HostedSearchKind::X)
+                        .count();
+                    let has_observable_output = self.saw_text_output
+                        || !snapshot_text.is_empty()
+                        || !self.completed_calls.is_empty()
+                        || completed_visible_hosted_calls > 0;
+                    if completed_hidden_x_calls > 0 && !has_observable_output {
+                        anyhow::bail!(
+                            "Grok completed with only an unobservable hosted x_search call"
+                        );
+                    }
+                    self.tool_policy.validate_success_terminal(
+                        self.completed_calls.len(),
+                        completed_visible_hosted_calls,
+                    )?;
+                }
                 let fallback_text = if self.saw_text_output {
                     Vec::new()
                 } else {
                     snapshot_text
                 };
                 let mut out = self.close_active()?;
-                self.pending_function_text = None;
+                self.pending_tool_boundary_text = None;
                 for text in fallback_text {
                     out.extend(self.delta("text", &text)?);
                     out.extend(self.close_kind("text")?);
@@ -1070,7 +1132,7 @@ impl Reducer {
             anyhow::bail!("completed hosted search is out of order");
         }
         let query = hosted_search_query(item, &active.input);
-        let mut out = self.close_active()?;
+        let mut out = self.close_active_for_tool_boundary()?;
         self.hosted_calls
             .remove(id)
             .expect("validated hosted search call");
@@ -1095,7 +1157,7 @@ impl Reducer {
         out.push(ReducerEvent::HostedSearch {
             index,
             result_index,
-            id: format!("srvtoolu_{id}"),
+            id: hosted_downstream_tool_use_id(id),
             name: search_kind.name().into(),
             query,
         });
@@ -1172,7 +1234,7 @@ impl Reducer {
             self.active = Some((kind.into(), index));
             if kind == "text" {
                 self.active_text.clear();
-                self.pending_function_text = None;
+                self.pending_tool_boundary_text = None;
             }
             out.push(if kind == "thinking" {
                 ReducerEvent::ThinkingStart(index)
@@ -1209,11 +1271,13 @@ impl Reducer {
             None => vec![],
         })
     }
-    fn close_active_for_function_call(&mut self) -> anyhow::Result<Vec<ReducerEvent>> {
+    fn close_active_for_tool_boundary(&mut self) -> anyhow::Result<Vec<ReducerEvent>> {
         if self.active.as_ref().is_some_and(|(kind, _)| kind == "text") {
-            // Grok can open a function call before the preceding output_text.done. Keep this
-            // exact text once so that late snapshot can be reconciled after TextStop.
-            self.pending_function_text = Some(std::mem::take(&mut self.active_text));
+            // Grok can cross a function or hosted-tool boundary before the preceding
+            // output_text.done. Keep this exact text once so that the late snapshot can be
+            // reconciled after TextStop. Adjacent tool boundaries do not replace it because only
+            // the first boundary still has an active text block.
+            self.pending_tool_boundary_text = Some(std::mem::take(&mut self.active_text));
         }
         self.close_active()
     }
@@ -1224,12 +1288,12 @@ impl Reducer {
                     anyhow::anyhow!("completed text snapshot disagrees with streamed deltas")
                 })?
             }
-            // Grok commonly emits `response.output_item.added(function_call)` before
+            // Grok can cross a function or hosted-tool boundary before
             // `response.output_text.done`. The text block is already closed and forwarded;
             // accept the one matching snapshot. A strict extension cannot be inserted before
             // the already-forwarded tool block, so keep that malformed ordering fail-closed.
-            _ if self.pending_function_text.as_deref() == Some(snapshot) => "",
-            _ if !self.saw_text_output && self.pending_function_text.is_none() => snapshot,
+            _ if self.pending_tool_boundary_text.as_deref() == Some(snapshot) => "",
+            _ if !self.saw_text_output && self.pending_tool_boundary_text.is_none() => snapshot,
             _ => {
                 return Err(anyhow::anyhow!(
                     "completed text snapshot disagrees with streamed deltas"
@@ -1322,6 +1386,10 @@ fn hosted_search_identity(
         anyhow::bail!("hosted tool call name disagrees with its type");
     }
     Ok(identity)
+}
+
+fn hosted_downstream_tool_use_id(upstream_id: &str) -> String {
+    format!("srvtoolu_{upstream_id}")
 }
 
 fn hosted_search_query(item: &serde_json::Map<String, Value>, buffered_input: &str) -> String {
@@ -1541,7 +1609,14 @@ pub(super) fn parse_function_arguments(arguments: &str) -> anyhow::Result<Value>
 }
 
 pub fn reduce_upstream_bytes(bytes: &[u8]) -> Result<Vec<ReducerEvent>, GrokReductionError> {
-    let mut reducer = Reducer::default();
+    reduce_upstream_bytes_with_tool_policy(bytes, &ToolCallPolicy::permissive())
+}
+
+pub(crate) fn reduce_upstream_bytes_with_tool_policy(
+    bytes: &[u8],
+    tool_policy: &ToolCallPolicy,
+) -> Result<Vec<ReducerEvent>, GrokReductionError> {
+    let mut reducer = Reducer::with_tool_policy(tool_policy.clone());
     let mut decoder = SseDecoder::default();
     let values = decoder
         .push(bytes)
@@ -1571,6 +1646,252 @@ pub fn reduce_upstream_bytes(bytes: &[u8]) -> Result<Vec<ReducerEvent>, GrokRedu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_tool_policy(tools: Value, tool_choice: Value) -> ToolCallPolicy {
+        let request: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "messages":[{"role":"user","content":"use tools"}],
+                "tools":tools,
+                "tool_choice":tool_choice
+            }))
+            .unwrap();
+        let translated = super::super::request::translate_request(&request, "grok-4.5".into())
+            .expect("test request must translate");
+        ToolCallPolicy::from_request(&translated)
+    }
+
+    fn function_added(id: &str, name: &str) -> Value {
+        serde_json::json!({
+            "type":"response.output_item.added",
+            "item":{"type":"function_call","call_id":id,"name":name}
+        })
+    }
+
+    #[test]
+    fn response_tool_policy_enforces_none_named_and_effective_allowlist() {
+        let tools = serde_json::json!([
+            {"name":"Read","input_schema":{"type":"object"}},
+            {"name":"Grep","input_schema":{"type":"object"}},
+            {"name":"XSearch","input_schema":{"type":"object"}}
+        ]);
+
+        let mut none = Reducer::with_tool_policy(response_tool_policy(
+            tools.clone(),
+            serde_json::json!({"type":"none"}),
+        ));
+        let error = none.push(function_added("c1", "Read")).unwrap_err();
+        assert!(error.to_string().contains("tool_choice forbids"), "{error}");
+        assert_eq!(none.total_tool_items, 0);
+
+        let mut named = Reducer::with_tool_policy(response_tool_policy(
+            tools,
+            serde_json::json!({"type":"tool","name":"Read"}),
+        ));
+        let error = named.push(function_added("c1", "Grep")).unwrap_err();
+        assert!(error.to_string().contains("requires \"Read\""), "{error}");
+        named.push(function_added("c1", "Read")).unwrap();
+
+        let mut auto = Reducer::with_tool_policy(response_tool_policy(
+            serde_json::json!([{"name":"Read","input_schema":{"type":"object"}}]),
+            serde_json::json!({"type":"auto"}),
+        ));
+        let function_error = auto.push(function_added("c1", "Bash")).unwrap_err();
+        assert!(
+            function_error.to_string().contains("undeclared function"),
+            "{function_error}"
+        );
+        let hosted_error = auto
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"web_search_call","id":"ws1"}
+            }))
+            .unwrap_err();
+        assert!(
+            hosted_error.to_string().contains("undeclared hosted"),
+            "{hosted_error}"
+        );
+    }
+
+    #[test]
+    fn response_tool_policy_requires_a_tool_only_on_success_terminal() {
+        let tools = serde_json::json!([{"name":"Read","input_schema":{"type":"object"}}]);
+        let policy = response_tool_policy(tools.clone(), serde_json::json!({"type":"any"}));
+        let terminal = serde_json::json!({
+            "type":"response.completed",
+            "response":{"status":"completed","usage":{}}
+        });
+        let error = Reducer::with_tool_policy(policy.clone())
+            .push(terminal.clone())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("required by tool_choice"),
+            "{error}"
+        );
+
+        let named = response_tool_policy(tools, serde_json::json!({"type":"tool","name":"Read"}));
+        let error = Reducer::with_tool_policy(named).push(terminal).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("required function tool \"Read\""),
+            "{error}"
+        );
+
+        let incomplete = Reducer::with_tool_policy(policy)
+            .push(serde_json::json!({
+                "type":"response.incomplete",
+                "response":{
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":"max_output_tokens"},
+                    "usage":{}
+                }
+            }))
+            .expect("an incomplete response is not required to contain a tool call");
+        assert!(incomplete.iter().any(|event| matches!(
+            event,
+            ReducerEvent::Terminal(GrokTerminal::IncompleteMaxOutputTokens)
+        )));
+    }
+
+    #[test]
+    fn response_tool_policy_accepts_completed_required_and_named_calls() {
+        let tools = serde_json::json!([{"name":"Read","input_schema":{"type":"object"}}]);
+        for choice in [
+            serde_json::json!({"type":"any"}),
+            serde_json::json!({"type":"tool","name":"Read"}),
+        ] {
+            let mut reducer =
+                Reducer::with_tool_policy(response_tool_policy(tools.clone(), choice));
+            let events = reducer
+                .push_batch([
+                    function_added("c1", "Read"),
+                    serde_json::json!({
+                        "type":"response.output_item.done",
+                        "item":{
+                            "type":"function_call",
+                            "call_id":"c1",
+                            "name":"Read",
+                            "arguments":"{}"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type":"response.completed",
+                        "response":{"status":"completed","usage":{}}
+                    }),
+                ])
+                .expect("the required function lifecycle is complete");
+            assert!(matches!(
+                events.last(),
+                Some(ReducerEvent::Finish { stop_reason, .. }) if stop_reason == "tool_use"
+            ));
+        }
+    }
+
+    #[test]
+    fn response_tool_policy_enforces_serial_and_parallel_call_counts() {
+        let tools = serde_json::json!([
+            {"name":"Read","input_schema":{"type":"object"}},
+            {"type":"x_search","name":"XSearch","input_schema":{"type":"object"}}
+        ]);
+        let serial_policy = response_tool_policy(
+            tools.clone(),
+            serde_json::json!({"type":"auto","disable_parallel_tool_use":true}),
+        );
+
+        let mut repeated = Reducer::with_tool_policy(serial_policy.clone());
+        repeated.push(function_added("c1", "Read")).unwrap();
+        let error = repeated.push(function_added("c2", "Read")).unwrap_err();
+        assert!(
+            error.to_string().contains("parallel_tool_calls is false"),
+            "{error}"
+        );
+        assert_eq!(repeated.total_tool_items, 1);
+
+        let mut mixed = Reducer::with_tool_policy(serial_policy);
+        mixed.push(function_added("c1", "Read")).unwrap();
+        let error = mixed
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"x_search_call","id":"xs1"}
+            }))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("parallel_tool_calls is false"),
+            "{error}"
+        );
+        assert_eq!(mixed.total_tool_items, 1);
+
+        let parallel_policy = response_tool_policy(tools, serde_json::json!({"type":"auto"}));
+        let mut parallel = Reducer::with_tool_policy(parallel_policy);
+        parallel.push(function_added("c1", "Read")).unwrap();
+        parallel.push(function_added("c2", "Read")).unwrap();
+        parallel
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"x_search_call","id":"xs1"}
+            }))
+            .unwrap();
+        assert_eq!(parallel.total_tool_items, 3);
+    }
+
+    #[test]
+    fn response_tool_policy_enforces_hosted_max_uses_before_state_mutation() {
+        for (declared_type, name, item_type) in [
+            ("web_search_20260318", "web_search", "web_search_call"),
+            ("x_search", "XSearch", "x_search_call"),
+        ] {
+            let policy = response_tool_policy(
+                serde_json::json!([{
+                    "type":declared_type,
+                    "name":name,
+                    "input_schema":{"type":"object"},
+                    "max_uses":1,
+                    "allowed_callers":["direct"]
+                }]),
+                serde_json::json!({"type":"auto"}),
+            );
+            let mut reducer = Reducer::with_tool_policy(policy);
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.added",
+                    "item":{"type":item_type,"id":"search_1"}
+                }))
+                .unwrap();
+            let error = reducer
+                .push(serde_json::json!({
+                    "type":"response.output_item.added",
+                    "item":{"type":item_type,"id":"search_2"}
+                }))
+                .unwrap_err();
+            assert!(error.to_string().contains("max_uses"), "{name}: {error}");
+            assert_eq!(reducer.total_tool_items, 1, "{name}");
+            assert_eq!(reducer.hosted_calls.len(), 1, "{name}");
+            assert!(!reducer.tool_item_ids.contains("search_2"), "{name}");
+        }
+    }
+
+    #[test]
+    fn required_policy_rejects_x_search_filtered_from_the_wire_request() {
+        let policy = response_tool_policy(
+            serde_json::json!([
+                {"type":"x_search","name":"XSearch","input_schema":{"type":"object"}},
+                {"name":"Read","input_schema":{"type":"object"}}
+            ]),
+            serde_json::json!({"type":"any"}),
+        );
+        let mut reducer = Reducer::with_tool_policy(policy);
+        let error = reducer
+            .push(serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":"x_search_call","id":"xs1"}
+            }))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("undeclared hosted tool"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn sequence_validator_ignores_only_the_same_number_and_payload() {
@@ -2308,7 +2629,7 @@ mod tests {
                 serde_json::json!({"type":"response.reasoning_text.delta","delta":"thinking"}),
                 serde_json::json!({"type":"response.output_text.done","text":"Hello"}),
             ])
-            .expect_err("only a function call may retain text for a late done snapshot");
+            .expect_err("only a tool boundary may retain text for a late done snapshot");
         assert!(
             error
                 .to_string()
@@ -2354,6 +2675,164 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    fn complete_typed_hosted_search(
+        reducer: &mut Reducer,
+        event_name: &str,
+        item_type: &str,
+        id: &str,
+    ) -> anyhow::Result<Vec<ReducerEvent>> {
+        reducer.push_batch([
+            serde_json::json!({
+                "type":"response.output_item.added",
+                "item":{"type":item_type,"id":id}
+            }),
+            serde_json::json!({
+                "type":format!("response.{event_name}.in_progress"),
+                "item_id":id
+            }),
+            serde_json::json!({
+                "type":format!("response.{event_name}.searching"),
+                "item_id":id
+            }),
+            serde_json::json!({
+                "type":format!("response.{event_name}.completed"),
+                "item_id":id
+            }),
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "item":{"type":item_type,"id":id,"action":{"query":"rust"}}
+            }),
+        ])
+    }
+
+    #[test]
+    fn late_output_text_done_after_typed_hosted_search_completion_is_accepted() {
+        for (event_name, item_type, id) in [
+            ("web_search_call", "web_search_call", "ws1"),
+            ("x_search_call", "x_search_call", "xs1"),
+        ] {
+            let mut reducer = Reducer::default();
+            reducer
+                .push(serde_json::json!({
+                    "type":"response.output_text.delta",
+                    "delta":"Hello"
+                }))
+                .unwrap();
+            let boundary = complete_typed_hosted_search(&mut reducer, event_name, item_type, id)
+                .expect("a completed hosted search must close the active text block");
+            assert!(
+                boundary
+                    .iter()
+                    .any(|event| matches!(event, ReducerEvent::TextStop(_))),
+                "{boundary:?}"
+            );
+
+            let late_done = reducer
+                .push(serde_json::json!({
+                    "type":"response.output_text.done",
+                    "text":"Hello"
+                }))
+                .expect("an exact late snapshot after a hosted search must be accepted");
+            assert!(late_done.is_empty(), "{late_done:?}");
+            assert!(reducer.pending_tool_boundary_text.is_none());
+        }
+    }
+
+    #[test]
+    fn hosted_tool_boundary_late_snapshot_is_exact_and_consumed_once() {
+        for (event_name, item_type, id) in [
+            ("web_search_call", "web_search_call", "ws1"),
+            ("x_search_call", "x_search_call", "xs1"),
+        ] {
+            let mut extended = Reducer::default();
+            extended
+                .push(serde_json::json!({
+                    "type":"response.output_text.delta",
+                    "delta":"Hello"
+                }))
+                .unwrap();
+            complete_typed_hosted_search(&mut extended, event_name, item_type, id).unwrap();
+            let error = extended
+                .push(serde_json::json!({
+                    "type":"response.output_text.done",
+                    "text":"Hello injected"
+                }))
+                .expect_err("a hosted-tool boundary must reject an unstreamed extension");
+            assert!(
+                error
+                    .to_string()
+                    .contains("completed text snapshot disagrees with streamed deltas"),
+                "{error}"
+            );
+
+            let mut repeated = Reducer::default();
+            repeated
+                .push(serde_json::json!({
+                    "type":"response.output_text.delta",
+                    "delta":"Hello"
+                }))
+                .unwrap();
+            complete_typed_hosted_search(&mut repeated, event_name, item_type, id).unwrap();
+            repeated
+                .push(serde_json::json!({
+                    "type":"response.output_text.done",
+                    "text":"Hello"
+                }))
+                .unwrap();
+            let error = repeated
+                .push(serde_json::json!({
+                    "type":"response.output_text.done",
+                    "text":"Hello"
+                }))
+                .expect_err("an exact hosted-tool snapshot must be consumed once");
+            assert!(
+                error
+                    .to_string()
+                    .contains("completed text snapshot disagrees with streamed deltas"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_web_and_x_search_boundaries_preserve_one_late_text_snapshot() {
+        let mut reducer = Reducer::default();
+        let events = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"Hello"}),
+                serde_json::json!({"type":"response.output_item.added","item":{"type":"web_search_call","id":"ws1"}}),
+                serde_json::json!({"type":"response.output_item.added","item":{"type":"x_search_call","id":"xs1"}}),
+                serde_json::json!({"type":"response.web_search_call.in_progress","item_id":"ws1"}),
+                serde_json::json!({"type":"response.x_search_call.in_progress","item_id":"xs1"}),
+                serde_json::json!({"type":"response.x_search_call.searching","item_id":"xs1"}),
+                serde_json::json!({"type":"response.web_search_call.searching","item_id":"ws1"}),
+                serde_json::json!({"type":"response.web_search_call.completed","item_id":"ws1"}),
+                serde_json::json!({"type":"response.x_search_call.completed","item_id":"xs1"}),
+                serde_json::json!({"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws1","action":{"query":"rust"}}}),
+                serde_json::json!({"type":"response.output_item.done","item":{"type":"x_search_call","id":"xs1","action":{"query":"grok"}}}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello"}),
+            ])
+            .expect("adjacent hosted-tool boundaries must preserve the first late snapshot");
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ReducerEvent::TextStop(_)))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ReducerEvent::HostedSearch { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        assert!(reducer.pending_tool_boundary_text.is_none());
     }
 
     #[test]
@@ -2680,6 +3159,40 @@ mod tests {
     }
 
     #[test]
+    fn function_and_hosted_calls_share_downstream_anthropic_tool_use_ids() {
+        let hosted = serde_json::json!({
+            "type":"response.output_item.added",
+            "item":{"type":"web_search_call","id":"ws1"}
+        });
+        let function = serde_json::json!({
+            "type":"response.output_item.added",
+            "item":{
+                "type":"function_call",
+                "call_id":"srvtoolu_ws1",
+                "name":"lookup"
+            }
+        });
+
+        for values in [
+            vec![hosted.clone(), function.clone()],
+            vec![function.clone(), hosted.clone()],
+        ] {
+            let mut reducer = Reducer::default();
+            let error = reducer.push_batch(values).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate downstream Anthropic tool-use id"),
+                "{error}"
+            );
+            assert_eq!(reducer.total_tool_items, 0);
+            assert!(reducer.calls.is_empty());
+            assert!(reducer.hosted_calls.is_empty());
+            assert!(reducer.downstream_tool_use_ids.is_empty());
+        }
+    }
+
+    #[test]
     fn response_total_tool_item_history_has_an_explicit_limit() {
         let mut reducer = Reducer::default();
         for index in 0..MAX_TOTAL_TOOL_ITEMS {
@@ -2801,23 +3314,13 @@ mod tests {
     }
 
     #[test]
-    fn grok_reducer_accepts_current_x_search_call_lifecycle() {
+    fn grok_reducer_rejects_x_search_only_empty_success() {
         let input = b"data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"x_search_call\",\"id\":\"xs_1\"}}\n\ndata: {\"type\":\"response.x_search_call.in_progress\",\"item_id\":\"xs_1\"}\n\ndata: {\"type\":\"response.x_search_call.searching\",\"item_id\":\"xs_1\"}\n\ndata: {\"type\":\"response.x_search_call.completed\",\"item_id\":\"xs_1\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"x_search_call\",\"id\":\"xs_1\",\"action\":{\"query\":\"rust\"}}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
-        let events = reduce_upstream_bytes(input).unwrap();
+        let error = reduce_upstream_bytes(input).unwrap_err();
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, ReducerEvent::HostedSearch { .. }))
+            error.to_string().contains("unobservable hosted x_search"),
+            "{error}"
         );
-        assert!(matches!(
-            events.last(),
-            Some(ReducerEvent::Finish {
-                stop_reason,
-                web_search_requests: 0,
-                x_search_requests: 0,
-                ..
-            }) if stop_reason == "end_turn"
-        ));
     }
 
     #[test]

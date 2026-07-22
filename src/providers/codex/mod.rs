@@ -39,16 +39,17 @@ use self::continuation::{
     ContinuationCandidate, abort_continuation, continuation_candidate, record_continuation,
 };
 use self::count_tokens::count_translated_tokens;
-use self::translate::accumulate::accumulate_response_with_traffic_and_schema;
+use self::translate::accumulate::accumulate_response_with_traffic_schema_tool_policy_and_metadata;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
-    assert_allowed_model, full_lane_web_search_model, resolve_model_request, uses_responses_lite,
+    assert_allowed_model, resolve_model_request, uses_responses_lite,
 };
-use self::translate::reducer::finish_metadata_from_upstream;
+use self::translate::reducer::{FinishMetadata, finish_metadata_from_upstream_with_tool_policy};
 use self::translate::request::{
     ServiceTier, TranslateOptions, TranslationOverrides, has_hosted_web_search,
-    translate_request_with_overrides,
+    has_parallel_callable_function, translate_request_with_overrides,
 };
+use self::translate::tool_policy::ToolCallPolicy;
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_LIVE_TRANSPORT_RETRIES: u32 = 2;
@@ -84,8 +85,6 @@ fn stream_heartbeat_duration(configured_ms: u64) -> Duration {
 #[cfg(test)]
 pub(super) static CODEX_STATE_TEST_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
     once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
-use self::translate::stream::translate_stream_bytes_with_traffic;
-
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
@@ -141,7 +140,7 @@ impl Provider for CodexProvider {
             .unwrap_or_else(|| "gpt-5.6-sol".to_string());
         let model = requested_model.as_str();
 
-        let mut resolved = resolve_model_request(model);
+        let resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -165,7 +164,19 @@ impl Provider for CodexProvider {
                 }
             };
         let native_web_search = has_hosted_web_search(&body);
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite = match apply_model_lane_for_request(&resolved.model, &body) {
+            Ok(lite) => lite,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!(
+                        "Model \"{model}\" resolves to \"{}\": {error}",
+                        resolved.model
+                    ),
+                );
+            }
+        };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -236,37 +247,35 @@ impl Provider for CodexProvider {
             }
         };
 
-        if want_stream {
-            buffered_stream_response(upstream, &message_id, model, &ctx, turn_id, &translated)
-        } else {
-            match accumulate_response_with_traffic_and_schema(
-                &upstream.body,
-                &message_id,
-                model,
-                ctx.traffic.as_deref(),
-                translated.schema_bridge.as_deref(),
-            ) {
-                Ok(json) => {
-                    if let Some(monitor) = ctx.monitor.as_ref() {
-                        monitor.usage_updated(
-                            &ctx.req_id,
-                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
-                            json.pointer("/usage/output_tokens")
-                                .and_then(|v| v.as_u64()),
-                        );
-                    }
-                    update_continuation_from_upstream(
-                        ctx.session_id.as_deref(),
-                        turn_id,
-                        &translated,
-                        &upstream.body,
+        let tool_policy = ToolCallPolicy::from_request(&translated);
+        match accumulate_response_with_traffic_schema_tool_policy_and_metadata(
+            &upstream.body,
+            &message_id,
+            model,
+            ctx.traffic.as_deref(),
+            translated.schema_bridge.as_deref(),
+            &tool_policy,
+        ) {
+            Ok((json, finish_metadata)) => {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.usage_updated(
+                        &ctx.req_id,
+                        json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+                        json.pointer("/usage/output_tokens")
+                            .and_then(|v| v.as_u64()),
                     );
-                    (StatusCode::OK, Json(json)).into_response()
                 }
-                Err(e) => {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
-                    map_codex_failure_to_response(&format!("Accumulation error: {e}"))
-                }
+                update_continuation_from_finish_metadata(
+                    ctx.session_id.as_deref(),
+                    turn_id,
+                    &translated,
+                    finish_metadata.as_ref(),
+                );
+                (StatusCode::OK, Json(json)).into_response()
+            }
+            Err(e) => {
+                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                map_codex_failure_to_response(&format!("Accumulation error: {e}"))
             }
         }
     }
@@ -277,7 +286,7 @@ impl Provider for CodexProvider {
             .clone()
             .unwrap_or_else(|| "gpt-5.6-sol".to_string());
         let model = requested_model.as_str();
-        let mut resolved = resolve_model_request(model);
+        let resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -288,7 +297,19 @@ impl Provider for CodexProvider {
                 ),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite = match apply_model_lane_for_request(&resolved.model, &body) {
+            Ok(lite) => lite,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!(
+                        "Model \"{model}\" resolves to \"{}\": {error}",
+                        resolved.model
+                    ),
+                );
+            }
+        };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -406,10 +427,10 @@ async fn translate_codex_request_for_provider(
     })
 }
 
-/// Picks the upstream model and lane for a request. Hosted web_search always
-/// uses the full Responses API and upgrades Luna for account compatibility.
-/// Other GPT-5.6 requests use Lite by default but may opt into the full shape.
-fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> bool {
+/// Picks the upstream lane for a request. Luna is a Lite-only model, so any
+/// request that requires the full Responses API fails locally rather than
+/// silently changing the caller's selected model.
+fn apply_model_lane_for_request(model: &str, body: &MessagesRequest) -> Result<bool, &'static str> {
     apply_model_lane_for_request_with_options(
         model,
         body,
@@ -419,40 +440,45 @@ fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> b
 }
 
 fn apply_model_lane_for_request_with_options(
-    model: &mut String,
+    model: &str,
     body: &MessagesRequest,
     responses_lite: bool,
     parallel_tools: bool,
-) -> bool {
+) -> Result<bool, &'static str> {
     if has_hosted_web_search(body) {
-        *model = full_lane_web_search_model(model).to_string();
-        return false;
+        return full_lane_for_model(model);
     }
     if responses_lite && parallel_tools && parallel_tool_lane_eligible(model, body) {
-        return false;
+        return Ok(false);
     }
-    responses_lite && uses_responses_lite(model)
+    let use_responses_lite = responses_lite && uses_responses_lite(model);
+    if use_responses_lite {
+        Ok(true)
+    } else {
+        full_lane_for_model(model)
+    }
+}
+
+fn full_lane_for_model(model: &str) -> Result<bool, &'static str> {
+    if model == "gpt-5.6-luna" {
+        Err(
+            "gpt-5.6-luna is available only through Responses Lite, but this request requires the full Responses lane; enable codex.responsesLite and remove hosted web_search, or explicitly select gpt-5.6-sol/gpt-5.6-terra",
+        )
+    } else {
+        Ok(false)
+    }
 }
 
 fn parallel_tool_lane_eligible(model: &str, body: &MessagesRequest) -> bool {
     if !matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra")
         || is_claude_code_compaction_request(body)
         || has_structured_output(body)
-        || !tool_choice_allows_parallel(body)
+        || !has_parallel_callable_function(body)
     {
         return false;
     }
 
-    body.extra
-        .get("tools")
-        .and_then(serde_json::Value::as_array)
-        .map(|tools| {
-            tools
-                .iter()
-                .filter(|tool| is_ordinary_function_tool(tool))
-                .count()
-        })
-        .is_some_and(|count| count >= 2)
+    true
 }
 
 fn has_structured_output(body: &MessagesRequest) -> bool {
@@ -462,94 +488,8 @@ fn has_structured_output(body: &MessagesRequest) -> bool {
         .is_some_and(|output| output.contains_key("format"))
 }
 
-fn is_ordinary_function_tool(tool: &serde_json::Value) -> bool {
-    let Some(tool) = tool.as_object() else {
-        return false;
-    };
-    let ordinary_type = tool
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .is_none_or(|kind| matches!(kind, "function" | "custom"));
-    ordinary_type
-        && tool
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| !name.is_empty())
-}
-
-fn tool_choice_allows_parallel(body: &MessagesRequest) -> bool {
-    let Some(choice) = body.extra.get("tool_choice") else {
-        return true;
-    };
-    match choice {
-        serde_json::Value::String(mode) => matches!(mode.as_str(), "auto" | "any" | "required"),
-        serde_json::Value::Object(choice) => {
-            if choice
-                .get("disable_parallel_tool_use")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                return false;
-            }
-            matches!(
-                choice
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("auto"),
-                "auto" | "any" | "required"
-            )
-        }
-        _ => false,
-    }
-}
-
 fn count_sse_events(bytes: &[u8]) -> u64 {
     String::from_utf8_lossy(bytes).matches("event:").count() as u64
-}
-
-fn buffered_stream_response(
-    upstream: client::CodexResponse,
-    message_id: &str,
-    model: &str,
-    ctx: &RequestContext,
-    turn_id: Option<u64>,
-    request_body: &translate::request::ResponsesRequest,
-) -> Response {
-    let sse_bytes = match translate_stream_bytes_with_traffic(
-        &upstream.body,
-        message_id,
-        model,
-        ctx.traffic.as_deref(),
-    ) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            abort_continuation(ctx.session_id.as_deref(), turn_id);
-            return map_codex_failure_to_response(&format!("Stream translation error: {error}"));
-        }
-    };
-    if let Some(monitor) = ctx.monitor.as_ref() {
-        let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-        monitor.stream_progress(
-            &ctx.req_id,
-            sse_bytes.len() as u64,
-            count_sse_events(&sse_bytes),
-            input_tokens,
-            output_tokens,
-        );
-    }
-    update_continuation_from_upstream(
-        ctx.session_id.as_deref(),
-        turn_id,
-        request_body,
-        &upstream.body,
-    );
-
-    let headers = [
-        (http::header::CONTENT_TYPE, "text/event-stream"),
-        (http::header::CACHE_CONTROL, "no-cache"),
-        (http::header::CONNECTION, "keep-alive"),
-    ];
-    (headers, sse_bytes).into_response()
 }
 
 enum LiveStreamStart {
@@ -804,7 +744,7 @@ async fn live_stream_response_inner(
             }
         };
 
-        match live_stream_response_once_with_schema(
+        match live_stream_response_once_with_schema_and_tool_policy(
             upstream_events,
             message_id.clone(),
             &model,
@@ -815,6 +755,7 @@ async fn live_stream_response_inner(
             deadline,
             stream_heartbeat,
             request_body.schema_bridge.clone(),
+            ToolCallPolicy::from_request(&request_body),
         )
         .await
         {
@@ -911,8 +852,38 @@ async fn live_stream_response_once(
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn live_stream_response_once_with_schema(
+    upstream_events: websocket::CodexWebSocketEventReceiver,
+    message_id: String,
+    model: &str,
+    ctx: RequestContext,
+    turn_id: Option<u64>,
+    continuation_capture: Option<LiveContinuationCapture>,
+    provider_started_at: Instant,
+    deadline: client::CodexRequestDeadline,
+    keepalive_delay: Duration,
+    schema_bridge: Option<Arc<translate::schema_bridge::SchemaBridge>>,
+) -> LiveStreamStart {
+    live_stream_response_once_with_schema_and_tool_policy(
+        upstream_events,
+        message_id,
+        model,
+        ctx,
+        turn_id,
+        continuation_capture,
+        provider_started_at,
+        deadline,
+        keepalive_delay,
+        schema_bridge,
+        ToolCallPolicy::permissive(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn live_stream_response_once_with_schema_and_tool_policy(
     mut upstream_events: websocket::CodexWebSocketEventReceiver,
     message_id: String,
     model: &str,
@@ -923,10 +894,16 @@ async fn live_stream_response_once_with_schema(
     deadline: client::CodexRequestDeadline,
     keepalive_delay: Duration,
     schema_bridge: Option<Arc<translate::schema_bridge::SchemaBridge>>,
+    tool_policy: ToolCallPolicy,
 ) -> LiveStreamStart {
-    let mut translator =
-        LiveStreamTranslator::with_schema_bridge(message_id, model.to_string(), schema_bridge);
+    let mut translator = LiveStreamTranslator::with_schema_bridge_and_tool_policy(
+        message_id,
+        model.to_string(),
+        schema_bridge,
+        tool_policy,
+    );
     let mut generation_started = false;
+    let mut hosted_side_effect_started = false;
     // Start the downstream grace window as soon as either live transport is ready.
     // Waiting for the first WebSocket generation event can otherwise leave Claude with
     // no bytes for the full response-start timeout and trigger a false interruption warning.
@@ -965,8 +942,9 @@ async fn live_stream_response_once_with_schema(
         let payload = match item {
             Ok(payload) => payload,
             Err(err) => {
-                if retryable_live_start_codex_error(&err)
-                    || err.origin == client::CodexErrorOrigin::WebSocketHandshake
+                if !hosted_side_effect_started
+                    && (retryable_live_start_codex_error(&err)
+                        || err.origin == client::CodexErrorOrigin::WebSocketHandshake)
                 {
                     return LiveStreamStart::Retry { error: err };
                 }
@@ -974,6 +952,7 @@ async fn live_stream_response_once_with_schema(
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
+        hosted_side_effect_started |= events::starts_hosted_side_effect(&payload);
         log_native_web_search_phase(&ctx, &payload, provider_started_at);
         record_codex_generation_start(&ctx, &payload, provider_started_at, &mut generation_started);
         if continuation_capture
@@ -1010,15 +989,18 @@ async fn live_stream_response_once_with_schema(
                             503
                         }
                     });
-                    return LiveStreamStart::Retry {
-                        error: client::CodexError {
-                            status,
-                            message: message.clone(),
-                            detail: Some(message),
-                            retry_after: retry_after_from_live_payload(&payload),
-                            origin: client::CodexErrorOrigin::WebSocket,
-                        },
+                    let error = client::CodexError {
+                        status,
+                        message: message.clone(),
+                        detail: Some(message),
+                        retry_after: retry_after_from_live_payload(&payload),
+                        origin: client::CodexErrorOrigin::WebSocket,
                     };
+                    if !hosted_side_effect_started {
+                        return LiveStreamStart::Retry { error };
+                    }
+                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    return LiveStreamStart::Response(map_codex_error_to_response(&error));
                 }
                 abort_continuation(ctx.session_id.as_deref(), turn_id);
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
@@ -1067,14 +1049,18 @@ async fn live_stream_response_once_with_schema(
         }
     }
 
-    LiveStreamStart::Retry {
-        error: client::CodexError {
-            status: 0,
-            message: "WebSocket connection closed before terminal Codex response event".to_string(),
-            detail: Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
-            retry_after: None,
-            origin: client::CodexErrorOrigin::WebSocket,
-        },
+    let error = client::CodexError {
+        status: 0,
+        message: "WebSocket connection closed before terminal Codex response event".to_string(),
+        detail: Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
+        retry_after: None,
+        origin: client::CodexErrorOrigin::WebSocket,
+    };
+    if hosted_side_effect_started {
+        abort_continuation(ctx.session_id.as_deref(), turn_id);
+        LiveStreamStart::Response(map_codex_error_to_response(&error))
+    } else {
+        LiveStreamStart::Retry { error }
     }
 }
 
@@ -1118,6 +1104,43 @@ fn log_codex_request_configuration(
         .as_ref()
         .and_then(|reasoning| reasoning.effort.as_ref())
         .map(ToString::to_string);
+    let (top_level_function_tools, top_level_hosted_tools) =
+        request
+            .tools
+            .iter()
+            .flatten()
+            .fold((0_usize, 0_usize), |(functions, hosted), tool| match tool {
+                translate::request::ResponsesTool::Function(_) => (functions + 1, hosted),
+                translate::request::ResponsesTool::WebSearch(_) => (functions, hosted + 1),
+            });
+    let (input_function_tools, input_hosted_tools) =
+        request
+            .input
+            .iter()
+            .fold((0_usize, 0_usize), |(functions, hosted), item| {
+                let translate::request::ResponsesInputItem::AdditionalTools { tools, .. } = item
+                else {
+                    return (functions, hosted);
+                };
+                tools.iter().fold((functions, hosted), |counts, tool| {
+                    match tool.get("type").and_then(serde_json::Value::as_str) {
+                        Some("function") => (counts.0 + 1, counts.1),
+                        Some("web_search") => (counts.0, counts.1 + 1),
+                        _ => counts,
+                    }
+                })
+            });
+    let function_tool_count = top_level_function_tools + input_function_tools;
+    let hosted_tool_count = top_level_hosted_tools + input_hosted_tools;
+    let lane_reason = if use_responses_lite {
+        "responses_lite"
+    } else if native_web_search {
+        "hosted_web_search"
+    } else if request.parallel_tool_calls && function_tool_count > 0 {
+        "parallel_functions"
+    } else {
+        "full_responses"
+    };
     crate::logging::create_logger("codex").info(
         "request_configuration",
         Some(serde_json::Map::from_iter([
@@ -1152,6 +1175,23 @@ fn log_codex_request_configuration(
                 "parallelToolCalls".to_string(),
                 serde_json::json!(request.parallel_tool_calls),
             ),
+            (
+                "toolChoice".to_string(),
+                serde_json::json!(request.tool_choice),
+            ),
+            (
+                "functionToolCount".to_string(),
+                serde_json::json!(function_tool_count),
+            ),
+            (
+                "hostedToolCount".to_string(),
+                serde_json::json!(hosted_tool_count),
+            ),
+            (
+                "inputFunctionToolCount".to_string(),
+                serde_json::json!(input_function_tools),
+            ),
+            ("laneReason".to_string(), serde_json::json!(lane_reason)),
             (
                 "anthropicMaxTokens".to_string(),
                 serde_json::json!(requested_max_tokens),
@@ -1838,12 +1878,15 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
     }
 }
 
-fn update_continuation_from_upstream(
+fn update_continuation_from_finish_metadata(
     session_id: Option<&str>,
     turn_id: Option<u64>,
     request_body: &translate::request::ResponsesRequest,
-    upstream_body: &[u8],
+    finish: Option<&FinishMetadata>,
 ) {
+    if session_id.is_none() || turn_id.is_none() {
+        return;
+    }
     // The upstream response id refers to the raw structured JSON, while the
     // SchemaBridge may remove synthetic nulls before Claude Code records its
     // transcript. Reusing that id against a normalized transcript would make
@@ -1860,8 +1903,8 @@ fn update_continuation_from_upstream(
         abort_continuation(session_id, turn_id);
         return;
     }
-    match finish_metadata_from_upstream(upstream_body) {
-        Ok(Some(finish)) if finish.continuation_eligible => {
+    match finish {
+        Some(finish) if finish.continuation_eligible => {
             record_continuation(
                 session_id,
                 turn_id,
@@ -1872,6 +1915,23 @@ fn update_continuation_from_upstream(
         }
         _ => abort_continuation(session_id, turn_id),
     }
+}
+
+fn update_continuation_from_upstream(
+    session_id: Option<&str>,
+    turn_id: Option<u64>,
+    request_body: &translate::request::ResponsesRequest,
+    upstream_body: &[u8],
+) {
+    if session_id.is_none() || turn_id.is_none() || request_body.schema_bridge.is_some() {
+        update_continuation_from_finish_metadata(session_id, turn_id, request_body, None);
+        return;
+    }
+    let tool_policy = ToolCallPolicy::from_request(request_body);
+    let finish = finish_metadata_from_upstream_with_tool_policy(upstream_body, &tool_policy)
+        .ok()
+        .flatten();
+    update_continuation_from_finish_metadata(session_id, turn_id, request_body, finish.as_ref());
 }
 
 // ---------------------------------------------------------------------------
@@ -2442,20 +2502,79 @@ mod tests {
     }
 
     #[test]
-    fn web_search_requests_leave_lite_lane_and_upgrade_luna() {
+    fn web_search_requests_require_a_supported_full_lane_model() {
         let body = request_with_tools(serde_json::json!([
             {"type":"web_search_20250305", "name":"web_search"}
         ]));
-        for (resolved, expected) in [
-            ("gpt-5.6-luna", "gpt-5.6-sol"),
-            ("gpt-5.6-sol", "gpt-5.6-sol"),
-            ("gpt-5.6-terra", "gpt-5.6-terra"),
-            ("gpt-5.4", "gpt-5.4"),
-        ] {
-            let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request_with_options(&mut model, &body, true, false);
-            assert!(!lite, "{resolved} with web_search must use the full lane");
-            assert_eq!(model, expected);
+        let error = apply_model_lane_for_request_with_options("gpt-5.6-luna", &body, true, false)
+            .unwrap_err();
+        assert!(error.contains("available only through Responses Lite"));
+
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.4"] {
+            assert_eq!(
+                apply_model_lane_for_request_with_options(model, &body, true, false),
+                Ok(false),
+                "{model} with web_search must use the full lane"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_web_search_changes_lane_only_when_forced_or_loaded() {
+        let tools = serde_json::json!([
+            {"name":"ToolSearch", "input_schema":{}},
+            {
+                "type":"web_search_20260318",
+                "name":"web_search",
+                "defer_loading":true,
+                "allowed_callers":["direct"]
+            }
+        ]);
+        let cases = [
+            (
+                serde_json::json!({
+                    "model":"gpt-5.6-luna",
+                    "messages":[{"role":"user", "content":"find it"}],
+                    "tools":tools
+                }),
+                Some(true),
+            ),
+            (
+                serde_json::json!({
+                    "model":"gpt-5.6-luna",
+                    "messages":[{"role":"user", "content":"find it"}],
+                    "tools":tools,
+                    "tool_choice":{"type":"tool", "name":"web_search"}
+                }),
+                None,
+            ),
+            (
+                serde_json::json!({
+                    "model":"gpt-5.6-luna",
+                    "messages":[
+                        {"role":"assistant", "content":[{
+                            "type":"tool_use", "id":"search_1", "name":"ToolSearch", "input":{}
+                        }]},
+                        {"role":"user", "content":[{
+                            "type":"tool_result", "tool_use_id":"search_1", "content":[{
+                                "type":"tool_reference", "tool_name":"web_search"
+                            }]
+                        }]}
+                    ],
+                    "tools":tools
+                }),
+                None,
+            ),
+        ];
+
+        for (body, expected_lite) in cases {
+            let body: MessagesRequest = serde_json::from_value(body).unwrap();
+            let result =
+                apply_model_lane_for_request_with_options("gpt-5.6-luna", &body, true, false);
+            match expected_lite {
+                Some(lite) => assert_eq!(result, Ok(lite)),
+                None => assert!(result.is_err()),
+            }
         }
     }
 
@@ -2469,9 +2588,8 @@ mod tests {
             ("gpt-5.6-sol", true),
             ("gpt-5.4", false),
         ] {
-            let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request_with_options(&mut model, &body, true, false);
-            assert_eq!(model, resolved, "model must not change without web_search");
+            let lite =
+                apply_model_lane_for_request_with_options(resolved, &body, true, false).unwrap();
             assert_eq!(lite, lite_expected);
         }
     }
@@ -2484,10 +2602,10 @@ mod tests {
         ]));
 
         for resolved in ["gpt-5.6-sol", "gpt-5.6-terra"] {
-            let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request_with_options(&mut model, &body, true, true);
+            let model = resolved.to_string();
+            let lite =
+                apply_model_lane_for_request_with_options(&model, &body, true, true).unwrap();
             assert!(!lite, "{resolved} should use the full parallel-tool lane");
-            assert_eq!(model, resolved);
 
             let translated = translate_request_with_overrides(
                 &body,
@@ -2507,17 +2625,61 @@ mod tests {
     }
 
     #[test]
+    fn parallel_tools_use_full_lane_for_single_and_forced_function_tools() {
+        let cases = [
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"read both files"}],
+                "tools":[{"name":"Read", "input_schema":{}}]
+            }),
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"read both files"}],
+                "tools":[
+                    {"name":"Read", "input_schema":{}},
+                    {"name":"Grep", "input_schema":{}}
+                ],
+                "tool_choice":{"type":"tool", "name":"Read"}
+            }),
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"run it twice"}],
+                "tools":[{
+                    "name":"DeferredTool", "defer_loading":true, "input_schema":{}
+                }],
+                "tool_choice":{"type":"tool", "name":"DeferredTool"}
+            }),
+        ];
+
+        for case in cases {
+            let body: MessagesRequest = serde_json::from_value(case).unwrap();
+            let model = "gpt-5.6-sol".to_string();
+            let lite =
+                apply_model_lane_for_request_with_options(&model, &body, true, true).unwrap();
+            assert!(!lite, "callable function request should use the full lane");
+
+            let translated = translate_request_with_overrides(
+                &body,
+                TranslateOptions {
+                    session_id: None,
+                    service_tier: None,
+                    model,
+                    use_responses_lite: lite,
+                },
+                TranslationOverrides::default(),
+            )
+            .unwrap();
+            assert!(translated.parallel_tool_calls);
+        }
+    }
+
+    #[test]
     fn parallel_tools_keep_luna_and_ineligible_requests_on_lite() {
         let two_tools = serde_json::json!([
             {"name":"Read", "input_schema":{}},
             {"name":"Grep", "input_schema":{}}
         ]);
         let cases = [
-            serde_json::json!({
-                "model":"gpt-5.6-sol",
-                "messages":[{"role":"user", "content":"inspect"}],
-                "tools":[{"name":"Read", "input_schema":{}}]
-            }),
             serde_json::json!({
                 "model":"gpt-5.6-sol",
                 "messages":[{"role":"user", "content":"inspect"}],
@@ -2534,13 +2696,31 @@ mod tests {
                 "model":"gpt-5.6-sol",
                 "messages":[{"role":"user", "content":"inspect"}],
                 "tools":two_tools,
-                "tool_choice":{"type":"tool", "name":"Read"}
+                "tool_choice":{"type":"auto", "disable_parallel_tool_use":true}
             }),
             serde_json::json!({
                 "model":"gpt-5.6-sol",
                 "messages":[{"role":"user", "content":"inspect"}],
                 "tools":two_tools,
-                "tool_choice":{"type":"auto", "disable_parallel_tool_use":true}
+                "tool_choice":{
+                    "type":"tool", "name":"Read", "disable_parallel_tool_use":true
+                }
+            }),
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"inspect"}],
+                "tools":[{
+                    "name":"ProgrammaticOnly",
+                    "allowed_callers":["code_execution_20260120"],
+                    "input_schema":{}
+                }]
+            }),
+            serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "messages":[{"role":"user", "content":"inspect"}],
+                "tools":[{
+                    "name":"DeferredTool", "defer_loading":true, "input_schema":{}
+                }]
             }),
             serde_json::json!({
                 "model":"gpt-5.6-sol",
@@ -2553,16 +2733,16 @@ mod tests {
         ];
 
         let luna_body = request_with_tools(two_tools.clone());
-        let mut luna = "gpt-5.6-luna".to_string();
-        assert!(apply_model_lane_for_request_with_options(
-            &mut luna, &luna_body, true, true
-        ));
+        assert_eq!(
+            apply_model_lane_for_request_with_options("gpt-5.6-luna", &luna_body, true, true,),
+            Ok(true)
+        );
 
         for body in cases {
             let body: MessagesRequest = serde_json::from_value(body).unwrap();
-            let mut model = "gpt-5.6-sol".to_string();
             assert!(
-                apply_model_lane_for_request_with_options(&mut model, &body, true, true),
+                apply_model_lane_for_request_with_options("gpt-5.6-sol", &body, true, true,)
+                    .unwrap(),
                 "ineligible request unexpectedly left Responses Lite: {body:?}"
             );
         }
@@ -2574,27 +2754,30 @@ mod tests {
             {"name":"Read", "input_schema":{}},
             {"name":"Grep", "input_schema":{}}
         ]));
-        let mut model = "gpt-5.6-sol".to_string();
-
-        assert!(apply_model_lane_for_request_with_options(
-            &mut model, &body, true, false
-        ));
-        assert_eq!(model, "gpt-5.6-sol");
+        assert_eq!(
+            apply_model_lane_for_request_with_options("gpt-5.6-sol", &body, true, false),
+            Ok(true)
+        );
     }
 
     #[test]
-    fn responses_lite_can_be_disabled_without_changing_the_model() {
+    fn responses_lite_disabled_rejects_luna_instead_of_changing_models() {
         let body = request_with_tools(serde_json::json!([
             {"name":"Bash", "input_schema":{}}
         ]));
         for parallel_tools in [false, true] {
-            let mut model = "gpt-5.6-luna".to_string();
-            let lite =
-                apply_model_lane_for_request_with_options(&mut model, &body, false, parallel_tools);
-
-            assert!(!lite);
-            assert_eq!(model, "gpt-5.6-luna");
+            let error = apply_model_lane_for_request_with_options(
+                "gpt-5.6-luna",
+                &body,
+                false,
+                parallel_tools,
+            )
+            .unwrap_err();
+            assert!(error.contains("available only through Responses Lite"));
         }
+
+        let alias = resolve_model_request("haiku").model;
+        assert!(apply_model_lane_for_request_with_options(&alias, &body, false, false).is_err());
     }
 
     #[test]
@@ -2734,6 +2917,48 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("hello"));
         assert!(body.contains("heartbeat timed out"));
+    }
+
+    #[tokio::test]
+    async fn live_hosted_side_effect_blocks_outer_retry_and_preserves_failure_status() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(Ok(serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type":"web_search_call", "id":"ws_1"}
+        })))
+        .await
+        .unwrap();
+        tx.send(Ok(serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"status":503, "message":"hosted search failed after dispatch"}
+            }
+        })))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let response = match live_stream_response_once(
+            rx,
+            "msg_hosted_barrier".to_string(),
+            "gpt-5.6-sol",
+            live_test_context(),
+            None,
+            None,
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(10_000),
+            DEFAULT_STREAM_HEARTBEAT,
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { .. } => {
+                panic!("hosted side effects must close the outer replay window")
+            }
+        };
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

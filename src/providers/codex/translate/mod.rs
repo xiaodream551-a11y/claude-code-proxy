@@ -7,4 +7,5 @@ pub mod reducer;
 pub mod request;
 pub mod schema_bridge;
 pub mod stream;
+pub mod tool_policy;
 pub mod web_search_compat;

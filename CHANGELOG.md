@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Enforce Codex and Grok response tool policy in live and buffered paths:
+  reject undeclared or forbidden function/hosted calls, a second call in
+  serial mode, and successful responses that omit a required or named tool.
+- Let opt-in Codex full-lane and Grok guidance cover independent repeated calls
+  to one function tool, including named choices, while keeping `none` and
+  `disable_parallel_tool_use` serial and free of tool-use guidance.
+- Reconcile Grok's late `output_text.done` snapshot across hosted web/X tool
+  boundaries, retaining exact-once matching and fail-closing on extensions or
+  duplicates. Forced Grok function choices now match only exact declared names.
+- Enforce hosted-search `max_uses` in Codex and Grok response policy, and close
+  retry, reconnect, and transport-fallback windows as soon as an upstream
+  hosted search starts so one logical request cannot replay the side effect.
+- Give Codex hosted-search blocks collision-free downstream IDs, require an
+  authoritative non-empty upstream ID, and preserve monotonic content-block
+  ordering when a live response continues with function calls.
+- Keep omitted-type and explicitly typed Grok functions named `WebSearch` or
+  `XSearch` as functions; only explicit hosted types move execution upstream.
+  Reject forced or otherwise unobservable hosted X-only responses, and reject
+  request-level reasoning effort for Composer instead of dropping it.
+- Reject GPT-5.6 Luna locally when a request requires the full Responses lane,
+  preserving the caller's selected model instead of silently changing it to
+  Sol. Reuse non-stream accumulator finish metadata instead of running the
+  reducer again for continuation, and remove the unreachable buffered-stream
+  production branch.
+
 ## v0.1.23 (2026-07-22)
 
 - Accept Grok streams that open function calls before a matching late

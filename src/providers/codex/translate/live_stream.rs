@@ -8,13 +8,16 @@ use super::super::events::validate_terminal_snapshot_status;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
-    CodexUsage, OutputItemIdentity, OutputItemKind, STOP_END_TURN, STOP_TOOL_USE, event_type,
-    is_post_terminal_telemetry, map_codex_usage_to_anthropic, parse_output_item_added,
-    reconcile_output_text_snapshot, register_output_item, require_active_output_kind,
+    CodexUsage, OutputItemIdentity, OutputItemKind, STOP_END_TURN, STOP_TOOL_USE,
+    completed_tool_counts, event_type, is_post_terminal_telemetry, map_codex_usage_to_anthropic,
+    parse_output_item_added, reconcile_output_text_snapshot, register_output_item,
+    registered_hosted_tool_count, registered_tool_count, require_active_output_kind,
     resolve_semantic_output_index, stop_reason_for_incomplete_response, unfinished_output_indices,
     validate_output_item_done, validate_tool_arguments,
 };
 use super::schema_bridge::SchemaBridge;
+use super::tool_policy::ToolCallPolicy;
+use super::web_search_compat::server_tool_use_id_from_codex_web_search_id;
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
 const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
@@ -65,6 +68,13 @@ struct PreparedToolArguments {
     emit: bool,
 }
 
+struct DeferredLiveContentEvent {
+    index: usize,
+    sequence: usize,
+    event: String,
+    data: serde_json::Value,
+}
+
 pub struct LiveStreamTranslator {
     message_id: String,
     model: String,
@@ -72,6 +82,8 @@ pub struct LiveStreamTranslator {
     blocks_by_output_index: HashMap<usize, LiveBlock>,
     item_id_to_output_index: HashMap<String, usize>,
     call_id_to_output_index: HashMap<String, usize>,
+    downstream_tool_ids: HashSet<String>,
+    downstream_open_content_blocks: HashSet<usize>,
     output_identities: HashMap<usize, OutputItemIdentity>,
     completed_output_indices: HashSet<usize>,
     anthropic_index: usize,
@@ -83,7 +95,11 @@ pub struct LiveStreamTranslator {
     web_searches: Vec<LiveWebSearch>,
     web_search_results: Vec<LiveWebSearchResult>,
     deferred_text: Vec<(usize, String)>,
+    defer_content_after_web_search: bool,
+    deferred_content_events: Vec<DeferredLiveContentEvent>,
+    deferred_content_sequence: usize,
     schema_bridge: Option<Arc<SchemaBridge>>,
+    tool_policy: ToolCallPolicy,
     upstream_input_bytes: usize,
     finished: bool,
 }
@@ -98,6 +114,20 @@ impl LiveStreamTranslator {
         model: impl Into<String>,
         schema_bridge: Option<Arc<SchemaBridge>>,
     ) -> Self {
+        Self::with_schema_bridge_and_tool_policy(
+            message_id,
+            model,
+            schema_bridge,
+            ToolCallPolicy::permissive(),
+        )
+    }
+
+    pub(crate) fn with_schema_bridge_and_tool_policy(
+        message_id: impl Into<String>,
+        model: impl Into<String>,
+        schema_bridge: Option<Arc<SchemaBridge>>,
+        tool_policy: ToolCallPolicy,
+    ) -> Self {
         Self {
             message_id: message_id.into(),
             model: model.into(),
@@ -105,6 +135,8 @@ impl LiveStreamTranslator {
             blocks_by_output_index: HashMap::new(),
             item_id_to_output_index: HashMap::new(),
             call_id_to_output_index: HashMap::new(),
+            downstream_tool_ids: HashSet::new(),
+            downstream_open_content_blocks: HashSet::new(),
             output_identities: HashMap::new(),
             completed_output_indices: HashSet::new(),
             anthropic_index: 0,
@@ -116,7 +148,11 @@ impl LiveStreamTranslator {
             web_searches: Vec::new(),
             web_search_results: Vec::new(),
             deferred_text: Vec::new(),
+            defer_content_after_web_search: false,
+            deferred_content_events: Vec::new(),
+            deferred_content_sequence: 0,
             schema_bridge,
+            tool_policy,
             upstream_input_bytes: 0,
             finished: false,
         }
@@ -407,12 +443,53 @@ impl LiveStreamTranslator {
     }
 
     fn emit(
-        &self,
+        &mut self,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
         event: &str,
         data: &serde_json::Value,
     ) {
+        if self.defer_content_after_web_search && event.starts_with("content_block_") {
+            let index = data
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .expect("content block events carry a non-negative index")
+                as usize;
+            let sequence = self.deferred_content_sequence;
+            self.deferred_content_sequence += 1;
+            self.deferred_content_events.push(DeferredLiveContentEvent {
+                index,
+                sequence,
+                event: event.to_string(),
+                data: data.clone(),
+            });
+            return;
+        }
+        self.emit_now(traffic, out, event, data);
+    }
+
+    fn emit_now(
+        &mut self,
+        traffic: Option<&TrafficCapture>,
+        out: &mut Vec<u8>,
+        event: &str,
+        data: &serde_json::Value,
+    ) {
+        if let Some(index) = data
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .map(|index| index as usize)
+        {
+            match event {
+                "content_block_start" => {
+                    self.downstream_open_content_blocks.insert(index);
+                }
+                "content_block_stop" => {
+                    self.downstream_open_content_blocks.remove(&index);
+                }
+                _ => {}
+            }
+        }
         if let Some(traffic) = traffic {
             traffic.write_json_event(
                 "050-downstream-event",
@@ -425,6 +502,15 @@ impl LiveStreamTranslator {
         out.extend_from_slice(&encode_sse_event(Some(event), &data.to_string()));
     }
 
+    fn flush_deferred_content(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
+        self.defer_content_after_web_search = false;
+        let mut events = std::mem::take(&mut self.deferred_content_events);
+        events.sort_by_key(|event| (event.index, event.sequence));
+        for event in events {
+            self.emit_now(traffic, out, &event.event, &event.data);
+        }
+    }
+
     fn output_item_added(
         &mut self,
         payload: &serde_json::Value,
@@ -432,7 +518,39 @@ impl LiveStreamTranslator {
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
         let (output_index, item, identity) = parse_output_item_added(payload)?;
+        if identity.kind == OutputItemKind::FunctionCall {
+            self.tool_policy.validate_function_name(
+                identity.name.as_deref().expect("validated function name"),
+            )?;
+        } else if identity.kind == OutputItemKind::WebSearchCall {
+            self.tool_policy
+                .validate_hosted_call(registered_hosted_tool_count(&self.output_identities))?;
+        }
+        if matches!(
+            identity.kind,
+            OutputItemKind::FunctionCall | OutputItemKind::WebSearchCall
+        ) {
+            self.tool_policy
+                .validate_next_tool_call(registered_tool_count(&self.output_identities))?;
+        }
         let item_type = identity.kind;
+        let downstream_tool_id = match identity.kind {
+            OutputItemKind::FunctionCall => identity.call_id.clone(),
+            OutputItemKind::WebSearchCall => Some(server_tool_use_id_from_codex_web_search_id(
+                identity
+                    .item_id
+                    .as_deref()
+                    .expect("validated web search item id"),
+            )?),
+            OutputItemKind::Reasoning | OutputItemKind::Message => None,
+        };
+        if let Some(id) = downstream_tool_id.as_deref()
+            && self.downstream_tool_ids.contains(id)
+        {
+            return Err(format!(
+                "Codex produced duplicate downstream tool use id {id:?}"
+            ));
+        }
         register_output_item(
             output_index,
             identity,
@@ -440,6 +558,9 @@ impl LiveStreamTranslator {
             &mut self.item_id_to_output_index,
             &mut self.call_id_to_output_index,
         )?;
+        if let Some(id) = downstream_tool_id.clone() {
+            self.downstream_tool_ids.insert(id);
+        }
 
         match item_type {
             OutputItemKind::Reasoning => {
@@ -522,6 +643,19 @@ impl LiveStreamTranslator {
                 );
             }
             OutputItemKind::WebSearchCall => {
+                let index = self.anthropic_index;
+                self.anthropic_index += 1;
+                let result_index = self.anthropic_index;
+                self.anthropic_index += 1;
+                self.web_searches.push(LiveWebSearch {
+                    output_index,
+                    index,
+                    result_index,
+                    id: downstream_tool_id.expect("validated downstream web search id"),
+                    query: String::new(),
+                    results: Vec::new(),
+                });
+                self.defer_content_after_web_search = true;
                 if self.web_search_output_indices.insert(output_index) {
                     self.web_search_requests += 1;
                 }
@@ -824,29 +958,17 @@ impl LiveStreamTranslator {
 
         if identity.kind == OutputItemKind::WebSearchCall {
             self.close_thinking(traffic, out);
-            let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            if self.web_search_output_indices.insert(output_index) {
-                self.web_search_requests += 1;
-            }
-            if self
+            let search = self
                 .web_searches
-                .iter()
-                .any(|search| search.output_index == output_index)
-            {
-                return Ok(());
-            }
-            let index = self.anthropic_index;
-            self.anthropic_index += 1;
-            let result_index = self.anthropic_index;
-            self.anthropic_index += 1;
-            self.web_searches.push(LiveWebSearch {
-                output_index,
-                index,
-                result_index,
-                id: super::web_search_compat::server_tool_use_id_from_codex_web_search_id(raw_id),
-                query: web_search_query(item),
-                results: web_search_sources(item),
-            });
+                .iter_mut()
+                .find(|search| search.output_index == output_index)
+                .ok_or_else(|| {
+                    format!(
+                        "{event} references missing web search state at output_index {output_index}"
+                    )
+                })?;
+            search.query = web_search_query(item);
+            search.results = web_search_sources(item);
             self.completed_output_indices.insert(output_index);
             return Ok(());
         }
@@ -1170,20 +1292,29 @@ impl LiveStreamTranslator {
                 "{event_type} arrived with unfinished Codex output items at output_index(es) {unfinished:?}"
             ));
         }
+        let terminal_stop_reason = stop_reason_for_incomplete_response(payload, event_type);
+        if matches!(event_type, "response.completed" | "response.done")
+            && terminal_stop_reason.is_none()
+        {
+            let (completed_function_calls, completed_hosted_calls) =
+                completed_tool_counts(&self.output_identities, &self.completed_output_indices);
+            self.tool_policy
+                .validate_success_terminal(completed_function_calls, completed_hosted_calls)?;
+        }
         self.close_thinking(traffic, out);
         let usage = payload.get("response").map(parse_codex_usage);
-        let stop_reason =
-            if let Some(reason) = stop_reason_for_incomplete_response(payload, event_type) {
-                reason
-            } else if self.saw_tool_use {
-                STOP_TOOL_USE
-            } else {
-                STOP_END_TURN
-            };
+        let stop_reason = if let Some(reason) = terminal_stop_reason {
+            reason
+        } else if self.saw_tool_use {
+            STOP_TOOL_USE
+        } else {
+            STOP_END_TURN
+        };
         if stop_reason == STOP_END_TURN {
             self.normalize_deferred_structured_text()?;
         }
         self.emit_web_searches(traffic, out);
+        self.flush_deferred_content(traffic, out);
         self.ensure_message_start(traffic, out);
         self.emit_finish(stop_reason, usage, traffic, out);
         Ok(())
@@ -1244,35 +1375,25 @@ impl LiveStreamTranslator {
     }
 
     fn close_open_blocks(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
-        self.close_thinking(traffic, out);
+        // An error must not flush content that was only queued behind a hosted search.
+        // Drop those never-emitted blocks and close only indices that the downstream
+        // has actually observed as open.
+        self.defer_content_after_web_search = false;
+        self.deferred_content_events.clear();
+        self.blocks_by_output_index.clear();
+        self.thinking = None;
+        self.reasoning_by_output_index.clear();
+        self.web_searches.clear();
+        self.deferred_text.clear();
+
         let mut open: Vec<_> = self
-            .blocks_by_output_index
+            .downstream_open_content_blocks
             .iter()
-            .map(|(output_index, state)| {
-                let index = match state {
-                    LiveBlock::Text { index, .. } | LiveBlock::Tool { index, .. } => *index,
-                };
-                (*output_index, index)
-            })
+            .copied()
             .collect();
-        open.sort_by_key(|(_, index)| *index);
-        for (output_index, _) in open {
-            let Some(state) = self.blocks_by_output_index.remove(&output_index) else {
-                continue;
-            };
-            let index = match state {
-                LiveBlock::Text {
-                    index,
-                    text,
-                    deferred: true,
-                } => {
-                    self.deferred_text.push((index, text));
-                    continue;
-                }
-                LiveBlock::Text { index, .. } => index,
-                LiveBlock::Tool { index, .. } => index,
-            };
-            self.emit(
+        open.sort_unstable();
+        for index in open {
+            self.emit_now(
                 traffic,
                 out,
                 "content_block_stop",
@@ -1525,6 +1646,7 @@ fn error_message(payload: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::request::{ResponsesRequest, ResponsesToolChoice, ResponsesToolChoiceMode};
     use super::*;
     use serde_json::json;
 
@@ -1570,6 +1692,267 @@ mod tests {
                 "item": {"type": "message", "id": "msg_up"}
             }),
         ]
+    }
+
+    fn translator_with_tool_policy(
+        function_names: &[&str],
+        hosted_web_search: bool,
+        tool_choice: ResponsesToolChoice,
+    ) -> LiveStreamTranslator {
+        translator_with_tool_policy_and_parallel(
+            function_names,
+            hosted_web_search,
+            tool_choice,
+            true,
+        )
+    }
+
+    fn translator_with_tool_policy_and_parallel(
+        function_names: &[&str],
+        hosted_web_search: bool,
+        tool_choice: ResponsesToolChoice,
+        parallel_tool_calls: bool,
+    ) -> LiveStreamTranslator {
+        let mut tools: Vec<serde_json::Value> = function_names
+            .iter()
+            .map(|name| {
+                json!({
+                    "type": "function",
+                    "name": name,
+                    "parameters": {"type": "object"},
+                    "strict": false
+                })
+            })
+            .collect();
+        if hosted_web_search {
+            tools.push(json!({
+                "type": "web_search",
+                "external_web_access": true,
+                "search_content_types": ["text"]
+            }));
+        }
+        let mut request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": [],
+            "tools": tools,
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": parallel_tool_calls,
+            "text": {}
+        }))
+        .unwrap();
+        request.tool_choice = Some(tool_choice);
+        let policy = ToolCallPolicy::from_request(&request);
+        LiveStreamTranslator::with_schema_bridge_and_tool_policy(
+            "msg_policy",
+            "gpt-5.6-sol",
+            None,
+            policy,
+        )
+    }
+
+    fn function_call_added(output_index: usize, call_id: &str, name: &str) -> serde_json::Value {
+        json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {"type": "function_call", "call_id": call_id, "name": name}
+        })
+    }
+
+    #[test]
+    fn tool_policy_none_rejects_upstream_function_before_emission() {
+        let mut translator = translator_with_tool_policy(
+            &["Bash"],
+            false,
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None),
+        );
+        let error = translator
+            .accept(&function_call_added(0, "call_1", "Bash"), None)
+            .unwrap_err();
+        assert!(error.contains("forbids function calls"));
+        assert!(translator.output_identities.is_empty());
+        assert!(!translator.message_started);
+    }
+
+    #[test]
+    fn tool_policy_named_function_rejects_a_different_function() {
+        let mut translator = translator_with_tool_policy(
+            &["Read", "Bash"],
+            false,
+            ResponsesToolChoice::Function {
+                r#type: "function".to_string(),
+                name: "Read".to_string(),
+            },
+        );
+        let error = translator
+            .accept(&function_call_added(0, "call_1", "Bash"), None)
+            .unwrap_err();
+        assert!(error.contains("requires \"Read\""));
+        assert!(translator.output_identities.is_empty());
+
+        let error = translator
+            .accept(
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {"type": "web_search_call", "id": "search_1"}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("tool_choice forbids"));
+
+        let error = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "incomplete_details": null,
+                        "usage": {}
+                    }
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("required function tool \"Read\""));
+    }
+
+    #[test]
+    fn tool_policy_auto_rejects_undeclared_function_and_hosted_calls() {
+        let mut translator = translator_with_tool_policy(
+            &["Read"],
+            false,
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
+        );
+        let error = translator
+            .accept(&function_call_added(0, "call_1", "Bash"), None)
+            .unwrap_err();
+        assert!(error.contains("undeclared function tool \"Bash\""));
+
+        let error = translator
+            .accept(
+                &json!({
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {"type": "web_search_call", "id": "search_1"}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("undeclared hosted web search"));
+        assert!(translator.output_identities.is_empty());
+    }
+
+    #[test]
+    fn tool_policy_required_rejects_success_terminal_without_a_call() {
+        let mut translator = translator_with_tool_policy(
+            &["Read"],
+            false,
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required),
+        );
+        let error = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "incomplete_details": null,
+                        "usage": {}
+                    }
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("required by tool_choice"));
+        assert!(!translator.is_finished());
+    }
+
+    #[test]
+    fn tool_policy_allows_declared_parallel_function_calls() {
+        let mut translator = translator_with_tool_policy(
+            &["Read", "Bash"],
+            false,
+            ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
+        );
+        let events = [
+            function_call_added(3, "call_read", "Read"),
+            function_call_added(7, "call_bash", "Bash"),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 3,
+                "delta": "{\"file_path\":\"/tmp/a\"}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 7,
+                "delta": "{\"command\":\"pwd\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 7,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_bash",
+                    "name": "Bash",
+                    "arguments": "{\"command\":\"pwd\"}"
+                }
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 3,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_read",
+                    "name": "Read",
+                    "arguments": "{\"file_path\":\"/tmp/a\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "incomplete_details": null,
+                    "usage": {}
+                }
+            }),
+        ];
+        let mut out = Vec::new();
+        for event in events {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+        let rendered = String::from_utf8(out).unwrap();
+        assert_eq!(rendered.matches(r#""type":"tool_use""#).count(), 2);
+        assert!(rendered.contains(r#""stop_reason":"tool_use""#));
+        assert!(translator.is_finished());
+    }
+
+    #[test]
+    fn tool_policy_rejects_a_second_call_when_parallel_is_disabled() {
+        for second in [
+            function_call_added(1, "call_read_2", "Read"),
+            json!({
+                "type":"response.output_item.added",
+                "output_index":1,
+                "item":{"type":"web_search_call", "id":"search_1"}
+            }),
+        ] {
+            let mut translator = translator_with_tool_policy_and_parallel(
+                &["Read"],
+                true,
+                ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto),
+                false,
+            );
+            translator
+                .accept(&function_call_added(0, "call_read_1", "Read"), None)
+                .unwrap();
+            let error = translator.accept(&second, None).unwrap_err();
+            assert!(error.contains("parallel_tool_calls is false"), "{error}");
+            assert_eq!(translator.output_identities.len(), 1);
+        }
     }
 
     #[test]
@@ -3133,6 +3516,397 @@ mod tests {
         assert!(out.contains(r#""encrypted_content":"""#));
         assert!(out.contains(r#""page_age":null"#));
         assert!(out.contains(r#""web_search_requests":1"#));
+    }
+
+    #[test]
+    fn live_web_search_ids_are_nonempty_injective_and_cross_tool_unique() {
+        let mut translator = LiveStreamTranslator::new("msg_ids", "gpt-5.6-sol");
+        let missing = translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"web_search_call"}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(missing.contains("web search item id"));
+        assert!(translator.output_identities.is_empty());
+
+        let mut translator = LiveStreamTranslator::new("msg_ids", "gpt-5.6-sol");
+        translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1"}
+                }),
+                None,
+            )
+            .unwrap();
+        let collision = translator
+            .accept(&function_call_added(1, "srvtoolu_ws_1", "Read"), None)
+            .unwrap_err();
+        assert!(collision.contains("duplicate downstream tool use id"));
+        assert_eq!(translator.output_identities.len(), 1);
+
+        let out = render(vec![
+            json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"web_search_call","id":"ws-1"}
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"web_search_call","id":"ws-1","action":{"query":"a"}}
+            }),
+            json!({
+                "type":"response.output_item.added",
+                "output_index":1,
+                "item":{"type":"web_search_call","id":"ws_1"}
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":1,
+                "item":{"type":"web_search_call","id":"ws_1","action":{"query":"b"}}
+            }),
+            json!({
+                "type":"response.completed",
+                "response":{"status":"completed","usage":{}}
+            }),
+        ]);
+        assert!(out.contains("srvtoolu_b64_d3MtMQ"));
+        assert!(out.contains("srvtoolu_ws_1"));
+    }
+
+    #[test]
+    fn live_hosted_max_uses_rejects_the_next_call_before_registration() {
+        let mut request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "input":[],
+            "tools":[{"type":"web_search","external_web_access":true,"search_content_types":["text"]}],
+            "tool_choice":"auto",
+            "store":false,
+            "stream":true,
+            "parallel_tool_calls":true,
+            "text":{}
+        }))
+        .unwrap();
+        request.hosted_web_search_max_uses = Some(1);
+        let mut translator = LiveStreamTranslator::with_schema_bridge_and_tool_policy(
+            "msg_max",
+            "gpt-5.6-sol",
+            None,
+            ToolCallPolicy::from_request(&request),
+        );
+        translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1"}
+                }),
+                None,
+            )
+            .unwrap();
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.added",
+                    "output_index":1,
+                    "item":{"type":"web_search_call","id":"ws_2"}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("max_uses"));
+        assert_eq!(translator.output_identities.len(), 1);
+        assert_eq!(translator.web_searches.len(), 1);
+    }
+
+    #[test]
+    fn live_web_search_then_function_emits_monotonic_content_indices() {
+        let out = render(vec![
+            json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"web_search_call","id":"ws_1"}
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"web_search_call","id":"ws_1","action":{"query":"rust"}}
+            }),
+            function_call_added(1, "call_1", "Read"),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":1,
+                "item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{}"}
+            }),
+            json!({
+                "type":"response.completed",
+                "response":{"status":"completed","usage":{}}
+            }),
+        ]);
+        let starts: Vec<_> = crate::anthropic::sse::try_parse_sse_events(out.as_bytes())
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event.as_deref() == Some("content_block_start"))
+            .map(|event| serde_json::from_str::<serde_json::Value>(&event.data).unwrap())
+            .map(|value| {
+                (
+                    value["index"].as_u64().unwrap(),
+                    value["content_block"]["type"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (0, "server_tool_use".to_string()),
+                (1, "web_search_tool_result".to_string()),
+                (2, "tool_use".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_error_closes_only_content_blocks_already_emitted_downstream() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let mut out = translator
+            .accept(&function_call_added(0, "call_1", "Read"), None)
+            .unwrap();
+        out.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type":"response.output_item.added",
+                        "output_index":1,
+                        "item":{"type":"web_search_call","id":"ws_1"}
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
+        out.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type":"response.output_item.done",
+                        "output_index":0,
+                        "item":{
+                            "type":"function_call",
+                            "call_id":"call_1",
+                            "name":"Read",
+                            "arguments":"{}"
+                        }
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.failed",
+                    "response":{"error":{"message":"upstream timed out"}}
+                }),
+                None,
+            )
+            .unwrap_err();
+        out.extend(translator.error_chunk(&error, "api_error", None));
+
+        let values: Vec<serde_json::Value> = crate::anthropic::sse::try_parse_sse_events(&out)
+            .unwrap()
+            .into_iter()
+            .map(|event| serde_json::from_str(&event.data).unwrap())
+            .collect();
+        let starts: Vec<_> = values
+            .iter()
+            .filter(|value| value["type"] == "content_block_start")
+            .collect();
+        let stops: Vec<_> = values
+            .iter()
+            .filter(|value| value["type"] == "content_block_stop")
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["index"], 0);
+        assert_eq!(starts[0]["content_block"]["type"], "tool_use");
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0]["index"], 0);
+        assert!(values.iter().any(|value| value["type"] == "error"));
+        assert!(
+            !values
+                .iter()
+                .any(|value| value["content_block"]["type"] == "server_tool_use")
+        );
+        assert!(!values.iter().any(|value| {
+            value["type"] == "content_block_delta" && value["delta"]["type"] == "input_json_delta"
+        }));
+    }
+
+    #[test]
+    fn live_error_discards_never_emitted_deferred_function_block() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let mut out = translator
+            .accept(
+                &json!({
+                    "type":"response.output_item.added",
+                    "output_index":0,
+                    "item":{"type":"web_search_call","id":"ws_1"}
+                }),
+                None,
+            )
+            .unwrap();
+        out.extend(
+            translator
+                .accept(&function_call_added(1, "call_1", "Read"), None)
+                .unwrap(),
+        );
+        out.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type":"response.function_call_arguments.delta",
+                        "output_index":1,
+                        "delta":"{}"
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
+        let error = translator
+            .accept(
+                &json!({
+                    "type":"response.failed",
+                    "response":{"error":{"message":"upstream timed out"}}
+                }),
+                None,
+            )
+            .unwrap_err();
+        out.extend(translator.error_chunk(&error, "api_error", None));
+
+        let values: Vec<serde_json::Value> = crate::anthropic::sse::try_parse_sse_events(&out)
+            .unwrap()
+            .into_iter()
+            .map(|event| serde_json::from_str(&event.data).unwrap())
+            .collect();
+        assert!(!values.iter().any(|value| {
+            matches!(
+                value["type"].as_str(),
+                Some("content_block_start" | "content_block_delta" | "content_block_stop")
+            )
+        }));
+        assert!(values.iter().any(|value| value["type"] == "error"));
+        assert!(!values.iter().any(|value| value["type"] == "message_stop"));
+    }
+
+    #[test]
+    fn interleaved_web_and_function_order_matches_all_response_paths() {
+        let events = vec![
+            json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"web_search_call","id":"ws_1"}
+            }),
+            function_call_added(1, "call_1", "Read"),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":1,
+                "item":{
+                    "type":"function_call",
+                    "call_id":"call_1",
+                    "name":"Read",
+                    "arguments":"{}"
+                }
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"web_search_call",
+                    "id":"ws_1",
+                    "action":{
+                        "query":"rust",
+                        "sources":[{
+                            "type":"url",
+                            "title":"Rust",
+                            "url":"https://www.rust-lang.org"
+                        }]
+                    }
+                }
+            }),
+            json!({
+                "type":"response.completed",
+                "response":{"id":"resp_1","status":"completed","usage":{}}
+            }),
+        ];
+        let upstream: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+
+        let live = render(events);
+        let buffered =
+            super::super::stream::translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5")
+                .unwrap();
+        let reduced = super::super::reducer::reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let non_stream =
+            super::super::accumulate::accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5")
+                .unwrap();
+
+        let streaming_starts = |bytes: &[u8]| {
+            crate::anthropic::sse::try_parse_sse_events(bytes)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.event.as_deref() == Some("content_block_start"))
+                .map(|event| serde_json::from_str::<serde_json::Value>(&event.data).unwrap())
+                .map(|value| {
+                    (
+                        value["index"].as_u64().unwrap(),
+                        value["content_block"]["type"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            (0, "server_tool_use".to_string()),
+            (1, "web_search_tool_result".to_string()),
+            (2, "tool_use".to_string()),
+        ];
+        assert_eq!(streaming_starts(live.as_bytes()), expected);
+        assert_eq!(streaming_starts(&buffered), expected);
+
+        let mut reduced_starts = reduced
+            .iter()
+            .flat_map(|event| match event {
+                super::super::reducer::ReducerEvent::WebSearch {
+                    index,
+                    result_index,
+                    ..
+                } => vec![
+                    (*index as u64, "server_tool_use".to_string()),
+                    (*result_index as u64, "web_search_tool_result".to_string()),
+                ],
+                super::super::reducer::ReducerEvent::ToolStart { index, .. } => {
+                    vec![(*index as u64, "tool_use".to_string())]
+                }
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        reduced_starts.sort_by_key(|(index, _)| *index);
+        assert_eq!(reduced_starts, expected);
+        assert_eq!(
+            non_stream["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|block| block["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["server_tool_use", "web_search_tool_result", "tool_use"]
+        );
     }
 
     #[test]

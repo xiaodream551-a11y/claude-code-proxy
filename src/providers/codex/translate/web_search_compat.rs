@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use serde_json::Value;
 
 pub struct WebSearchCompatBlock {
@@ -25,18 +26,26 @@ pub struct WebSearchResult {
     pub url: String,
 }
 
-pub fn server_tool_use_id_from_codex_web_search_id(id: &str) -> String {
-    let suffix: String = id
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("srvtoolu_{suffix}")
+pub fn server_tool_use_id_from_codex_web_search_id(id: &str) -> Result<String, String> {
+    if id.is_empty() {
+        return Err("Codex web search item id must be a non-empty string".to_string());
+    }
+    // Preserve the common legacy shape, while reserving `b64_` as an escape
+    // namespace for every value that the legacy sanitizer could collapse.
+    // Encoding the full UTF-8 byte sequence makes the mapping injective.
+    let safe_legacy = id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && !id.starts_with("b64_");
+    let suffix = if safe_legacy {
+        id.to_string()
+    } else {
+        format!(
+            "b64_{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id.as_bytes())
+        )
+    };
+    Ok(format!("srvtoolu_{suffix}"))
 }
 
 fn extract_web_search_results_from_text(text: &str) -> Vec<WebSearchResult> {
@@ -174,8 +183,21 @@ mod tests {
 
     #[test]
     fn server_tool_use_id_format() {
-        let id = server_tool_use_id_from_codex_web_search_id("ws_123");
+        let id = server_tool_use_id_from_codex_web_search_id("ws_123").unwrap();
         assert_eq!(id, "srvtoolu_ws_123");
+    }
+
+    #[test]
+    fn server_tool_use_id_mapping_is_injective_and_rejects_empty_ids() {
+        let dashed = server_tool_use_id_from_codex_web_search_id("ws-1").unwrap();
+        let underscored = server_tool_use_id_from_codex_web_search_id("ws_1").unwrap();
+        let reserved = server_tool_use_id_from_codex_web_search_id("b64_d3MtMQ").unwrap();
+
+        assert_ne!(dashed, underscored);
+        assert_ne!(dashed, reserved);
+        assert!(dashed.starts_with("srvtoolu_b64_"));
+        assert!(reserved.starts_with("srvtoolu_b64_"));
+        assert!(server_tool_use_id_from_codex_web_search_id("").is_err());
     }
 
     #[test]
