@@ -307,9 +307,9 @@ pub struct Reducer {
     next_index: usize,
     active: Option<(String, usize)>,
     active_text: String,
-    /// Text closed early (for example when a function call starts before
-    /// `response.output_text.done`) so a late matching snapshot can be accepted.
-    closed_text: Option<String>,
+    /// Text closed specifically by a function call before `response.output_text.done`, kept
+    /// for one exact late-snapshot reconciliation.
+    pending_function_text: Option<String>,
     saw_text_output: bool,
     calls: HashMap<String, ActiveFunctionCall>,
     item_calls: HashMap<String, String>,
@@ -565,7 +565,7 @@ impl Reducer {
                         {
                             anyhow::bail!("duplicate output tool item id");
                         }
-                        let mut out = self.close_active()?;
+                        let mut out = self.close_active_for_function_call()?;
                         let index = self.next_index;
                         self.next_index += 1;
                         self.calls.insert(
@@ -655,6 +655,9 @@ impl Reducer {
                     .transpose()?
                     .unwrap_or_default();
                 out.extend(self.close_kind("text")?);
+                // A done event consumes any snapshot retained when a function call closed the
+                // text early. Do not let a duplicate done event reopen the text.
+                self.pending_function_text = None;
                 Ok(out)
             }
             "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
@@ -775,6 +778,7 @@ impl Reducer {
                     snapshot_text
                 };
                 let mut out = self.close_active()?;
+                self.pending_function_text = None;
                 for text in fallback_text {
                     out.extend(self.delta("text", &text)?);
                     out.extend(self.close_kind("text")?);
@@ -1168,7 +1172,7 @@ impl Reducer {
             self.active = Some((kind.into(), index));
             if kind == "text" {
                 self.active_text.clear();
-                self.closed_text = None;
+                self.pending_function_text = None;
             }
             out.push(if kind == "thinking" {
                 ReducerEvent::ThinkingStart(index)
@@ -1199,35 +1203,38 @@ impl Reducer {
         Ok(match self.active.take() {
             Some((kind, index)) if kind == "thinking" => vec![ReducerEvent::ThinkingStop(index)],
             Some((_, index)) => {
-                // Keep the streamed text so a late `response.output_text.done` can still
-                // reconcile after Grok opens a tool call mid-message.
-                self.closed_text = Some(std::mem::take(&mut self.active_text));
+                self.active_text.clear();
                 vec![ReducerEvent::TextStop(index)]
             }
             None => vec![],
         })
     }
+    fn close_active_for_function_call(&mut self) -> anyhow::Result<Vec<ReducerEvent>> {
+        if self.active.as_ref().is_some_and(|(kind, _)| kind == "text") {
+            // Grok can open a function call before the preceding output_text.done. Keep this
+            // exact text once so that late snapshot can be reconciled after TextStop.
+            self.pending_function_text = Some(std::mem::take(&mut self.active_text));
+        }
+        self.close_active()
+    }
     fn complete_text_snapshot(&mut self, snapshot: &str) -> anyhow::Result<Vec<ReducerEvent>> {
         let suffix = match self.active.as_ref() {
-            Some((kind, _)) if kind == "text" => snapshot
-                .strip_prefix(&self.active_text)
-                .ok_or_else(|| {
+            Some((kind, _)) if kind == "text" => {
+                snapshot.strip_prefix(&self.active_text).ok_or_else(|| {
                     anyhow::anyhow!("completed text snapshot disagrees with streamed deltas")
-                })?,
-            _ if !self.saw_text_output => snapshot,
+                })?
+            }
             // Grok commonly emits `response.output_item.added(function_call)` before
             // `response.output_text.done`. The text block is already closed and forwarded;
-            // accept a matching (or strictly extending) snapshot instead of fail-closing.
-            _ => match self.closed_text.as_deref() {
-                Some(closed) => snapshot.strip_prefix(closed).ok_or_else(|| {
-                    anyhow::anyhow!("completed text snapshot disagrees with streamed deltas")
-                })?,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "completed text snapshot disagrees with streamed deltas"
-                    ));
-                }
-            },
+            // accept the one matching snapshot. A strict extension cannot be inserted before
+            // the already-forwarded tool block, so keep that malformed ordering fail-closed.
+            _ if self.pending_function_text.as_deref() == Some(snapshot) => "",
+            _ if !self.saw_text_output && self.pending_function_text.is_none() => snapshot,
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "completed text snapshot disagrees with streamed deltas"
+                ));
+            }
         };
         if suffix.is_empty() {
             Ok(Vec::new())
@@ -2204,7 +2211,9 @@ mod tests {
             ])
             .expect("late matching output_text.done after tool start must not fail closed");
         assert!(
-            events.iter().any(|event| matches!(event, ReducerEvent::TextDelta(_, text) if text == "Hello")),
+            events
+                .iter()
+                .any(|event| matches!(event, ReducerEvent::TextDelta(_, text) if text == "Hello")),
             "{events:?}"
         );
         assert!(
@@ -2227,6 +2236,138 @@ mod tests {
                 serde_json::json!({"type":"response.output_text.done","text":"Goodbye"}),
             ])
             .expect_err("mismatched late text snapshot must still fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("completed text snapshot disagrees with streamed deltas"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn completed_text_snapshot_cannot_be_extended_by_a_second_done_event() {
+        let mut reducer = Reducer::default();
+        let error = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"Hello"}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello"}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello injected"}),
+            ])
+            .expect_err("a completed text block must not be reopened by another done event");
+        assert!(
+            error
+                .to_string()
+                .contains("completed text snapshot disagrees with streamed deltas"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn late_output_text_done_is_consumed_once() {
+        let mut reducer = Reducer::default();
+        let error = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"Hello"}),
+                serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"Bash","id":"fc1"}}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello"}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello"}),
+            ])
+            .expect_err("a late text snapshot must not be accepted twice");
+        assert!(
+            error
+                .to_string()
+                .contains("completed text snapshot disagrees with streamed deltas"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn late_output_text_done_rejects_unstreamed_extension_after_tool_start() {
+        let mut reducer = Reducer::default();
+        let error = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"Hello"}),
+                serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"Bash","id":"fc1"}}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello injected"}),
+            ])
+            .expect_err("late text cannot be extended after its content block was closed");
+        assert!(
+            error
+                .to_string()
+                .contains("completed text snapshot disagrees with streamed deltas"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn non_tool_text_close_does_not_authorize_a_late_done_snapshot() {
+        let mut reducer = Reducer::default();
+        let error = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"Hello"}),
+                serde_json::json!({"type":"response.reasoning_text.delta","delta":"thinking"}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello"}),
+            ])
+            .expect_err("only a function call may retain text for a late done snapshot");
+        assert!(
+            error
+                .to_string()
+                .contains("completed text snapshot disagrees with streamed deltas"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn textless_done_consumes_the_late_snapshot_window() {
+        let mut reducer = Reducer::default();
+        let error = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"Hello"}),
+                serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"Bash","id":"fc1"}}),
+                serde_json::json!({"type":"response.output_text.done"}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello"}),
+            ])
+            .expect_err("a textless done must still consume the late snapshot window");
+        assert!(
+            error
+                .to_string()
+                .contains("completed text snapshot disagrees with streamed deltas"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parallel_function_calls_preserve_one_pending_late_text_snapshot() {
+        let mut reducer = Reducer::default();
+        let events = reducer
+            .push_batch([
+                serde_json::json!({"type":"response.output_text.delta","delta":"Hello"}),
+                serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"Read","id":"fc1"}}),
+                serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","call_id":"c2","name":"Grep","id":"fc2"}}),
+                serde_json::json!({"type":"response.output_text.done","text":"Hello"}),
+            ])
+            .expect("another function call must not discard the pending text snapshot");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ReducerEvent::ToolStart(_, _, _)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn empty_text_delta_cannot_bypass_late_snapshot_exact_match() {
+        let mut reducer = Reducer::default();
+        reducer
+            .push(serde_json::json!({"type":"response.output_text.delta","delta":""}))
+            .unwrap();
+        reducer
+            .push(serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"Bash","id":"fc1"}}))
+            .unwrap();
+        let error = reducer
+            .push(serde_json::json!({"type":"response.output_text.done","text":"injected"}))
+            .expect_err("an empty delta must still require an exact late snapshot");
         assert!(
             error
                 .to_string()
