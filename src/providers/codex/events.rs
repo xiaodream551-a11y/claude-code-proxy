@@ -483,6 +483,16 @@ mod tests {
     }
 
     #[test]
+    fn response_metadata_does_not_close_buffered_retry_prescan() {
+        let body = b"data: {\"type\":\"codex.response.metadata\",\"headers\":{\"openai-model\":\"gpt-5.6-sol\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"status\":503,\"message\":\"busy\"}}}\n\n";
+
+        assert_eq!(
+            first_retryable_failure(body).map(|failure| failure.status),
+            Some(503)
+        );
+    }
+
+    #[test]
     fn hosted_side_effect_blocks_buffered_model_replay() {
         for hosted in [
             r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1"}}"#,

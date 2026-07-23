@@ -1067,7 +1067,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
 fn codex_generation_event(payload: &serde_json::Value) -> bool {
     !matches!(
         payload.get("type").and_then(|value| value.as_str()),
-        Some("codex.rate_limits" | "keepalive") | None
+        Some("codex.rate_limits" | "codex.response.metadata" | "keepalive") | None
     )
 }
 
@@ -2787,6 +2787,9 @@ mod tests {
         })));
         assert!(!codex_generation_event(&serde_json::json!({
             "type": "keepalive"
+        })));
+        assert!(!codex_generation_event(&serde_json::json!({
+            "type": "codex.response.metadata"
         })));
         assert!(codex_generation_event(&serde_json::json!({
             "type": "response.created"

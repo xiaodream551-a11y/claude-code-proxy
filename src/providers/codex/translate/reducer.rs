@@ -817,7 +817,9 @@ pub(crate) fn reduce_upstream_bytes_with_tool_policy(
             continue;
         }
 
-        if t == "keepalive" {
+        if matches!(t.as_str(), "keepalive" | "codex.response.metadata") {
+            // `codex.response.metadata` carries response-scoped gateway
+            // headers. It is an acknowledged control frame, not model output.
             out.push(ReducerEvent::Progress);
             continue;
         }
@@ -2246,6 +2248,57 @@ mod tests {
     }
 
     #[test]
+    fn buffered_reducer_ignores_codex_response_metadata_control_frame() {
+        let upstream = format!(
+            "{}{}{}{}{}{}",
+            sse(
+                "codex.response.metadata",
+                json!({
+                    "headers": {
+                        "openai-model": "gpt-5.6-sol",
+                        "x-codex-safety-buffering-enabled": "true"
+                    }
+                })
+            ),
+            sse(
+                "response.created",
+                json!({"response":{"id":"resp_1","status":"in_progress"}})
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse(
+                "response.output_text.delta",
+                json!({"output_index":0,"delta":"metadata survived"})
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"message","id":"msg_up"}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","status":"completed","usage":{}}
+                })
+            ),
+        );
+
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        assert!(out.iter().any(|event| matches!(
+            event,
+            ReducerEvent::TextDelta { text, .. } if text == "metadata survived"
+        )));
+        assert!(matches!(out.last(), Some(ReducerEvent::Finish { .. })));
+    }
+
+    #[test]
     fn buffered_reducer_accepts_stream_start_bom_and_rejects_invalid_utf8() {
         let with_bom = b"\xef\xbb\xbfdata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\n";
         let reduced = reduce_upstream_bytes(with_bom).unwrap();
@@ -2622,6 +2675,10 @@ mod tests {
             sse(
                 "response.completed",
                 json!({"response":{"id":"resp_2","usage":{}}}),
+            ),
+            sse(
+                "codex.response.metadata",
+                json!({"headers":{"openai-model":"gpt-5.6-sol"}}),
             ),
             sse("future.semantic.event", json!({"value":1})),
         ] {
@@ -3097,7 +3154,16 @@ mod tests {
     #[test]
     fn finish_metadata_extracts_continuation_state() {
         let upstream = format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
+            sse(
+                "codex.response.metadata",
+                json!({
+                    "headers": {
+                        "openai-model": "gpt-5.6-sol",
+                        "x-codex-safety-buffering-enabled": "true"
+                    }
+                })
+            ),
             sse(
                 "response.output_item.added",
                 json!({

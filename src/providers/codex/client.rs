@@ -2649,7 +2649,7 @@ fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
     // open until an event can commit semantic output such as text or tool use.
     !matches!(
         payload.get("type").and_then(|value| value.as_str()),
-        Some("codex.rate_limits" | "keepalive" | "response.created")
+        Some("codex.rate_limits" | "codex.response.metadata" | "keepalive" | "response.created")
     )
 }
 
@@ -5963,6 +5963,10 @@ mod tests {
         })));
         assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "keepalive"
+        })));
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
+            "type": "codex.response.metadata",
+            "headers": {"openai-model": "gpt-5.6-sol"}
         })));
         assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "response.created"

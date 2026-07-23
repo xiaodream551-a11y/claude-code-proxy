@@ -198,6 +198,10 @@ impl LiveStreamTranslator {
                     return Err("rate limit reached".to_string());
                 }
             }
+            // The Codex WebSocket gateway sends response-scoped headers in this
+            // control frame. They influence Codex's own UI/runtime behavior but
+            // have no Anthropic content mapping.
+            "codex.response.metadata" => {}
             "keepalive" => {}
             "response.failed" | "response.error" | "response.cancelled" | "error" => {
                 return Err(error_message(payload));
@@ -2399,6 +2403,16 @@ mod tests {
         let error = translator
             .accept(
                 &json!({
+                    "type":"codex.response.metadata",
+                    "headers":{"openai-model":"gpt-5.6-sol"}
+                }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("after terminal"));
+        let error = translator
+            .accept(
+                &json!({
                     "type":"response.output_text.delta",
                     "output_index":0,
                     "delta":"late"
@@ -2407,6 +2421,47 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("after terminal"));
+    }
+
+    #[test]
+    fn codex_live_ignores_response_metadata_control_frame() {
+        let out = render(vec![
+            json!({
+                "type":"codex.response.metadata",
+                "headers":{
+                    "openai-model":"gpt-5.6-sol",
+                    "x-codex-safety-buffering-enabled":"true"
+                }
+            }),
+            json!({
+                "type":"response.created",
+                "response":{"id":"resp_1","status":"in_progress"}
+            }),
+            json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_up"}
+            }),
+            json!({
+                "type":"response.output_text.delta",
+                "output_index":0,
+                "delta":"metadata survived"
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_up"}
+            }),
+            json!({
+                "type":"response.completed",
+                "response":{"id":"resp_1","status":"completed","usage":{}}
+            }),
+        ]);
+
+        assert!(out.contains("metadata survived"));
+        assert!(out.contains("message_stop"));
+        assert!(!out.contains("codex.response.metadata"));
+        assert!(!out.contains("x-codex-safety-buffering-enabled"));
     }
 
     #[test]
@@ -2426,6 +2481,13 @@ mod tests {
 
         let error = translator
             .accept(&json!({"type":"future.semantic.event","value":1}), None)
+            .unwrap_err();
+        assert!(error.contains("unsupported Codex semantic event"));
+        let error = translator
+            .accept(
+                &json!({"type":"codex.response.metadata.v2","value":1}),
+                None,
+            )
             .unwrap_err();
         assert!(error.contains("unsupported Codex semantic event"));
 
