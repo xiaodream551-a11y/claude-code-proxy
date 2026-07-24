@@ -183,26 +183,13 @@ jobs:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           merge-multiple: true
-      - name: Require immutable releases
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          enabled="$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            --jq '.enabled')"
-          if [ "$enabled" != "true" ]; then
-            echo "Enable immutable releases in repository settings before publishing." >&2
-            exit 1
-          fi
       - name: Attest release archives
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
         with:
           subject-path: |
             *.tar.gz
             *.zip
-      - name: Publish immutable-ready release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -211,6 +198,19 @@ jobs:
           --verify-tag
           --generate-notes
           ./*.tar.gz ./*.zip ./*.sha256 ./*.provenance.json
+      - name: Verify release immutability
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          immutable="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.immutable')"
+          if [ "$immutable" != "true" ]; then
+            echo "Published release is not immutable." >&2
+            exit 1
+          fi
 
   update-tap:
     needs: release
