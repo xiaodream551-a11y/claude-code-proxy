@@ -39,7 +39,10 @@ fn release_workflow_uses_least_privilege_and_signed_provenance() {
             .contains("contents: write\n      id-token: write\n      attestations: write")
     );
     assert!(RELEASE_WORKFLOW.contains("persist-credentials: false"));
-    assert!(RELEASE_WORKFLOW.contains("Require immutable releases"));
+    assert!(RELEASE_WORKFLOW.contains("Verify release immutability"));
+    assert!(RELEASE_WORKFLOW.contains("repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME"));
+    assert!(RELEASE_WORKFLOW.contains("--jq '.immutable'"));
+    assert!(!RELEASE_WORKFLOW.contains("repos/$GITHUB_REPOSITORY/immutable-releases"));
     assert!(RELEASE_WORKFLOW.contains("uses: actions/attest@"));
     assert!(RELEASE_WORKFLOW.contains("gh release create"));
     assert!(!RELEASE_WORKFLOW.contains("softprops/action-gh-release"));
