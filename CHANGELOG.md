@@ -2,7 +2,17 @@
 
 ## Unreleased
 
-## v0.1.24-preview.1 (2026-07-22)
+## v0.1.25 (2026-07-24)
+
+- Keep `co` and `cg` Claude Code transcripts, prompt history, session state,
+  and resume targets isolated in dedicated GPT and Grok profiles while sharing
+  an explicit first-use snapshot of non-session configuration.
+- Add privacy-preserving diagnostic bundles for transferring bounded proxy
+  logs and runtime metadata between Linux, WSL2, and the development machine
+  without including credentials or captured prompt/tool payloads.
+- Accept and ignore informational Codex response metadata events that do not
+  change Anthropic output, preventing valid streams from failing closed when
+  newer gateways emit them.
 
 - Enforce Codex and Grok response tool policy in live and buffered paths:
   reject undeclared or forbidden function/hosted calls, a second call in
