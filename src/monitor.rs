@@ -1106,6 +1106,14 @@ pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
     (input_tokens, output_tokens)
 }
 
+/// Cheap event-count estimate for monitor progress reporting.
+///
+/// Counts the substring `"event:"` rather than fully parsing SSE. Providers use
+/// this only for approximate chunk/event metrics, not protocol validation.
+pub fn count_sse_events(bytes: &[u8]) -> u64 {
+    String::from_utf8_lossy(bytes).matches("event:").count() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

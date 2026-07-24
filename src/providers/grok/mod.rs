@@ -8,7 +8,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
@@ -46,6 +46,7 @@ use self::translate::{
     stream::{SseDecoder, StreamTranslator, stream_ping},
     tool_policy::ToolCallPolicy,
 };
+use crate::timeutil::now_ms;
 
 const GROK_DOWNSTREAM_CHANNEL_CAPACITY: usize = 3;
 const GROK_DOWNSTREAM_QUEUE_BYTES: usize = 2 * 1024 * 1024;
@@ -609,8 +610,7 @@ where
     let state = GrokStreamState {
         upstream: Box::pin(upstream),
         decoder: SseDecoder::default(),
-        reducer: translate::reducer::Reducer::with_tool_policy(tool_policy.clone()),
-        tool_policy,
+        reducer: translate::reducer::Reducer::with_tool_policy(tool_policy),
         translator: StreamTranslator::new(message_id.clone(), model.clone()),
         message_id,
         model,
@@ -797,7 +797,6 @@ struct GrokStreamState {
     upstream: GrokByteStream,
     decoder: SseDecoder,
     reducer: translate::reducer::Reducer,
-    tool_policy: ToolCallPolicy,
     translator: StreamTranslator,
     message_id: String,
     model: String,
@@ -1221,7 +1220,7 @@ impl GrokStreamState {
     fn reset_attempt(&mut self, upstream: GrokByteStream) {
         self.upstream = upstream;
         self.decoder = SseDecoder::default();
-        self.reducer = translate::reducer::Reducer::with_tool_policy(self.tool_policy.clone());
+        self.reducer.reset_for_retry();
         self.translator = StreamTranslator::new(self.message_id.clone(), self.model.clone());
         self.attempt_bytes = 0;
         self.usage = None;
@@ -1564,19 +1563,13 @@ impl CliHandlers for GrokCli {
         Ok(())
     }
 }
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use crate::monitor::{EndpointKind, MonitorHandle};
     use crate::traffic::test_capture;
@@ -2153,11 +2146,7 @@ mod tests {
             .save_auth(auth::token_store::StoredAuth {
                 access: "test-access".into(),
                 refresh: "test-refresh".into(),
-                expires_at_ms: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64
-                    + 3_600_000,
+                expires_at_ms: now_ms() + 3_600_000,
                 issuer: auth::login::CANONICAL_ISSUER.into(),
                 client_id: auth::login::CLIENT_ID.into(),
             })

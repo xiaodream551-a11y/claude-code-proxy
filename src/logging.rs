@@ -336,20 +336,8 @@ fn rotate_file(path: &Path) -> io::Result<()> {
 
 fn create_dir(path: &Path, mode: u32) -> io::Result<()> {
     fs::create_dir_all(path)?;
-    set_mode(path, mode);
+    crate::paths::set_mode(path, mode);
     Ok(())
-}
-
-fn set_mode(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perm = meta.permissions();
-            perm.set_mode(mode);
-            let _ = fs::set_permissions(path, perm);
-        }
-    }
 }
 
 fn now_iso8601() -> String {

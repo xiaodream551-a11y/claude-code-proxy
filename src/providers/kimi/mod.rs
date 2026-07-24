@@ -7,11 +7,10 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
-use crate::monitor::usage_from_anthropic_sse;
+use crate::monitor::{count_sse_events, usage_from_anthropic_sse};
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::providers::kimi::auth::token_store::file_store;
 use crate::providers::kimi::translate::accumulate::accumulate_response;
@@ -19,13 +18,7 @@ use crate::providers::kimi::translate::model_allowlist::{assert_allowed_model, r
 use crate::providers::kimi::translate::request::{TranslateOptions, translate_request};
 use crate::providers::kimi::translate::stream::translate_stream_bytes;
 use crate::registry::KIMI_MODELS;
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+use crate::timeutil::now_ms;
 
 pub struct KimiProvider;
 
@@ -128,23 +121,8 @@ impl Provider for KimiProvider {
                     );
                 }
             };
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                monitor.stream_progress(
-                    &ctx.req_id,
-                    sse_bytes.len() as u64,
-                    count_sse_events(&sse_bytes),
-                    input_tokens,
-                    output_tokens,
-                );
-            }
-
-            let headers = [
-                (http::header::CONTENT_TYPE, "text/event-stream"),
-                (http::header::CACHE_CONTROL, "no-cache"),
-                (http::header::CONNECTION, "keep-alive"),
-            ];
-            (headers, sse_bytes).into_response()
+            report_stream_progress(&ctx, &sse_bytes);
+            sse_stream_response(sse_bytes)
         } else {
             match accumulate_response(&upstream.body, &message_id, model) {
                 Ok(json) => {
@@ -187,8 +165,26 @@ impl Provider for KimiProvider {
     }
 }
 
-fn count_sse_events(bytes: &[u8]) -> u64 {
-    String::from_utf8_lossy(bytes).matches("event:").count() as u64
+fn report_stream_progress(ctx: &RequestContext, sse_bytes: &[u8]) {
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        let (input_tokens, output_tokens) = usage_from_anthropic_sse(sse_bytes);
+        monitor.stream_progress(
+            &ctx.req_id,
+            sse_bytes.len() as u64,
+            count_sse_events(sse_bytes),
+            input_tokens,
+            output_tokens,
+        );
+    }
+}
+
+fn sse_stream_response(sse_bytes: Vec<u8>) -> Response {
+    let headers = [
+        (http::header::CONTENT_TYPE, "text/event-stream"),
+        (http::header::CACHE_CONTROL, "no-cache"),
+        (http::header::CONNECTION, "keep-alive"),
+    ];
+    (headers, sse_bytes).into_response()
 }
 
 fn map_kimi_error_to_response(err: &client::KimiError) -> Response {

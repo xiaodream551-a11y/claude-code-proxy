@@ -1644,7 +1644,6 @@ mod tests {
     }
     use crate::traffic::test_capture;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1653,17 +1652,10 @@ mod tests {
         StoredAuth {
             access: "test-access".into(),
             refresh: "test-refresh".into(),
-            expires_at_ms: now_ms() + 3_600_000,
+            expires_at_ms: crate::timeutil::now_ms() + 3_600_000,
             issuer: super::super::auth::login::CANONICAL_ISSUER.into(),
             client_id: super::super::auth::login::CLIENT_ID.into(),
         }
-    }
-
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
     }
 
     async fn test_client(base_url: &str, timeouts: GrokTimeouts) -> (GrokClient, TempDir) {
@@ -2445,7 +2437,7 @@ mod tests {
         let (client, _temp) = test_client_with_auth_issuer(
             &format!("http://{model_addr}/v1"),
             issuer,
-            now_ms().saturating_add(3_600_000),
+            crate::timeutil::now_ms().saturating_add(3_600_000),
             GrokTimeouts {
                 connect_ms: 1_000,
                 header_ms: 1_000,
@@ -2509,7 +2501,7 @@ mod tests {
         let (client, _temp) = test_client_with_auth_issuer(
             &format!("http://{model_addr}/v1"),
             issuer,
-            now_ms().saturating_add(3_600_000),
+            crate::timeutil::now_ms().saturating_add(3_600_000),
             GrokTimeouts {
                 connect_ms: 1_000,
                 header_ms: 1_000,
@@ -2609,7 +2601,7 @@ mod tests {
         let (client, _temp) = test_client_with_auth_issuer(
             &format!("http://{model_addr}/v1"),
             issuer,
-            now_ms().saturating_add(3_600_000),
+            crate::timeutil::now_ms().saturating_add(3_600_000),
             GrokTimeouts {
                 connect_ms: 1_000,
                 header_ms: 1_000,

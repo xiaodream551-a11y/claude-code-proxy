@@ -50,19 +50,19 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
             .get("APPDATA")
             .cloned()
             .unwrap_or_else(|| format!("{}\\AppData\\Roaming", deps.home));
-        return join_with_sep(&appdata, &["claude-code-proxy"], true);
+        return join_with_sep(&appdata, &["claude-code-proxy"]);
     }
 
     if deps.platform == "darwin" {
-        return join_with_sep(&deps.home, &[".config", "claude-code-proxy"], false);
+        return join_with_sep(&deps.home, &[".config", "claude-code-proxy"]);
     }
 
     let base = deps.env.get("XDG_CONFIG_HOME").cloned().unwrap_or_else(|| {
-        join_with_sep(&deps.home, &[".config"], false)
+        join_with_sep(&deps.home, &[".config"])
             .to_string_lossy()
             .into_owned()
     });
-    join_with_sep(&base, &["claude-code-proxy"], false)
+    join_with_sep(&base, &["claude-code-proxy"])
 }
 
 pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
@@ -72,19 +72,19 @@ pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
             .get("LOCALAPPDATA")
             .cloned()
             .unwrap_or_else(|| format!("{}\\AppData\\Local", deps.home));
-        return join_with_sep(&local, &["claude-code-proxy"], true);
+        return join_with_sep(&local, &["claude-code-proxy"]);
     }
 
     let base = deps.env.get("XDG_STATE_HOME").cloned().unwrap_or_else(|| {
-        join_with_sep(&deps.home, &[".local", "state"], false)
+        join_with_sep(&deps.home, &[".local", "state"])
             .to_string_lossy()
             .into_owned()
     });
-    join_with_sep(&base, &["claude-code-proxy"], false)
+    join_with_sep(&base, &["claude-code-proxy"])
 }
 
 pub fn legacy_config_dir(deps: &DirResolverEnv) -> PathBuf {
-    join_with_sep(&deps.home, &[".config", "claude-code-proxy"], false)
+    join_with_sep(&deps.home, &[".config", "claude-code-proxy"])
 }
 
 pub fn config_dir() -> PathBuf {
@@ -166,13 +166,11 @@ pub fn provider_legacy_auth_file(provider: &str) -> PathBuf {
     legacy_config_dir(&deps).join(provider).join("auth.json")
 }
 
-fn join_with_sep(base: &str, parts: &[&str], win32: bool) -> PathBuf {
-    let sep = '/';
-    let _ = win32;
+fn join_with_sep(base: &str, parts: &[&str]) -> PathBuf {
     let mut out = String::new();
     for part in std::iter::once(base).chain(parts.iter().copied()) {
-        if !out.is_empty() && !out.ends_with(sep) {
-            out.push(sep);
+        if !out.is_empty() && !out.ends_with('/') {
+            out.push('/');
         }
         out.push_str(part);
     }
@@ -201,6 +199,23 @@ pub fn resolve_state_dir_for_env(
         env: env.clone(),
         home: home.to_string(),
     })
+}
+
+/// Best-effort Unix mode update. No-op on non-Unix targets and on permission failures.
+pub(crate) fn set_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut permissions = meta.permissions();
+            permissions.set_mode(mode);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
 }
 
 #[cfg(test)]

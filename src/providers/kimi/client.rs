@@ -1,11 +1,10 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::providers::kimi::auth::constants::api_base_url;
-use crate::providers::kimi::auth::headers::common_headers;
+use crate::providers::kimi::auth::headers::{common_headers, header_map};
 use crate::providers::kimi::auth::manager::KimiAuthManager;
 use crate::providers::kimi::auth::token_store::{StoredAuth, file_store};
 use crate::providers::kimi::translate::request::KimiChatRequest;
 use crate::retry::{MAX_RATE_LIMIT_RETRIES, compute_backoff_delay};
+use crate::timeutil::now_ms;
 
 #[derive(Debug)]
 pub struct KimiError {
@@ -122,23 +121,16 @@ impl KimiHttpClient {
 
         let request_start_time = now_ms();
 
-        let mut req_builder = self
+        let resp = match self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .header("Authorization", format!("Bearer {access_token}"));
-
-        // Add common headers
-        for (k, v) in &headers {
-            if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes())
-                && let Ok(value) = reqwest::header::HeaderValue::from_str(v)
-            {
-                req_builder = req_builder.header(name, value);
-            }
-        }
-
-        let resp = match req_builder.body(body_json).send() {
+            .header("Authorization", format!("Bearer {access_token}"))
+            .headers(header_map(&headers))
+            .body(body_json)
+            .send()
+        {
             Ok(r) => r,
             Err(e) => {
                 return Err(KimiError {
@@ -200,11 +192,4 @@ impl KimiHttpClient {
             request_start_time,
         })
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }

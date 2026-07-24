@@ -1,6 +1,5 @@
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use crate::paths;
@@ -35,20 +34,9 @@ pub fn get_device_id() -> Result<String, anyhow::Error> {
     let target = device_id_path();
     if let Some(dir) = target.parent() {
         fs::create_dir_all(dir)?;
-        set_mode(dir, 0o700);
+        crate::paths::set_mode(dir, 0o700);
     }
     fs::write(&target, &id)?;
-    set_mode(&target, 0o600);
+    crate::paths::set_mode(&target, 0o600);
     Ok(id)
-}
-
-fn set_mode(path: &std::path::Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        if let Ok(meta) = fs::metadata(path) {
-            let mut permissions = meta.permissions();
-            permissions.set_mode(mode);
-            let _ = fs::set_permissions(path, permissions);
-        }
-    }
 }

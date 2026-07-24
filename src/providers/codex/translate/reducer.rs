@@ -474,8 +474,8 @@ pub const TERM_COMPLETED: &str = "response.completed";
 pub const TERM_INCOMPLETE: &str = "response.incomplete";
 pub const TERM_DONE: &str = "response.done";
 
-const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
-const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
+pub(super) const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
+pub(super) const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 
 #[derive(Debug, Clone)]
 pub enum ReducerEvent {
@@ -1676,10 +1676,9 @@ fn describe_open_blocks(
     out
 }
 
-fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
-    let usage = match response.get("usage") {
-        Some(u) => u,
-        None => return CodexUsage::default(),
+pub(super) fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
+    let Some(usage) = response.get("usage") else {
+        return CodexUsage::default();
     };
     CodexUsage {
         input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
@@ -1717,7 +1716,6 @@ pub fn stop_reason_for_incomplete_response(
 
     Some(match reason {
         Some("max_output_tokens" | "max_tokens" | "length") | None => STOP_MAX_TOKENS,
-        Some("content_filter") => STOP_REFUSAL,
         Some(_) => STOP_REFUSAL,
     })
 }
@@ -1741,7 +1739,7 @@ pub(super) fn validate_tool_arguments(
     }
 }
 
-fn repair_whitespace_stalled_read_args(
+pub(super) fn repair_whitespace_stalled_read_args(
     name: &str,
     args: &str,
     call_id: Option<&str>,
@@ -1809,10 +1807,9 @@ fn is_valid_read_args(value: &serde_json::Value) -> bool {
     true
 }
 
-fn web_search_query(item: &serde_json::Value) -> String {
-    let action = match item.get("action") {
-        Some(v) => v,
-        None => return String::new(),
+pub(super) fn web_search_query(item: &serde_json::Value) -> String {
+    let Some(action) = item.get("action") else {
+        return String::new();
     };
     if let Some(query) = action.get("query").and_then(|v| v.as_str()) {
         return query.to_string();

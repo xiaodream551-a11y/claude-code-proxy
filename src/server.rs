@@ -464,7 +464,7 @@ static ERROR_CAPTURE_GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 // request can hash a newly overwritten Cellar path while an old PID is alive.
 pub fn initialize_process_identity() {
     PROCESS_IDENTITY.get_or_init(|| {
-        let started_at_ms = current_millis();
+        let started_at_ms = crate::timeutil::now_ms();
         let executable = std::env::current_exe().ok();
         let sha256 = executable.as_deref().and_then(hash_file_sha256);
         ProcessIdentity {
@@ -821,7 +821,7 @@ async fn dispatch_request_with_id(
         }
     };
 
-    let now = current_millis();
+    let now = crate::timeutil::now_ms();
 
     let mut body: crate::anthropic::schema::MessagesRequest = match parse_json_body(&body_bytes) {
         Ok(body) => body,
@@ -2032,15 +2032,15 @@ async fn write_error_capture(req_id: &str, document: Value) -> Option<PathBuf> {
 fn write_error_capture_blocking(req_id: &str, document: &Value) -> Option<PathBuf> {
     let dir = crate::paths::state_dir().join("errors");
     fs::create_dir_all(&dir).ok()?;
-    set_mode(&dir, 0o700);
+    crate::paths::set_mode(&dir, 0o700);
     prune_error_captures(&dir);
     let path = dir.join(format!(
         "{}-{}.json",
-        current_millis(),
+        crate::timeutil::now_ms(),
         sanitize_path_part(req_id)
     ));
     let mut file = File::create(&path).ok()?;
-    set_mode(&path, 0o600);
+    crate::paths::set_mode(&path, 0o600);
     let payload = serde_json::to_vec_pretty(document).ok()?;
     file.write_all(&payload).ok()?;
     file.write_all(b"\n").ok()?;
@@ -2251,30 +2251,6 @@ async fn fallback_handler(method: axum::http::Method, uri: axum::http::Uri) -> R
         "not_found",
         format!("No route for {method} {}", uri.path()),
     )
-}
-
-fn current_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn set_mode(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perm = meta.permissions();
-            perm.set_mode(mode);
-            let _ = fs::set_permissions(path, perm);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
 }
 
 #[cfg(test)]

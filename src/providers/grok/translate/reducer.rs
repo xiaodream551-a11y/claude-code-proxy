@@ -399,6 +399,11 @@ impl Reducer {
             ..Self::default()
         }
     }
+    /// Reset mutable stream state while preserving the request-scoped tool policy.
+    pub(crate) fn reset_for_retry(&mut self) {
+        let tool_policy = self.tool_policy.clone();
+        *self = Self::with_tool_policy(tool_policy);
+    }
 
     pub fn push(&mut self, value: Value) -> anyhow::Result<Vec<ReducerEvent>> {
         let typ = value

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
 use super::constants::KIMI_CLI_VERSION;
 use super::device_id::get_device_id;
 use crate::config;
@@ -50,4 +52,18 @@ pub fn common_headers() -> Result<HashMap<String, String>, anyhow::Error> {
         config::kimi_user_agent(&format!("KimiCLI/{KIMI_CLI_VERSION}")),
     );
     Ok(headers)
+}
+
+/// Convert stringly-typed Kimi headers into a reqwest `HeaderMap`, skipping any
+/// names or values that are not valid HTTP header tokens.
+pub fn header_map(headers: &HashMap<String, String>) -> HeaderMap {
+    let mut map = HeaderMap::new();
+    for (k, v) in headers {
+        if let Ok(name) = HeaderName::from_bytes(k.as_bytes())
+            && let Ok(value) = HeaderValue::from_str(v)
+        {
+            map.insert(name, value);
+        }
+    }
+    map
 }

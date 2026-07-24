@@ -56,38 +56,31 @@ impl ToolCallPolicy {
     /// and deferred-tool loading.
     pub(crate) fn from_request(request: &ResponsesRequest) -> Self {
         let (declared, hosted_declared) = declared_tools(request);
-        let mut policy = match request.tool_choice.as_ref() {
-            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None)) => Self {
-                function_rule: FunctionRule::Forbidden,
-                hosted_rule: HostedRule::Forbidden,
-                terminal_requirement: TerminalRequirement::None,
-                max_tool_calls: None,
-                max_hosted_calls: None,
-            },
-            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required)) => Self {
-                function_rule: FunctionRule::Declared(declared),
-                hosted_rule: HostedRule::Declared(hosted_declared),
-                terminal_requirement: TerminalRequirement::AnyTool,
-                max_tool_calls: None,
-                max_hosted_calls: None,
-            },
-            Some(ResponsesToolChoice::Function { name, .. }) => Self {
-                function_rule: FunctionRule::Named {
+        let (function_rule, hosted_rule, terminal_requirement) = match request.tool_choice.as_ref()
+        {
+            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None)) => (
+                FunctionRule::Forbidden,
+                HostedRule::Forbidden,
+                TerminalRequirement::None,
+            ),
+            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required)) => (
+                FunctionRule::Declared(declared),
+                HostedRule::Declared(hosted_declared),
+                TerminalRequirement::AnyTool,
+            ),
+            Some(ResponsesToolChoice::Function { name, .. }) => (
+                FunctionRule::Named {
                     name: name.clone(),
                     declared: declared.contains(name),
                 },
-                hosted_rule: HostedRule::Forbidden,
-                terminal_requirement: TerminalRequirement::NamedFunction(name.clone()),
-                max_tool_calls: None,
-                max_hosted_calls: None,
-            },
-            Some(ResponsesToolChoice::WebSearch { .. }) => Self {
-                function_rule: FunctionRule::Forbidden,
-                hosted_rule: HostedRule::Declared(hosted_declared),
-                terminal_requirement: TerminalRequirement::HostedWebSearch,
-                max_tool_calls: None,
-                max_hosted_calls: None,
-            },
+                HostedRule::Forbidden,
+                TerminalRequirement::NamedFunction(name.clone()),
+            ),
+            Some(ResponsesToolChoice::WebSearch { .. }) => (
+                FunctionRule::Forbidden,
+                HostedRule::Declared(hosted_declared),
+                TerminalRequirement::HostedWebSearch,
+            ),
             Some(ResponsesToolChoice::AllowedTools { mode, tools, .. }) => {
                 let allowed_functions: HashSet<String> = tools
                     .iter()
@@ -115,29 +108,29 @@ impl ToolCallPolicy {
                 } else {
                     TerminalRequirement::None
                 };
-                Self {
+                (
                     function_rule,
-                    hosted_rule: if allows_hosted {
+                    if allows_hosted {
                         HostedRule::Declared(hosted_declared)
                     } else {
                         HostedRule::Forbidden
                     },
                     terminal_requirement,
-                    max_tool_calls: None,
-                    max_hosted_calls: None,
-                }
+                )
             }
-            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto)) | None => Self {
-                function_rule: FunctionRule::Declared(declared),
-                hosted_rule: HostedRule::Declared(hosted_declared),
-                terminal_requirement: TerminalRequirement::None,
-                max_tool_calls: None,
-                max_hosted_calls: None,
-            },
+            Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto)) | None => (
+                FunctionRule::Declared(declared),
+                HostedRule::Declared(hosted_declared),
+                TerminalRequirement::None,
+            ),
         };
-        policy.max_tool_calls = (!request.parallel_tool_calls).then_some(1);
-        policy.max_hosted_calls = request.hosted_web_search_max_uses;
-        policy
+        Self {
+            function_rule,
+            hosted_rule,
+            terminal_requirement,
+            max_tool_calls: (!request.parallel_tool_calls).then_some(1),
+            max_hosted_calls: request.hosted_web_search_max_uses,
+        }
     }
 
     pub(crate) fn validate_next_tool_call(

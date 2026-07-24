@@ -1,5 +1,3 @@
-use serde_json::Value;
-
 use super::translate::request::{
     ResponsesContentPart, ResponsesInputItem, ResponsesRequest, ResponsesTool,
 };
@@ -53,11 +51,8 @@ fn byte_length(s: &str) -> u64 {
     s.len() as u64
 }
 
-fn json_bytes(value: Option<&Value>) -> u64 {
-    match value {
-        Some(v) => byte_length(&serde_json::to_string(v).unwrap_or_default()),
-        None => 0,
-    }
+fn value_json_bytes<T: serde::Serialize>(value: &T) -> u64 {
+    byte_length(&serde_json::to_string(value).unwrap_or_default())
 }
 
 fn input_image_parts(input: &[ResponsesInputItem]) -> Vec<(usize, usize, &str)> {
@@ -111,13 +106,11 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
                     }
                     ResponsesInputItem::Reasoning { .. } => ("reasoning".to_string(), None),
                 };
-                let json_bytes_val =
-                    json_bytes(Some(&serde_json::to_value(item).unwrap_or_default()));
                 InputItemSummary {
                     index: i,
                     r#type,
                     role,
-                    json_bytes: json_bytes_val,
+                    json_bytes: value_json_bytes(item),
                 }
             })
             .collect();
@@ -129,18 +122,15 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
     let largest_input_images = {
         let mut items: Vec<InputImageSummary> = image_parts
             .iter()
-            .map(|&(item_idx, part_idx, url)| {
-                let json_bytes_val = json_bytes(Some(&serde_json::json!({
+            .map(|&(item_idx, part_idx, url)| InputImageSummary {
+                item_index: item_idx,
+                part_index: part_idx,
+                json_bytes: value_json_bytes(&serde_json::json!({
                     "type": "input_image",
                     "image_url": url,
-                })));
-                InputImageSummary {
-                    item_index: item_idx,
-                    part_index: part_idx,
-                    json_bytes: json_bytes_val,
-                    image_url_bytes: byte_length(url),
-                    data_url: url.starts_with("data:"),
-                }
+                })),
+                image_url_bytes: byte_length(url),
+                data_url: url.starts_with("data:"),
             })
             .collect();
         items.sort_by_key(|item| std::cmp::Reverse(item.image_url_bytes));
@@ -156,12 +146,10 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
                     ResponsesTool::Function(f) => f.name.clone(),
                     ResponsesTool::WebSearch(_) => "web_search".to_string(),
                 };
-                let json_bytes_val =
-                    json_bytes(Some(&serde_json::to_value(tool).unwrap_or_default()));
                 items.push(ToolSummary {
                     index: i,
                     name,
-                    json_bytes: json_bytes_val,
+                    json_bytes: value_json_bytes(tool),
                 });
             }
         }
@@ -173,30 +161,12 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
     CodexRequestSizeSummary {
         body_json_bytes: byte_length(&body_json),
         instructions_bytes: body.instructions.as_ref().map_or(0, |s| byte_length(s)),
-        input_json_bytes: json_bytes(Some(&serde_json::to_value(&body.input).unwrap_or_default())),
-        tools_json_bytes: match &body.tools {
-            Some(tools) => json_bytes(Some(&serde_json::to_value(tools).unwrap_or_default())),
-            None => 0,
-        },
-        text_json_bytes: json_bytes(Some(&serde_json::to_value(&body.text).unwrap_or_default())),
-        reasoning_json_bytes: json_bytes(
-            body.reasoning
-                .as_ref()
-                .map(|r| serde_json::to_value(r).unwrap_or_default())
-                .as_ref(),
-        ),
-        include_json_bytes: json_bytes(
-            body.include
-                .as_ref()
-                .map(|i| serde_json::to_value(i).unwrap_or_default())
-                .as_ref(),
-        ),
-        client_metadata_json_bytes: json_bytes(
-            body.client_metadata
-                .as_ref()
-                .map(|m| serde_json::to_value(m).unwrap_or_default())
-                .as_ref(),
-        ),
+        input_json_bytes: value_json_bytes(&body.input),
+        tools_json_bytes: body.tools.as_ref().map_or(0, value_json_bytes),
+        text_json_bytes: value_json_bytes(&body.text),
+        reasoning_json_bytes: body.reasoning.as_ref().map_or(0, value_json_bytes),
+        include_json_bytes: body.include.as_ref().map_or(0, value_json_bytes),
+        client_metadata_json_bytes: body.client_metadata.as_ref().map_or(0, value_json_bytes),
         input_item_count: body.input.len(),
         tool_count: body.tools.as_ref().map_or(0, |t| t.len()),
         input_image_part_count: image_parts.len(),

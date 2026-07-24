@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,6 +12,7 @@ use super::login::{CANONICAL_ISSUER, CLIENT_ID};
 use super::token_store::{AuthMutationLock, GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
 use crate::oauth_http::{MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_async};
+use crate::timeutil::now_ms;
 
 const REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
 
@@ -611,13 +612,6 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<String> {
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]

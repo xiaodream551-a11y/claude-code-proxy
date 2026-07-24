@@ -1413,7 +1413,7 @@ fn create_temporary(parent: &Path, stem: &str) -> Result<(PathBuf, File)> {
 }
 
 fn set_file_mode_600(path: &Path) -> Result<()> {
-    crate::auth::set_mode(path, 0o600);
+    crate::paths::set_mode(path, 0o600);
     Ok(())
 }
 

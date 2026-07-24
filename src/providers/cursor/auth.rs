@@ -2,9 +2,10 @@ use base64::Engine;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::auth::{AuthStorage, KeychainFileAuthStore, SystemKeychain};
+use crate::timeutil::now_ms;
 use crate::{config, paths};
 
 pub const KEYCHAIN_SERVICE: &str = "claude-code-proxy.cursor";
@@ -365,13 +366,6 @@ fn base64_url(bytes: &[u8]) -> String {
 
 fn use_macos_keychain() -> bool {
     cfg!(target_os = "macos") && std::env::var_os("CCP_CONFIG_DIR").is_none()
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn format_unix_ms(ms: u64) -> String {
