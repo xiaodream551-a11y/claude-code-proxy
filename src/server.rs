@@ -1,5 +1,6 @@
 use crate::{
     anthropic::json_error,
+    diagnostics,
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     project,
@@ -24,7 +25,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -475,17 +476,7 @@ pub fn initialize_process_identity() {
 }
 
 fn hash_file_sha256(path: &Path) -> Option<String> {
-    let mut file = File::open(path).ok()?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Some(hex::encode(digest.finalize()))
+    diagnostics::sha256_file(path).ok()
 }
 
 fn initialize_config_fingerprint(
@@ -1522,7 +1513,7 @@ fn diagnostic_identifier_hash(value: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
-    Some(hex::encode(Sha256::digest(value.as_bytes()))[..16].to_string())
+    Some(diagnostics::identifier_hash(value))
 }
 
 #[derive(Default)]

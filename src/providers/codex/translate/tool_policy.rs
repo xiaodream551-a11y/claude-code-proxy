@@ -55,8 +55,7 @@ impl ToolCallPolicy {
     /// intentionally observes only tools that survived direct-caller filtering
     /// and deferred-tool loading.
     pub(crate) fn from_request(request: &ResponsesRequest) -> Self {
-        let declared = declared_function_names(request);
-        let hosted_declared = has_declared_hosted_tool(request);
+        let (declared, hosted_declared) = declared_tools(request);
         let mut policy = match request.tool_choice.as_ref() {
             Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::None)) => Self {
                 function_rule: FunctionRule::Forbidden,
@@ -230,42 +229,37 @@ impl ToolCallPolicy {
     }
 }
 
-fn declared_function_names(request: &ResponsesRequest) -> HashSet<String> {
-    let top_level = request
-        .tools
-        .iter()
-        .flatten()
-        .filter_map(|tool| match tool {
-            ResponsesTool::Function(function) => Some(function.name.clone()),
-            ResponsesTool::WebSearch(_) => None,
-        });
-    let additional = request.input.iter().flat_map(|item| match item {
-        ResponsesInputItem::AdditionalTools { tools, .. } => tools
-            .iter()
-            .filter(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("function"))
-            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    });
-    top_level.chain(additional).collect()
-}
+fn declared_tools(request: &ResponsesRequest) -> (HashSet<String>, bool) {
+    let mut functions = HashSet::new();
+    let mut hosted = false;
 
-fn has_declared_hosted_tool(request: &ResponsesRequest) -> bool {
-    request
-        .tools
-        .iter()
-        .flatten()
-        .any(|tool| matches!(tool, ResponsesTool::WebSearch(_)))
-        || request.input.iter().any(|item| {
-            matches!(
-                item,
-                ResponsesInputItem::AdditionalTools { tools, .. }
-                    if tools.iter().any(|tool| {
-                        tool.get("type").and_then(serde_json::Value::as_str) == Some("web_search")
-                    })
-            )
-        })
+    for tool in request.tools.iter().flatten() {
+        match tool {
+            ResponsesTool::Function(function) => {
+                functions.insert(function.name.clone());
+            }
+            ResponsesTool::WebSearch(_) => hosted = true,
+        }
+    }
+
+    for item in &request.input {
+        let ResponsesInputItem::AdditionalTools { tools, .. } = item else {
+            continue;
+        };
+        for tool in tools {
+            match tool.get("type").and_then(serde_json::Value::as_str) {
+                Some("function") => {
+                    if let Some(name) = tool.get("name").and_then(serde_json::Value::as_str) {
+                        functions.insert(name.to_string());
+                    }
+                }
+                Some("web_search") => hosted = true,
+                _ => {}
+            }
+        }
+    }
+
+    (functions, hosted)
 }
 
 #[cfg(test)]
