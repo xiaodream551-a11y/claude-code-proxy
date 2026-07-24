@@ -7,7 +7,7 @@ use crate::{
     provider::{Provider, RequestByteLease, RequestContext},
     registry::{Registry, normalize_incoming_model},
     session,
-    traffic::{TrafficCaptureOptions, create_traffic_capture_async},
+    traffic::{TrafficCaptureOptions, create_traffic_capture_async, sanitize_path_part},
 };
 use axum::{
     Json, Router,
@@ -2069,24 +2069,6 @@ fn prune_error_captures(dir: &Path) {
         .saturating_sub(MAX_ERROR_CAPTURE_FILES);
     for (_, path) in files.into_iter().take(remove) {
         let _ = fs::remove_file(path);
-    }
-}
-
-fn sanitize_path_part(raw: &str) -> String {
-    let sanitized: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
     }
 }
 
