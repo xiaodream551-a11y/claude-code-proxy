@@ -97,7 +97,6 @@ pub struct LiveStreamTranslator {
     deferred_text: Vec<(usize, String)>,
     defer_content_after_web_search: bool,
     deferred_content_events: Vec<DeferredLiveContentEvent>,
-    deferred_content_sequence: usize,
     schema_bridge: Option<Arc<SchemaBridge>>,
     tool_policy: ToolCallPolicy,
     upstream_input_bytes: usize,
@@ -150,7 +149,6 @@ impl LiveStreamTranslator {
             deferred_text: Vec::new(),
             defer_content_after_web_search: false,
             deferred_content_events: Vec::new(),
-            deferred_content_sequence: 0,
             schema_bridge,
             tool_policy,
             upstream_input_bytes: 0,
@@ -459,8 +457,7 @@ impl LiveStreamTranslator {
                 .and_then(serde_json::Value::as_u64)
                 .expect("content block events carry a non-negative index")
                 as usize;
-            let sequence = self.deferred_content_sequence;
-            self.deferred_content_sequence += 1;
+            let sequence = self.deferred_content_events.len();
             self.deferred_content_events.push(DeferredLiveContentEvent {
                 index,
                 sequence,

@@ -2032,16 +2032,10 @@ mod tests {
     }
 
     fn response_tool_policy(tool_choice: serde_json::Value) -> ToolCallPolicy {
-        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
-            "model":"grok-4.5",
-            "messages":[{"role":"user","content":"use tools"}],
-            "tools":[{"name":"Read","input_schema":{"type":"object"}}],
-            "tool_choice":tool_choice
-        }))
-        .unwrap();
-        let translated =
-            translate_request(&request, "grok-4.5".into()).expect("test request must translate");
-        ToolCallPolicy::from_request(&translated)
+        crate::providers::grok::translate::tool_policy::response_tool_policy_from_choice(
+            serde_json::json!([{"name":"Read","input_schema":{"type":"object"}}]),
+            tool_choice,
+        )
     }
 
     #[tokio::test]

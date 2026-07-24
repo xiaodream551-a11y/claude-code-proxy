@@ -457,7 +457,7 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
     Ok(())
 }
 
-fn set_mode(path: &std::path::Path, mode: u32) {
+pub(crate) fn set_mode(path: &std::path::Path, mode: u32) {
     #[cfg(unix)]
     {
         if let Ok(meta) = fs::metadata(path) {
