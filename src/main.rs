@@ -3,7 +3,8 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use claude_code_proxy::{
     config,
     diagnostics::{
-        CollectOptions, UploadTarget, collect_bundle, inspect_bundle, upload_bundle_sftp,
+        CollectOptions, MAX_INPUT_BYTES as MAX_DIAGNOSTIC_INPUT_BYTES, UploadTarget,
+        collect_bundle, inspect_bundle, upload_bundle_sftp,
     },
     logging,
     monitor::MonitorHandle,
@@ -24,7 +25,6 @@ const CODEX_XHIGH_AS_MAX_HEADER_NAME: &str = "x-ccproxy-codex-xhigh-as-max";
 const CODEX_XHIGH_AS_MAX_HEADER: &str = "x-ccproxy-codex-xhigh-as-max: 1";
 const SESSION_END_HELPER_ARG: &str = "--ccproxy-session-end-hook";
 const MAX_SESSION_END_INPUT_BYTES: u64 = 64 * 1024;
-const MAX_DIAGNOSTIC_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 const CLAUDE_PROFILE_ROOT_DIR: &str = ".claude-ccproxy";
 const CLAUDE_PROFILE_LOCK_FILE: &str = ".ccproxy-profile.lock";
 const CLAUDE_PROFILE_INITIALIZED_FILE: &str = ".ccproxy-profile-initialized";
