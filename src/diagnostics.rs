@@ -2011,8 +2011,10 @@ mod tests {
             )
             .is_err()
         );
-        let mut options = CollectOptions::default();
-        options.max_lines = 0;
+        let options = CollectOptions {
+            max_lines: 0,
+            ..CollectOptions::default()
+        };
         assert!(validate_collect_options(&options).is_err());
     }
 
