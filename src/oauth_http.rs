@@ -18,6 +18,10 @@ pub(crate) fn is_loopback_url(raw: &str) -> bool {
     }
 }
 
+fn body_capacity(content_length: Option<u64>, limit: usize) -> usize {
+    content_length.unwrap_or_default().min(limit as u64) as usize
+}
+
 fn reject_oversized_content_length(
     content_length: Option<u64>,
     limit: usize,
@@ -35,12 +39,7 @@ async fn read_limited_async(
     label: &str,
 ) -> anyhow::Result<Vec<u8>> {
     reject_oversized_content_length(response.content_length(), limit, label)?;
-    let mut body = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or_default()
-            .min(limit as u64) as usize,
-    );
+    let mut body = Vec::with_capacity(body_capacity(response.content_length(), limit));
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -58,12 +57,7 @@ fn read_limited_blocking(
     label: &str,
 ) -> anyhow::Result<Vec<u8>> {
     reject_oversized_content_length(response.content_length(), limit, label)?;
-    let mut body = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or_default()
-            .min(limit as u64) as usize,
-    );
+    let mut body = Vec::with_capacity(body_capacity(response.content_length(), limit));
     response
         .by_ref()
         .take(limit.saturating_add(1) as u64)

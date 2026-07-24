@@ -440,22 +440,13 @@ pub(super) fn anthropic_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::grok::translate::tool_policy::response_tool_policy_from_choice;
 
     fn response_tool_policy(
         tools: serde_json::Value,
         tool_choice: serde_json::Value,
     ) -> ToolCallPolicy {
-        let request: crate::anthropic::schema::MessagesRequest =
-            serde_json::from_value(serde_json::json!({
-                "model":"grok-4.5",
-                "messages":[{"role":"user","content":"use tools"}],
-                "tools":tools,
-                "tool_choice":tool_choice
-            }))
-            .unwrap();
-        let translated = super::super::request::translate_request(&request, "grok-4.5".into())
-            .expect("test request must translate");
-        ToolCallPolicy::from_request(&translated)
+        response_tool_policy_from_choice(tools, tool_choice)
     }
 
     #[test]

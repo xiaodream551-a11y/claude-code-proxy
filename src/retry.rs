@@ -65,14 +65,15 @@ impl ModelRetryBackoff {
                 let first_predispatch = !self.saw_definitely_not_dispatched;
                 self.saw_definitely_not_dispatched = true;
                 if first_predispatch && retry_after.is_none() {
-                    return Some(BackoffOutcome {
+                    Some(BackoffOutcome {
                         wait_ms: rand::thread_rng().gen_range(
                             FAST_PRE_DISPATCH_MIN_DELAY_MS..=FAST_PRE_DISPATCH_MAX_DELAY_MS,
                         ),
                         exceeds_budget: false,
-                    });
+                    })
+                } else {
+                    Some(self.next_standard_delay(retry_after))
                 }
-                Some(self.next_standard_delay(retry_after))
             }
             ReplaySafety::ExplicitlyRetryableResponse => {
                 Some(self.next_standard_delay(retry_after))

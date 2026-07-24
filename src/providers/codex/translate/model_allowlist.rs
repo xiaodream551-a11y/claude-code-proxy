@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::config;
 
 use super::request::ServiceTier;
@@ -36,14 +34,10 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
-fn fast_model_aliases() -> HashSet<String> {
-    ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
-}
-
 fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
-        let base = model.trim_end_matches("-fast");
+    if let Some(base) = model.strip_suffix("-fast")
+        && ALLOWED_MODELS.contains(&base)
+    {
         ResolvedModel {
             model: base.to_string(),
             service_tier: Some(ServiceTier::Priority),
@@ -116,8 +110,9 @@ pub fn is_valid_model_for_codex(model: &str) -> bool {
     if ALLOWED_MODELS.contains(&model) {
         return true;
     }
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
+    if let Some(base) = model.strip_suffix("-fast")
+        && ALLOWED_MODELS.contains(&base)
+    {
         return true;
     }
     MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)

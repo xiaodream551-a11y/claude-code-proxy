@@ -1,12 +1,12 @@
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::constants::{CLIENT_ID, REFRESH_MARGIN_MS, oauth_host};
-use super::headers::common_headers;
+use super::headers::{common_headers, header_map};
 use super::jwt::extract_user_id;
 use super::login::TokenResponse;
 use super::token_store::{KimiTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
+use crate::timeutil::now_ms;
 
 const MAX_REFRESH_ATTEMPTS: u32 = 3;
 const RETRYABLE_STATUSES: &[u16] = &[429, 500, 502, 503, 504];
@@ -24,26 +24,19 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
         }
     }
 
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+    fn lock_cache(&self) -> Result<MutexGuard<'_, Option<StoredAuth>>, anyhow::Error> {
+        self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     pub fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
-        let cached = {
-            let guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-            guard.clone()
-        };
+        let cached = self.lock_cache()?.clone();
         let stored = match cached {
-            Some(ref auth) => auth.clone(),
+            Some(auth) => auth,
             None => {
                 let loaded = self.store.load_auth()?;
                 match loaded {
                     Some(auth) => {
-                        let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-                        *guard = Some(auth.clone());
+                        *self.lock_cache()? = Some(auth.clone());
                         auth
                     }
                     None => {
@@ -53,7 +46,7 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
             }
         };
 
-        if stored.expires > Self::now_ms() + REFRESH_MARGIN_MS {
+        if stored.expires > now_ms() + REFRESH_MARGIN_MS {
             return Ok(stored);
         }
 
@@ -61,11 +54,7 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
     }
 
     pub fn force_refresh(&self) -> Result<StoredAuth, anyhow::Error> {
-        let stored = {
-            let guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-            guard.clone()
-        };
-        let stored = match stored {
+        let stored = match self.lock_cache()?.clone() {
             Some(auth) => auth,
             None => {
                 let loaded = self.store.load_auth()?;
@@ -92,7 +81,7 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
 
             let resp = match client
                 .post(format!("{}/api/oauth/token", oauth_host()))
-                .headers(build_headers_map(&headers))
+                .headers(header_map(&headers))
                 .form(&form)
                 .send()
             {
@@ -109,7 +98,7 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
 
             if resp.status().as_u16() == 200 {
                 let tokens: TokenResponse = resp.json()?;
-                let expires = Self::now_ms() + (tokens.expires_in.unwrap_or(900) as u64 * 1000);
+                let expires = now_ms() + (tokens.expires_in.unwrap_or(900) as u64 * 1000);
                 let next = StoredAuth {
                     access: tokens.access_token.clone(),
                     refresh: tokens
@@ -121,19 +110,13 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
                         .or_else(|| current.user_id.clone()),
                 };
                 self.store.save_auth(next.clone())?;
-                {
-                    let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-                    *guard = Some(next.clone());
-                }
+                *self.lock_cache()? = Some(next.clone());
                 return Ok(next);
             }
 
             let status = resp.status().as_u16();
             if status == 401 || status == 403 {
-                {
-                    let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-                    *guard = None;
-                }
+                *self.lock_cache()? = None;
                 let _ = self.store.clear_auth();
                 let err_msg = resp
                     .text()
@@ -158,7 +141,7 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
         &self,
         tokens: &TokenResponse,
     ) -> Result<StoredAuth, anyhow::Error> {
-        let expires = Self::now_ms() + (tokens.expires_in.unwrap_or(900) * 1000);
+        let expires = now_ms() + (tokens.expires_in.unwrap_or(900) * 1000);
         let auth = StoredAuth {
             access: tokens.access_token.clone(),
             refresh: tokens.refresh_token.clone().unwrap_or_default(),
@@ -167,10 +150,7 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
             user_id: extract_user_id(&tokens.access_token),
         };
         self.store.save_auth(auth.clone())?;
-        {
-            let mut guard = self.cached.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-            *guard = Some(auth.clone());
-        }
+        *self.lock_cache()? = Some(auth.clone());
         Ok(auth)
     }
 
@@ -179,20 +159,6 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
             *guard = None;
         }
     }
-}
-
-fn build_headers_map(
-    headers: &std::collections::HashMap<String, String>,
-) -> reqwest::header::HeaderMap {
-    let mut map = reqwest::header::HeaderMap::new();
-    for (k, v) in headers {
-        if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes())
-            && let Ok(value) = reqwest::header::HeaderValue::from_str(v)
-        {
-            map.insert(name, value);
-        }
-    }
-    map
 }
 
 #[cfg(test)]

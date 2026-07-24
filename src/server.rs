@@ -1,12 +1,13 @@
 use crate::{
     anthropic::json_error,
+    diagnostics,
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     project,
     provider::{Provider, RequestByteLease, RequestContext},
     registry::{Registry, normalize_incoming_model},
     session,
-    traffic::{TrafficCaptureOptions, create_traffic_capture_async},
+    traffic::{TrafficCaptureOptions, create_traffic_capture_async, sanitize_path_part},
 };
 use axum::{
     Json, Router,
@@ -24,7 +25,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -463,7 +464,7 @@ static ERROR_CAPTURE_GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 // request can hash a newly overwritten Cellar path while an old PID is alive.
 pub fn initialize_process_identity() {
     PROCESS_IDENTITY.get_or_init(|| {
-        let started_at_ms = current_millis();
+        let started_at_ms = crate::timeutil::now_ms();
         let executable = std::env::current_exe().ok();
         let sha256 = executable.as_deref().and_then(hash_file_sha256);
         ProcessIdentity {
@@ -475,17 +476,7 @@ pub fn initialize_process_identity() {
 }
 
 fn hash_file_sha256(path: &Path) -> Option<String> {
-    let mut file = File::open(path).ok()?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Some(hex::encode(digest.finalize()))
+    diagnostics::sha256_file(path).ok()
 }
 
 fn initialize_config_fingerprint(
@@ -830,7 +821,7 @@ async fn dispatch_request_with_id(
         }
     };
 
-    let now = current_millis();
+    let now = crate::timeutil::now_ms();
 
     let mut body: crate::anthropic::schema::MessagesRequest = match parse_json_body(&body_bytes) {
         Ok(body) => body,
@@ -1522,7 +1513,7 @@ fn diagnostic_identifier_hash(value: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
-    Some(hex::encode(Sha256::digest(value.as_bytes()))[..16].to_string())
+    Some(diagnostics::identifier_hash(value))
 }
 
 #[derive(Default)]
@@ -2041,15 +2032,15 @@ async fn write_error_capture(req_id: &str, document: Value) -> Option<PathBuf> {
 fn write_error_capture_blocking(req_id: &str, document: &Value) -> Option<PathBuf> {
     let dir = crate::paths::state_dir().join("errors");
     fs::create_dir_all(&dir).ok()?;
-    set_mode(&dir, 0o700);
+    crate::paths::set_mode(&dir, 0o700);
     prune_error_captures(&dir);
     let path = dir.join(format!(
         "{}-{}.json",
-        current_millis(),
+        crate::timeutil::now_ms(),
         sanitize_path_part(req_id)
     ));
     let mut file = File::create(&path).ok()?;
-    set_mode(&path, 0o600);
+    crate::paths::set_mode(&path, 0o600);
     let payload = serde_json::to_vec_pretty(document).ok()?;
     file.write_all(&payload).ok()?;
     file.write_all(b"\n").ok()?;
@@ -2078,24 +2069,6 @@ fn prune_error_captures(dir: &Path) {
         .saturating_sub(MAX_ERROR_CAPTURE_FILES);
     for (_, path) in files.into_iter().take(remove) {
         let _ = fs::remove_file(path);
-    }
-}
-
-fn sanitize_path_part(raw: &str) -> String {
-    let sanitized: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
     }
 }
 
@@ -2260,30 +2233,6 @@ async fn fallback_handler(method: axum::http::Method, uri: axum::http::Uri) -> R
         "not_found",
         format!("No route for {method} {}", uri.path()),
     )
-}
-
-fn current_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn set_mode(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perm = meta.permissions();
-            perm.set_mode(mode);
-            let _ = fs::set_permissions(path, perm);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
 }
 
 #[cfg(test)]

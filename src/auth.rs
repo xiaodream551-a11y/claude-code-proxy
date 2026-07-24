@@ -4,8 +4,9 @@ use serde_json::to_string_pretty;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
+use crate::paths::set_mode;
 
 pub trait AuthStorage<T>: Send + Sync
 where
@@ -182,7 +183,7 @@ where
     }
 
     fn save(&self, value: T) -> Result<()> {
-        let path = std::path::Path::new(&self.file);
+        let path = Path::new(&self.file);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
             set_mode(dir, 0o700);
@@ -424,7 +425,7 @@ pub fn delete_auth_file(primary: &std::path::Path, legacy: &std::path::Path) -> 
 }
 
 pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
-    let dir = std::path::Path::new(path)
+    let dir = Path::new(path)
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid auth path"))?;
     fs::create_dir_all(dir)?;
@@ -453,19 +454,8 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
     }
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
-    set_mode(std::path::Path::new(path), 0o600);
+    set_mode(Path::new(path), 0o600);
     Ok(())
-}
-
-fn set_mode(path: &std::path::Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        if let Ok(meta) = fs::metadata(path) {
-            let mut permissions = meta.permissions();
-            permissions.set_mode(mode);
-            let _ = fs::set_permissions(path, permissions);
-        }
-    }
 }
 
 pub struct InMemoryAuthStore<T>
@@ -654,10 +644,7 @@ mod tests {
         );
 
         assert_eq!(store.path(), "macOS Keychain");
-        assert_eq!(
-            store.coordination_path().as_deref(),
-            Some(std::path::Path::new(&file))
-        );
+        assert_eq!(store.coordination_path().as_deref(), Some(Path::new(&file)));
     }
 
     #[test]
@@ -716,7 +703,7 @@ mod tests {
 
         store.clear().unwrap();
         assert!(keychain.raw("svc", "acct").is_none());
-        assert!(!std::path::Path::new(&file).exists());
+        assert!(!Path::new(&file).exists());
     }
 
     #[test]
@@ -763,7 +750,7 @@ mod tests {
             store.load().unwrap().unwrap()["source"],
             json!("file-fallback")
         );
-        assert!(std::path::Path::new(&file).exists());
+        assert!(Path::new(&file).exists());
         assert_eq!(store.path(), format!("File fallback: {file}"));
     }
 

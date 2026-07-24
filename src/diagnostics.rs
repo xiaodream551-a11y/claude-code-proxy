@@ -694,12 +694,14 @@ fn read_recent_chunks(
     let mut truncated = false;
     let mut newest_first = Vec::new();
     for source in sources.iter().rev() {
+        // Older rotated sources are unread once the byte budget is exhausted;
+        // avoid opening them just to mark truncation.
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
         let mut file = open_source(&source.path)?;
         let len = file.metadata()?.len();
-        if remaining == 0 {
-            truncated |= len > 0;
-            continue;
-        }
         let take = len.min(remaining);
         if take == 0 {
             continue;
@@ -1317,8 +1319,13 @@ fn dynamic_fingerprint(value: &str) -> String {
     identifier_hash(&normalized)
 }
 
-fn identifier_hash(value: &str) -> String {
-    hex::encode(Sha256::digest(value.as_bytes()))[..16].to_string()
+/// Stable 16-char hex fingerprint used by both live diagnostic logs and
+/// offline bundle sanitization. Keep the truncation width in lockstep with
+/// server-side `reqIdHash` / `callIdHash` emitters.
+pub(crate) fn identifier_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    // Only hex-encode the bytes we keep (8 → 16 hex chars).
+    hex::encode(&digest[..8])
 }
 
 fn encode_events(events: &VecDeque<Value>) -> Result<Vec<u8>> {
@@ -1406,11 +1413,7 @@ fn create_temporary(parent: &Path, stem: &str) -> Result<(PathBuf, File)> {
 }
 
 fn set_file_mode_600(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
+    crate::paths::set_mode(path, 0o600);
     Ok(())
 }
 
@@ -1455,7 +1458,7 @@ fn runtime_kind() -> &'static str {
     }
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];

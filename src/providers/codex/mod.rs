@@ -50,6 +50,7 @@ use self::translate::request::{
     has_parallel_callable_function, translate_request_with_overrides,
 };
 use self::translate::tool_policy::ToolCallPolicy;
+use crate::timeutil::now_ms;
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const MAX_LIVE_TRANSPORT_RETRIES: u32 = 2;
@@ -2087,13 +2088,6 @@ pub(crate) static CODEX_CLI: CodexCli = CodexCli;
 // ---------------------------------------------------------------------------
 // CLI helpers
 // ---------------------------------------------------------------------------
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 fn format_expiry(expires: u64, now: u64) -> String {
     let remaining = (i128::from(expires) - i128::from(now)).div_euclid(1000);

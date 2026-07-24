@@ -666,7 +666,7 @@ fn write_file_bytes(path: PathBuf, value: &[u8]) -> Result<(), TrafficWriteFailu
             file_created: false,
         })?;
         if let Ok(meta) = fs::metadata(parent) {
-            set_mode(parent, 0o700);
+            crate::paths::set_mode(parent, 0o700);
             if meta.is_dir() {
                 #[cfg(unix)]
                 {
@@ -938,18 +938,6 @@ fn redact_traffic_value(value: &Value) -> Value {
         Value::String(s) => Value::String(format!("[redacted len={}]", s.len())),
         Value::Object(_) | Value::Array(_) => Value::String("[redacted]".to_string()),
         _ => Value::String("[redacted]".to_string()),
-    }
-}
-
-fn set_mode(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perm = meta.permissions();
-            perm.set_mode(mode);
-            let _ = fs::set_permissions(path, perm);
-        }
     }
 }
 

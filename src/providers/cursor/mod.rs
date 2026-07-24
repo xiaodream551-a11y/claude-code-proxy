@@ -18,7 +18,7 @@ use http::StatusCode;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
-use crate::monitor::usage_from_anthropic_sse;
+use crate::monitor::{count_sse_events, usage_from_anthropic_sse};
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::providers::cursor::auth::{
     clear_cursor_auth, expired_auth_message, load_cursor_auth, missing_auth_message,
@@ -34,6 +34,7 @@ use crate::providers::cursor::tool_bridge::{
     BridgeRegistry, advertised_tool_names, can_bridge_cursor_native_tools, find_tool_result,
     resume_cursor_tool_bridge, start_cursor_tool_bridge,
 };
+use crate::timeutil::now_ms;
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -87,22 +88,8 @@ impl Provider for CursorProvider {
         {
             let (_result_messages, sse_bytes) =
                 resume_cursor_tool_bridge(session_id, &message_id, model, result, &pending);
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                monitor.stream_progress(
-                    &ctx.req_id,
-                    sse_bytes.len() as u64,
-                    count_sse_events(&sse_bytes),
-                    input_tokens,
-                    output_tokens,
-                );
-            }
-            let headers = [
-                (http::header::CONTENT_TYPE, "text/event-stream"),
-                (http::header::CACHE_CONTROL, "no-cache"),
-                (http::header::CONNECTION, "keep-alive"),
-            ];
-            return (headers, sse_bytes).into_response();
+            report_stream_progress(&ctx, &sse_bytes);
+            return sse_stream_response(sse_bytes);
         }
 
         let auth = match load_cursor_auth() {
@@ -166,41 +153,12 @@ impl Provider for CursorProvider {
                     allowed,
                     Box::new(|| uuid::Uuid::new_v4().to_string().replace('-', "")),
                 );
-                if let Some(monitor) = ctx.monitor.as_ref() {
-                    let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                    monitor.stream_progress(
-                        &ctx.req_id,
-                        sse_bytes.len() as u64,
-                        count_sse_events(&sse_bytes),
-                        input_tokens,
-                        output_tokens,
-                    );
-                }
-
-                let headers = [
-                    (http::header::CONTENT_TYPE, "text/event-stream"),
-                    (http::header::CACHE_CONTROL, "no-cache"),
-                    (http::header::CONNECTION, "keep-alive"),
-                ];
-                (headers, sse_bytes).into_response()
+                report_stream_progress(&ctx, &sse_bytes);
+                sse_stream_response(sse_bytes)
             } else {
                 let sse_bytes = sse::frame_cursor_stream(&upstream, &message_id, model);
-                if let Some(monitor) = ctx.monitor.as_ref() {
-                    let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                    monitor.stream_progress(
-                        &ctx.req_id,
-                        sse_bytes.len() as u64,
-                        count_sse_events(&sse_bytes),
-                        input_tokens,
-                        output_tokens,
-                    );
-                }
-                let headers = [
-                    (http::header::CONTENT_TYPE, "text/event-stream"),
-                    (http::header::CACHE_CONTROL, "no-cache"),
-                    (http::header::CONNECTION, "keep-alive"),
-                ];
-                (headers, sse_bytes).into_response()
+                report_stream_progress(&ctx, &sse_bytes);
+                sse_stream_response(sse_bytes)
             }
         } else {
             match decode_cursor_upstream(&upstream, &message_id, model) {
@@ -236,20 +194,31 @@ impl Provider for CursorProvider {
     }
 }
 
-fn count_sse_events(bytes: &[u8]) -> u64 {
-    String::from_utf8_lossy(bytes).matches("event:").count() as u64
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 // ---------------------------------------------------------------------------
 // Error mapping
 // ---------------------------------------------------------------------------
+
+fn report_stream_progress(ctx: &RequestContext, sse_bytes: &[u8]) {
+    if let Some(monitor) = ctx.monitor.as_ref() {
+        let (input_tokens, output_tokens) = usage_from_anthropic_sse(sse_bytes);
+        monitor.stream_progress(
+            &ctx.req_id,
+            sse_bytes.len() as u64,
+            count_sse_events(sse_bytes),
+            input_tokens,
+            output_tokens,
+        );
+    }
+}
+
+fn sse_stream_response(sse_bytes: Vec<u8>) -> Response {
+    let headers = [
+        (http::header::CONTENT_TYPE, "text/event-stream"),
+        (http::header::CACHE_CONTROL, "no-cache"),
+        (http::header::CONNECTION, "keep-alive"),
+    ];
+    (headers, sse_bytes).into_response()
+}
 
 fn map_cursor_error_to_response(err: &client::CursorError) -> Response {
     match err.status {
