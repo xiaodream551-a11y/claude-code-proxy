@@ -191,6 +191,17 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+fn isolate_state_dir(state_dir: &Path) -> EnvGuard {
+    // Windows resolves the process state root from LOCALAPPDATA and ignores
+    // XDG_STATE_HOME. Point the platform-correct variable at the temporary
+    // state directory so traffic captures stay isolated and discoverable.
+    if cfg!(windows) {
+        EnvGuard::set("LOCALAPPDATA", state_dir)
+    } else {
+        EnvGuard::set("XDG_STATE_HOME", state_dir)
+    }
+}
+
 fn traffic_files(state_dir: &Path) -> Vec<PathBuf> {
     collect_files(
         &state_dir
@@ -1526,7 +1537,7 @@ async fn smoke_codex_http_traffic_capture_writes_upstream_artifacts() {
     .await;
 
     let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
-    let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _state_env = isolate_state_dir(state.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
@@ -1574,7 +1585,7 @@ async fn smoke_codex_http_stream_traffic_captures_downstream_events() {
     .await;
 
     let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
-    let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _state_env = isolate_state_dir(state.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
@@ -1619,7 +1630,7 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
     .await;
 
     let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
-    let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _state_env = isolate_state_dir(state.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
@@ -2352,7 +2363,7 @@ async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
     let upstream = spawn_websocket_upstream(captured.clone()).await;
 
     let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
-    let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _state_env = isolate_state_dir(state.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
