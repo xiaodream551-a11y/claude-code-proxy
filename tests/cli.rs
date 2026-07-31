@@ -27,6 +27,20 @@ fn version_json_is_machine_readable() -> Result<(), Box<dyn std::error::Error>> 
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     assert!(value["binarySha256"].as_str().is_some());
+    assert_eq!(value["metadataScope"], "local_binary");
+    for service_only_field in [
+        "configGeneration",
+        "providerConstructionConfigGeneration",
+        "providerConstructionConfigGenerationEnd",
+        "providerConstructionSnapshotStable",
+        "configGenerationChangedSinceProviderConstruction",
+        "configReload",
+    ] {
+        assert!(
+            value.get(service_only_field).is_none(),
+            "local version command must not report running-service field {service_only_field}"
+        );
+    }
     Ok(())
 }
 
@@ -255,7 +269,11 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .env("HOME", &fixture.home_dir)
         .env("PORT", "19876")
         .env("CCP_BIND_ADDRESS", "0.0.0.0")
-        .env("ANTHROPIC_CUSTOM_HEADERS", "x-existing: keep");
+        .env("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "25000")
+        .env(
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "x-existing: keep\nX-CCPROXY-COMPACTION-MODEL: stale",
+        );
 
     cmd.assert()
         .success()
@@ -265,7 +283,7 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
             expected_config_dir.display()
         )))
         .stdout(contains("profile_managed=1"))
-        .stdout(contains("main=gpt-5.6-sol"))
+        .stdout(contains("main=fable"))
         .stdout(contains("fable=gpt-5.6-sol"))
         .stdout(contains("sonnet=gpt-5.6-terra"))
         .stdout(contains("haiku=gpt-5.6-luna"))
@@ -274,13 +292,14 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .stdout(contains("compact_window=272000"))
         .stdout(contains("compact_pct=90"))
         .stdout(contains("disable_1m=1"))
+        .stdout(contains("subagent_depth=1"))
         .stdout(contains("max_retries=1"))
         .stdout(contains("tool_concurrency=10"))
+        .stdout(contains("file_read_cap=8000"))
         .stdout(contains("tool_search=true"))
         .stdout(contains(
-            "custom_headers=x-ccproxy-compaction-model: gpt-5.6-terra",
+            "custom_headers=x-existing: keep\nx-ccproxy-compaction-model: gpt-5.6-terra",
         ))
-        .stdout(contains("custom_headers=x-existing: keep").not())
         .stdout(contains("arg=<--settings>"))
         .stdout(contains("arg=<--agents>"))
         .stdout(contains(
@@ -303,12 +322,34 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
             "\"tools\":[\"Read\",\"Glob\",\"Grep\"]",
         ))
         .stdout(contains("\"effortLevel\":\"high\""))
-        .stdout(contains("\"model\":\"gpt-5.6-sol\""))
+        .stdout(contains("\"model\":\"fable\""))
         .stdout(contains("\"ultracode\":false"))
+        .stdout(contains("\"workflowSizeGuideline\":\"small\""))
         .stdout(contains("arg=<--effort>"))
         .stdout(contains("arg=<max>"))
         .stdout(contains("arg=<hello world>"))
         .stdout(contains("x-ccproxy-codex-xhigh-as-max").not());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn co_rejects_unsafe_custom_headers_before_launch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ClaudeLauncherFixture::new("co")?;
+    let mut cmd = Command::new(&fixture.shortcut);
+    cmd.env("PATH", fixture.path_env())
+        .env("HOME", &fixture.home_dir)
+        .env(
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "x-safe: value\r\nx-injected: no",
+        );
+
+    cmd.assert()
+        .failure()
+        .stderr(contains(
+            "ANTHROPIC_CUSTOM_HEADERS must use LF separators and must not contain CR",
+        ))
+        .stdout(contains("base=").not());
     Ok(())
 }
 
@@ -323,6 +364,8 @@ fn cg_execs_claude_with_grok_profile_and_preserves_exit_code()
         .env("PATH", fixture.path_env())
         .env("HOME", &fixture.home_dir)
         .env("PORT", "19877")
+        .env("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "25000")
+        .env("ANTHROPIC_CUSTOM_HEADERS", "x-existing: keep")
         .env("FAKE_CLAUDE_EXIT_CODE", "37");
 
     cmd.assert()
@@ -344,9 +387,12 @@ fn cg_execs_claude_with_grok_profile_and_preserves_exit_code()
         .stdout(contains("compact_window=500000"))
         .stdout(contains("compact_pct=90"))
         .stdout(contains("disable_1m=1"))
+        .stdout(contains("subagent_depth=1"))
         .stdout(contains("max_retries=1"))
         .stdout(contains("tool_concurrency=10"))
+        .stdout(contains("file_read_cap=\n"))
         .stdout(contains("tool_search=true"))
+        .stdout(contains("custom_headers=x-existing: keep"))
         .stdout(contains("arg=<--settings>"))
         .stdout(contains("arg=<--agents>"))
         .stdout(contains(
@@ -541,8 +587,10 @@ printf 'max_context=%s\n' "$CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 printf 'compact_window=%s\n' "$CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 printf 'compact_pct=%s\n' "$CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 printf 'disable_1m=%s\n' "$CLAUDE_CODE_DISABLE_1M_CONTEXT"
+printf 'subagent_depth=%s\n' "$CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"
 printf 'max_retries=%s\n' "$CLAUDE_CODE_MAX_RETRIES"
 printf 'tool_concurrency=%s\n' "$CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"
+printf 'file_read_cap=%s\n' "$CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"
 printf 'tool_search=%s\n' "$ENABLE_TOOL_SEARCH"
 printf 'custom_headers=%s\n' "$ANTHROPIC_CUSTOM_HEADERS"
 for arg in "$@"; do

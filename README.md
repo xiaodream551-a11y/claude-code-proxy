@@ -193,8 +193,13 @@ agent files:
 
 The `co` profile also routes recognized automatic and manual compaction to
 GPT-5.6 Terra. Codex compaction uses `medium` reasoning independently of the
-main session effort. The session-scoped override replaces an inherited
-compaction header, while `cg` keeps its existing main-loop compaction behavior.
+main session effort. The launcher preserves unrelated newline-separated
+`ANTHROPIC_CUSTOM_HEADERS`, removes every case-insensitive inherited
+`x-ccproxy-compaction-model` entry, and appends exactly one profile-controlled
+value. Malformed, non-UTF-8, CR-containing, or oversized inherited header input
+fails before Claude Code starts instead of being guessed or silently dropped.
+The `cg` profile does not modify this variable and keeps its existing main-loop
+compaction behavior.
 
 The special built-in `claude` catch-all remains untouched because Claude Code
 adds a private background-job and Agent View protocol that public `--agents`
@@ -224,6 +229,58 @@ starts. Options that can replace profile isolation (`--settings`,
 rejected. Run plain `claude` for fully custom combinations. A future custom
 agent outside the injected table that names a generic model alias inherits the
 active parent model unless its definition uses a profile-allowed concrete id.
+
+Managed `co` and `cg` launches currently set
+`CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`. Claude Code 2.1.219 expanded its
+default nested-subagent depth, but nested hook request shapes and same-family
+routing have not yet passed the versioned depth-2/depth-3 canary. Depth 1 keeps
+the verified top-level Agent boundary and prevents a nested generic model alias
+from silently crossing the GPT/Grok profile boundary. Run plain `claude` for an
+unmanaged nesting policy.
+
+Every pull request, main-branch push, and release tag runs the Ubuntu
+latest/previous compatibility gate. The scheduled/manual
+`Claude Code compatibility canary` workflow additionally runs the latest pin on
+macOS. These jobs read
+[`compatibility/claude-code.json`](compatibility/claude-code.json) and install
+the pinned latest and previous Claude Code releases. Run the same isolated
+compatibility canary locally with:
+
+```sh
+scripts/claude-code-launcher-smoke
+```
+
+The manifest is the sole source of the latest/previous version pins and their
+npm `dist.integrity` SHA-512 values. The smoke verifies the downloaded tarball
+before installation and fails when npm's `latest` dist-tag or its immediate
+previous stable release no longer matches the reviewed manifest. It then checks
+the exact installed version, real `co` and `cg` startup with the managed inline
+settings/agent definitions, top-level Agent input preservation, model-override
+removal, and fail-safe nested-hook behavior. For each version it also starts
+ccproxy on a temporary loopback port with fake credentials and a deterministic
+Responses mock, then runs real Claude Code requests through `co`. The mock
+requires a `Read` round trip before it computes a weighted proof from the
+returned file contents. The canary asserts the translated model and streaming
+shape, matching tool call/result IDs, Anthropic cache-read/cache-write usage,
+and a real `--resume` continuation that must carry the prior tool result and
+content-derived proof. It also exercises the top-level Agent/Explore chain:
+Explore must route to the same-family `gpt-5.6-luna` model and return a derived
+child proof, and the parent must carry that Agent result before producing its
+own proof. A direct Anthropic probe asserts HTTP 413 and
+`error.type=request_too_large`; the real Claude client must independently show
+an unambiguous size failure without relying on words planted in its prompt.
+Both paths check one-shot dispatch and absence of an injected secret in direct,
+Claude-facing, and proxy-log output. The canary never uses the default config,
+default port, deployed service, or real provider credentials. Manual dispatch
+accepts an ordered, comma-separated subset of versions already pinned in the
+manifest; empty lists, duplicates, unknown versions, and any whitespace are
+rejected.
+
+This covers the deterministic provider, tool, top-level agent, resume, and
+typed-error slices of CC-COMPAT-002, but does **not** claim live compaction,
+terminal-stream interruption, real provider, or depth-2 routing coverage. The
+scheduled workflow remains manually dispatchable for targeted reruns and macOS
+coverage; the Ubuntu matrix is also an explicit pull-request and release gate.
 
 On Unix, symlinking the same binary as `co` and `cg` enables shorter forms. The
 proxy selects the profile from the executable name and launches Claude Code
@@ -288,6 +345,7 @@ ANTHROPIC_CUSTOM_HEADERS='x-ccproxy-compaction-model: gpt-5.6-terra' \
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
+CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=8000 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
@@ -305,6 +363,12 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
 ```
+
+The managed `co` launcher additionally sets
+`workflowSizeGuideline: "small"` in Claude Code's inline settings. Together
+with the 8K `Read` cap, this keeps broad dynamic workflows from filling a
+272K GPT context with a few whole-file tool results. These GPT-specific
+guards are not applied to the 500K `cg` profile.
 
 Claude Code sends automatic and manual compaction with the main-loop model.
 The `co` profile already routes recognized compaction to GPT-5.6 Terra. For a
@@ -329,6 +393,7 @@ the same Claude config, put the env in `~/.claude/settings.json`:
 
 ```json
 {
+  "workflowSizeGuideline": "small",
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:18765",
     "ANTHROPIC_AUTH_TOKEN": "unused",
@@ -337,6 +402,7 @@ the same Claude config, put the env in `~/.claude/settings.json`:
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "272000",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "272000",
     "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90",
+    "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "8000",
     "CLAUDE_CODE_MAX_RETRIES": "2",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
     "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": 1
@@ -472,7 +538,10 @@ Also verified:
 If the resolved model isn't supported by your account, upstream returns a 400
 like
 `"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account."`.
-The proxy surfaces that verbatim.
+The proxy preserves bounded, allowlisted diagnostic fields while sanitizing
+secrets, credentials, local paths, and URL query data. Unknown JSON error
+shapes are replaced with a generic status-bearing message instead of being
+echoed to Claude Code.
 
 Auth:
 
@@ -788,14 +857,16 @@ The proxy speaks enough of the Anthropic API for Claude Code:
 - `POST /v1/messages?beta=true`: same (Claude Code always sends `?beta=true`)
 - `POST /v1/messages/count_tokens`: local token count via `tiktoken-rs`
   (`o200k_base` text tokenization plus compatibility estimates for fixed
-  request overhead and non-text content); used by Claude Code's compaction
-  logic. GPT and Grok share a two-slot blocking admission gate, and the work
-  runs through Tokio's blocking pool. A request waiting more than 30 seconds
-  for an admission slot receives retryable HTTP 503 overload.
+  request overhead, non-text content, and translated structured-output
+  schemas); used by Claude Code's compaction logic. GPT and Grok share a
+  two-slot blocking admission gate, and the work runs through Tokio's blocking
+  pool. A request waiting more than 30 seconds for an admission slot receives
+  retryable HTTP 503 overload.
 - `GET /v1/models`: the active Codex and Grok model catalog
 - `GET /healthz`: liveness check
 - `GET /version`: build SHA, binary SHA-256, PID, executable path, startup time,
-  and a non-secret configuration fingerprint
+  a non-secret configuration fingerprint, current/provider-construction config
+  generations, and the live-versus-restart-required reload contract
 
 ## Configuration
 
@@ -808,6 +879,13 @@ The file lives at `~/.config/claude-code-proxy/config.json` on macOS
 Windows, and at
 `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/config.json` on Linux. Set
 `CCP_CONFIG_DIR` to use a separate config and auth directory for that process.
+On macOS and Windows, if that platform's primary file does not exist, ccproxy
+also checks the historical `XDG_CONFIG_HOME/claude-code-proxy/config.json`
+location when `XDG_CONFIG_HOME` is set, otherwise the home-directory
+`.config/claude-code-proxy/config.json` location. Older releases used this
+generic path because of incorrect platform detection. This is a read-only
+fallback: creating the primary file takes precedence, and ccproxy does not move
+or delete the old file. `CCP_CONFIG_DIR` disables the fallback.
 
 ```json
 {
@@ -918,9 +996,39 @@ Windows, and at
 | `CCP_ORIGINATOR`                 | —                          | `claude-code-proxy`                               | Fallback for `CCP_CODEX_ORIGINATOR`                                                                                                                                               |
 | `CCP_USER_AGENT`                 | —                          | unset                                             | Fallback for `CCP_CODEX_USER_AGENT`                                                                                                                                               |
 
-A malformed `config.json` is reported on stderr and ignored; defaults are used
-in its place. Invalid types for individual keys are warned and skipped without
-affecting other keys.
+A malformed or unreadable `config.json` is reported on stderr. At startup it is
+ignored and defaults are used; during hot reload ccproxy keeps the last valid
+snapshot and generation until the file becomes valid again. Type errors reject
+the new snapshot as a whole so a partially applied configuration cannot mix old
+and new policy.
+
+“Hot reload” applies only to settings resolved on a later request. Transport
+clients, listeners, and admission semaphores are intentionally not swapped
+inside a running process:
+
+| Application point | Settings |
+| --- | --- |
+| Next request after the metadata recheck (normally within 500 ms) | `log.*`; Codex model, effort, reasoning summary, service tier, lane/tool switches, request headers, continuation/salvage policy, total deadline, stream heartbeat, and WebSocket request/pool timeouts; Grok total deadline and stream heartbeat |
+| Restart required | `bindAddress`, `port`, `server.*`; Codex base URL, transport, connect/header/HTTP first-byte/body-idle timeouts; Grok base URL, client version, connect/header/first-byte/body-idle timeouts; environment or operating-system proxy settings |
+
+`GET /version` exposes `configGeneration`,
+`providerConstructionConfigGeneration`, and
+`configGenerationChangedSinceProviderConstruction`. It also reports
+`providerConstructionConfigGenerationEnd` and
+`providerConstructionSnapshotStable`, because provider construction resolves
+multiple immutable transport settings and a file generation accepted during
+that window could otherwise make a single construction generation misleading.
+An unstable construction snapshot always requires restart. A later changed
+generation does not claim that every field is stale: compare the edited field
+with the `configReload` matrix returned by the endpoint. Restart the service
+when a restart-required effective field changed (a file value masked by an
+environment override is not effective); the endpoint deliberately reports the
+generation difference instead of pretending that provider clients were
+hot-swapped.
+The first `GET /version` that observes each new stale generation also emits one
+`provider_config_generation_stale` warning. It contains only construction
+generation metadata, the current generation, and a fixed remediation action;
+configuration paths and values are not logged.
 
 Codex uses `auto` transport by default. Without a system proxy, `auto` starts
 with live WebSocket streaming while the connection is healthy. It falls back
@@ -962,7 +1070,10 @@ even when no Anthropic semantic output was emitted.
 An upstream hosted-search added, in-progress, searching, completed, or done
 event is also a replay barrier: after observing one, Codex will not retry,
 reconnect, or switch transports even if no Anthropic content block has yet been
-emitted.
+emitted. The same barrier applies once Codex starts generation (for example
+`response.created`): transport-only Anthropic `ping` events keep the
+pre-generation recovery window open, but a second model dispatch is closed after
+generation begins.
 Both Codex live transports emit a standard Anthropic `ping` after 5 seconds
 without visible output, including while waiting for the first generation event.
 HTTP SSE is decoded incrementally, so cancellation closes the upstream socket
@@ -1095,11 +1206,18 @@ not merely until response headers arrive.
 
 Request lifecycle logs distinguish response headers from a finished stream:
 `response_started` records the status returned by the provider,
-`request_completed` is written only after response-body EOF, `request_failed`
-captures HTTP or in-band SSE errors, and `request_abandoned` records downstream
-cancellation before completion.
+`request_completed` is written only after response-body EOF; successful SSE
+responses must first contain a complete Anthropic `message_stop`. A clean
+channel EOF without that terminal event is surfaced as a body error and recorded
+as `request_failed`. HTTP and in-band SSE errors are also recorded as failed,
+while `request_abandoned` records downstream cancellation before completion.
 
 ### Files
+
+On Unix, credential and diagnostic files are created as `0600` inside `0700`
+directories. Sensitive traffic/error capture fails closed if that boundary
+cannot be established; ordinary redacted logging reports a permission warning
+but remains available. Windows relies on the profile directories' ACLs.
 
 - `proxy.log` — JSON-lines log, rotated at 20 MiB. It lives at
   `$XDG_STATE_HOME/claude-code-proxy/proxy.log` on macOS/Linux and at
@@ -1139,17 +1257,21 @@ CCP_TRAFFIC_LOG=1`.
   `~/.config/claude-code-proxy/config.json` on macOS,
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/config.json` on Linux,
   and `%APPDATA%\claude-code-proxy\config.json` on Windows. `CCP_CONFIG_DIR`
-  replaces the platform config directory for the current process.
-- Codex tokens — macOS prefers Keychain service `claude-code-proxy.codex`; when
-  writes are unavailable it falls back to
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/codex/auth.json` and
-  reports that backend. Linux uses the same file path; Windows uses
-  `%APPDATA%\claude-code-proxy\codex\auth.json`.
-- Grok tokens — macOS prefers Keychain service `claude-code-proxy.grok`; when
-  access is unavailable it falls back to
-  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/grok/auth.json`. Linux
-  uses the same file path, and Windows uses
-  `%APPDATA%\claude-code-proxy\grok\auth.json`.
+  replaces the platform config directory for the current process. The macOS
+  and Windows legacy fallback described above is disabled for explicit config
+  directories.
+- Codex tokens — macOS prefers Keychain service `claude-code-proxy.codex`; its
+  file fallback writes `~/.config/claude-code-proxy/codex/auth.json` and reports
+  that backend. Linux uses
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/codex/auth.json`;
+  Windows uses `%APPDATA%\claude-code-proxy\codex\auth.json`.
+- Grok tokens — macOS prefers Keychain service `claude-code-proxy.grok`; its
+  file fallback writes `~/.config/claude-code-proxy/grok/auth.json`. Linux uses
+  `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/grok/auth.json`, and
+  Windows uses `%APPDATA%\claude-code-proxy\grok\auth.json`.
+  On macOS and Windows, provider auth also reads the historical generic path
+  described above when it differs from the primary path; new writes stay on
+  the primary path.
 
 ## Switching models and backends
 
@@ -1254,6 +1376,7 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
       export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-272000}"
       export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-272000}"
       export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
+      export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS:-8000}"
       ;;
     grok-4.5|grok-4.5-high|grok-4.5-medium)
       export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-500000}"
@@ -1353,6 +1476,7 @@ ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna \
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
+CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=8000 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 ```
@@ -1441,9 +1565,13 @@ within the active profile family.
 - **GPT/Grok — request controls:** unknown fields, malformed compatibility
   metadata, fixed thinking budgets, disabled reasoning, sampling controls, and
   non-empty stop sequences fail before dispatch. Claude Code's current adaptive
-  thinking and shaped `context_management` metadata remain accepted; the
-  alternate providers own the actual context/reasoning policy rather than
-  receiving those Anthropic fields verbatim.
+  thinking plus null or empty `context_management.edits` remain accepted. Its
+  exact `clear_thinking_20251015` marker with `keep: "all"` is also accepted
+  because it removes no history. Context edits that can modify conversation
+  history fail before dispatch because the alternate providers cannot apply or
+  report Anthropic context editing faithfully. Grok also rejects `service_tier:
+  "standard_only"` because it cannot guarantee that capacity constraint; `auto`
+  remains supported.
 - **Grok — `output_config.format`:** translated to Responses API `text.format`
   for structured background requests such as session title generation.
 

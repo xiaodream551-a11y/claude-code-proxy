@@ -21,8 +21,12 @@ use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SESSION_END_HELPER_ARG: &str = "--ccproxy-session-end-hook";
+const AGENT_MODEL_POLICY_HELPER_ARG: &str = "--ccproxy-agent-model-policy-hook";
 const MAX_SESSION_END_INPUT_BYTES: u64 = 64 * 1024;
+const MAX_AGENT_MODEL_POLICY_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_DIAGNOSTIC_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES: usize = 64 * 1024;
+const CCP_COMPACTION_HEADER_NAME: &str = "x-ccproxy-compaction-model";
 const CLAUDE_PROFILE_ROOT_DIR: &str = ".claude-ccproxy";
 const CLAUDE_PROFILE_LOCK_FILE: &str = ".ccproxy-profile.lock";
 const CLAUDE_PROFILE_INITIALIZED_FILE: &str = ".ccproxy-profile-initialized";
@@ -43,12 +47,12 @@ const CLAUDE_SHARED_CONFIG_ENTRIES: &[&str] = &[
     "themes",
     "workflows",
 ];
-const EXPLORE_AGENT_DESCRIPTION: &str = "Fast, focused, read-only codebase exploration and search. Use proactively to locate files, trace code paths, understand architecture, and gather evidence before implementation.";
-const EXPLORE_AGENT_PROMPT: &str = "You are a focused codebase exploration agent. Investigate the requested scope without modifying files. Prefer targeted searches and exact paths, trace the relevant control flow, and return concise findings with file and line references. Clearly separate confirmed evidence from inference.";
+const EXPLORE_AGENT_DESCRIPTION: &str = "Fast, focused, read-only codebase exploration and search. Use proactively to locate files, trace code paths, understand architecture, and gather evidence before implementation. Preserve this role's configured fast model; do not override it with the parent model.";
+const EXPLORE_AGENT_PROMPT: &str = "You are a focused codebase exploration agent. Investigate the requested scope without modifying files. Prefer targeted searches, exact paths, and bounded line ranges over whole-file reads; trace the relevant control flow and return concise findings with file and line references. Follow every tool's declared input schema exactly. For case-insensitive Grep, put `(?i)` in the pattern and rely on content output's line numbers; never add `i`, `n`, or `case_insensitive` fields. Reformulate the pattern or use an available shell search when advanced matching is needed. Clearly separate confirmed evidence from inference.";
 const GENERAL_PURPOSE_AGENT_DESCRIPTION: &str = "General-purpose agent for complex, multi-step work that may require investigation, reasoning, implementation, and verification. Use proactively for substantial tasks that do not fit a narrower specialist.";
 const GENERAL_PURPOSE_AGENT_PROMPT: &str = "You are a capable general-purpose engineering agent. Complete the delegated task end to end: inspect the relevant context, make focused changes when authorized, verify the result in proportion to risk, and return a concise evidence-backed summary. Preserve unrelated user changes and follow all applicable instructions.";
-const PLAN_AGENT_DESCRIPTION: &str = "Read-only planning and research agent. Use proactively to investigate architecture, constraints, risks, and verification needs before implementation.";
-const PLAN_AGENT_PROMPT: &str = "You are a read-only planning and research agent. Investigate the requested scope without modifying files, identify the relevant architecture and constraints, surface risks and edge cases, and produce a decision-complete implementation and verification plan grounded in file and line evidence.";
+const PLAN_AGENT_DESCRIPTION: &str = "Read-only planning and research agent. Use proactively to investigate architecture, constraints, risks, and verification needs before implementation. Preserve this role's configured planning model; do not override it with the parent model.";
+const PLAN_AGENT_PROMPT: &str = "You are a read-only planning and research agent. Investigate the requested scope without modifying files, using targeted searches and bounded line ranges instead of ingesting whole large files. Follow every tool's declared input schema exactly. For case-insensitive Grep, put `(?i)` in the pattern and rely on content output's line numbers; never add `i`, `n`, or `case_insensitive` fields. Reformulate the pattern or use an available shell search when advanced matching is needed. Identify the relevant architecture and constraints, surface risks and edge cases, and produce a decision-complete implementation and verification plan grounded in file and line evidence.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -127,6 +131,8 @@ struct ClaudeProfileConfig {
     haiku_model: &'static str,
     compaction_model: Option<&'static str>,
     context_tokens: &'static str,
+    file_read_max_output_tokens: Option<&'static str>,
+    workflow_size_guideline: Option<&'static str>,
     effort_level: &'static str,
     ultracode: bool,
     explore_effort: &'static str,
@@ -147,13 +153,15 @@ impl ClaudeProfile {
         match self {
             Self::Gpt => ClaudeProfileConfig {
                 name: "GPT",
-                main_model: "gpt-5.6-sol",
+                main_model: "fable",
                 fable_model: "gpt-5.6-sol",
                 opus_model: "gpt-5.6-sol",
                 sonnet_model: "gpt-5.6-terra",
                 haiku_model: "gpt-5.6-luna",
                 compaction_model: Some("gpt-5.6-terra"),
                 context_tokens: "272000",
+                file_read_max_output_tokens: Some("8000"),
+                workflow_size_guideline: Some("small"),
                 // Default to high (not ultracode/xhigh) so ordinary co sessions
                 // start at a calmer effort; users can still raise /effort later.
                 effort_level: "high",
@@ -162,6 +170,7 @@ impl ClaudeProfile {
                 general_purpose_effort: "high",
                 plan_effort: "high",
                 available_models: &[
+                    "fable",
                     "gpt-5.6-sol",
                     "gpt-5.6-sol-fast",
                     "gpt-5.6-terra",
@@ -181,6 +190,8 @@ impl ClaudeProfile {
                 haiku_model: "grok-4.5-medium",
                 compaction_model: None,
                 context_tokens: "500000",
+                file_read_max_output_tokens: None,
+                workflow_size_guideline: None,
                 effort_level: "high",
                 ultracode: false,
                 explore_effort: "medium",
@@ -257,6 +268,10 @@ fn run() -> Result<()> {
     if let Some(destination) = session_end_helper_destination_from_argv(&raw_args) {
         return run_session_end_helper(&destination?);
     }
+    if let Some(helper) = agent_model_policy_helper_from_argv(&raw_args) {
+        helper?;
+        return run_agent_model_policy_helper();
+    }
     if let Some((profile, args)) = claude_profile_from_argv(raw_args) {
         return launch_claude(profile, ClaudeLaunchStyle::Shortcut, &args);
     }
@@ -277,7 +292,7 @@ fn run() -> Result<()> {
     match commands {
         Commands::Version { json } => {
             if json {
-                println!("{}", serde_json::to_string(&server::version_info())?);
+                println!("{}", serde_json::to_string(&local_binary_version_info())?);
             } else {
                 println!("claude-code-proxy {}", VERSION);
             }
@@ -388,6 +403,27 @@ fn run() -> Result<()> {
     }
 }
 
+fn local_binary_version_info() -> serde_json::Value {
+    let mut info = server::version_info();
+    let object = info
+        .as_object_mut()
+        .expect("server version metadata is always a JSON object");
+    // This command is a short-lived local process: it has not constructed the
+    // provider clients owned by a running server. Keep those generation and
+    // reload claims exclusive to GET /version on the serving process.
+    object.remove("configGeneration");
+    object.remove("providerConstructionConfigGeneration");
+    object.remove("providerConstructionConfigGenerationEnd");
+    object.remove("providerConstructionSnapshotStable");
+    object.remove("configGenerationChangedSinceProviderConstruction");
+    object.remove("configReload");
+    object.insert(
+        "metadataScope".to_string(),
+        serde_json::Value::String("local_binary".to_string()),
+    );
+    info
+}
+
 fn run_diagnostics(command: DiagnosticsCommand) -> Result<()> {
     match command {
         DiagnosticsCommand::Collect {
@@ -495,9 +531,96 @@ fn session_end_helper_destination_from_argv(args: &[OsString]) -> Option<Result<
     })
 }
 
+fn agent_model_policy_helper_from_argv(args: &[OsString]) -> Option<Result<()>> {
+    if args.get(1).and_then(|argument| argument.to_str()) != Some(AGENT_MODEL_POLICY_HELPER_ARG) {
+        return None;
+    }
+    Some(match args {
+        [_, _] => Ok(()),
+        _ => Err(anyhow::anyhow!(
+            "{AGENT_MODEL_POLICY_HELPER_ARG} does not accept arguments"
+        )),
+    })
+}
+
 fn run_session_end_helper(destination: &Path) -> Result<()> {
     let stdin = std::io::stdin();
     write_session_end_capture(destination, stdin.lock())
+}
+
+fn run_agent_model_policy_helper() -> Result<()> {
+    let stdin = std::io::stdin();
+    let Some(output) = agent_model_policy_hook_output(stdin.lock())? else {
+        return Ok(());
+    };
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(&mut stdout, &output)
+        .context("failed to write the Agent model policy hook output")?;
+    writeln!(stdout).context("failed to finish the Agent model policy hook output")
+}
+
+fn agent_model_policy_hook_output(input: impl Read) -> Result<Option<serde_json::Value>> {
+    let mut payload = Vec::new();
+    input
+        .take(MAX_AGENT_MODEL_POLICY_INPUT_BYTES + 1)
+        .read_to_end(&mut payload)
+        .context("failed to read the Agent model policy hook input")?;
+    if payload.len() as u64 > MAX_AGENT_MODEL_POLICY_INPUT_BYTES {
+        anyhow::bail!(
+            "Agent model policy hook input exceeds {MAX_AGENT_MODEL_POLICY_INPUT_BYTES} bytes"
+        );
+    }
+
+    let payload: serde_json::Value = serde_json::from_slice(&payload)
+        .context("Agent model policy hook input is not valid JSON")?;
+    let payload = payload
+        .as_object()
+        .context("Agent model policy hook input must be a JSON object")?;
+    if payload
+        .get("hook_event_name")
+        .and_then(|value| value.as_str())
+        != Some("PreToolUse")
+    {
+        return Ok(None);
+    }
+    // Claude Code adds `agent_id` to hook input when the hook is running
+    // inside an agent. Treat even malformed values as nested so ambiguous
+    // provenance can never receive this helper's allow decision.
+    if payload.contains_key("agent_id") {
+        return Ok(None);
+    }
+    if !matches!(
+        payload.get("tool_name").and_then(|value| value.as_str()),
+        Some("Agent" | "Task")
+    ) {
+        return Ok(None);
+    }
+
+    let tool_input = payload
+        .get("tool_input")
+        .and_then(|value| value.as_object())
+        .context("Agent model policy hook input is missing an object tool_input")?;
+    if !matches!(
+        tool_input
+            .get("subagent_type")
+            .and_then(|value| value.as_str()),
+        Some("Plan" | "Explore")
+    ) || !tool_input.contains_key("model")
+    {
+        return Ok(None);
+    }
+
+    let mut updated_input = tool_input.clone();
+    updated_input.remove("model");
+    Ok(Some(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "Use the configured Plan or Explore agent model",
+            "updatedInput": updated_input,
+        },
+    })))
 }
 
 fn write_session_end_capture(destination: &Path, input: impl Read) -> Result<()> {
@@ -667,6 +790,46 @@ fn session_end_hook_settings(executable: &Path, destination: &Path) -> Result<se
             }],
         }],
     }))
+}
+
+fn agent_model_policy_hook_settings(executable: &Path) -> Result<serde_json::Value> {
+    if !executable.is_absolute() {
+        anyhow::bail!("Agent model policy hook executable must be an absolute path");
+    }
+    let executable = executable
+        .to_str()
+        .context("Agent model policy hook executable path must be valid UTF-8")?;
+    Ok(serde_json::json!({
+        "PreToolUse": [{
+            "matcher": "Agent|Task",
+            "hooks": [{
+                "type": "command",
+                "command": executable,
+                "args": [AGENT_MODEL_POLICY_HELPER_ARG],
+                "timeout": 5,
+            }],
+        }],
+    }))
+}
+
+fn claude_hook_settings(
+    executable: &Path,
+    session_end_destination: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let mut hooks = agent_model_policy_hook_settings(executable)?;
+    if let Some(destination) = session_end_destination {
+        let session_end = session_end_hook_settings(executable, destination)?;
+        hooks
+            .as_object_mut()
+            .expect("hook settings must be an object")
+            .extend(
+                session_end
+                    .as_object()
+                    .expect("SessionEnd hook settings must be an object")
+                    .clone(),
+            );
+    }
+    Ok(hooks)
 }
 
 fn claude_resume_hint(
@@ -1112,10 +1275,13 @@ fn launch_claude(
         return launch_claude_without_capture(command);
     };
 
-    let executable = std::env::current_exe().context("failed to locate the ccproxy executable")?;
-    let hook = Some((executable.as_path(), capture.destination()));
-    let mut command =
-        build_claude_command_for_profile_config(profile, args, &base_url, &profile_config, hook)?;
+    let mut command = build_claude_command_for_profile_config(
+        profile,
+        args,
+        &base_url,
+        &profile_config,
+        Some(capture.destination()),
+    )?;
     #[cfg(unix)]
     let status = wait_for_claude_with_signal_forwarding(&mut command)?;
     #[cfg(not(unix))]
@@ -1132,7 +1298,6 @@ fn launch_claude(
 
     // process::exit does not run destructors. Remove the private capture
     // directory explicitly before preserving Claude Code's exit status.
-    drop(executable);
     drop(capture);
     exit_with_child_status(status);
 }
@@ -1254,7 +1419,7 @@ fn build_claude_command_with_session_end_hook(
     profile: ClaudeProfile,
     args: &[OsString],
     base_url: &str,
-    session_end_hook: Option<(&Path, &Path)>,
+    session_end_destination: Option<&Path>,
 ) -> Result<Command> {
     let home = claude_home_directory()?;
     let profile_config = claude_profile_config_directory(&home, profile);
@@ -1263,7 +1428,7 @@ fn build_claude_command_with_session_end_hook(
         args,
         base_url,
         &profile_config,
-        session_end_hook,
+        session_end_destination,
     )
 }
 
@@ -1272,11 +1437,11 @@ fn build_claude_command_for_profile_config(
     args: &[OsString],
     base_url: &str,
     profile_config_directory: &Path,
-    session_end_hook: Option<(&Path, &Path)>,
+    session_end_destination: Option<&Path>,
 ) -> Result<Command> {
     let profile = profile.config();
     validate_claude_profile_args(profile, args)?;
-    let environment = claude_profile_environment(profile, base_url, profile_config_directory);
+    let environment = claude_profile_environment(profile, base_url, profile_config_directory)?;
     let settings_environment = environment
         .iter()
         .map(|(name, value)| (name.to_string(), serde_json::Value::String(value.clone())))
@@ -1290,9 +1455,11 @@ fn build_claude_command_for_profile_config(
         "enforceAvailableModels": true,
         "fallbackModel": [],
     });
-    if let Some((executable, destination)) = session_end_hook {
-        inline_settings["hooks"] = session_end_hook_settings(executable, destination)?;
+    if let Some(guideline) = profile.workflow_size_guideline {
+        inline_settings["workflowSizeGuideline"] = serde_json::json!(guideline);
     }
+    let executable = std::env::current_exe().context("failed to locate the ccproxy executable")?;
+    inline_settings["hooks"] = claude_hook_settings(&executable, session_end_destination)?;
     let inline_settings = inline_settings.to_string();
     // CLI agent definitions are replacements, not partial overrides: Claude
     // Code requires both description and prompt. Keep its private built-in
@@ -1331,6 +1498,11 @@ fn build_claude_command_for_profile_config(
         .arg("--agents")
         .arg(inline_agents);
     command.args(args).envs(environment);
+    if profile.file_read_max_output_tokens.is_none() {
+        // Keep the Grok profile independent from a GPT-specific cap inherited
+        // from the parent shell or from a previously configured launcher.
+        command.env_remove("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS");
+    }
     Ok(command)
 }
 
@@ -1425,7 +1597,7 @@ fn claude_profile_environment(
     profile: ClaudeProfileConfig,
     base_url: &str,
     profile_config_directory: &Path,
-) -> Vec<(&'static str, String)> {
+) -> Result<Vec<(&'static str, String)>> {
     let mut environment = vec![
         (CLAUDE_PROFILE_MANAGED_ENV, "1".to_string()),
         (
@@ -1483,17 +1655,85 @@ fn claude_profile_environment(
         ("CLAUDE_CODE_DISABLE_1M_CONTEXT", "1".to_string()),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
         ("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1".to_string()),
+        // Claude Code 2.1.219 enabled nested subagent spawning by default.
+        // Keep managed profiles at the previously verified boundary until a
+        // versioned canary proves same-family routing at greater depths.
+        ("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH", "1".to_string()),
         ("CLAUDE_CODE_MAX_RETRIES", "1".to_string()),
         ("CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY", "10".to_string()),
         ("ENABLE_TOOL_SEARCH", "true".to_string()),
     ];
     if let Some(model) = profile.compaction_model {
+        let inherited = std::env::var_os("ANTHROPIC_CUSTOM_HEADERS");
         environment.push((
             "ANTHROPIC_CUSTOM_HEADERS",
-            format!("x-ccproxy-compaction-model: {model}"),
+            merge_anthropic_custom_headers(inherited.as_deref(), model)?,
         ));
     }
-    environment
+    if let Some(tokens) = profile.file_read_max_output_tokens {
+        environment.push((
+            "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS",
+            tokens.to_string(),
+        ));
+    }
+    Ok(environment)
+}
+
+fn merge_anthropic_custom_headers(
+    inherited: Option<&std::ffi::OsStr>,
+    compaction_model: &str,
+) -> Result<String> {
+    let managed = format!("{CCP_COMPACTION_HEADER_NAME}: {compaction_model}");
+    http::HeaderValue::from_str(compaction_model)
+        .context("configured compaction model is not a valid HTTP header value")?;
+
+    let Some(inherited) = inherited else {
+        return Ok(managed);
+    };
+    let inherited = inherited
+        .to_str()
+        .context("ANTHROPIC_CUSTOM_HEADERS must be valid UTF-8")?;
+    if inherited.len() > MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES {
+        anyhow::bail!(
+            "ANTHROPIC_CUSTOM_HEADERS exceeds {MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES} bytes"
+        );
+    }
+    // Claude Code documents LF-separated `Name: Value` entries. Reject CR
+    // rather than normalizing it so an injected or platform-rewritten line
+    // cannot acquire a different meaning after this validation boundary.
+    if inherited.contains('\r') {
+        anyhow::bail!("ANTHROPIC_CUSTOM_HEADERS must use LF separators and must not contain CR");
+    }
+
+    let mut retained = Vec::new();
+    for line in inherited.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (raw_name, raw_value) = line.split_once(':').context(
+            "ANTHROPIC_CUSTOM_HEADERS entries must use newline-separated `Name: Value` syntax",
+        )?;
+        let name = raw_name.trim();
+        let value = raw_value.trim();
+        let parsed_name = http::HeaderName::from_bytes(name.as_bytes())
+            .context("ANTHROPIC_CUSTOM_HEADERS contains an invalid header name")?;
+        http::HeaderValue::from_str(value)
+            .context("ANTHROPIC_CUSTOM_HEADERS contains an invalid header value")?;
+        if parsed_name.as_str() != CCP_COMPACTION_HEADER_NAME {
+            // Emit exactly the syntax we validated. Retaining leading name
+            // whitespace or trailing value whitespace would make Claude Code
+            // parse a subtly different header line from this validation pass.
+            retained.push(format!("{}: {value}", parsed_name.as_str()));
+        }
+    }
+    retained.push(managed);
+    let merged = retained.join("\n");
+    if merged.len() > MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES {
+        anyhow::bail!(
+            "merged ANTHROPIC_CUSTOM_HEADERS exceeds {MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES} bytes"
+        );
+    }
+    Ok(merged)
 }
 
 fn proxy_client_url(bind_address: &str, port: u16) -> String {
@@ -1895,6 +2135,157 @@ mod tests {
     }
 
     #[test]
+    fn hidden_agent_model_policy_helper_requires_exact_argv() {
+        let exact = [
+            OsString::from("co"),
+            OsString::from(AGENT_MODEL_POLICY_HELPER_ARG),
+        ];
+        agent_model_policy_helper_from_argv(&exact)
+            .expect("helper flag should be recognized")
+            .expect("exact helper argv should be valid");
+
+        let extra = [
+            OsString::from("co"),
+            OsString::from(AGENT_MODEL_POLICY_HELPER_ARG),
+            OsString::from("unexpected"),
+        ];
+        assert!(
+            agent_model_policy_helper_from_argv(&extra)
+                .expect("helper flag should be recognized")
+                .is_err()
+        );
+        assert!(
+            agent_model_policy_helper_from_argv(&[
+                OsString::from("co"),
+                OsString::from("--print"),
+                OsString::from(AGENT_MODEL_POLICY_HELPER_ARG),
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_model_policy_hook_removes_only_plan_and_explore_model_overrides() {
+        for (tool_name, subagent_type) in [("Agent", "Plan"), ("Task", "Explore")] {
+            let payload = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool_name,
+                "tool_input": {
+                    "description": "Investigate the code",
+                    "prompt": "Trace the difficult control flow",
+                    "subagent_type": subagent_type,
+                    "model": "fable",
+                    "run_in_background": true,
+                },
+            })
+            .to_string();
+
+            let output = agent_model_policy_hook_output(payload.as_bytes())
+                .unwrap()
+                .expect("matching tool input should produce an update");
+            assert_eq!(output["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+            assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "allow");
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecisionReason"],
+                "Use the configured Plan or Explore agent model"
+            );
+            assert_eq!(
+                output["hookSpecificOutput"]["updatedInput"],
+                serde_json::json!({
+                    "description": "Investigate the code",
+                    "prompt": "Trace the difficult control flow",
+                    "subagent_type": subagent_type,
+                    "run_in_background": true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn agent_model_policy_hook_is_silent_for_nonmatching_calls() {
+        for tool_input in [
+            serde_json::json!({
+                "subagent_type": "general-purpose",
+                "model": "fable",
+                "prompt": "implement",
+            }),
+            serde_json::json!({
+                "subagent_type": "Plan",
+                "prompt": "investigate",
+            }),
+        ] {
+            let payload = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_input": tool_input,
+            })
+            .to_string();
+            assert!(
+                agent_model_policy_hook_output(payload.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let wrong_event = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "Plan",
+                "model": "fable",
+            },
+        })
+        .to_string();
+        assert!(
+            agent_model_policy_hook_output(wrong_event.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+
+        for agent_id in [
+            serde_json::json!("nested-agent-id"),
+            serde_json::json!(""),
+            serde_json::Value::Null,
+            serde_json::json!({"unexpected": "shape"}),
+        ] {
+            let nested_agent = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "agent_id": agent_id,
+                "tool_name": "Agent",
+                "tool_input": {
+                    "subagent_type": "Plan",
+                    "model": "fable",
+                    "prompt": "delegate again",
+                },
+            })
+            .to_string();
+            assert!(
+                agent_model_policy_hook_output(nested_agent.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn agent_model_policy_hook_errors_do_not_echo_prompt_content() {
+        let secret_prompt = "SECRET_PROMPT_MUST_NOT_LEAK";
+        let malformed = format!(
+            r#"{{"hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":{{"prompt":"{secret_prompt}""#
+        );
+        let error = agent_model_policy_hook_output(malformed.as_bytes()).unwrap_err();
+        assert!(!error.to_string().contains(secret_prompt));
+
+        let oversized = format!(
+            r#"{{"prompt":"{secret_prompt}{}"#,
+            "x".repeat(MAX_AGENT_MODEL_POLICY_INPUT_BYTES as usize)
+        );
+        let error = agent_model_policy_hook_output(oversized.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+        assert!(!error.to_string().contains(secret_prompt));
+    }
+
+    #[test]
     fn session_end_helper_validates_and_exclusively_writes_uuid() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("session-id");
@@ -2029,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn session_end_hook_uses_exec_form_with_absolute_current_executable() {
+    fn claude_hooks_use_exec_form_and_merge_agent_policy_with_session_end() {
         let executable = std::env::current_exe().unwrap();
         assert!(executable.is_absolute());
         let destination = std::env::temp_dir().join("ccproxy-session-id");
@@ -2037,20 +2428,51 @@ mod tests {
             ClaudeProfile::Gpt,
             &[],
             "http://127.0.0.1:18765",
-            Some((&executable, &destination)),
+            Some(&destination),
         )
         .unwrap();
         let settings = command_inline_settings(&command);
+        let pre_tool_use = &settings["hooks"]["PreToolUse"][0];
+        let policy_hook = &pre_tool_use["hooks"][0];
         let session_end = &settings["hooks"]["SessionEnd"][0];
-        let hook = &session_end["hooks"][0];
+        let session_end_hook = &session_end["hooks"][0];
 
+        assert_eq!(pre_tool_use["matcher"], "Agent|Task");
+        assert_eq!(policy_hook["type"], "command");
+        assert_eq!(policy_hook["command"], executable.to_str().unwrap());
+        assert_eq!(
+            policy_hook["args"],
+            serde_json::json!([AGENT_MODEL_POLICY_HELPER_ARG])
+        );
+        assert_eq!(policy_hook["timeout"], 5);
         assert_eq!(session_end["matcher"], "prompt_input_exit|other");
+        assert_eq!(session_end_hook["type"], "command");
+        assert_eq!(session_end_hook["command"], executable.to_str().unwrap());
+        assert_eq!(
+            session_end_hook["args"],
+            serde_json::json!([SESSION_END_HELPER_ARG, destination.to_str().unwrap()])
+        );
+    }
+
+    #[test]
+    fn agent_model_policy_hook_is_configured_without_session_capture() {
+        let executable = std::env::current_exe().unwrap();
+        let command =
+            build_claude_command(ClaudeProfile::Gpt, &[], "http://127.0.0.1:18765").unwrap();
+        let settings = command_inline_settings(&command);
+        let pre_tool_use = &settings["hooks"]["PreToolUse"][0];
+        let hook = &pre_tool_use["hooks"][0];
+
+        assert_eq!(pre_tool_use["matcher"], "Agent|Task");
         assert_eq!(hook["type"], "command");
         assert_eq!(hook["command"], executable.to_str().unwrap());
         assert_eq!(
             hook["args"],
-            serde_json::json!([SESSION_END_HELPER_ARG, destination.to_str().unwrap()])
+            serde_json::json!([AGENT_MODEL_POLICY_HELPER_ARG])
         );
+        assert_eq!(hook["timeout"], 5);
+        assert!(settings["hooks"].get("SessionEnd").is_none());
+        assert!(agent_model_policy_hook_settings(Path::new("relative")).is_err());
     }
 
     #[test]
@@ -2128,9 +2550,10 @@ mod tests {
         let settings = command_inline_settings(&command);
         let agents = command_inline_agents(&command);
         assert_complete_inline_agents(&agents);
-        assert_eq!(settings["model"], "gpt-5.6-sol");
+        assert_eq!(settings["model"], "fable");
         assert_eq!(settings["effortLevel"], "high");
         assert_eq!(settings["ultracode"], false);
+        assert_eq!(settings["workflowSizeGuideline"], "small");
         assert_eq!(settings["enforceAvailableModels"], true);
         assert_eq!(settings["fallbackModel"], serde_json::json!([]));
         assert!(
@@ -2156,6 +2579,13 @@ mod tests {
                 .any(|model| model == "gpt-5.6-terra")
         );
         assert!(
+            settings["availableModels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| model == "fable")
+        );
+        assert!(
             !settings["availableModels"]
                 .as_array()
                 .unwrap()
@@ -2163,7 +2593,7 @@ mod tests {
                 .any(|model| model == "opus")
         );
         assert_eq!(settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "272000");
-        assert_eq!(command_env(&command, "ANTHROPIC_MODEL"), "gpt-5.6-sol");
+        assert_eq!(command_env(&command, "ANTHROPIC_MODEL"), "fable");
         assert_eq!(
             command_env(&command, "ANTHROPIC_DEFAULT_SONNET_MODEL"),
             "gpt-5.6-terra"
@@ -2179,6 +2609,14 @@ mod tests {
         assert_eq!(
             command_env(&command, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
             "272000"
+        );
+        assert_eq!(
+            command_env(&command, "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"),
+            "1"
+        );
+        assert_eq!(
+            command_env(&command, "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"),
+            "8000"
         );
         assert_eq!(
             command_env(&command, "ANTHROPIC_CUSTOM_HEADERS"),
@@ -2201,6 +2639,7 @@ mod tests {
         assert_eq!(settings["model"], "grok-4.5");
         assert_eq!(settings["effortLevel"], "high");
         assert_eq!(settings["ultracode"], false);
+        assert!(settings.get("workflowSizeGuideline").is_none());
         assert!(
             PathBuf::from(command_env(&command, "CLAUDE_CONFIG_DIR"))
                 .ends_with(".claude-ccproxy/grok")
@@ -2239,6 +2678,10 @@ mod tests {
             "grok-4.5-medium"
         );
         assert_eq!(
+            command_env(&command, "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"),
+            "1"
+        );
+        assert_eq!(
             command_env(&command, "ANTHROPIC_SMALL_FAST_MODEL"),
             "grok-4.5-medium"
         );
@@ -2254,6 +2697,9 @@ mod tests {
         assert_eq!(
             command_env(&command, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
             "90"
+        );
+        assert!(
+            command_env_optional(&command, "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS").is_none()
         );
         assert!(command_env_optional(&command, "ANTHROPIC_CUSTOM_HEADERS").is_none());
     }
@@ -2339,6 +2785,53 @@ mod tests {
     }
 
     #[test]
+    fn custom_headers_preserve_unrelated_entries_and_replace_reserved_duplicates() {
+        let inherited = OsStr::new(
+            " x-trace-id : abc \nX-CCProxy-Compaction-Model: stale\nx-tenant: one:two\nx-ccproxy-compaction-model: duplicate",
+        );
+        let merged = merge_anthropic_custom_headers(Some(inherited), "gpt-5.6-terra").unwrap();
+        assert_eq!(
+            merged,
+            "x-trace-id: abc\nx-tenant: one:two\nx-ccproxy-compaction-model: gpt-5.6-terra"
+        );
+    }
+
+    #[test]
+    fn custom_headers_reject_ambiguous_or_unsafe_input_without_echoing_it() {
+        for inherited in [
+            "missing-colon",
+            "bad header: value",
+            "x-ok: value\r\nx-injected: yes",
+            "x-value: valid\u{7f}",
+        ] {
+            let error =
+                merge_anthropic_custom_headers(Some(OsStr::new(inherited)), "gpt-5.6-terra")
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("ANTHROPIC_CUSTOM_HEADERS"),
+                "{error:#}"
+            );
+            assert!(!error.to_string().contains(inherited));
+        }
+
+        let oversized = format!("x-long: {}", "a".repeat(MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES));
+        let error = merge_anthropic_custom_headers(Some(OsStr::new(&oversized)), "gpt-5.6-terra")
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+        assert!(!error.to_string().contains(&oversized));
+
+        let prefix = "x-long: ";
+        let nearly_full = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES - prefix.len())
+        );
+        let error = merge_anthropic_custom_headers(Some(OsStr::new(&nearly_full)), "gpt-5.6-terra")
+            .unwrap_err();
+        assert!(error.to_string().contains("merged"));
+        assert!(!error.to_string().contains(&nearly_full));
+    }
+
+    #[test]
     fn proxy_client_url_uses_loopback_for_unspecified_listener() {
         assert_eq!(proxy_client_url("0.0.0.0", 18765), "http://127.0.0.1:18765");
         assert_eq!(proxy_client_url("::", 18765), "http://[::1]:18765");
@@ -2405,6 +2898,13 @@ mod tests {
         for name in ["Explore", "Plan"] {
             assert_eq!(agents[name]["tools"], read_only_tools);
             assert_eq!(agents[name]["permissionMode"], "plan");
+            assert!(
+                agents[name]["prompt"].as_str().is_some_and(|prompt| {
+                    prompt.contains("put `(?i)` in the pattern")
+                        && prompt.contains("never add `i`, `n`, or `case_insensitive` fields")
+                }),
+                "{name} must guard against unsupported search-tool fields"
+            );
         }
         assert!(agents["general-purpose"].get("tools").is_none());
         assert!(agents["general-purpose"].get("permissionMode").is_none());

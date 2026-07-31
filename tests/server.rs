@@ -132,6 +132,29 @@ async fn version_reports_build_and_runtime_identity() {
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert!(body["gitSha"].as_str().is_some_and(|sha| !sha.is_empty()));
     assert_eq!(body["pid"], std::process::id());
+    assert!(body["configGeneration"].as_u64().is_some());
+    assert_eq!(
+        body["providerConstructionConfigGeneration"],
+        body["configGeneration"]
+    );
+    assert_eq!(
+        body["providerConstructionConfigGenerationEnd"],
+        body["providerConstructionConfigGeneration"]
+    );
+    assert_eq!(body["providerConstructionSnapshotStable"], true);
+    assert_eq!(
+        body["configGenerationChangedSinceProviderConstruction"],
+        false
+    );
+    assert_eq!(
+        body["configReload"]["status"],
+        "provider_generation_current"
+    );
+    assert!(
+        body["configReload"]["restartRequired"]
+            .as_array()
+            .is_some_and(|fields| !fields.is_empty())
+    );
     assert!(
         body["binarySha256"]
             .as_str()
@@ -523,6 +546,75 @@ async fn count_tokens_routes_to_provider() {
 }
 
 #[tokio::test]
+async fn count_tokens_endpoint_includes_structured_output_schema_for_each_provider() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "result": {
+                "type": "string",
+                "description": "schema-token-evidence-".repeat(512)
+            }
+        },
+        "required": ["result"],
+        "additionalProperties": false
+    });
+    assert!(serde_json::to_vec(&schema).unwrap().len() >= 10 * 1024);
+
+    for model in ["gpt-5.6-sol", "grok-4.5-high"] {
+        let app = app(Arc::new(Registry::with_default_alias()));
+        let mut counts = Vec::new();
+        for format in [
+            None,
+            Some(json!({
+                "type": "json_schema",
+                "name": "large_result",
+                "schema": schema.clone()
+            })),
+        ] {
+            let mut payload = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "return a result"}]
+            });
+            if let Some(format) = format {
+                payload["output_config"] = json!({"format": format});
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/messages/count_tokens")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{model} count response: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            counts.push(
+                body["input_tokens"]
+                    .as_u64()
+                    .expect("count endpoint returns input_tokens"),
+            );
+        }
+        assert!(
+            counts[1] > counts[0],
+            "{model} endpoint omitted the translated structured schema: {counts:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn count_tokens_opus_5_uses_grok_session_affinity() {
     let monitor = MonitorHandle::new(10);
     let app = app_with_monitor(
@@ -855,8 +947,12 @@ async fn compaction_header_routes_only_compaction_requests_to_grok() {
                 .uri("/v1/messages/count_tokens")
                 .header("content-type", "application/json")
                 .header("x-ccproxy-compaction-model", "grok-4.5-high")
+                .header(
+                    "x-claude-code-session-id",
+                    "compaction-without-prior-affinity",
+                )
                 .body(body_string(
-                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}]}"#,
+                    r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far."}]}"#,
                 ))
                 .unwrap(),
         )
@@ -874,8 +970,12 @@ async fn compaction_header_routes_only_compaction_requests_to_grok() {
                 .uri("/v1/messages/count_tokens")
                 .header("content-type", "application/json")
                 .header("x-ccproxy-compaction-model", "grok-4.5-high")
+                .header(
+                    "x-claude-code-session-id",
+                    "compaction-without-prior-affinity",
+                )
                 .body(body_string(
-                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"ordinary request"}]}"#,
+                    r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"ordinary request"}]}"#,
                 ))
                 .unwrap(),
         )
@@ -891,15 +991,94 @@ async fn compaction_header_routes_only_compaction_requests_to_grok() {
     let compact = state
         .recent
         .iter()
-        .find(|request| request.model.as_deref() == Some("grok-4.5-high"))
+        .find(|request| request.session_seq == Some(1))
         .expect("compaction route must be recorded");
+    assert_eq!(compact.model.as_deref(), Some("grok-4.5-high"));
     assert_eq!(compact.provider.as_deref(), Some("grok"));
     let normal = state
         .recent
         .iter()
-        .find(|request| request.model.as_deref() == Some("gpt-5.4"))
+        .find(|request| request.session_seq == Some(2))
         .expect("ordinary route must be recorded");
+    assert!(
+        normal
+            .model
+            .as_deref()
+            .is_some_and(|model| model.starts_with("claude-opus-5"))
+    );
     assert_eq!(normal.provider.as_deref(), Some("codex"));
+}
+
+#[tokio::test]
+async fn codex_compaction_preserves_existing_grok_session_affinity() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let session_id = "codex-compaction-with-grok-affinity";
+    let requests = [
+        ("grok-4.5", None, "establish explicit Grok affinity"),
+        (
+            "claude-opus-5",
+            Some("gpt-5.6-terra"),
+            "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour entire response must be plain text: an <analysis> block followed by a <summary> block.\nYour task is to create a detailed summary of the conversation so far.",
+        ),
+        ("claude-opus-5", None, "ordinary alias request"),
+    ];
+
+    for (model, compaction_model, content) in requests {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages/count_tokens")
+            .header("content-type", "application/json")
+            .header("x-claude-code-session-id", session_id);
+        if let Some(compaction_model) = compaction_model {
+            request = request.header("x-ccproxy-compaction-model", compaction_model);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": content}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model} response body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 3);
+    let expected = [
+        (1, "grok-4.5", "grok"),
+        (2, "gpt-5.6-terra", "codex"),
+        (3, "claude-opus-5", "grok"),
+    ];
+    for (session_seq, model, provider) in expected {
+        let request = state
+            .recent
+            .iter()
+            .find(|request| request.session_seq == Some(session_seq))
+            .unwrap_or_else(|| panic!("session sequence {session_seq} must be recorded"));
+        assert_eq!(request.model.as_deref(), Some(model));
+        assert_eq!(request.provider.as_deref(), Some(provider));
+    }
 }
 
 #[tokio::test]

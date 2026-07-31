@@ -37,6 +37,9 @@ impl AuthMutationLock {
     pub fn acquire(coordination_path: Option<&Path>) -> io::Result<Self> {
         let file = Self::open(coordination_path)?;
         if let Some(file) = file.as_ref() {
+            // Block until the exclusive lock is available. On Windows, fs2 maps
+            // contended locks to ERROR_LOCK_VIOLATION rather than WouldBlock for
+            // some try_lock paths; the blocking lock remains correct here.
             file.lock_exclusive()?;
         }
         Ok(Self { _file: file })
@@ -46,7 +49,7 @@ impl AuthMutationLock {
         loop {
             let file = Self::open(coordination_path)?;
             match file.as_ref().map(FileExt::try_lock_exclusive) {
-                Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                Some(Err(error)) if is_exclusive_lock_busy(&error) => {
                     drop(file);
                     tokio::time::sleep(Duration::from_millis(25)).await;
                     continue;
@@ -56,6 +59,16 @@ impl AuthMutationLock {
             }
         }
     }
+}
+
+fn is_exclusive_lock_busy(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    // Windows: ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33) are
+    // the normal contended outcomes for try_lock_exclusive. Treating them as
+    // hard failures races concurrent OAuth refreshes that share one lock file.
+    matches!(error.raw_os_error(), Some(32 | 33))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,6 +146,17 @@ pub fn refresh_pending_path(coordination_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusive_lock_busy_recognizes_windows_contention_codes() {
+        assert!(is_exclusive_lock_busy(&io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "busy",
+        )));
+        assert!(is_exclusive_lock_busy(&io::Error::from_raw_os_error(32)));
+        assert!(is_exclusive_lock_busy(&io::Error::from_raw_os_error(33)));
+        assert!(!is_exclusive_lock_busy(&io::Error::from_raw_os_error(5)));
+    }
 
     #[test]
     fn pending_marker_roundtrips_and_clears() {

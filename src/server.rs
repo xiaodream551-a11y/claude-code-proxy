@@ -22,7 +22,7 @@ use http_body_util::{BodyExt, StreamBody};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::future::Future;
 use std::io::{Read, Write};
@@ -46,6 +46,7 @@ const ERROR_RESPONSE_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_CAPTURE_FILES: usize = 128;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPACTION_MODEL_HEADER: &str = "x-ccproxy-compaction-model";
+const INCOMPLETE_SSE_ERROR: &str = "SSE response ended before message_stop";
 
 fn compaction_model_override(
     headers: &HeaderMap,
@@ -288,11 +289,22 @@ pub fn app_with_limits(
 ) -> Router {
     initialize_process_identity();
     initialize_config_fingerprint(&limits, None, None);
+    let provider_construction_config_generation = registry.construction_config_generation();
+    let provider_construction_config_generation_end = registry.construction_config_generation_end();
+    let provider_construction_config_snapshot_stable =
+        registry.construction_config_snapshot_stable();
     let state = Arc::new(AppState {
         registry,
         monitor,
         admission: AdmissionState::new(&limits),
         limits,
+        provider_construction_config_generation,
+        provider_construction_config_generation_end,
+        provider_construction_config_snapshot_stable,
+        config_generation_drift_warning: ConfigGenerationDriftWarning::new(
+            provider_construction_config_generation,
+            provider_construction_config_snapshot_stable,
+        ),
     });
     Router::new()
         .route("/healthz", get(healthz))
@@ -309,6 +321,45 @@ struct AppState {
     monitor: Option<MonitorHandle>,
     admission: AdmissionState,
     limits: ServerLimits,
+    provider_construction_config_generation: u64,
+    provider_construction_config_generation_end: u64,
+    provider_construction_config_snapshot_stable: bool,
+    config_generation_drift_warning: ConfigGenerationDriftWarning,
+}
+
+struct ConfigGenerationDriftWarning {
+    provider_construction_generation: u64,
+    provider_construction_snapshot_stable: bool,
+    warned_generations: Mutex<HashSet<u64>>,
+}
+
+impl ConfigGenerationDriftWarning {
+    fn new(
+        provider_construction_generation: u64,
+        provider_construction_snapshot_stable: bool,
+    ) -> Self {
+        Self {
+            provider_construction_generation,
+            provider_construction_snapshot_stable,
+            warned_generations: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn observe(&self, current_generation: u64) -> bool {
+        if self.provider_construction_snapshot_stable
+            && current_generation == self.provider_construction_generation
+        {
+            return false;
+        }
+
+        // GET /version is a diagnostic path, so a small lock is preferable to
+        // losing or repeating a warning if concurrent requests observe two
+        // different generations and complete out of order.
+        self.warned_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(current_generation)
+    }
 }
 
 struct AdmissionState {
@@ -378,8 +429,44 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn version() -> Json<serde_json::Value> {
-    Json(version_info())
+async fn version(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let current_config_generation = crate::config::load_config().config_generation;
+    if state
+        .config_generation_drift_warning
+        .observe(current_config_generation)
+    {
+        create_logger("server").warn(
+            "provider_config_generation_stale",
+            Some(Map::from_iter([
+                (
+                    "providerConstructionConfigGeneration".to_string(),
+                    Value::Number(state.provider_construction_config_generation.into()),
+                ),
+                (
+                    "configGeneration".to_string(),
+                    Value::Number(current_config_generation.into()),
+                ),
+                (
+                    "providerConstructionConfigGenerationEnd".to_string(),
+                    Value::Number(state.provider_construction_config_generation_end.into()),
+                ),
+                (
+                    "providerConstructionSnapshotStable".to_string(),
+                    Value::Bool(state.provider_construction_config_snapshot_stable),
+                ),
+                (
+                    "action".to_string(),
+                    Value::String("inspect_get_version_configReload_and_restart_if_needed".into()),
+                ),
+            ])),
+        );
+    }
+    Json(version_info_with_config_generations(
+        state.provider_construction_config_generation,
+        state.provider_construction_config_generation_end,
+        state.provider_construction_config_snapshot_stable,
+        current_config_generation,
+    ))
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -544,6 +631,66 @@ pub fn version_info() -> Value {
             "samplingControls": "rejected_before_dispatch",
         },
     })
+}
+
+fn version_info_with_config_generations(
+    provider_construction_config_generation: u64,
+    provider_construction_config_generation_end: u64,
+    provider_construction_config_snapshot_stable: bool,
+    current_config_generation: u64,
+) -> Value {
+    let generation_changed = current_config_generation != provider_construction_config_generation;
+    let mut info = version_info();
+    info.as_object_mut()
+        .expect("version metadata is a JSON object")
+        .extend(Map::from_iter([
+            (
+                "configGeneration".to_string(),
+                Value::Number(current_config_generation.into()),
+            ),
+            (
+                "providerConstructionConfigGeneration".to_string(),
+                Value::Number(provider_construction_config_generation.into()),
+            ),
+            (
+                "providerConstructionConfigGenerationEnd".to_string(),
+                Value::Number(provider_construction_config_generation_end.into()),
+            ),
+            (
+                "providerConstructionSnapshotStable".to_string(),
+                Value::Bool(provider_construction_config_snapshot_stable),
+            ),
+            (
+                "configGenerationChangedSinceProviderConstruction".to_string(),
+                Value::Bool(generation_changed),
+            ),
+            (
+                "configReload".to_string(),
+                json!({
+                    "status": if !provider_construction_config_snapshot_stable {
+                        "provider_construction_snapshot_unstable_restart_required"
+                    } else if generation_changed {
+                        "generation_changed_check_restart_required_fields"
+                    } else {
+                        "provider_generation_current"
+                    },
+                    "nextRequest": [
+                        "log.*",
+                        "codex.model/effort/reasoningSummary/serviceTier/responsesLite/parallelTools",
+                        "codex.originator/userAgent/previousResponseId/unsafeSalvageToolCallOnClose",
+                        "codex.totalTimeoutMs/streamHeartbeatMs/websocket*TimeoutMs/maxIdleWebSockets/idleWebSocketTtlMs",
+                        "grok.totalTimeoutMs/streamHeartbeatMs",
+                    ],
+                    "restartRequired": [
+                        "bindAddress/port/server.*",
+                        "codex.baseUrl/transport/connectTimeoutMs/headerTimeoutMs/httpFirstByteTimeoutMs/bodyIdleTimeoutMs",
+                        "grok.baseUrl/clientVersion/connectTimeoutMs/headerTimeoutMs/firstByteTimeoutMs/bodyIdleTimeoutMs",
+                        "HTTP(S)_PROXY/ALL_PROXY/NO_PROXY and operating-system proxy settings",
+                    ],
+                }),
+            ),
+        ]));
+    info
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
@@ -903,8 +1050,9 @@ async fn dispatch_request_with_id(
         }
     };
 
-    let effective_model =
-        compaction_model_override(&headers, &body).unwrap_or_else(|| requested_model.clone());
+    let compaction_model = compaction_model_override(&headers, &body);
+    let uses_compaction_model_override = compaction_model.is_some();
+    let effective_model = compaction_model.unwrap_or_else(|| requested_model.clone());
     let normalized_model = normalize_incoming_model(&effective_model);
     if normalized_model != normalize_incoming_model(&requested_model) {
         log.info(
@@ -930,10 +1078,14 @@ async fn dispatch_request_with_id(
                         .admission
                         .acquire(state.admission.provider(provider_name))
                     {
-                        Some(permit) => session::SessionRoute::new(
-                            ProviderRouteSelection::Admitted { provider, permit },
-                            provider_name,
-                        ),
+                        Some(permit) => {
+                            let selection = ProviderRouteSelection::Admitted { provider, permit };
+                            if uses_compaction_model_override {
+                                session::SessionRoute::preserving_affinity(selection, provider_name)
+                            } else {
+                                session::SessionRoute::new(selection, provider_name)
+                            }
+                        }
                         None => session::SessionRoute::without_commit(
                             ProviderRouteSelection::Saturated(provider_name),
                         ),
@@ -1261,6 +1413,7 @@ fn monitor_response_body(
         sse_detector: is_event_stream.then(SseErrorDetector::default),
         open_tool_blocks: HashMap::new(),
         provisionally_closed_tool_blocks: HashMap::new(),
+        saw_message_stop: false,
         _permits: permits,
         terminal: false,
     };
@@ -1284,6 +1437,14 @@ fn monitor_response_body(
                     Some((Err(err), (body, lifecycle)))
                 }
                 None => {
+                    if lifecycle.sse_detector.is_some() && !lifecycle.saw_message_stop {
+                        lifecycle.failed(INCOMPLETE_SSE_ERROR.to_string(), false);
+                        let error = axum::Error::new(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            INCOMPLETE_SSE_ERROR,
+                        ));
+                        return Some((Err(error), (body, lifecycle)));
+                    }
                     lifecycle.completed();
                     None
                 }
@@ -1317,6 +1478,7 @@ struct ResponseBodyLifecycle {
     sse_detector: Option<SseErrorDetector>,
     open_tool_blocks: HashMap<u64, ToolBlockTrace>,
     provisionally_closed_tool_blocks: HashMap<u64, ToolBlockTrace>,
+    saw_message_stop: bool,
     _permits: RequestPermits,
     terminal: bool,
 }
@@ -1386,6 +1548,7 @@ impl ResponseBodyLifecycle {
                 }
             }
             SseToolEvent::MessageStopped => {
+                self.saw_message_stop = true;
                 let completed = std::mem::take(&mut self.provisionally_closed_tool_blocks);
                 for (_, tool) in completed {
                     log_tool_block_event(&self.log_context, "tool_block_completed", &tool, None);
@@ -1839,7 +2002,21 @@ async fn record_failed_response(
         "bodyReadError": read.error.as_deref(),
     });
     let error_file = if should_capture_error_response(ctx.provider, status) {
-        write_error_capture(ctx.req_id, redact_error_value(document)).await
+        match write_error_capture(ctx.req_id, redact_error_value(document)).await {
+            Ok(path) => path,
+            Err(error) => {
+                log.warn(
+                    "error_capture_failed",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".to_string(), json!(ctx.req_id)),
+                        ("provider".to_string(), json!(ctx.provider)),
+                        ("status".to_string(), json!(status.as_u16())),
+                        ("error".to_string(), json!(error)),
+                    ])),
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -1985,33 +2162,65 @@ fn should_capture_error_response(provider: Option<&str>, status: StatusCode) -> 
     provider.is_some() && status.is_server_error()
 }
 
-async fn write_error_capture(req_id: &str, document: Value) -> Option<PathBuf> {
+async fn write_error_capture(req_id: &str, document: Value) -> Result<Option<PathBuf>, String> {
     let gate = ERROR_CAPTURE_GATE
         .get_or_init(|| Arc::new(Semaphore::new(1)))
         .clone();
-    let permit = gate.try_acquire_owned().ok()?;
+    let permit = match gate.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return Ok(None),
+    };
     let req_id = req_id.to_string();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         write_error_capture_blocking(&req_id, &document)
     })
     .await
-    .ok()
-    .flatten()
+    .map_err(|error| format!("error capture task failed: {error}"))?
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
-fn write_error_capture_blocking(req_id: &str, document: &Value) -> Option<PathBuf> {
+fn write_error_capture_blocking(req_id: &str, document: &Value) -> std::io::Result<PathBuf> {
     let dir = crate::paths::state_dir().join("errors");
-    fs::create_dir_all(&dir).ok()?;
-    crate::fsutil::set_mode(&dir, 0o700);
-    prune_error_captures(&dir);
+    write_error_capture_in_dir(&dir, req_id, document)
+}
+
+fn write_error_capture_in_dir(
+    dir: &Path,
+    req_id: &str,
+    document: &Value,
+) -> std::io::Result<PathBuf> {
+    let payload = serde_json::to_vec_pretty(document).map_err(std::io::Error::other)?;
+    crate::fsutil::create_dir_all_with_mode(dir, 0o700)?;
+    prune_error_captures(dir);
     let path = dir.join(format!("{}-{}.json", now_ms(), sanitize_path_part(req_id)));
-    let mut file = File::create(&path).ok()?;
-    crate::fsutil::set_mode(&path, 0o600);
-    let payload = serde_json::to_vec_pretty(document).ok()?;
-    file.write_all(&payload).ok()?;
-    file.write_all(b"\n").ok()?;
-    Some(path)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    if let Err(write_error) = file.write_all(&payload).and_then(|_| file.write_all(b"\n")) {
+        drop(file);
+        let cleanup_error = fs::remove_file(&path)
+            .err()
+            .filter(|error| error.kind() != std::io::ErrorKind::NotFound);
+        let detail = match cleanup_error {
+            Some(cleanup_error) => format!(
+                "failed to write error capture {}: {write_error}; failed to remove partial file: {cleanup_error}",
+                path.display()
+            ),
+            None => format!(
+                "failed to write error capture {}: {write_error}",
+                path.display()
+            ),
+        };
+        return Err(std::io::Error::new(write_error.kind(), detail));
+    }
+    Ok(path)
 }
 
 fn prune_error_captures(dir: &Path) {
@@ -2226,6 +2435,60 @@ mod tests {
     use bytes::Bytes;
     use futures_util::stream;
 
+    #[test]
+    fn provider_generation_drift_warning_is_once_per_new_generation() {
+        let warning = Arc::new(ConfigGenerationDriftWarning::new(7, true));
+        assert!(!warning.observe(7));
+
+        for generation in [8, 9] {
+            let observations = (0..16)
+                .map(|_| {
+                    let warning = warning.clone();
+                    std::thread::spawn(move || warning.observe(generation))
+                })
+                .collect::<Vec<_>>();
+            let emitted = observations
+                .into_iter()
+                .map(|observation| observation.join().unwrap())
+                .filter(|emitted| *emitted)
+                .count();
+            assert_eq!(emitted, 1, "generation {generation}");
+        }
+    }
+
+    #[test]
+    fn version_marks_provider_generation_drift_without_claiming_hot_swap() {
+        let info = version_info_with_config_generations(7, 7, true, 9);
+        assert_eq!(info["providerConstructionConfigGeneration"], 7);
+        assert_eq!(info["providerConstructionConfigGenerationEnd"], 7);
+        assert_eq!(info["providerConstructionSnapshotStable"], true);
+        assert_eq!(info["configGeneration"], 9);
+        assert_eq!(
+            info["configGenerationChangedSinceProviderConstruction"],
+            true
+        );
+        assert_eq!(
+            info["configReload"]["status"],
+            "generation_changed_check_restart_required_fields"
+        );
+    }
+
+    #[test]
+    fn version_requires_restart_when_provider_construction_snapshot_was_unstable() {
+        let info = version_info_with_config_generations(7, 8, false, 8);
+        assert_eq!(info["providerConstructionConfigGeneration"], 7);
+        assert_eq!(info["providerConstructionConfigGenerationEnd"], 8);
+        assert_eq!(info["providerConstructionSnapshotStable"], false);
+        assert_eq!(
+            info["configReload"]["status"],
+            "provider_construction_snapshot_unstable_restart_required"
+        );
+
+        let warning = ConfigGenerationDriftWarning::new(8, false);
+        assert!(warning.observe(8));
+        assert!(!warning.observe(8));
+    }
+
     fn compaction_request() -> crate::anthropic::schema::MessagesRequest {
         serde_json::from_value(serde_json::json!({
             "model": "fable",
@@ -2284,7 +2547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_body_stays_active_until_successful_eof() {
+    async fn response_body_stays_active_until_message_stop_and_eof() {
         let req_id = "stream-success";
         let monitor = started_monitor(req_id);
         let response = Response::builder()
@@ -2293,6 +2556,9 @@ mod tests {
             .body(Body::from_stream(stream::iter(vec![
                 Ok::<_, std::io::Error>(Bytes::from_static(
                     b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 )),
             ])))
             .unwrap();
@@ -2319,6 +2585,69 @@ mod tests {
             crate::monitor::RequestStatus::Completed
         );
         assert_eq!(state.recent[0].http_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn aborted_sse_producer_surfaces_body_error_and_failed_request() {
+        let req_id = "stream-producer-aborted";
+        let monitor = started_monitor(req_id);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+        let producer = tokio::spawn(async move {
+            tx.send(Ok(Bytes::from_static(
+                b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            )))
+            .await
+            .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let producer_stream = stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(producer_stream))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            request_guard(monitor.clone(), req_id),
+            response_log_context(req_id),
+            RequestPermits::default(),
+        );
+        let mut body = response.into_body();
+
+        let first = body
+            .frame()
+            .await
+            .expect("producer should emit its first frame")
+            .expect("first frame should be valid");
+        assert!(
+            first
+                .data_ref()
+                .is_some_and(|data| data.starts_with(b"event: ping"))
+        );
+        assert_eq!(monitor.snapshot().active.len(), 1);
+
+        producer.abort();
+        assert!(producer.await.unwrap_err().is_cancelled());
+
+        let error = body
+            .frame()
+            .await
+            .expect("abrupt producer exit must surface a body error")
+            .expect_err("missing message_stop must not be a successful EOF");
+        assert!(error.to_string().contains(INCOMPLETE_SSE_ERROR));
+        assert!(body.frame().await.is_none());
+
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent[0].status,
+            crate::monitor::RequestStatus::Failed
+        );
+        assert_eq!(state.recent[0].http_status, Some(200));
+        assert_eq!(state.recent[0].error.as_deref(), Some(INCOMPLETE_SSE_ERROR));
     }
 
     #[tokio::test]
@@ -2515,6 +2844,7 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
                 sse_detector: Some(SseErrorDetector::default()),
                 open_tool_blocks: HashMap::new(),
                 provisionally_closed_tool_blocks: HashMap::new(),
+                saw_message_stop: false,
                 _permits: RequestPermits::default(),
                 terminal: false,
             }
@@ -2580,6 +2910,50 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
             Some("codex"),
             StatusCode::BAD_GATEWAY
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn error_capture_directory_and_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("errors");
+        let path = write_error_capture_in_dir(
+            &directory,
+            "private-capture",
+            &json!({"error": {"message": "sensitive"}}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn error_capture_directory_failure_is_returned() {
+        let temp = tempfile::tempdir().unwrap();
+        let not_a_directory = temp.path().join("not-a-directory");
+        fs::write(&not_a_directory, b"block directory creation").unwrap();
+
+        let error = write_error_capture_in_dir(
+            &not_a_directory,
+            "failed-capture",
+            &json!({"error": {"message": "sensitive"}}),
+        )
+        .unwrap_err();
+
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read(&not_a_directory).unwrap(),
+            b"block directory creation"
+        );
     }
 
     #[tokio::test]

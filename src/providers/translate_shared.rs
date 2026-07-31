@@ -75,7 +75,11 @@ pub fn validate_alternate_provider_fields(
 
     if let Some(service_tier) = req.extra.get("service_tier") {
         match service_tier.as_str() {
-            Some("auto" | "standard_only") => {}
+            Some("auto") => {}
+            Some("standard_only") if provider == "Grok" => anyhow::bail!(
+                "Grok cannot guarantee Anthropic service_tier=standard_only; the request was not sent upstream"
+            ),
+            Some("standard_only") => {}
             _ => anyhow::bail!("service_tier must be auto or standard_only"),
         }
     }
@@ -178,17 +182,35 @@ fn validate_context_management_shape(
         .get("edits")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("context_management.edits must be an array"))?;
+    let mut has_effectful_edit = false;
     for (index, edit) in edits.iter().enumerate() {
         let edit = edit.as_object().ok_or_else(|| {
             anyhow::anyhow!("context_management.edits[{index}] must be an object")
         })?;
-        if edit
+        let edit_type = edit
             .get("type")
             .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-        {
-            anyhow::bail!("context_management.edits[{index}].type must be a non-empty string");
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("context_management.edits[{index}].type must be a non-empty string")
+            })?;
+        // Claude Code sends this exact marker whenever adaptive thinking is
+        // enabled. `keep: "all"` removes no history, so ignoring it is
+        // semantically equivalent. Every edit that can change conversation
+        // history remains fail-closed.
+        let is_noop_thinking_marker = edit_type == "clear_thinking_20251015"
+            && edit.get("keep").and_then(Value::as_str) == Some("all")
+            && edit
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "keep"));
+        if !is_noop_thinking_marker {
+            has_effectful_edit = true;
         }
+    }
+    if has_effectful_edit {
+        anyhow::bail!(
+            "alternate providers do not support context_management edits that modify conversation history; the request was not sent upstream"
+        );
     }
     Ok(())
 }
@@ -274,6 +296,7 @@ pub enum ContentBlock {
         thinking: String,
         signature: Option<String>,
     },
+    RedactedThinking,
 }
 
 #[derive(Debug)]
@@ -1079,13 +1102,261 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
                 signature,
             })
         }
+        "redacted_thinking" => Some(ContentBlock::RedactedThinking),
         _ => None,
     }
+}
+
+pub(crate) const MAX_EXTERNAL_ERROR_DETAIL_BYTES: usize = 1_024;
+const EXTERNAL_ERROR_TRUNCATED_SUFFIX: &str = "…[truncated]";
+
+/// Bound and redact untrusted provider error text before it crosses the proxy boundary.
+///
+/// Upstream error bodies are not a safe display contract: they can echo credentials,
+/// request payloads, or local paths. Callers should retain structured, allowlisted
+/// error codes separately and expose only this sanitized detail to clients and logs.
+pub(crate) fn sanitize_external_error_detail(value: &str) -> Option<String> {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    let lower = collapsed.to_ascii_lowercase();
+    if [
+        "authorization:",
+        "bearer ",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "api_key",
+        "x-api-key",
+        "client_secret",
+        "set-cookie:",
+        "cookie:",
+        "password=",
+        "password:",
+        "token=",
+        "secret=",
+        "secret:",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "private_key",
+        "-----begin ",
+        "\"prompt\"",
+        "\"input\"",
+        "prompt=",
+        "system prompt",
+        "/users/",
+        "/home/",
+        "/volumes/",
+        "/private/",
+        "/var/folders/",
+        "/tmp/",
+        "file://",
+        "\\users\\",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || [
+            "\"authorization\"",
+            "\"password\"",
+            "\"token\"",
+            "\"secret\"",
+            "\"access_token\"",
+            "\"refreshtoken\"",
+            "\"refresh_token\"",
+            "\"id_token\"",
+            "\"api_key\"",
+            "\"apikey\"",
+            "\"x-api-key\"",
+            "\"client_secret\"",
+            "\"clientsecret\"",
+            "\"exaapikey\"",
+            "\"cookie\"",
+            "\"set-cookie\"",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || contains_secret_token_prefix(&lower)
+        || [
+            "?key=",
+            "&key=",
+            "?token=",
+            "&token=",
+            "?api_key=",
+            "&api_key=",
+            "?apikey=",
+            "&apikey=",
+            "?exaapikey=",
+            "&exaapikey=",
+            "?access_token=",
+            "&access_token=",
+            "?refresh_token=",
+            "&refresh_token=",
+            "?client_secret=",
+            "&client_secret=",
+            "?password=",
+            "&password=",
+            "?signature=",
+            "&signature=",
+            "?credential=",
+            "&credential=",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || contains_url_query(&lower)
+        || contains_url_userinfo(&lower)
+        || contains_posix_absolute_path(&lower)
+        || contains_windows_absolute_path(&lower)
+    {
+        return Some("[redacted upstream error detail]".to_string());
+    }
+
+    if collapsed.len() <= MAX_EXTERNAL_ERROR_DETAIL_BYTES {
+        return Some(collapsed);
+    }
+
+    let prefix_budget =
+        MAX_EXTERNAL_ERROR_DETAIL_BYTES.saturating_sub(EXTERNAL_ERROR_TRUNCATED_SUFFIX.len());
+    let mut end = prefix_budget.min(collapsed.len());
+    while end > 0 && !collapsed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!(
+        "{}{}",
+        &collapsed[..end],
+        EXTERNAL_ERROR_TRUNCATED_SUFFIX
+    ))
+}
+
+fn contains_posix_absolute_path(value: &str) -> bool {
+    value.char_indices().any(|(index, character)| {
+        if character != '/' {
+            return false;
+        }
+        let next = value.as_bytes().get(index + 1).copied();
+        if next.is_none()
+            || next == Some(b'/')
+            || next.is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            return false;
+        }
+        index == 0
+            || value[..index].chars().next_back().is_some_and(|previous| {
+                previous.is_ascii_whitespace()
+                    || matches!(previous, '"' | '\'' | '=' | ':' | '(' | '[' | '{')
+            })
+    })
+}
+
+fn contains_windows_absolute_path(value: &str) -> bool {
+    value.contains(r"\\")
+        || value.as_bytes().windows(3).any(|window| {
+            window[0].is_ascii_alphabetic()
+                && window[1] == b':'
+                && matches!(window[2], b'\\' | b'/')
+        })
+}
+
+fn contains_secret_token_prefix(value: &str) -> bool {
+    value.match_indices("sk-").any(|(index, _)| {
+        let has_boundary = index == 0
+            || value
+                .as_bytes()
+                .get(index - 1)
+                .is_some_and(|byte| !byte.is_ascii_alphanumeric());
+        has_boundary && value.len().saturating_sub(index) >= 8
+    })
+}
+
+fn contains_url_userinfo(value: &str) -> bool {
+    value.split_whitespace().any(|token| {
+        let Some((_, after_scheme)) = token.split_once("://") else {
+            return false;
+        };
+        after_scheme
+            .split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    })
+}
+
+fn contains_url_query(value: &str) -> bool {
+    value.split_whitespace().any(|token| {
+        token
+            .split_once("://")
+            .is_some_and(|(_, remainder)| remainder.contains('?'))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_error_detail_is_redacted_collapsed_and_utf8_bounded() {
+        assert_eq!(
+            sanitize_external_error_detail("  safe \n diagnostic  ").as_deref(),
+            Some("safe diagnostic")
+        );
+        assert_eq!(
+            sanitize_external_error_detail("disk-full diagnostic").as_deref(),
+            Some("disk-full diagnostic")
+        );
+        for secret in [
+            "Authorization: Bearer top-secret",
+            r#"{"access_token":"top-secret"}"#,
+            r#"{"password":"top-secret"}"#,
+            r#"{"token":"top-secret"}"#,
+            r#"{"secret":"top-secret"}"#,
+            "token=top-secret",
+            "provider returned sk-live-123",
+            r#"{"authorization":"Basic dXNlcjpzZWNyZXQ="}"#,
+            r#"{"exaApiKey":"top-secret"}"#,
+            "https://example.test/failure?key=top-secret",
+            "https://example.test/failure?exaApiKey=top-secret",
+            "https://example.test/failure?X-Amz-Signature=top-secret",
+            "https://user:top-secret@example.test/failure",
+            r#"{"prompt":"private request"}"#,
+            "failed while reading /Users/alice/private.txt",
+            "failed while reading /Volumes/External/private.txt",
+            "failed while reading /root/private.txt",
+            r#"{"path":"/srv/ccproxy/private.txt"}"#,
+            "failed while reading file:///private/tmp/request.json",
+            r"failed while reading C:\Users\alice\private.txt",
+            r"failed while reading \\server\share\private.txt",
+        ] {
+            assert_eq!(
+                sanitize_external_error_detail(secret).as_deref(),
+                Some("[redacted upstream error detail]")
+            );
+        }
+
+        let detail = format!("{}😊", "x".repeat(MAX_EXTERNAL_ERROR_DETAIL_BYTES));
+        let sanitized = sanitize_external_error_detail(&detail).unwrap();
+        assert!(sanitized.ends_with(EXTERNAL_ERROR_TRUNCATED_SUFFIX));
+        assert!(sanitized.len() <= MAX_EXTERNAL_ERROR_DETAIL_BYTES);
+        assert!(sanitized.is_char_boundary(sanitized.len()));
+    }
+
+    #[test]
+    fn normalization_recognizes_redacted_thinking_without_payload() {
+        let blocks = normalize_content(
+            &serde_json::json!([{
+                "type":"redacted_thinking",
+                "data":"sensitive reasoning"
+            }]),
+            Value::Null,
+        );
+
+        assert!(matches!(
+            blocks.as_slice(),
+            [ContentBlock::RedactedThinking]
+        ));
+        assert!(!format!("{blocks:?}").contains("sensitive reasoning"));
+    }
 
     #[test]
     fn alternate_provider_fields_reject_silent_generation_controls() {
@@ -1170,6 +1441,59 @@ mod tests {
                 .to_string();
             assert!(error.contains(expected), "{field}: {error}");
         }
+    }
+
+    #[test]
+    fn alternate_provider_fields_reject_non_empty_context_edits() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"hello"}],
+            "context_management":{
+                "edits":[{
+                    "type":"clear_tool_uses_20250919",
+                    "trigger":{"type":"input_tokens","value":100000}
+                }]
+            }
+        }))
+        .unwrap();
+
+        let error = validate_alternate_provider_fields(&request, "Codex")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("modify conversation history"), "{error}");
+    }
+
+    #[test]
+    fn alternate_provider_fields_accept_claude_code_noop_thinking_marker() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"fable",
+            "messages":[{"role":"user", "content":"hello"}],
+            "context_management":{
+                "edits":[{
+                    "type":"clear_thinking_20251015",
+                    "keep":"all"
+                }]
+            }
+        }))
+        .unwrap();
+
+        validate_alternate_provider_fields(&request, "Codex").unwrap();
+    }
+
+    #[test]
+    fn grok_rejects_standard_only_service_tier() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"grok-4.5",
+            "messages":[{"role":"user", "content":"hello"}],
+            "service_tier":"standard_only"
+        }))
+        .unwrap();
+
+        let error = validate_alternate_provider_fields(&request, "Grok")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("service_tier=standard_only"), "{error}");
+        validate_alternate_provider_fields(&request, "Codex").unwrap();
     }
 
     #[test]
