@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -768,6 +769,17 @@ def clean_environment(
         if name in base
     }
     base_path = base.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    path_entries = [str(claude_bin.parent)]
+    # npm shims for Claude Code invoke `node` via `#!/usr/bin/env node`. Keep the
+    # host Node binary discoverable even when the inherited PATH is sparse.
+    node_path = shutil.which("node", path=base_path)
+    if node_path:
+        node_dir = str(Path(node_path).parent)
+        if node_dir not in path_entries:
+            path_entries.append(node_dir)
+    for entry in base_path.split(os.pathsep):
+        if entry and entry not in path_entries:
+            path_entries.append(entry)
     canary_tmp = config_dir.parent / "tmp"
     canary_tmp.mkdir(exist_ok=True)
     environment.update(
@@ -777,7 +789,7 @@ def clean_environment(
             "DISABLE_AUTOUPDATER": "1",
             "HOME": str(home),
             "NO_PROXY": "127.0.0.1,localhost",
-            "PATH": f"{claude_bin.parent}{os.pathsep}{base_path}",
+            "PATH": os.pathsep.join(path_entries),
             "TMPDIR": str(canary_tmp),
             "no_proxy": "127.0.0.1,localhost",
         }
@@ -839,8 +851,17 @@ def main() -> int:
     parser.add_argument("--label", default="unlabeled")
     args = parser.parse_args()
 
-    claude_bin = args.claude_bin.resolve()
-    proxy_binary = args.proxy_binary.resolve()
+    # Keep the npm shim path (…/node_modules/.bin/claude). resolve() would
+    # follow it to the package entrypoint and drop the directory that `co`
+    # searches when it execs the bare `claude` command name.
+    claude_bin = args.claude_bin.expanduser()
+    if not claude_bin.is_absolute():
+        claude_bin = (Path.cwd() / claude_bin).resolve(strict=False)
+    proxy_binary = args.proxy_binary.expanduser()
+    if not proxy_binary.is_absolute():
+        proxy_binary = (Path.cwd() / proxy_binary).resolve(strict=False)
+    else:
+        proxy_binary = proxy_binary.resolve(strict=False)
     if not os.access(claude_bin, os.X_OK):
         fail(f"Claude Code executable is missing: {claude_bin}")
     if not os.access(proxy_binary, os.X_OK):

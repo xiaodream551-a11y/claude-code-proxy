@@ -1842,6 +1842,10 @@ async fn smoke_codex_websocket_and_auto_stream_return_delta_before_terminal() {
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    // First process-local provider construction can dominate a tight stream-start
+    // window on cold CI runners. Warm it outside the timed assertions so this
+    // test measures early stream emission rather than registry startup.
+    let _ = app(Arc::new(Registry::with_default_alias()));
 
     for transport in ["websocket", "auto"] {
         clear_codex_websocket_pool_for_tests();
@@ -1849,8 +1853,11 @@ async fn smoke_codex_websocket_and_auto_stream_return_delta_before_terminal() {
         let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
         let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", transport);
 
+        // The mock holds the terminal for 2s after the early delta. Keep the
+        // header wait well below that delay while remaining tolerant of CI
+        // scheduling noise after the warm-up above.
         let response = tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_secs(1),
             call_messages_body(json!({
                 "model": "gpt-5.5",
                 "max_tokens": 64,
@@ -1864,7 +1871,7 @@ async fn smoke_codex_websocket_and_auto_stream_return_delta_before_terminal() {
 
         let mut body = response.into_body();
         let mut collected = Vec::new();
-        let read = tokio::time::timeout(Duration::from_millis(500), async {
+        let read = tokio::time::timeout(Duration::from_secs(1), async {
             while !String::from_utf8_lossy(&collected).contains("text_delta") {
                 let Some(frame) = body.frame().await else {
                     break;

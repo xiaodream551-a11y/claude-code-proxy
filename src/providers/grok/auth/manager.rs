@@ -1026,7 +1026,7 @@ mod tests {
         let mut refresh =
             tokio::spawn(async move { refresh_manager.force_refresh("rejected-access").await });
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut refresh)
+            tokio::time::timeout(Duration::from_millis(500), &mut refresh)
                 .await
                 .is_err(),
             "volatile repair should wait for the cross-process mutation lock"
@@ -1054,7 +1054,7 @@ mod tests {
         let mut refresh =
             tokio::spawn(async move { refresh_manager.force_refresh("rejected-access").await });
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut refresh)
+            tokio::time::timeout(Duration::from_millis(500), &mut refresh)
                 .await
                 .is_err(),
             "volatile repair should wait for the cross-process mutation lock"
