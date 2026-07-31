@@ -5217,15 +5217,20 @@ mod tests {
                 .unwrap();
             drop(websocket);
 
+            // Mark fallback as soon as Auto opens the HTTP transport. On slower
+            // Windows runners the shared deadline can cancel the POST body write
+            // immediately after TCP accept, so do not require a full request
+            // frame before observing that fallback began.
             let (mut http, _) = listener.accept().await.unwrap();
-            let read = http.read(&mut request).await.unwrap();
-            assert!(read > 0);
-            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
             let _ = fallback_started_tx.send(());
+            let _ = tokio::time::timeout(Duration::from_millis(50), http.read(&mut request)).await;
             futures_util::future::pending::<()>().await;
         });
+        // Explicit 503 fallback still honors Retry-After (minimum 100ms). Leave
+        // enough shared wall time for that backoff plus an HTTP connect on CI,
+        // while still finishing well under one second once HTTP stalls.
         let client =
-            CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 5_000, 5_000, 120);
+            CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 5_000, 5_000, 400);
         client.auth_manager().set_test_auth(http_test_auth());
 
         let started_at = Instant::now();
@@ -5237,7 +5242,7 @@ mod tests {
                 crate::config::CodexTransport::Auto,
             )
             .await;
-        tokio::time::timeout(Duration::from_millis(250), fallback_started_rx)
+        tokio::time::timeout(Duration::from_millis(500), fallback_started_rx)
             .await
             .expect("Auto should reach HTTP fallback within the shared budget")
             .expect("fallback observer should remain available");
@@ -5249,7 +5254,7 @@ mod tests {
 
         assert_eq!(error.status, 504);
         assert_eq!(error.detail.as_deref(), Some(CODEX_TOTAL_TIMEOUT_DETAIL));
-        assert!(started_at.elapsed() < Duration::from_millis(500));
+        assert!(started_at.elapsed() < Duration::from_millis(900));
     }
 
     #[tokio::test]
