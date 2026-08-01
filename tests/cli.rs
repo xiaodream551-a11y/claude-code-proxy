@@ -355,7 +355,7 @@ fn co_rejects_unsafe_custom_headers_before_launch() -> Result<(), Box<dyn std::e
 
 #[cfg(unix)]
 #[test]
-fn cg_execs_claude_with_grok_profile_and_preserves_exit_code()
+fn cg_clears_inherited_custom_headers_and_preserves_exit_code()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = ClaudeLauncherFixture::new("cg")?;
     let expected_config_dir = fixture.home_dir.join(".claude-ccproxy/grok");
@@ -384,15 +384,16 @@ fn cg_execs_claude_with_grok_profile_and_preserves_exit_code()
         .stdout(contains("haiku=grok-4.5-medium"))
         .stdout(contains("small=grok-4.5-medium"))
         .stdout(contains("max_context=500000"))
-        .stdout(contains("compact_window=500000"))
+        .stdout(contains("compact_window=272000"))
         .stdout(contains("compact_pct=90"))
         .stdout(contains("disable_1m=1"))
         .stdout(contains("subagent_depth=1"))
         .stdout(contains("max_retries=1"))
         .stdout(contains("tool_concurrency=10"))
-        .stdout(contains("file_read_cap=\n"))
+        .stdout(contains("file_read_cap=8000"))
         .stdout(contains("tool_search=true"))
-        .stdout(contains("custom_headers=x-existing: keep"))
+        .stdout(contains("custom_headers=\n"))
+        .stdout(contains("x-existing: keep").not())
         .stdout(contains("arg=<--settings>"))
         .stdout(contains("arg=<--agents>"))
         .stdout(contains(
@@ -418,6 +419,7 @@ fn cg_execs_claude_with_grok_profile_and_preserves_exit_code()
         .stdout(contains("\"model\":\"grok-4.5\""))
         .stdout(contains("grok-composer-2.5-fast"))
         .stdout(contains("\"ultracode\":false"))
+        .stdout(contains("\"workflowSizeGuideline\":\"small\""))
         .stdout(contains("arg=<--continue>"));
     Ok(())
 }

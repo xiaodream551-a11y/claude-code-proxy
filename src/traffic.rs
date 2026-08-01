@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use crate::fsutil;
-use crate::logging::REDACT_KEYS;
+use crate::logging::is_sensitive_payload_key;
 use crate::paths;
 
 #[derive(Debug)]
@@ -908,27 +908,7 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
         Value::Object(map) => {
             let mut out = Map::new();
             for (key, value) in map {
-                let normalized = key.to_lowercase();
-                if REDACT_KEYS.contains(&normalized.as_str())
-                    || matches!(
-                        normalized.as_str(),
-                        "token"
-                            | "bearer_token"
-                            | "oauth_token"
-                            | "oauth_access_token"
-                            | "oauth_refresh_token"
-                            | "client_secret"
-                            | "secret"
-                            | "password"
-                            | "email"
-                            | "user_id"
-                            | "account_id"
-                            | "identity"
-                            | "identity_id"
-                            | "subject"
-                            | "sub"
-                    )
-                {
+                if is_sensitive_payload_key(key) {
                     out.insert(key.clone(), redact_traffic_value(value));
                 } else {
                     out.insert(key.clone(), redact_traffic_with_depth(value, depth + 1));
@@ -1005,6 +985,21 @@ mod quota_tests {
             artifact_counter: Mutex::new(0),
             event_counter: Mutex::new(0),
         }
+    }
+
+    #[test]
+    fn traffic_redaction_uses_shared_payload_policy_case_insensitively() {
+        let redacted = redact_traffic(&serde_json::json!({
+            "nested": [{
+                "PaSsWoRd": "traffic-secret",
+                "client_secret": "client-secret",
+                "safe_field": "safe-value"
+            }]
+        }));
+
+        assert_eq!(redacted["nested"][0]["PaSsWoRd"], "[redacted len=14]");
+        assert_eq!(redacted["nested"][0]["client_secret"], "[redacted len=13]");
+        assert_eq!(redacted["nested"][0]["safe_field"], "safe-value");
     }
 
     #[cfg(unix)]

@@ -35,6 +35,35 @@ pub const REDACT_KEYS: [&str; 14] = [
     "api_key",
 ];
 
+/// Additional sensitive fields that may occur inside provider payloads or structured log fields.
+///
+/// Keep the source list separate so callers that need the legacy header/query names can still
+/// inspect `REDACT_KEYS`, but every recursive redaction path uses `is_sensitive_payload_key`.
+/// Callers that need an identifier for correlation must log an explicit fingerprint instead of
+/// relying on a raw account, user, or identity field.
+pub(crate) const PAYLOAD_REDACT_KEYS: [&str; 15] = [
+    "token",
+    "bearer_token",
+    "oauth_token",
+    "oauth_access_token",
+    "oauth_refresh_token",
+    "client_secret",
+    "secret",
+    "password",
+    "email",
+    "user_id",
+    "account_id",
+    "identity",
+    "identity_id",
+    "subject",
+    "sub",
+];
+
+pub(crate) fn is_sensitive_payload_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    REDACT_KEYS.contains(&normalized.as_str()) || PAYLOAD_REDACT_KEYS.contains(&normalized.as_str())
+}
+
 pub fn log_file() -> std::path::PathBuf {
     paths::log_file()
 }
@@ -427,7 +456,7 @@ fn redact_with_depth(value: Value, depth: u8, verbose: bool) -> Value {
         Value::Object(fields) => {
             let mut out = serde_json::Map::new();
             for (key, value) in fields {
-                if REDACT_KEYS.contains(&key.to_lowercase().as_str()) {
+                if is_sensitive_payload_key(&key) {
                     out.insert(key, redact_key_redaction(value));
                 } else {
                     out.insert(key, redact_with_depth(value, depth + 1, verbose));
@@ -464,7 +493,11 @@ fn redact_key_redaction(value: Value) -> Value {
 }
 
 pub fn redacted_keys() -> HashSet<&'static str> {
-    REDACT_KEYS.iter().copied().collect()
+    REDACT_KEYS
+        .iter()
+        .chain(PAYLOAD_REDACT_KEYS.iter())
+        .copied()
+        .collect()
 }
 
 #[cfg(test)]
@@ -517,6 +550,8 @@ mod tests {
             "outer": [{
                 "payload": long,
                 "authorization": "secret",
+                "client_secret": "also-secret",
+                "Email": "private@example.test",
             }],
         });
 
@@ -524,10 +559,14 @@ mod tests {
         let concise_payload = concise["outer"][0]["payload"].as_str().unwrap();
         assert!(concise_payload.ends_with("…[1 more]"));
         assert_eq!(concise["outer"][0]["authorization"], "[redacted len=6]");
+        assert_eq!(concise["outer"][0]["client_secret"], "[redacted len=11]");
+        assert_eq!(concise["outer"][0]["Email"], "[redacted len=20]");
 
         let verbose = redact_with_depth(value, 0, true);
         assert_eq!(verbose["outer"][0]["payload"], long);
         assert_eq!(verbose["outer"][0]["authorization"], "[redacted len=6]");
+        assert_eq!(verbose["outer"][0]["client_secret"], "[redacted len=11]");
+        assert_eq!(verbose["outer"][0]["Email"], "[redacted len=20]");
     }
 
     #[test]

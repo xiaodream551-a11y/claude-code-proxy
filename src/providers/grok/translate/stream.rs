@@ -180,7 +180,8 @@ impl StreamTranslator {
             if !self.started
                 && matches!(
                     event,
-                    ReducerEvent::TextStart(_)
+                    ReducerEvent::ThinkingStart(_)
+                        | ReducerEvent::TextStart(_)
                         | ReducerEvent::ToolStart(_, _, _)
                         | ReducerEvent::HostedSearch { .. }
                         | ReducerEvent::Finish { .. }
@@ -301,8 +302,10 @@ fn emit(out: &mut Vec<u8>, event: &str, data: serde_json::Value) {
 fn render(out: &mut Vec<u8>, event: ReducerEvent, usage: &GrokUsage) {
     match event {
         // The Grok CLI endpoint exposes a plaintext reasoning summary. It is not a signed
-        // Anthropic thinking block and often contains draft answers or model chatter. The Grok
-        // coordinator emits protocol-level pings independently, so suppress these events here.
+        // Anthropic thinking block and often contains draft answers or model chatter. Starting
+        // the ordinary Anthropic message on ThinkingStart gives Claude Code immediate, valid
+        // progress without fabricating a thinking content block or exposing the draft text. The
+        // coordinator emits protocol-level pings independently during longer reasoning phases.
         ReducerEvent::ThinkingStart(_)
         | ReducerEvent::ThinkingDelta(_, _)
         | ReducerEvent::ThinkingStop(_) => {}
@@ -613,6 +616,49 @@ mod tests {
             .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n")
             .unwrap();
         assert!(String::from_utf8(output).unwrap().contains("first"));
+    }
+
+    #[test]
+    fn live_reasoning_starts_a_message_without_exposing_or_fabricating_thinking() {
+        let mut translator = LiveStreamTranslator::new("msg_1".into(), "grok-4.5".into());
+        let first = String::from_utf8(
+            translator
+                .push(
+                    b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"private draft \\ud83d\\ude0a\"}\n\n",
+                )
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(first.matches("event: message_start").count(), 1, "{first}");
+        assert!(!first.contains("private draft"), "{first}");
+        assert!(!first.contains('😊'), "{first}");
+        assert!(!first.contains("content_block_start"), "{first}");
+        assert!(!first.contains("thinking"), "{first}");
+
+        let more_reasoning = translator
+            .push(
+                b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"more draft\"}\n\n",
+            )
+            .unwrap();
+        assert!(more_reasoning.is_empty());
+
+        let final_output = String::from_utf8(
+            translator
+                .push(b"data: {\"type\":\"response.reasoning_text.done\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"safe final\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n")
+                .unwrap(),
+        )
+        .unwrap();
+        translator.finish().unwrap();
+
+        assert!(
+            !final_output.contains("event: message_start"),
+            "{final_output}"
+        );
+        assert!(final_output.contains("safe final"), "{final_output}");
+        assert!(final_output.contains("\"index\":0"), "{final_output}");
+        assert!(!final_output.contains("draft"), "{final_output}");
+        assert!(!final_output.contains("thinking"), "{final_output}");
     }
 
     #[test]

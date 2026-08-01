@@ -1723,6 +1723,7 @@ mod tests {
     fn sample_body() -> GrokResponsesRequest {
         GrokResponsesRequest {
             model: "grok-4.5".into(),
+            prompt_cache_key: None,
             instructions: None,
             input: vec![],
             tools: None,

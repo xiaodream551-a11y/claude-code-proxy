@@ -32,6 +32,8 @@ const CLAUDE_CODE_AGENT_LIST_PREFIX: &str = "Available agent types for the Agent
 const CLAUDE_CODE_ULTRACODE_MARKER: &str =
     "Ultracode is on: optimize for the most exhaustive, correct answer";
 const CLAUDE_CODE_ULTRACODE_OFF_MARKER: &str = "Ultracode is off";
+pub(crate) const UNAVAILABLE_TOOL_REFERENCES_OUTPUT: &str =
+    "[Tool references removed - tools no longer available]";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -127,6 +129,49 @@ pub struct ResponsesRequest {
     /// before accepting an upstream hosted call.
     #[serde(skip)]
     pub(crate) hosted_web_search_max_uses: Option<u64>,
+    /// Translator-only proof describing deferred tools loaded by historical
+    /// Claude Code `ToolSearch` results. Continuation may use this sidecar to
+    /// retain an exact response-affine branch across the one known resume
+    /// hydration drift; it is never serialized to Codex.
+    #[serde(skip)]
+    pub(crate) deferred_tool_hydration: DeferredToolHydrationProvenance,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeferredToolHydrationProvenance {
+    pub(crate) loaded_groups: Vec<DeferredToolHydrationGroup>,
+    pub(crate) unavailable_results: Vec<DeferredToolHydrationResult>,
+    pub(crate) ambiguous: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeferredToolHydrationGroup {
+    pub(crate) results: Vec<DeferredToolHydrationResult>,
+    pub(crate) additional_tools_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeferredToolHydrationResult {
+    pub(crate) tool_search_call_index: usize,
+    pub(crate) output_index: usize,
+}
+
+impl DeferredToolHydrationProvenance {
+    fn shift_indices(&mut self, offset: usize) -> Option<()> {
+        for group in &mut self.loaded_groups {
+            group.additional_tools_index = group.additional_tools_index.checked_add(offset)?;
+            for result in &mut group.results {
+                result.tool_search_call_index =
+                    result.tool_search_call_index.checked_add(offset)?;
+                result.output_index = result.output_index.checked_add(offset)?;
+            }
+        }
+        for result in &mut self.unavailable_results {
+            result.tool_search_call_index = result.tool_search_call_index.checked_add(offset)?;
+            result.output_index = result.output_index.checked_add(offset)?;
+        }
+        Some(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,7 +206,7 @@ pub enum ResponsesTextFormat {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ResponsesInputItem {
     #[serde(rename = "additional_tools")]
@@ -197,14 +242,14 @@ pub enum ResponsesInputItem {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ResponsesFunctionCallOutput {
     Text(String),
     Content(Vec<ResponsesFunctionCallOutputContent>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsesFunctionCallOutputContent {
     InputText {
@@ -217,7 +262,7 @@ pub enum ResponsesFunctionCallOutputContent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ResponsesContentPart {
     #[serde(rename = "input_text")]
@@ -517,7 +562,7 @@ pub fn translate_request_with_overrides(
     let (output_format, schema_bridge) = read_output_format(req)?;
     let mut instructions = flatten_system_text(req.extra.get("system"));
     let tool_plan = read_tools(req)?;
-    let mut input = build_input(req, &tool_plan.deferred);
+    let (mut input, mut deferred_tool_hydration) = build_input(req, &tool_plan.deferred);
     validate_effective_tool_choice(req, &tool_plan, &input)?;
     if compaction {
         // Claude Code requires a plain-text compaction summary. Responses Lite
@@ -525,6 +570,9 @@ pub fn translate_request_with_overrides(
         // only top-level tools would still let the model call Read or
         // StructuredOutput instead of returning the summary.
         input.retain(|item| !matches!(item, ResponsesInputItem::AdditionalTools { .. }));
+        // Compaction rewrites the input indices and intentionally removes the
+        // control items that prove hydration. It must never seed a resume fork.
+        deferred_tool_hydration = DeferredToolHydrationProvenance::default();
     }
     let parallel_function_available = (tool_plan.initial.as_ref().is_some_and(|tools| {
         tools
@@ -589,6 +637,7 @@ pub fn translate_request_with_overrides(
         reasoning: None,
         schema_bridge,
         hosted_web_search_max_uses,
+        deferred_tool_hydration,
     };
 
     if opts.use_responses_lite {
@@ -621,6 +670,15 @@ pub fn translate_request_with_overrides(
             });
         }
         if !prefix.is_empty() {
+            if out
+                .deferred_tool_hydration
+                .shift_indices(prefix.len())
+                .is_none()
+            {
+                // Index overflow is unreachable under the request-size limits,
+                // but the safe fallback is to discard optimization provenance.
+                out.deferred_tool_hydration = DeferredToolHydrationProvenance::default();
+            }
             prefix.extend(out.input);
             out.input = prefix;
         }
@@ -2174,23 +2232,39 @@ enum CodexInputBlock {
 fn build_input(
     req: &MessagesRequest,
     deferred_tools: &HashMap<String, ResponsesTool>,
-) -> Vec<ResponsesInputItem> {
+) -> (Vec<ResponsesInputItem>, DeferredToolHydrationProvenance) {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
     let mut loaded_deferred_tools = HashSet::new();
+    let mut tool_search_calls = HashMap::new();
+    let mut hydration = DeferredToolHydrationProvenance::default();
 
     for msg in &req.messages {
         let blocks = codex_input_blocks(&msg.content);
         match msg.role.as_str() {
             "user" => {
                 let mut parts: Vec<ResponsesContentPart> = Vec::new();
+                let mut pending_deferred_tools = Vec::new();
+                let mut pending_loaded_results = Vec::new();
                 for block in &blocks {
                     match block {
                         CodexInputBlock::Native(ContentBlock::Text { text })
                         | CodexInputBlock::PreservedText(text) => {
+                            flush_deferred_tool_additions(
+                                &mut out,
+                                &mut pending_deferred_tools,
+                                &mut pending_loaded_results,
+                                &mut hydration,
+                            );
                             parts.push(ResponsesContentPart::InputText { text: text.clone() });
                         }
                         CodexInputBlock::Native(ContentBlock::Image { source }) => {
+                            flush_deferred_tool_additions(
+                                &mut out,
+                                &mut pending_deferred_tools,
+                                &mut pending_loaded_results,
+                                &mut hydration,
+                            );
                             parts.push(ResponsesContentPart::InputImage {
                                 image_url: image_source_to_url(source),
                                 detail: None,
@@ -2217,26 +2291,59 @@ fn build_input(
                                 read_tool_uses_with_offset.contains(tool_use_id),
                                 is_error.unwrap_or(false),
                             );
+                            let output_index = out.len();
+                            let unavailable_reference = !is_error.unwrap_or(false)
+                                && matches!(
+                                    &output,
+                                    ResponsesFunctionCallOutput::Text(text)
+                                        if text == UNAVAILABLE_TOOL_REFERENCES_OUTPUT
+                                );
                             out.push(ResponsesInputItem::FunctionCallOutput {
                                 call_id: tool_use_id.clone(),
                                 output,
                             });
-                            let additions = deferred_tools_for_result(
+                            let (additions, matched_deferred_reference) = deferred_tools_for_result(
                                 content,
                                 deferred_tools,
                                 &mut loaded_deferred_tools,
                             );
-                            if !additions.is_empty() {
-                                out.push(ResponsesInputItem::AdditionalTools {
-                                    id: None,
-                                    role: "developer".to_string(),
-                                    tools: additions,
-                                });
+                            if let Some(&tool_search_call_index) =
+                                tool_search_calls.get(tool_use_id)
+                            {
+                                let result = DeferredToolHydrationResult {
+                                    tool_search_call_index,
+                                    output_index,
+                                };
+                                if unavailable_reference {
+                                    if additions.is_empty() {
+                                        hydration.unavailable_results.push(result);
+                                    } else {
+                                        hydration.ambiguous = true;
+                                    }
+                                } else if matched_deferred_reference {
+                                    pending_loaded_results.push(result);
+                                }
+                            } else if unavailable_reference || !additions.is_empty() {
+                                // The control/output is not tied to one unique historical
+                                // ToolSearch call, so it cannot prove a hydration-only drift.
+                                hydration.ambiguous = true;
                             }
+                            pending_deferred_tools.extend(additions);
                         }
-                        _ => {}
+                        _ => flush_deferred_tool_additions(
+                            &mut out,
+                            &mut pending_deferred_tools,
+                            &mut pending_loaded_results,
+                            &mut hydration,
+                        ),
                     }
                 }
+                flush_deferred_tool_additions(
+                    &mut out,
+                    &mut pending_deferred_tools,
+                    &mut pending_loaded_results,
+                    &mut hydration,
+                );
                 if !parts.is_empty() {
                     out.push(ResponsesInputItem::Message {
                         role: "user".to_string(),
@@ -2288,11 +2395,18 @@ fn build_input(
                             }
                             let args =
                                 serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                            let call_index = out.len();
                             out.push(ResponsesInputItem::FunctionCall {
                                 call_id: id.clone(),
                                 name: name.clone(),
                                 arguments: args,
                             });
+                            if name == "ToolSearch"
+                                && (id.is_empty()
+                                    || tool_search_calls.insert(id.clone(), call_index).is_some())
+                            {
+                                hydration.ambiguous = true;
+                            }
                         }
                         CodexInputBlock::Native(ContentBlock::RedactedThinking) => {
                             // Anthropic intentionally withholds this reasoning payload. It is
@@ -2319,7 +2433,40 @@ fn build_input(
         }
     }
 
-    out
+    (out, hydration)
+}
+
+fn flush_deferred_tool_additions(
+    out: &mut Vec<ResponsesInputItem>,
+    pending: &mut Vec<Value>,
+    pending_results: &mut Vec<DeferredToolHydrationResult>,
+    hydration: &mut DeferredToolHydrationProvenance,
+) {
+    if pending.is_empty() {
+        if !pending_results.is_empty() {
+            if let Some(group) = hydration.loaded_groups.last_mut() {
+                group.results.append(pending_results);
+            } else {
+                hydration.ambiguous = true;
+                pending_results.clear();
+            }
+        }
+        return;
+    }
+    let additional_tools_index = out.len();
+    out.push(ResponsesInputItem::AdditionalTools {
+        id: None,
+        role: "developer".to_string(),
+        tools: std::mem::take(pending),
+    });
+    if pending_results.is_empty() {
+        hydration.ambiguous = true;
+    } else {
+        hydration.loaded_groups.push(DeferredToolHydrationGroup {
+            results: std::mem::take(pending_results),
+            additional_tools_index,
+        });
+    }
 }
 
 fn codex_input_blocks(content: &Value) -> Vec<CodexInputBlock> {
@@ -2357,24 +2504,31 @@ fn deferred_tools_for_result(
     content: &Value,
     deferred_tools: &HashMap<String, ResponsesTool>,
     loaded: &mut HashSet<String>,
-) -> Vec<Value> {
+) -> (Vec<Value>, bool) {
     let Some(blocks) = content.as_array() else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
-    blocks
+    let mut additions = Vec::new();
+    let mut matched_deferred_reference = false;
+    for name in blocks
         .iter()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_reference"))
         .filter_map(|block| block.get("tool_name").and_then(Value::as_str))
-        .filter_map(|name| {
-            if loaded.contains(name) {
-                return None;
-            }
-            let tool = deferred_tools.get(name)?;
-            let encoded = serde_json::to_value(tool).ok()?;
-            loaded.insert(name.to_string());
-            Some(encoded)
-        })
-        .collect()
+    {
+        let Some(tool) = deferred_tools.get(name) else {
+            continue;
+        };
+        matched_deferred_reference = true;
+        if loaded.contains(name) {
+            continue;
+        }
+        let Ok(encoded) = serde_json::to_value(tool) else {
+            continue;
+        };
+        loaded.insert(name.to_string());
+        additions.push(encoded);
+    }
+    (additions, matched_deferred_reference)
 }
 
 fn is_read_tool_use_with_offset(name: &str, input: &Value) -> bool {
@@ -3402,6 +3556,293 @@ mod tests {
     }
 
     #[test]
+    fn hydration_provenance_tracks_translator_controls_and_lite_index_shift() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "system":"stable instructions",
+            "messages":[
+                {"role":"assistant", "content":[{
+                    "type":"tool_use", "id":"search_1", "name":"ToolSearch", "input":{}
+                }]},
+                {"role":"user", "content":[{
+                    "type":"tool_result", "tool_use_id":"search_1", "content":[
+                        {"type":"tool_reference", "tool_name":"DeferredTool"}
+                    ]
+                }]}
+            ],
+            "tools":[
+                {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                {"name":"DeferredTool", "defer_loading":true,
+                 "input_schema":{"type":"object","properties":{}}}
+            ]
+        }))
+        .unwrap();
+
+        for use_responses_lite in [false, true] {
+            let mut options = opts();
+            options.use_responses_lite = use_responses_lite;
+            let out = translate_request(&req, options).unwrap();
+            assert!(!out.deferred_tool_hydration.ambiguous);
+            assert!(out.deferred_tool_hydration.unavailable_results.is_empty());
+            let group = &out.deferred_tool_hydration.loaded_groups[0];
+            let result = group.results[0];
+            assert!(matches!(
+                &out.input[result.tool_search_call_index],
+                ResponsesInputItem::FunctionCall { name, .. } if name == "ToolSearch"
+            ));
+            assert!(matches!(
+                &out.input[result.output_index],
+                ResponsesInputItem::FunctionCallOutput { .. }
+            ));
+            assert!(matches!(
+                &out.input[group.additional_tools_index],
+                ResponsesInputItem::AdditionalTools { tools, .. }
+                    if tools.first().and_then(|tool| tool.get("name")).and_then(Value::as_str)
+                        == Some("DeferredTool")
+            ));
+            assert!(
+                !serde_json::to_value(&out)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .contains_key("deferred_tool_hydration")
+            );
+        }
+    }
+
+    #[test]
+    fn hydration_provenance_requires_exact_unavailable_toolsearch_result() {
+        let make_request = |name: &str, text: &str| {
+            serde_json::from_value::<MessagesRequest>(json!({
+                "model":"gpt-5.6-sol",
+                "messages":[
+                    {"role":"assistant", "content":[{
+                        "type":"tool_use", "id":"call_1", "name":name, "input":{}
+                    }]},
+                    {"role":"user", "content":[{
+                        "type":"tool_result", "tool_use_id":"call_1", "content":text
+                    }]}
+                ],
+                "tools":[{"name":name, "input_schema":{"type":"object"}}]
+            }))
+            .unwrap()
+        };
+
+        let exact = translate_request(
+            &make_request("ToolSearch", UNAVAILABLE_TOOL_REFERENCES_OUTPUT),
+            opts(),
+        )
+        .unwrap();
+        assert_eq!(exact.deferred_tool_hydration.unavailable_results.len(), 1);
+
+        let near_match = translate_request(
+            &make_request(
+                "ToolSearch",
+                "[Tool references removed - tools no longer available] ",
+            ),
+            opts(),
+        )
+        .unwrap();
+        assert!(
+            near_match
+                .deferred_tool_hydration
+                .unavailable_results
+                .is_empty()
+        );
+
+        let wrong_tool = translate_request(
+            &make_request("Read", UNAVAILABLE_TOOL_REFERENCES_OUTPUT),
+            opts(),
+        )
+        .unwrap();
+        assert!(
+            wrong_tool
+                .deferred_tool_hydration
+                .unavailable_results
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hydration_provenance_keeps_repeated_reference_without_duplicate_tool_addition() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[
+                    {"type":"tool_use", "id":"search_1", "name":"ToolSearch", "input":{}}
+                ]},
+                {"role":"user", "content":[
+                    {"type":"tool_result", "tool_use_id":"search_1", "content":[
+                        {"type":"tool_reference", "tool_name":"DeferredOne"}
+                    ]}
+                ]},
+                {"role":"assistant", "content":[
+                    {"type":"tool_use", "id":"search_2", "name":"ToolSearch", "input":{}}
+                ]},
+                {"role":"user", "content":[
+                    {"type":"tool_result", "tool_use_id":"search_2", "content":[
+                        {"type":"tool_reference", "tool_name":"DeferredOne"}
+                    ]}
+                ]}
+            ],
+            "tools":[
+                {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                {"name":"DeferredOne", "defer_loading":true,
+                 "input_schema":{"type":"object","properties":{}}}
+            ]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        assert!(!out.deferred_tool_hydration.ambiguous);
+        assert_eq!(out.deferred_tool_hydration.loaded_groups.len(), 1);
+        assert_eq!(
+            out.deferred_tool_hydration.loaded_groups[0].results.len(),
+            2
+        );
+        let additions = out
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                ResponsesInputItem::AdditionalTools { tools, .. } => Some(tools),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(additions.len(), 1);
+        assert_eq!(additions[0].len(), 1);
+        assert_eq!(additions[0][0]["name"], "DeferredOne");
+    }
+
+    #[test]
+    fn parallel_tool_reference_results_flush_one_additional_tools_block_after_outputs() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[
+                    {"type":"tool_use", "id":"search_1", "name":"ToolSearch", "input":{}},
+                    {"type":"tool_use", "id":"search_2", "name":"ToolSearch", "input":{}},
+                    {"type":"tool_use", "id":"search_3", "name":"ToolSearch", "input":{}}
+                ]},
+                {"role":"user", "content":[
+                    {"type":"tool_result", "tool_use_id":"search_1", "content":[
+                        {"type":"tool_reference", "tool_name":"DeferredOne"}
+                    ]},
+                    {"type":"tool_result", "tool_use_id":"search_2", "content":[
+                        {"type":"tool_reference", "tool_name":"DeferredTwo"},
+                        {"type":"tool_reference", "tool_name":"DeferredThree"}
+                    ]},
+                    {"type":"tool_result", "tool_use_id":"search_3", "content":[
+                        {"type":"text", "text":"no additional match"}
+                    ]}
+                ]}
+            ],
+            "tools":[
+                {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                {"name":"DeferredOne", "defer_loading":true,
+                 "input_schema":{"type":"object","properties":{"one":{"type":"string"}}}},
+                {"name":"DeferredTwo", "defer_loading":true,
+                 "input_schema":{"type":"object","properties":{"two":{"type":"string"}}}},
+                {"name":"DeferredThree", "defer_loading":true,
+                 "input_schema":{"type":"object","properties":{"three":{"type":"string"}}}}
+            ]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        let input = serde_json::to_value(&out.input).unwrap();
+        let input = input.as_array().unwrap();
+        let kinds = input
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "function_call",
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+                "function_call_output",
+                "additional_tools"
+            ]
+        );
+        assert_eq!(
+            input[6]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["DeferredOne", "DeferredTwo", "DeferredThree"]
+        );
+    }
+
+    #[test]
+    fn deferred_tool_additions_flush_before_text_and_image_boundary() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[
+                {"role":"assistant", "content":[
+                    {"type":"tool_use", "id":"search_1", "name":"ToolSearch", "input":{}},
+                    {"type":"tool_use", "id":"search_2", "name":"ToolSearch", "input":{}}
+                ]},
+                {"role":"user", "content":[
+                    {"type":"tool_result", "tool_use_id":"search_1", "content":[
+                        {"type":"tool_reference", "tool_name":"DeferredOne"}
+                    ]},
+                    {"type":"tool_result", "tool_use_id":"search_2", "content":[
+                        {"type":"tool_reference", "tool_name":"DeferredTwo"}
+                    ]},
+                    {"type":"text", "text":"apply both tools to this image"},
+                    {"type":"image", "source":{
+                        "type":"base64", "media_type":"image/png", "data":VALID_PNG_BASE64
+                    }}
+                ]}
+            ],
+            "tools":[
+                {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                {"name":"DeferredOne", "defer_loading":true,
+                 "input_schema":{"type":"object","properties":{}}},
+                {"name":"DeferredTwo", "defer_loading":true,
+                 "input_schema":{"type":"object","properties":{}}}
+            ]
+        }))
+        .unwrap();
+
+        let out = translate_request(&req, opts()).unwrap();
+        let input = serde_json::to_value(&out.input).unwrap();
+        let input = input.as_array().unwrap();
+        let kinds = input
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+                "additional_tools",
+                "message"
+            ]
+        );
+        assert_eq!(
+            input[4]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["DeferredOne", "DeferredTwo"]
+        );
+        assert_eq!(input[5]["role"], "user");
+        assert_eq!(input[5]["content"][0]["type"], "input_text");
+        assert_eq!(input[5]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
     fn rejects_tool_references_without_valid_search_provenance() {
         let cases = [
             (
@@ -3853,6 +4294,7 @@ mod tests {
         let tool_plan = read_tools(&req).unwrap();
         assert!(
             build_input(&req, &tool_plan.deferred)
+                .0
                 .iter()
                 .any(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
         );
@@ -3870,6 +4312,10 @@ mod tests {
             assert!(out.tool_choice.is_none());
             assert!(!out.parallel_tool_calls);
             assert!(out.hosted_web_search_max_uses.is_none());
+            assert_eq!(
+                out.deferred_tool_hydration,
+                DeferredToolHydrationProvenance::default()
+            );
             assert!(
                 !out.input
                     .iter()

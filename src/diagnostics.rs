@@ -750,6 +750,7 @@ fn allowed_event(event: &str) -> bool {
             | "native_web_search_phase"
             | "upstream_first_event"
             | "stream_committed_before_semantic"
+            | "stream_committed_on_response_created"
             | "terminal_resolution"
             | "buffered_transport_retry"
             | "buffered_transport_retry_exhausted"
@@ -760,6 +761,7 @@ fn allowed_event(event: &str) -> bool {
             | "auto_transport_fallback"
             | "websocket_circuit_fallback"
             | "websocket_circuit_opened"
+            | "websocket_pool_checkout"
             | "websocket_pool_refresh"
             | "websocket_terminal_pool_probe_failed"
             | "upstream_retry"
@@ -820,8 +822,17 @@ fn sanitize_field(event: &str, key: &str, value: &Value) -> Option<(String, Valu
             .as_str()
             .filter(|v| v.len() == 16 && is_short_hex(v))
             .map(|v| (key.into(), json!(v))),
+        "promptCacheKeyFingerprint" => value
+            .as_str()
+            .filter(|v| v.len() == 12 && is_short_hex(v))
+            .map(|v| (key.into(), json!(v))),
+        "continuation" => {
+            sanitize_continuation_metadata(value).map(|continuation| (key.into(), continuation))
+        }
+        "usage" => sanitize_grok_usage_metadata(value).map(|usage| (key.into(), usage)),
         "toolName" => sanitize_tool_name(value.as_str()?).map(|name| (key.into(), json!(name))),
         "toolKind" => enum_string(value, &["tool_use", "server_tool_use"]).map(|v| (key.into(), v)),
+        "downstreamEvent" => enum_string(value, &["ping"]).map(|v| (key.into(), v)),
         "interruptReason" => enum_string(
             value,
             &[
@@ -841,11 +852,128 @@ fn sanitize_field(event: &str, key: &str, value: &Value) -> Option<(String, Valu
             "toolChoiceCategory".into(),
             json!(tool_choice_category(value)),
         )),
+        "outcome" if event == "websocket_pool_checkout" => enum_string(
+            value,
+            &[
+                "fresh_fork",
+                "affinity_match",
+                "affinity_miss",
+                "transport_reuse",
+                "fresh_connect",
+            ],
+        )
+        .map(|value| (key.into(), value)),
         _ => sanitize_scalar_field(key, value).map(|value| (key.into(), value)),
     }
 }
 
+fn sanitize_continuation_metadata(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let enabled = object.get("enabled")?.as_bool()?;
+    let used_previous_response = object.get("usedPreviousResponse")?.as_bool()?;
+    let input_delta_count = object
+        .get("inputDeltaCount")?
+        .as_u64()
+        .filter(|count| *count <= 1_000_000_000)?;
+    let disabled_reason = match object.get("disabledReason")? {
+        Value::Null => Value::Null,
+        Value::String(reason)
+            if matches!(
+                reason.as_str(),
+                "disabled"
+                    | "missing_session"
+                    | "superseded_turn"
+                    | "missing_state"
+                    | "prompt_changed"
+                    | "prompt_signature_error"
+                    | "not_append_only"
+                    | "empty_delta"
+                    | "full_context_retry"
+            ) =>
+        {
+            json!(reason)
+        }
+        _ => return None,
+    };
+
+    let mut sanitized = serde_json::Map::from_iter([
+        ("enabled".into(), json!(enabled)),
+        ("usedPreviousResponse".into(), json!(used_previous_response)),
+        ("inputDeltaCount".into(), json!(input_delta_count)),
+        ("disabledReason".into(), disabled_reason),
+    ]);
+    if let Some(value) = object.get("matchedCandidateRank") {
+        let rank = if value.is_null() {
+            Value::Null
+        } else {
+            json!(value.as_u64().filter(|rank| *rank <= 1)?)
+        };
+        sanitized.insert("matchedCandidateRank".into(), rank);
+    }
+    if let Some(value) = object.get("candidateCount") {
+        sanitized.insert(
+            "candidateCount".into(),
+            json!(value.as_u64().filter(|count| *count <= 2)?),
+        );
+    }
+    if let Some(value) = object.get("responseAffineFork") {
+        sanitized.insert("responseAffineFork".into(), Value::Bool(value.as_bool()?));
+    }
+
+    Some(Value::Object(sanitized))
+}
+
+fn sanitize_grok_usage_metadata(value: &Value) -> Option<Value> {
+    const TOKEN_FIELDS: [&str; 7] = [
+        "inputTokens",
+        "mappedInputTokens",
+        "outputTokens",
+        "cacheReadInputTokens",
+        "reasoningTokens",
+        "upstreamTotalTokens",
+        "estimatedInputTokens",
+    ];
+    const MAX_DIAGNOSTIC_TOKENS: u64 = 1_000_000_000;
+
+    let object = value.as_object()?;
+    let state = object
+        .get("state")?
+        .as_str()
+        .filter(|state| matches!(*state, "unavailable" | "partial" | "reported"))?;
+    let mut sanitized = serde_json::Map::from_iter([("state".into(), json!(state))]);
+    for key in TOKEN_FIELDS {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        let value = if value.is_null() {
+            Value::Null
+        } else {
+            json!(
+                value
+                    .as_u64()
+                    .filter(|tokens| *tokens <= MAX_DIAGNOSTIC_TOKENS)?
+            )
+        };
+        sanitized.insert(key.into(), value);
+    }
+    if let Some(value) = object.get("cacheBreakdownInconsistent") {
+        sanitized.insert(
+            "cacheBreakdownInconsistent".into(),
+            Value::Bool(value.as_bool()?),
+        );
+    }
+    if let Some(value) = object.get("cacheCreationInputTokensState") {
+        let state = value.as_str().filter(|state| *state == "unavailable")?;
+        sanitized.insert("cacheCreationInputTokensState".into(), json!(state));
+    }
+    Some(Value::Object(sanitized))
+}
+
 fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
+    if key == "candidateRank" && value.is_null() {
+        return Some(Value::Null);
+    }
+
     if matches!(
         key,
         "countTokens"
@@ -856,10 +984,16 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
             | "promptCacheKeyPresent"
             | "generationStarted"
             | "semanticEmitted"
+            | "replayWindowOpen"
             | "inBandSse"
             | "bodyTruncated"
             | "bodyTimedOut"
             | "downstreamEmitted"
+            | "affinityRequested"
+            | "affinityMatched"
+            | "pooled"
+            | "responseAffineFork"
+            | "hydrationAmbiguous"
     ) {
         return value.as_bool().map(Value::Bool);
     }
@@ -875,12 +1009,17 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
         | "heartbeatIntervalMs" => 7 * 24 * 60 * 60 * 1_000,
         "bytes" | "contentBytes" => 1_u64 << 40,
         "anthropicMaxTokens" | "estimatedInputTokens" => 1_000_000_000,
+        "candidateRank" => 1,
+        "candidateCount" => 2,
         "index"
         | "messageIndex"
         | "blockIndex"
         | "functionToolCount"
         | "hostedToolCount"
         | "inputFunctionToolCount"
+        | "hydrationLoadedGroupCount"
+        | "hydrationLoadedResultCount"
+        | "hydrationUnavailableResultCount"
         | "failedAttempt"
         | "nextAttempt"
         | "maxAttempts"
@@ -924,6 +1063,7 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
             "done",
         ],
         "toolKind" => &["tool_use", "server_tool_use"],
+        "downstreamEvent" => &["ping"],
         "serviceTier" => &["priority", "flex"],
         "transportReason" => &[
             "system_proxy",
@@ -1067,10 +1207,16 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "nativeWebSearch",
             "parallelToolCalls",
             "promptCacheKeyPresent",
+            "promptCacheKeyFingerprint",
+            "continuation",
             "toolChoice",
             "functionToolCount",
             "hostedToolCount",
             "inputFunctionToolCount",
+            "hydrationLoadedGroupCount",
+            "hydrationLoadedResultCount",
+            "hydrationUnavailableResultCount",
+            "hydrationAmbiguous",
             "laneReason",
             "anthropicMaxTokens",
             "outputBudgetEnforcement",
@@ -1083,6 +1229,13 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "generationStarted",
             "semanticEmitted",
             "heartbeatIntervalMs",
+        ],
+        "stream_committed_on_response_created" => &[
+            "reqId",
+            "elapsedMs",
+            "semanticEmitted",
+            "downstreamEvent",
+            "replayWindowOpen",
         ],
         "terminal_resolution" => &["reqId", "authority", "sourceEvent"],
         "buffered_transport_retry" | "live_transport_retry" => &[
@@ -1118,6 +1271,16 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
         "auto_transport_fallback" => &["reqId", "action", "origin", "status", "reason", "detail"],
         "websocket_circuit_fallback" => &["reqId", "cooldownMs", "fallbackTransport"],
         "websocket_circuit_opened" => &["reqId", "failures", "cooldownMs"],
+        "websocket_pool_checkout" => &[
+            "reqId",
+            "outcome",
+            "affinityRequested",
+            "affinityMatched",
+            "pooled",
+            "candidateRank",
+            "candidateCount",
+            "responseAffineFork",
+        ],
         "websocket_pool_refresh" => &["reqId", "reason"],
         "websocket_terminal_pool_probe_failed" => &["reason", "detail"],
         "upstream_retry" => &[
@@ -1167,6 +1330,7 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "status",
             "origin",
             "errorStage",
+            "usage",
         ],
         "log_records_dropped" => &["count", "queueCapacity"],
         _ => &[],
@@ -1240,6 +1404,9 @@ fn protocol_event_category(value: &str) -> &'static str {
         "response.error" => "response_error",
         "response.output_item.added" => "output_item_added",
         "response.output_item.done" => "output_item_done",
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            "reasoning_delta"
+        }
         "response.output_text.delta" => "output_text_delta",
         "response.function_call_arguments.delta" => "function_arguments_delta",
         "response.function_call_arguments.done" => "function_arguments_done",
@@ -1804,10 +1971,10 @@ fn is_sanitized_event(value: &Value) -> bool {
         .collect();
     fields
         .iter()
-        .all(|(key, value)| allowed.contains(key) && sanitized_field_value(key, value))
+        .all(|(key, value)| allowed.contains(key) && sanitized_field_value(event, key, value))
 }
 
-fn sanitized_field_value(key: &str, value: &Value) -> bool {
+fn sanitized_field_value(event: &str, key: &str, value: &Value) -> bool {
     if key.ends_with("Diagnostic") {
         let Some(object) = value.as_object() else {
             return false;
@@ -1845,6 +2012,11 @@ fn sanitized_field_value(key: &str, value: &Value) -> bool {
         "callIdHash" => value
             .as_str()
             .is_some_and(|v| v.len() == 16 && is_short_hex(v)),
+        "promptCacheKeyFingerprint" => value
+            .as_str()
+            .is_some_and(|v| v.len() == 12 && is_short_hex(v)),
+        "continuation" => sanitize_continuation_metadata(value).as_ref() == Some(value),
+        "usage" => sanitize_grok_usage_metadata(value).as_ref() == Some(value),
         "model" => value
             .as_str()
             .is_some_and(|model| diagnostic_model(model) == model),
@@ -1872,6 +2044,7 @@ fn sanitized_field_value(key: &str, value: &Value) -> bool {
                     | "response_error"
                     | "output_item_added"
                     | "output_item_done"
+                    | "reasoning_delta"
                     | "output_text_delta"
                     | "function_arguments_delta"
                     | "function_arguments_done"
@@ -1881,6 +2054,16 @@ fn sanitized_field_value(key: &str, value: &Value) -> bool {
         "toolChoiceCategory" => matches!(
             value.as_str(),
             Some("auto" | "none" | "required" | "function" | "tool" | "object" | "unknown")
+        ),
+        "outcome" if event == "websocket_pool_checkout" => matches!(
+            value.as_str(),
+            Some(
+                "fresh_fork"
+                    | "affinity_match"
+                    | "affinity_miss"
+                    | "transport_reuse"
+                    | "fresh_connect"
+            )
         ),
         _ => sanitize_scalar_field(key, value).as_ref() == Some(value),
     }
@@ -2213,6 +2396,155 @@ mod tests {
     }
 
     #[test]
+    fn request_configuration_keeps_only_safe_continuation_and_cache_affinity_metadata() {
+        let codex = sanitize_event(
+            &serde_json::from_str(&log(
+                "request_configuration",
+                json!({
+                    "reqId":"request-1",
+                    "model":"gpt-5.6-sol",
+                    "hydrationLoadedGroupCount":1,
+                    "hydrationLoadedResultCount":2,
+                    "hydrationUnavailableResultCount":0,
+                    "hydrationAmbiguous":false,
+                    "continuation": {
+                        "enabled": true,
+                        "usedPreviousResponse": true,
+                        "matchedCandidateRank": 1,
+                        "candidateCount": 2,
+                        "responseAffineFork": false,
+                        "inputDeltaCount": 3,
+                        "disabledReason": null,
+                        "previousResponseId": "resp_secret_identifier",
+                        "sessionId": "session_secret_identifier",
+                        "input": "secret prompt"
+                    }
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            codex["fields"]["continuation"],
+            json!({
+                "enabled": true,
+                "usedPreviousResponse": true,
+                "matchedCandidateRank": 1,
+                "candidateCount": 2,
+                "responseAffineFork": false,
+                "inputDeltaCount": 3,
+                "disabledReason": null,
+            })
+        );
+        assert_eq!(codex["fields"]["hydrationLoadedGroupCount"], 1);
+        assert_eq!(codex["fields"]["hydrationLoadedResultCount"], 2);
+        assert_eq!(codex["fields"]["hydrationUnavailableResultCount"], 0);
+        assert_eq!(codex["fields"]["hydrationAmbiguous"], false);
+        assert!(!codex.to_string().contains("secret_identifier"));
+        assert!(!codex.to_string().contains("secret prompt"));
+        assert!(is_sanitized_event(&codex));
+
+        let grok_raw = json!({
+            "t":"2026-07-22T12:00:00Z",
+            "level":"info",
+            "service":"grok",
+            "msg":"request_configuration",
+            "fields":{
+                "reqId":"request-2",
+                "model":"grok-4.5",
+                "promptCacheKeyPresent":true,
+                "promptCacheKeyFingerprint":"abcdef012345",
+                "promptCacheKey":"full-secret-cache-key"
+            }
+        });
+        let grok = sanitize_event(&grok_raw).unwrap();
+        assert_eq!(grok["fields"]["promptCacheKeyPresent"], true);
+        assert_eq!(grok["fields"]["promptCacheKeyFingerprint"], "abcdef012345");
+        assert!(!grok.to_string().contains("full-secret-cache-key"));
+        assert!(is_sanitized_event(&grok));
+
+        let mut forged_continuation = codex.clone();
+        forged_continuation["fields"]["continuation"]["previousResponseId"] =
+            json!("resp_secret_identifier");
+        assert!(!is_sanitized_event(&forged_continuation));
+
+        let mut signature_error = codex.clone();
+        signature_error["fields"]["continuation"]["disabledReason"] =
+            json!("prompt_signature_error");
+        assert!(is_sanitized_event(&signature_error));
+
+        let mut forged_fingerprint = grok;
+        forged_fingerprint["fields"]["promptCacheKeyFingerprint"] = json!("not-a-short-hash");
+        assert!(!is_sanitized_event(&forged_fingerprint));
+    }
+
+    #[test]
+    fn websocket_pool_checkout_keeps_only_bounded_branch_metadata() {
+        let event = sanitize_event(
+            &serde_json::from_str(&log(
+                "websocket_pool_checkout",
+                json!({
+                    "reqId":"request-1",
+                    "outcome":"affinity_match",
+                    "affinityRequested":true,
+                    "affinityMatched":true,
+                    "pooled":true,
+                    "candidateRank":1,
+                    "candidateCount":2,
+                    "responseAffineFork":false,
+                    "previousResponseId":"resp_secret_identifier",
+                    "laneKey":"lane_secret_identifier",
+                    "sessionId":"session_secret_identifier"
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(event["fields"]["outcome"], "affinity_match");
+        assert_eq!(event["fields"]["affinityRequested"], true);
+        assert_eq!(event["fields"]["affinityMatched"], true);
+        assert_eq!(event["fields"]["pooled"], true);
+        assert_eq!(event["fields"]["candidateRank"], 1);
+        assert_eq!(event["fields"]["candidateCount"], 2);
+        assert_eq!(event["fields"]["responseAffineFork"], false);
+        assert!(!event.to_string().contains("secret_identifier"));
+        assert!(is_sanitized_event(&event));
+
+        let mut forged_rank = event.clone();
+        forged_rank["fields"]["candidateRank"] = json!(2);
+        assert!(!is_sanitized_event(&forged_rank));
+
+        let mut cross_event_outcome = event.clone();
+        cross_event_outcome["event"] = json!("stream_terminal");
+        cross_event_outcome["fields"] = json!({"outcome":"fresh_fork"});
+        assert!(!is_sanitized_event(&cross_event_outcome));
+
+        let mut forged_outcome = event;
+        forged_outcome["fields"]["outcome"] = json!("secret_branch");
+        assert!(!is_sanitized_event(&forged_outcome));
+
+        let fresh_fork = sanitize_event(
+            &serde_json::from_str(&log(
+                "websocket_pool_checkout",
+                json!({
+                    "reqId":"request-2",
+                    "outcome":"fresh_fork",
+                    "affinityRequested":false,
+                    "affinityMatched":false,
+                    "pooled":false,
+                    "candidateRank":null,
+                    "candidateCount":1,
+                    "responseAffineFork":true
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fresh_fork["fields"]["candidateRank"], Value::Null);
+        assert!(is_sanitized_event(&fresh_fork));
+    }
+
+    #[test]
     fn upstream_incomplete_reason_is_categorized_and_forged_enums_are_rejected() {
         let event = sanitize_event(
             &serde_json::from_str(&log(
@@ -2223,18 +2555,106 @@ mod tests {
                     "outcome":"incomplete",
                     "stopReason":"refusal",
                     "incompleteReason":"other",
-                    "upstreamIncompleteReason":"private_secret"
+                    "upstreamIncompleteReason":"private_secret",
+                    "usage": {
+                        "state":"reported",
+                        "inputTokens":125,
+                        "mappedInputTokens":27,
+                        "outputTokens":16,
+                        "cacheReadInputTokens":98,
+                        "cacheBreakdownInconsistent":false,
+                        "cacheCreationInputTokensState":"unavailable",
+                        "reasoningTokens":8,
+                        "upstreamTotalTokens":141,
+                        "estimatedInputTokens":130,
+                        "prompt":"secret prompt",
+                        "sessionId":"secret session"
+                    }
                 }),
             ))
             .unwrap(),
         )
         .unwrap();
         assert_eq!(event["fields"]["upstreamIncompleteReason"], "other");
+        assert_eq!(
+            event["fields"]["usage"],
+            json!({
+                "state":"reported",
+                "inputTokens":125,
+                "mappedInputTokens":27,
+                "outputTokens":16,
+                "cacheReadInputTokens":98,
+                "cacheBreakdownInconsistent":false,
+                "cacheCreationInputTokensState":"unavailable",
+                "reasoningTokens":8,
+                "upstreamTotalTokens":141,
+                "estimatedInputTokens":130,
+            })
+        );
         assert!(!event.to_string().contains("private_secret"));
+        assert!(!event.to_string().contains("secret prompt"));
+        assert!(!event.to_string().contains("secret session"));
         assert!(is_sanitized_event(&event));
+
+        let mut forged_usage = event.clone();
+        forged_usage["fields"]["usage"]["prompt"] = json!("secret prompt");
+        assert!(!is_sanitized_event(&forged_usage));
 
         let mut forged = event;
         forged["fields"]["stage"] = json!("private_secret");
+        assert!(!is_sanitized_event(&forged));
+    }
+
+    #[test]
+    fn grok_generation_event_preserves_reasoning_category_without_raw_event_name() {
+        let event = sanitize_event(
+            &serde_json::from_str(&log(
+                "upstream_first_event",
+                json!({
+                    "reqId":"request-1",
+                    "event":"response.reasoning_text.delta",
+                    "elapsedMs":123
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(event["fields"]["event"], "reasoning_delta");
+        assert!(is_sanitized_event(&event));
+        assert!(!event.to_string().contains("response.reasoning_text.delta"));
+    }
+
+    #[test]
+    fn response_created_stream_commit_keeps_only_bounded_timing_evidence() {
+        let event = sanitize_event(
+            &serde_json::from_str(&log(
+                "stream_committed_on_response_created",
+                json!({
+                    "reqId":"request-1",
+                    "elapsedMs":731,
+                    "semanticEmitted":false,
+                    "downstreamEvent":"ping",
+                    "replayWindowOpen":true,
+                    "responseId":"resp_secret_identifier",
+                    "prompt":"secret prompt"
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(event["event"], "stream_committed_on_response_created");
+        assert_eq!(event["fields"]["elapsedMs"], 731);
+        assert_eq!(event["fields"]["semanticEmitted"], false);
+        assert_eq!(event["fields"]["downstreamEvent"], "ping");
+        assert_eq!(event["fields"]["replayWindowOpen"], true);
+        assert!(!event.to_string().contains("resp_secret_identifier"));
+        assert!(!event.to_string().contains("secret prompt"));
+        assert!(is_sanitized_event(&event));
+
+        let mut forged = event;
+        forged["fields"]["downstreamEvent"] = json!("message_start");
         assert!(!is_sanitized_event(&forged));
     }
 

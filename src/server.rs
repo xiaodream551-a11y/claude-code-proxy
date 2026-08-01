@@ -1,9 +1,9 @@
 use crate::{
     anthropic::json_error,
-    logging::{Logger, REDACT_KEYS, create_logger},
+    logging::{Logger, create_logger, is_sensitive_payload_key},
     monitor::{EndpointKind, MonitorHandle},
     project,
-    provider::{Provider, RequestByteLease, RequestContext},
+    provider::{Provider, RequestByteLease, RequestContext, RequestLaneKey},
     registry::{Registry, normalize_incoming_model},
     session,
     timeutil::now_ms,
@@ -40,12 +40,18 @@ pub const DEFAULT_MAX_CONCURRENT_PER_PROVIDER: usize = 48;
 pub const DEFAULT_MAX_CONCURRENT_PER_SESSION: usize = 24;
 pub const DEFAULT_REQUEST_BODY_IDLE_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_SESSION_ID_BYTES: usize = 256;
+pub const MAX_AGENT_ID_BYTES: usize = 256;
 const MAX_ERROR_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 const ERROR_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_RESPONSE_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_CAPTURE_FILES: usize = 128;
+const MAX_ERROR_REDACTION_DEPTH: u16 = 100;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPACTION_MODEL_HEADER: &str = "x-ccproxy-compaction-model";
+const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
+const CLAUDE_CODE_PARENT_AGENT_ID_HEADER: &str = "x-claude-code-parent-agent-id";
+const REQUEST_LANE_KEY_DOMAIN: &[u8] = b"ccproxy-request-lane-key-v1\0";
 const INCOMPLETE_SSE_ERROR: &str = "SSE response ended before message_stop";
 
 fn compaction_model_override(
@@ -812,12 +818,10 @@ async fn dispatch_request_with_id(
             ("query".to_string(), json!(&query)),
         ])),
     );
-    let session_id = headers
-        .get("x-claude-code-session-id")
-        .and_then(|value| value.to_str().ok())
-        .map(std::string::ToString::to_string);
+    let parsed_session_id = session_id_from_headers(&headers);
+    let monitored_session_id = parsed_session_id.as_ref().ok().cloned().flatten();
     if let Some(monitor) = state.monitor.as_ref() {
-        monitor.request_started(&req_id, session_id.clone(), None, endpoint);
+        monitor.request_started(&req_id, monitored_session_id, None, endpoint);
     }
     let mut request_guard = RequestMonitorGuard::new(
         state.monitor.clone(),
@@ -826,6 +830,103 @@ async fn dispatch_request_with_id(
         started_at,
         count_tokens,
     );
+    let session_id = match parsed_session_id {
+        Ok(session_id) => session_id,
+        Err(SessionIdError::TooLong) => {
+            let response = json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("x-claude-code-session-id exceeds the {MAX_SESSION_ID_BYTES}-byte limit"),
+            );
+            return finalize_immediate_failure(
+                &log,
+                &mut request_guard,
+                &req_id,
+                None,
+                None,
+                count_tokens,
+                started_at,
+                response,
+            )
+            .await;
+        }
+        Err(SessionIdError::InvalidEncoding) => {
+            let response = json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "x-claude-code-session-id must contain valid visible text",
+            );
+            return finalize_immediate_failure(
+                &log,
+                &mut request_guard,
+                &req_id,
+                None,
+                None,
+                count_tokens,
+                started_at,
+                response,
+            )
+            .await;
+        }
+    };
+    let agent_id = match agent_id_from_headers(&headers) {
+        Ok(agent_id) => agent_id,
+        Err(AgentIdError::Empty) => {
+            let response = json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "x-claude-code-agent-id must not be empty",
+            );
+            return finalize_immediate_failure(
+                &log,
+                &mut request_guard,
+                &req_id,
+                None,
+                None,
+                count_tokens,
+                started_at,
+                response,
+            )
+            .await;
+        }
+        Err(AgentIdError::TooLong) => {
+            let response = json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("x-claude-code-agent-id exceeds the {MAX_AGENT_ID_BYTES}-byte limit"),
+            );
+            return finalize_immediate_failure(
+                &log,
+                &mut request_guard,
+                &req_id,
+                None,
+                None,
+                count_tokens,
+                started_at,
+                response,
+            )
+            .await;
+        }
+        Err(AgentIdError::InvalidEncoding) => {
+            let response = json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "x-claude-code-agent-id must contain valid visible ASCII text",
+            );
+            return finalize_immediate_failure(
+                &log,
+                &mut request_guard,
+                &req_id,
+                None,
+                None,
+                count_tokens,
+                started_at,
+                response,
+            )
+            .await;
+        }
+    };
+    let lane_key = request_lane_key(session_id.as_deref(), agent_id.as_deref());
     if headers
         .get(http::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -1218,6 +1319,7 @@ async fn dispatch_request_with_id(
     let context = RequestContext {
         req_id: req_id.clone(),
         session_id,
+        lane_key,
         session_seq: current.map(|s| s.seq),
         provider: provider.name().to_string(),
         traffic,
@@ -1283,6 +1385,76 @@ async fn dispatch_request_with_id(
             .unwrap_or_else(|| format!("HTTP {}", status.as_u16())),
     );
     hold_response_permits(response, permits)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionIdError {
+    TooLong,
+    InvalidEncoding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentIdError {
+    Empty,
+    TooLong,
+    InvalidEncoding,
+}
+
+fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, SessionIdError> {
+    let Some(value) = headers.get("x-claude-code-session-id") else {
+        return Ok(None);
+    };
+    let session_id = value
+        .to_str()
+        .map_err(|_| SessionIdError::InvalidEncoding)?;
+    if session_id.is_empty() {
+        return Ok(None);
+    }
+    if session_id.len() > MAX_SESSION_ID_BYTES {
+        return Err(SessionIdError::TooLong);
+    }
+    Ok(Some(session_id.to_string()))
+}
+
+fn agent_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, AgentIdError> {
+    let mut values = headers.get_all(CLAUDE_CODE_AGENT_ID_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(AgentIdError::InvalidEncoding);
+    }
+    let agent_id = value.to_str().map_err(|_| AgentIdError::InvalidEncoding)?;
+    if agent_id.is_empty() {
+        return Err(AgentIdError::Empty);
+    }
+    if agent_id.len() > MAX_AGENT_ID_BYTES {
+        return Err(AgentIdError::TooLong);
+    }
+    if !agent_id.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(AgentIdError::InvalidEncoding);
+    }
+    Ok(Some(agent_id.to_string()))
+}
+
+fn request_lane_key(session_id: Option<&str>, agent_id: Option<&str>) -> Option<RequestLaneKey> {
+    let session_id = session_id?;
+    let session_id_len = u64::try_from(session_id.len()).ok()?;
+
+    let mut digest = Sha256::new();
+    digest.update(REQUEST_LANE_KEY_DOMAIN);
+    digest.update(session_id_len.to_be_bytes());
+    digest.update(session_id.as_bytes());
+    match agent_id {
+        None => digest.update([0]),
+        Some(agent_id) => {
+            let agent_id_len = u64::try_from(agent_id.len()).ok()?;
+            digest.update([1]);
+            digest.update(agent_id_len.to_be_bytes());
+            digest.update(agent_id.as_bytes());
+        }
+    }
+    Some(RequestLaneKey::from_digest(digest.finalize().into()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2267,15 +2439,27 @@ fn sanitize_path_part(raw: &str) -> String {
 }
 
 fn redact_error_value(value: Value) -> Value {
+    redact_error_value_with_depth(value, 0)
+}
+
+fn redact_error_value_with_depth(value: Value, depth: u16) -> Value {
+    if depth > MAX_ERROR_REDACTION_DEPTH {
+        return Value::String("[depth-limit]".to_string());
+    }
     match value {
-        Value::Array(values) => Value::Array(values.into_iter().map(redact_error_value).collect()),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| redact_error_value_with_depth(value, depth + 1))
+                .collect(),
+        ),
         Value::Object(fields) => {
             let mut out = Map::new();
             for (key, value) in fields {
-                if REDACT_KEYS.contains(&key.to_lowercase().as_str()) {
+                if is_sensitive_payload_key(&key) {
                     out.insert(key, redact_error_key(value));
                 } else {
-                    out.insert(key, redact_error_value(value));
+                    out.insert(key, redact_error_value_with_depth(value, depth + 1));
                 }
             }
             Value::Object(out)
@@ -2375,8 +2559,18 @@ impl Drop for RequestMonitorGuard {
 fn headers_to_record(headers: &http::HeaderMap) -> Value {
     let mut out = Map::new();
     for (key, value) in headers {
+        let name = key.as_str();
+        if name.eq_ignore_ascii_case(CLAUDE_CODE_AGENT_ID_HEADER)
+            || name.eq_ignore_ascii_case(CLAUDE_CODE_PARENT_AGENT_ID_HEADER)
+        {
+            out.insert(
+                name.to_string(),
+                Value::String(format!("[redacted len={}]", value.as_bytes().len())),
+            );
+            continue;
+        }
         if let Ok(raw) = value.to_str() {
-            out.insert(key.as_str().to_string(), Value::String(raw.to_string()));
+            out.insert(name.to_string(), Value::String(raw.to_string()));
         }
     }
     Value::Object(out)
@@ -2389,8 +2583,7 @@ fn redacted_query(uri: &http::Uri) -> Value {
     };
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         let key = key.into_owned();
-        let lower = key.to_lowercase();
-        let value = if REDACT_KEYS.contains(&lower.as_str()) {
+        let value = if is_sensitive_payload_key(&key) {
             Value::String(format!("[redacted len={}]", value.len()))
         } else {
             Value::String(value.into_owned())
@@ -2434,6 +2627,18 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures_util::stream;
+
+    #[test]
+    fn request_query_redacts_all_shared_sensitive_keys_case_insensitively() {
+        let uri: http::Uri = "/v1/messages?safe=value&client_secret=top-secret&PaSsWoRd=hunter2"
+            .parse()
+            .unwrap();
+        let query = redacted_query(&uri);
+
+        assert_eq!(query["safe"], "value");
+        assert_eq!(query["client_secret"], "[redacted len=10]");
+        assert_eq!(query["PaSsWoRd"], "[redacted len=7]");
+    }
 
     #[test]
     fn provider_generation_drift_warning_is_once_per_new_generation() {
@@ -2910,6 +3115,361 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
             Some("codex"),
             StatusCode::BAD_GATEWAY
         ));
+    }
+
+    #[test]
+    fn session_id_length_boundary_is_enforced() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            http::HeaderValue::from_static(""),
+        );
+        assert_eq!(session_id_from_headers(&headers).unwrap(), None);
+
+        headers.insert(
+            "x-claude-code-session-id",
+            http::HeaderValue::from_bytes(&[0x80]).unwrap(),
+        );
+        assert_eq!(
+            session_id_from_headers(&headers),
+            Err(SessionIdError::InvalidEncoding)
+        );
+
+        let accepted = "s".repeat(MAX_SESSION_ID_BYTES);
+        headers.insert(
+            "x-claude-code-session-id",
+            http::HeaderValue::from_str(&accepted).unwrap(),
+        );
+        assert_eq!(
+            session_id_from_headers(&headers).unwrap().as_deref(),
+            Some(accepted.as_str())
+        );
+
+        let rejected = "s".repeat(MAX_SESSION_ID_BYTES + 1);
+        headers.insert(
+            "x-claude-code-session-id",
+            http::HeaderValue::from_str(&rejected).unwrap(),
+        );
+        assert!(session_id_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn agent_id_header_is_strict_and_length_bounded() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(agent_id_from_headers(&headers).unwrap(), None);
+
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            http::HeaderValue::from_static(""),
+        );
+        assert_eq!(agent_id_from_headers(&headers), Err(AgentIdError::Empty));
+
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            http::HeaderValue::from_bytes(&[0x80]).unwrap(),
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers),
+            Err(AgentIdError::InvalidEncoding)
+        );
+
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            http::HeaderValue::from_static("agent id"),
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers),
+            Err(AgentIdError::InvalidEncoding)
+        );
+
+        let accepted = "a".repeat(MAX_AGENT_ID_BYTES);
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            http::HeaderValue::from_str(&accepted).unwrap(),
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers).unwrap().as_deref(),
+            Some(accepted.as_str())
+        );
+
+        let rejected = "a".repeat(MAX_AGENT_ID_BYTES + 1);
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            http::HeaderValue::from_str(&rejected).unwrap(),
+        );
+        assert_eq!(agent_id_from_headers(&headers), Err(AgentIdError::TooLong));
+
+        headers.clear();
+        headers.append(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            http::HeaderValue::from_static("agent-a"),
+        );
+        headers.append(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            http::HeaderValue::from_static("agent-b"),
+        );
+        assert_eq!(
+            agent_id_from_headers(&headers),
+            Err(AgentIdError::InvalidEncoding)
+        );
+    }
+
+    #[test]
+    fn request_lane_key_is_stable_opaque_and_agent_scoped() {
+        let session_id = "57c7c914-ada4-4f40-9672-985f950fbb66";
+        let agent_a = "agent-ae50bd4cae9d19761";
+        let agent_b = "agent-be50bd4cae9d19762";
+
+        let main = request_lane_key(Some(session_id), None).unwrap();
+        let resumed_main = request_lane_key(Some(session_id), None).unwrap();
+        let first_agent = request_lane_key(Some(session_id), Some(agent_a)).unwrap();
+        let resumed_agent = request_lane_key(Some(session_id), Some(agent_a)).unwrap();
+        let sibling_agent = request_lane_key(Some(session_id), Some(agent_b)).unwrap();
+        let other_session = request_lane_key(Some("other-session"), Some(agent_a)).unwrap();
+
+        assert_eq!(main, resumed_main);
+        assert_eq!(first_agent, resumed_agent);
+        assert_ne!(main, first_agent);
+        assert_ne!(first_agent, sibling_agent);
+        assert_ne!(first_agent, other_session);
+        assert_eq!(main.as_bytes().len(), 32);
+        assert_eq!(main.to_hex().len(), 64);
+        assert_eq!(format!("{main:?}"), "RequestLaneKey([opaque])");
+        assert!(!main.to_hex().contains(session_id));
+        assert!(!first_agent.to_hex().contains(agent_a));
+        assert_eq!(request_lane_key(None, None), None);
+        assert_eq!(request_lane_key(None, Some(agent_a)), None);
+    }
+
+    #[test]
+    fn traffic_headers_redact_agent_identity() {
+        let agent_id = "agent-raw-canary-ae50bd4cae9d19761";
+        let parent_agent_id = "parent-agent-raw-canary";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            http::HeaderValue::from_str(agent_id).unwrap(),
+        );
+        headers.insert(
+            CLAUDE_CODE_PARENT_AGENT_ID_HEADER,
+            http::HeaderValue::from_str(parent_agent_id).unwrap(),
+        );
+        headers.insert(
+            "x-safe-header",
+            http::HeaderValue::from_static("safe-value"),
+        );
+
+        let recorded = headers_to_record(&headers);
+        assert_eq!(
+            recorded[CLAUDE_CODE_AGENT_ID_HEADER],
+            format!("[redacted len={}]", agent_id.len())
+        );
+        assert_eq!(
+            recorded[CLAUDE_CODE_PARENT_AGENT_ID_HEADER],
+            format!("[redacted len={}]", parent_agent_id.len())
+        );
+        assert_eq!(recorded["x-safe-header"], "safe-value");
+        let serialized = serde_json::to_string(&recorded).unwrap();
+        assert!(!serialized.contains(agent_id));
+        assert!(!serialized.contains(parent_agent_id));
+    }
+
+    #[tokio::test]
+    async fn oversized_session_id_is_rejected_before_admission_state_grows() {
+        let limits = ServerLimits::default();
+        let registry = Arc::new(Registry::with_default_alias());
+        let provider_construction_config_generation = registry.construction_config_generation();
+        let provider_construction_config_generation_end =
+            registry.construction_config_generation_end();
+        let provider_construction_config_snapshot_stable =
+            registry.construction_config_snapshot_stable();
+        let monitor = MonitorHandle::new(10);
+        let state = Arc::new(AppState {
+            registry,
+            monitor: Some(monitor.clone()),
+            admission: AdmissionState::new(&limits),
+            limits,
+            provider_construction_config_generation,
+            provider_construction_config_generation_end,
+            provider_construction_config_snapshot_stable,
+            config_generation_drift_warning: ConfigGenerationDriftWarning::new(
+                provider_construction_config_generation,
+                provider_construction_config_snapshot_stable,
+            ),
+        });
+        let oversized = "SESSION_CANARY".repeat(MAX_SESSION_ID_BYTES / 8 + 1);
+        assert!(oversized.len() > MAX_SESSION_ID_BYTES);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("x-claude-code-session-id", &oversized)
+            .body(Body::from(
+                r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"test"}]}"#,
+            ))
+            .unwrap();
+
+        let response = dispatch_request_with_id(
+            state.clone(),
+            request,
+            false,
+            "oversized-session-test".to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("exceeds the 256-byte limit"));
+        assert!(!body.contains(&oversized));
+        assert!(state.admission.sessions.lock().unwrap().is_empty());
+
+        let snapshot = monitor.snapshot();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(snapshot.recent.len(), 1);
+        assert!(snapshot.recent[0].session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_agent_ids_are_rejected_before_admission_state_grows() {
+        let limits = ServerLimits::default();
+        let registry = Arc::new(Registry::with_default_alias());
+        let provider_construction_config_generation = registry.construction_config_generation();
+        let provider_construction_config_generation_end =
+            registry.construction_config_generation_end();
+        let provider_construction_config_snapshot_stable =
+            registry.construction_config_snapshot_stable();
+        let state = Arc::new(AppState {
+            registry,
+            monitor: None,
+            admission: AdmissionState::new(&limits),
+            limits,
+            provider_construction_config_generation,
+            provider_construction_config_generation_end,
+            provider_construction_config_snapshot_stable,
+            config_generation_drift_warning: ConfigGenerationDriftWarning::new(
+                provider_construction_config_generation,
+                provider_construction_config_snapshot_stable,
+            ),
+        });
+        let oversized = "AGENT_ID_RAW_CANARY".repeat(MAX_AGENT_ID_BYTES / 8 + 1);
+        assert!(oversized.len() > MAX_AGENT_ID_BYTES);
+        let cases = [
+            (
+                http::HeaderValue::from_static(""),
+                "must not be empty",
+                None,
+            ),
+            (
+                http::HeaderValue::from_bytes(&[0x80]).unwrap(),
+                "must contain valid visible ASCII text",
+                None,
+            ),
+            (
+                http::HeaderValue::from_str(&oversized).unwrap(),
+                "exceeds the 256-byte limit",
+                Some(oversized.as_str()),
+            ),
+        ];
+
+        for (index, (agent_id, expected_error, raw_canary)) in cases.into_iter().enumerate() {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header("x-claude-code-session-id", "agent-validation-session")
+                .header(CLAUDE_CODE_AGENT_ID_HEADER, agent_id)
+                .body(Body::from(
+                    r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"test"}]}"#,
+                ))
+                .unwrap();
+
+            let response = dispatch_request_with_id(
+                state.clone(),
+                request,
+                false,
+                format!("invalid-agent-id-{index}"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains(expected_error), "unexpected response: {body}");
+            if let Some(raw_canary) = raw_canary {
+                assert!(!body.contains(raw_canary));
+            }
+        }
+
+        assert!(state.admission.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn error_capture_redacts_nested_payload_secrets_case_insensitively() {
+        let mut details = Map::new();
+        let mut canaries = Vec::new();
+        for (index, key) in crate::logging::PAYLOAD_REDACT_KEYS.iter().enumerate() {
+            let canary = format!("PAYLOAD_SECRET_{index}");
+            details.insert((*key).to_string(), Value::String(canary.clone()));
+            canaries.push(canary);
+        }
+        details.insert(
+            "access_token".to_string(),
+            Value::String("BASE_SECRET".to_string()),
+        );
+        details.insert(
+            "ClIeNt_SeCrEt".to_string(),
+            Value::String("MIXED_CASE_SECRET".to_string()),
+        );
+        details.insert(
+            "safe_field".to_string(),
+            Value::String("safe-value".to_string()),
+        );
+        let redacted = redact_error_value(json!({
+            "response": {
+                "json": {
+                    "error": {
+                        "details": Value::Object(details)
+                    }
+                }
+            }
+        }));
+        let details = &redacted["response"]["json"]["error"]["details"];
+
+        for key in crate::logging::PAYLOAD_REDACT_KEYS {
+            assert!(
+                details[key]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("[redacted len=")),
+                "payload key was not redacted: {key}"
+            );
+        }
+        assert_eq!(details["access_token"], "[redacted len=11]");
+        assert_eq!(details["ClIeNt_SeCrEt"], "[redacted len=17]");
+        assert_eq!(details["safe_field"], "safe-value");
+
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        for canary in canaries {
+            assert!(!serialized.contains(&canary));
+        }
+        assert!(!serialized.contains("BASE_SECRET"));
+        assert!(!serialized.contains("MIXED_CASE_SECRET"));
+    }
+
+    #[test]
+    fn error_capture_redaction_has_a_depth_limit() {
+        let mut value = json!({"safe_field": "too-deep"});
+        for _ in 0..=MAX_ERROR_REDACTION_DEPTH {
+            value = json!({"next": value});
+        }
+        let redacted = redact_error_value(value);
+        assert!(
+            serde_json::to_string(&redacted)
+                .unwrap()
+                .contains("[depth-limit]")
+        );
     }
 
     #[cfg(unix)]

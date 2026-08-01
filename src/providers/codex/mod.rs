@@ -21,7 +21,7 @@ use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::config;
 use crate::monitor::{anthropic_total_input_tokens, usage_from_anthropic_sse};
-use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
+use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext, RequestLaneKey};
 use crate::providers::downstream_queue::{
     self, BudgetedChunk, ByteBudget, SendOutcome as LiveChunkSendOutcome,
 };
@@ -40,7 +40,8 @@ use self::auth::manager::CodexAuthManager;
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
 use self::continuation::{
-    ContinuationCandidate, abort_continuation, continuation_candidate, record_continuation,
+    ContinuationCandidate, abort_continuation, continuation_candidate, discard_pending_fallback,
+    record_continuation,
 };
 use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic_schema_tool_policy_and_metadata;
@@ -188,7 +189,13 @@ impl Provider for CodexProvider {
         let translated = match translate_codex_request_for_provider(
             body,
             TranslateOptions {
-                session_id: ctx.session_id.clone(),
+                // Keep upstream prompt-cache routing on the same deterministic lane as local
+                // continuation state. Parent and subagent turns in one Claude session otherwise
+                // churn the same cache bucket even though their prompts and models diverge.
+                session_id: ctx
+                    .lane_key
+                    .map(RequestLaneKey::to_hex)
+                    .or_else(|| ctx.session_id.clone()),
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
                 use_responses_lite,
@@ -200,21 +207,30 @@ impl Provider for CodexProvider {
             Ok(t) => t,
             Err(response) => return response,
         };
+        // `store:false` response ids are WebSocket-affine. HTTP cannot publish a
+        // response id that a later request can reach, so keep both explicit HTTP
+        // and Auto decisions that resolved to HTTP out of the continuation registry.
+        let transport_decision = self.client.transport_decision();
+        let previous_response_id_enabled = continuation_enabled_for_transport(
+            config::codex_previous_response_id(),
+            transport_decision.effective(),
+        );
+        let continuation = continuation_candidate(
+            ctx.lane_key.as_ref(),
+            &translated,
+            previous_response_id_enabled,
+        );
         log_codex_request_configuration(
             &ctx,
             &translated,
             use_responses_lite,
             native_web_search,
-            self.client.transport_decision(),
+            transport_decision,
             requested_max_tokens,
-        );
-
-        // Check continuation
-        let previous_response_id_enabled = config::codex_previous_response_id();
-        let continuation = continuation_candidate(
-            ctx.session_id.as_deref(),
-            &translated,
-            previous_response_id_enabled,
+            CodexContinuationLog {
+                enabled: previous_response_id_enabled,
+                candidate: &continuation,
+            },
         );
         let turn_id = continuation.turn_id;
         let deadline = client::CodexRequestDeadline::configured_from(provider_started_at);
@@ -246,7 +262,7 @@ impl Provider for CodexProvider {
         {
             Ok(r) => r,
             Err(e) => {
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_continuation(ctx.lane_key.as_ref(), turn_id);
                 return map_codex_error_to_response(&e);
             }
         };
@@ -272,7 +288,7 @@ impl Provider for CodexProvider {
                     );
                 }
                 update_continuation_from_finish_metadata(
-                    ctx.session_id.as_deref(),
+                    ctx.lane_key.as_ref(),
                     turn_id,
                     &translated,
                     finish_metadata.as_ref(),
@@ -280,7 +296,7 @@ impl Provider for CodexProvider {
                 (StatusCode::OK, Json(json)).into_response()
             }
             Err(e) => {
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_continuation(ctx.lane_key.as_ref(), turn_id);
                 map_codex_failure_to_response(&format!("Accumulation error: {e}"))
             }
         }
@@ -351,6 +367,13 @@ impl Provider for CodexProvider {
         )
             .into_response()
     }
+}
+
+fn continuation_enabled_for_transport(
+    configured: bool,
+    effective_transport: config::CodexTransport,
+) -> bool {
+    configured && effective_transport != config::CodexTransport::Http
 }
 
 async fn count_codex_tokens_bounded(
@@ -685,11 +708,12 @@ impl LiveReplayState {
             if delay.exceeds_budget {
                 return Err(error);
             }
-            drop_live_continuation_for_retry(&mut self.continuation);
+            abandon_live_continuation_for_http(&mut self.continuation, ctx.lane_key.as_ref());
             self.active_transport = config::CodexTransport::Http;
             return Ok(delay.wait_ms);
         }
-        let dropped = drop_live_continuation_for_retry(&mut self.continuation);
+        let dropped =
+            drop_live_continuation_for_retry(&mut self.continuation, ctx.lane_key.as_ref());
         if dropped && is_missing_previous_response_error(&error) {
             self.attempt = self.attempt.saturating_add(1);
             return Ok(0);
@@ -803,16 +827,16 @@ impl LiveContinuationCapture {
 }
 
 fn update_live_continuation_from_capture(
-    session_id: Option<&str>,
+    lane_key: Option<&RequestLaneKey>,
     turn_id: Option<u64>,
     capture: Option<&LiveContinuationCapture>,
 ) {
     let Some(capture) = capture else {
-        abort_continuation(session_id, turn_id);
+        abort_continuation(lane_key, turn_id);
         return;
     };
     update_continuation_from_upstream(
-        session_id,
+        lane_key,
         turn_id,
         &capture.request_body,
         &capture.upstream_sse_body,
@@ -851,7 +875,7 @@ async fn live_stream_response(
     {
         Ok(response) => response,
         Err(_) => {
-            abort_continuation(ctx.session_id.as_deref(), turn_id);
+            abort_continuation(ctx.lane_key.as_ref(), turn_id);
             map_codex_error_to_response(&client::codex_total_timeout_error(
                 transport,
                 deadline.timeout_ms(),
@@ -881,16 +905,22 @@ async fn live_stream_response_inner(
         request_byte_lease,
         continuation,
     );
-    let turn_id = replay_state.turn_id();
+    if replay_state.configured_transport == config::CodexTransport::Http {
+        // This is normally already disabled by the request handler. Keep the
+        // replay state defensive for direct/test callers so an HTTP response
+        // can never be published as a future `store:false` continuation.
+        abandon_live_continuation_for_http(&mut replay_state.continuation, ctx.lane_key.as_ref());
+    }
     // Auto may fall back once, but it never switches back to WebSocket within
     // the same logical request. This prevents retry multiplication.
     if replay_state.configured_transport == config::CodexTransport::Auto
         && websocket::codex_websocket_circuit_open(&replay_state.circuit_key)
     {
         client::log_websocket_circuit_fallback(&ctx);
-        drop_live_continuation_for_retry(&mut replay_state.continuation);
+        abandon_live_continuation_for_http(&mut replay_state.continuation, ctx.lane_key.as_ref());
         replay_state.active_transport = config::CodexTransport::Http;
     }
+    let turn_id = replay_state.turn_id();
 
     loop {
         let upstream_events = match replay_state.open_upstream(&ctx, deadline).await {
@@ -903,7 +933,7 @@ async fn live_stream_response_inner(
                     continue;
                 }
                 Err(error) => {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation(ctx.lane_key.as_ref(), turn_id);
                     return map_codex_error_to_response(&error);
                 }
             },
@@ -952,7 +982,7 @@ async fn live_stream_response_inner(
                         }
                     }
                     Err(error) => {
-                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        abort_continuation(ctx.lane_key.as_ref(), turn_id);
                         return map_codex_error_to_response(&error);
                     }
                 }
@@ -1100,7 +1130,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                         replay_state,
                     };
                 }
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_continuation(ctx.lane_key.as_ref(), turn_id);
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
@@ -1109,13 +1139,12 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
             replay_state = None;
         }
         log_native_web_search_phase(&ctx, &payload, provider_started_at);
-        record_codex_generation_start(&ctx, &payload, provider_started_at, &mut generation_started);
         if continuation_capture
             .as_mut()
             .is_some_and(|capture| !capture.append(&payload))
         {
             continuation_capture = None;
-            abort_continuation(ctx.session_id.as_deref(), turn_id);
+            abort_continuation(ctx.lane_key.as_ref(), turn_id);
         }
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, &ctx)
         {
@@ -1137,15 +1166,37 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                             replay_state,
                         };
                     }
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation(ctx.lane_key.as_ref(), turn_id);
                     return LiveStreamStart::Response(map_codex_error_to_response(&error));
                 }
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_continuation(ctx.lane_key.as_ref(), turn_id);
                 return LiveStreamStart::Response(map_codex_payload_failure_to_response(
                     &payload, &message,
                 ));
             }
         };
+        // Record generation only after the reducer has validated the event. Lifecycle
+        // acknowledgements such as response.created establish transport readiness, not TTFT.
+        record_codex_generation_start(&ctx, &payload, provider_started_at, &mut generation_started);
+        if chunk.is_empty() && codex_response_created(&payload) {
+            // Commit HTTP/SSE transport immediately while keeping Anthropic message_start and
+            // semantic output uncommitted. This removes the fixed heartbeat floor without
+            // sacrificing the existing created -> explicit retryable-failure recovery contract.
+            record_codex_response_created_commit(&ctx, provider_started_at, replay_state.is_some());
+            return LiveStreamStart::Response(remaining_live_stream_response_with_replay(
+                upstream_events,
+                translator,
+                DOWNSTREAM_PING.to_vec(),
+                ctx,
+                turn_id,
+                continuation_capture,
+                provider_started_at,
+                deadline,
+                generation_started,
+                keepalive_delay,
+                replay_state,
+            ));
+        }
         if !chunk.is_empty() {
             replay_state = None;
             record_live_stream_progress(&ctx, &chunk);
@@ -1156,7 +1207,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                     payload.get("type").and_then(serde_json::Value::as_str),
                 );
                 update_live_continuation_from_capture(
-                    ctx.session_id.as_deref(),
+                    ctx.lane_key.as_ref(),
                     turn_id,
                     continuation_capture.as_ref(),
                 );
@@ -1183,7 +1234,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                 payload.get("type").and_then(serde_json::Value::as_str),
             );
             update_live_continuation_from_capture(
-                ctx.session_id.as_deref(),
+                ctx.lane_key.as_ref(),
                 turn_id,
                 continuation_capture.as_ref(),
             );
@@ -1199,7 +1250,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
         origin: client::CodexErrorOrigin::WebSocket,
     };
     if hosted_side_effect_started {
-        abort_continuation(ctx.session_id.as_deref(), turn_id);
+        abort_continuation(ctx.lane_key.as_ref(), turn_id);
         LiveStreamStart::Response(map_codex_error_to_response(&error))
     } else {
         LiveStreamStart::Retry {
@@ -1210,10 +1261,42 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
 }
 
 fn codex_generation_event(payload: &serde_json::Value) -> bool {
-    !matches!(
-        payload.get("type").and_then(|value| value.as_str()),
-        Some("codex.rate_limits" | "codex.response.metadata" | "keepalive") | None
+    matches!(
+        payload.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "response.output_item.added"
+                | "response.output_item.done"
+                | "response.content_part.added"
+                | "response.content_part.done"
+                | "response.output_text.delta"
+                | "response.output_text.done"
+                | "response.output_text.annotation.added"
+                | "response.function_call_arguments.delta"
+                | "response.function_call_arguments.done"
+                | "response.reasoning_summary_part.added"
+                | "response.reasoning_summary_part.done"
+                | "response.reasoning_summary_text.delta"
+                | "response.reasoning_summary_text.done"
+                | "response.web_search_call.in_progress"
+                | "response.web_search_call.searching"
+                | "response.web_search_call.completed"
+                | "response.completed"
+                | "response.done"
+                | "response.incomplete"
+        )
     )
+}
+
+fn codex_response_created(payload: &serde_json::Value) -> bool {
+    payload.get("type").and_then(serde_json::Value::as_str) == Some("response.created")
+}
+
+fn live_payload_closes_replay_window(payload: &serde_json::Value) -> bool {
+    !events::is_ignorable_control_event(payload)
+        && !matches!(
+            payload.get("type").and_then(serde_json::Value::as_str),
+            Some("codex.rate_limits" | "response.created")
+        )
 }
 
 fn record_codex_generation_start(
@@ -1232,6 +1315,11 @@ fn record_codex_generation_start(
     *generation_started = true;
 }
 
+struct CodexContinuationLog<'a> {
+    enabled: bool,
+    candidate: &'a continuation::ContinuationCandidate,
+}
+
 fn log_codex_request_configuration(
     ctx: &RequestContext,
     request: &translate::request::ResponsesRequest,
@@ -1239,6 +1327,7 @@ fn log_codex_request_configuration(
     native_web_search: bool,
     transport: config::CodexTransportDecision,
     requested_max_tokens: u32,
+    continuation: CodexContinuationLog<'_>,
 ) {
     let service_tier = request.service_tier.as_ref().map(|tier| match tier {
         ServiceTier::Priority => "priority",
@@ -1277,6 +1366,15 @@ fn log_codex_request_configuration(
             });
     let function_tool_count = top_level_function_tools + input_function_tools;
     let hosted_tool_count = top_level_hosted_tools + input_hosted_tools;
+    let hydration_loaded_group_count = request.deferred_tool_hydration.loaded_groups.len();
+    let hydration_loaded_result_count = request
+        .deferred_tool_hydration
+        .loaded_groups
+        .iter()
+        .map(|group| group.results.len())
+        .sum::<usize>();
+    let hydration_unavailable_result_count =
+        request.deferred_tool_hydration.unavailable_results.len();
     let lane_reason = if use_responses_lite {
         "responses_lite"
     } else if native_web_search {
@@ -1340,10 +1438,30 @@ fn log_codex_request_configuration(
                 "inputFunctionToolCount".to_string(),
                 serde_json::json!(input_function_tools),
             ),
+            (
+                "hydrationLoadedGroupCount".to_string(),
+                serde_json::json!(hydration_loaded_group_count),
+            ),
+            (
+                "hydrationLoadedResultCount".to_string(),
+                serde_json::json!(hydration_loaded_result_count),
+            ),
+            (
+                "hydrationUnavailableResultCount".to_string(),
+                serde_json::json!(hydration_unavailable_result_count),
+            ),
+            (
+                "hydrationAmbiguous".to_string(),
+                serde_json::json!(request.deferred_tool_hydration.ambiguous),
+            ),
             ("laneReason".to_string(), serde_json::json!(lane_reason)),
             (
                 "anthropicMaxTokens".to_string(),
                 serde_json::json!(requested_max_tokens),
+            ),
+            (
+                "continuation".to_string(),
+                codex_continuation_log_fields(continuation.enabled, continuation.candidate),
             ),
             (
                 "outputBudgetEnforcement".to_string(),
@@ -1351,6 +1469,21 @@ fn log_codex_request_configuration(
             ),
         ])),
     );
+}
+
+fn codex_continuation_log_fields(
+    enabled: bool,
+    continuation: &continuation::ContinuationCandidate,
+) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": enabled,
+        "usedPreviousResponse": continuation.previous_response_id.is_some(),
+        "matchedCandidateRank": continuation.matched_candidate_rank,
+        "candidateCount": continuation.candidate_count,
+        "responseAffineFork": continuation.response_affine_fork,
+        "inputDeltaCount": continuation.input_delta_count,
+        "disabledReason": continuation.disabled_reason.as_deref(),
+    })
 }
 
 fn native_web_search_phase(payload: &serde_json::Value) -> Option<&'static str> {
@@ -1448,6 +1581,41 @@ fn record_codex_stream_commit(
                 "generationStarted": generation_started,
                 "semanticEmitted": false,
                 "heartbeatIntervalMs": heartbeat_interval.as_millis(),
+            }),
+        );
+    }
+}
+
+fn record_codex_response_created_commit(
+    ctx: &RequestContext,
+    provider_started_at: Instant,
+    replay_window_open: bool,
+) {
+    crate::logging::create_logger("codex").info(
+        "stream_committed_on_response_created",
+        Some(serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(ctx.req_id)),
+            (
+                "elapsedMs".to_string(),
+                serde_json::json!(provider_started_at.elapsed().as_millis()),
+            ),
+            ("semanticEmitted".to_string(), serde_json::json!(false)),
+            ("downstreamEvent".to_string(), serde_json::json!("ping")),
+            (
+                "replayWindowOpen".to_string(),
+                serde_json::json!(replay_window_open),
+            ),
+        ])),
+    );
+    if let Some(traffic) = ctx.traffic.as_deref() {
+        traffic.write_json_event(
+            "stream-commit",
+            &serde_json::json!({
+                "committedOn": "response.created",
+                "downstreamEvent": "ping",
+                "elapsedMs": provider_started_at.elapsed().as_millis(),
+                "semanticEmitted": false,
+                "replayWindowOpen": replay_window_open,
             }),
         );
     }
@@ -1553,7 +1721,7 @@ fn finish_live_stream_after_downstream_stall(
     ctx: &RequestContext,
     turn_id: Option<u64>,
 ) {
-    abort_continuation(ctx.session_id.as_deref(), turn_id);
+    abort_continuation(ctx.lane_key.as_ref(), turn_id);
     let chunk = translator.error_chunk(
         "Claude Code did not consume the proxy response for 60 seconds",
         "api_error",
@@ -1576,7 +1744,7 @@ fn finish_live_stream_at_deadline(
     turn_id: Option<u64>,
     deadline: client::CodexRequestDeadline,
 ) {
-    abort_continuation(ctx.session_id.as_deref(), turn_id);
+    abort_continuation(ctx.lane_key.as_ref(), turn_id);
     let error =
         client::codex_total_timeout_error(config::CodexTransport::WebSocket, deadline.timeout_ms());
     let chunk = translator.error_chunk(&error.message, "api_error", ctx.traffic.as_deref());
@@ -1821,7 +1989,7 @@ fn remaining_live_stream_response_with_replay(
         let mut terminal_permit = match tx.clone().try_reserve_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
-                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                abort_continuation(ctx.lane_key.as_ref(), turn_id);
                 return;
             }
         };
@@ -1830,7 +1998,7 @@ fn remaining_live_stream_response_with_replay(
                 match send_live_chunk_before_deadline(&tx, &byte_budget, $chunk, deadline).await {
                     LiveChunkSendOutcome::Sent => {}
                     LiveChunkSendOutcome::Closed => {
-                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        abort_continuation(ctx.lane_key.as_ref(), turn_id);
                         return;
                     }
                     LiveChunkSendOutcome::Deadline => {
@@ -1853,7 +2021,7 @@ fn remaining_live_stream_response_with_replay(
                         return;
                     }
                     LiveChunkSendOutcome::TooLarge => {
-                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        abort_continuation(ctx.lane_key.as_ref(), turn_id);
                         let chunk = translator.error_chunk(
                             "Codex translated stream chunk exceeded the queue byte limit",
                             "api_error",
@@ -1899,13 +2067,13 @@ fn remaining_live_stream_response_with_replay(
                         translator = state.fresh_translator();
                         continuation_capture = state.fresh_continuation_capture();
                         if continuation_capture.is_none() {
-                            abort_continuation(ctx.session_id.as_deref(), turn_id);
+                            abort_continuation(ctx.lane_key.as_ref(), turn_id);
                         }
                         continue;
                     }
                     LiveReopenOutcome::Rejected(error) => {
                         drop(replay_state.take());
-                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        abort_continuation(ctx.lane_key.as_ref(), turn_id);
                         record_codex_terminal_resolution(
                             &ctx,
                             non_authoritative_close_authority(
@@ -1928,7 +2096,7 @@ fn remaining_live_stream_response_with_replay(
                     }
                     LiveReopenOutcome::Closed => {
                         drop(replay_state.take());
-                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        abort_continuation(ctx.lane_key.as_ref(), turn_id);
                         return;
                     }
                     LiveReopenOutcome::Deadline => {
@@ -1954,7 +2122,7 @@ fn remaining_live_stream_response_with_replay(
                     }
                     LiveReopenOutcome::TooLarge => {
                         drop(replay_state.take());
-                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        abort_continuation(ctx.lane_key.as_ref(), turn_id);
                         let chunk = translator.error_chunk(
                             "Codex translated stream chunk exceeded the queue byte limit",
                             "api_error",
@@ -1982,7 +2150,7 @@ fn remaining_live_stream_response_with_replay(
             let item = tokio::select! {
                 biased;
                 _ = tx.closed() => {
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation(ctx.lane_key.as_ref(), turn_id);
                     return;
                 }
                 _ = tokio::time::sleep_until(deadline.at()) => {
@@ -2012,26 +2180,12 @@ fn remaining_live_stream_response_with_replay(
                         replay_state = None;
                     }
                     log_native_web_search_phase(&ctx, &payload, provider_started_at);
-                    let generation_started_before = generation_started;
-                    record_codex_generation_start(
-                        &ctx,
-                        &payload,
-                        provider_started_at,
-                        &mut generation_started,
-                    );
-                    // A prior generation event already makes a second model dispatch
-                    // unsafe. The current payload itself may still be the first
-                    // retryable failure after a transport-only ping, so only close
-                    // for history that predates this event here.
-                    if generation_started_before {
-                        replay_state = None;
-                    }
                     if continuation_capture
                         .as_mut()
                         .is_some_and(|capture| !capture.append(&payload))
                     {
                         continuation_capture = None;
-                        abort_continuation(ctx.session_id.as_deref(), turn_id);
+                        abort_continuation(ctx.lane_key.as_ref(), turn_id);
                     }
                     let (chunk, terminal) =
                         match translate_live_stream_payload(&mut translator, &payload, &ctx) {
@@ -2048,7 +2202,7 @@ fn remaining_live_stream_response_with_replay(
                                         live_payload_codex_error(&payload, message, transport);
                                     reopen_or_stop!(error);
                                 }
-                                abort_continuation(ctx.session_id.as_deref(), turn_id);
+                                abort_continuation(ctx.lane_key.as_ref(), turn_id);
                                 let error_type = codex_stream_payload_error_type(&payload);
                                 let chunk = translator.error_chunk(
                                     &message,
@@ -2062,11 +2216,18 @@ fn remaining_live_stream_response_with_replay(
                                 return;
                             }
                         };
-                    // Successfully classified generation (for example response.created)
-                    // has begun even when no Anthropic text/tool bytes were produced.
-                    // Close the post-ping gate before any later transport or 503 path
-                    // can open a second model dispatch.
-                    if generation_started {
+                    // Keep TTFT tied to a reducer-validated generation event. A transport ping,
+                    // response lifecycle acknowledgement, or malformed failure is not output.
+                    record_codex_generation_start(
+                        &ctx,
+                        &payload,
+                        provider_started_at,
+                        &mut generation_started,
+                    );
+                    // Only a transport ping has been committed so far. `response.created` remains
+                    // non-semantic and preserves the same explicit-failure recovery contract as
+                    // buffered mode; any other classified response event closes the replay gate.
+                    if live_payload_closes_replay_window(&payload) {
                         replay_state = None;
                     }
                     if !chunk.is_empty() {
@@ -2081,7 +2242,7 @@ fn remaining_live_stream_response_with_replay(
                             payload.get("type").and_then(serde_json::Value::as_str),
                         );
                         update_live_continuation_from_capture(
-                            ctx.session_id.as_deref(),
+                            ctx.lane_key.as_ref(),
                             turn_id,
                             continuation_capture.as_ref(),
                         );
@@ -2093,7 +2254,7 @@ fn remaining_live_stream_response_with_replay(
                         reopen_or_stop!(err);
                     }
                     drop(replay_state.take());
-                    abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    abort_continuation(ctx.lane_key.as_ref(), turn_id);
                     let chunk = translator.finish_after_closed_completed_tool_call(
                         config::codex_unsafe_salvage_tool_call_on_close(),
                         ctx.traffic.as_deref(),
@@ -2134,7 +2295,7 @@ fn remaining_live_stream_response_with_replay(
             }
         }
 
-        abort_continuation(ctx.session_id.as_deref(), turn_id);
+        abort_continuation(ctx.lane_key.as_ref(), turn_id);
         let chunk = translator.finish_after_closed_completed_tool_call(
             config::codex_unsafe_salvage_tool_call_on_close(),
             ctx.traffic.as_deref(),
@@ -2238,7 +2399,24 @@ fn is_missing_previous_response_error(err: &client::CodexError) -> bool {
     err.detail.as_deref() == Some("previous_response_not_found")
 }
 
-fn drop_live_continuation_for_retry(continuation: &mut Option<ContinuationCandidate>) -> bool {
+fn abandon_live_continuation_for_http(
+    continuation: &mut Option<ContinuationCandidate>,
+    lane_key: Option<&RequestLaneKey>,
+) {
+    let turn_id = continuation
+        .as_ref()
+        .and_then(|candidate| candidate.turn_id);
+    if let Some(key) = lane_key {
+        websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+    }
+    abort_continuation(lane_key, turn_id);
+    *continuation = None;
+}
+
+fn drop_live_continuation_for_retry(
+    continuation: &mut Option<ContinuationCandidate>,
+    lane_key: Option<&RequestLaneKey>,
+) -> bool {
     if continuation
         .as_ref()
         .and_then(|candidate| candidate.previous_response_id.as_deref())
@@ -2248,7 +2426,11 @@ fn drop_live_continuation_for_retry(continuation: &mut Option<ContinuationCandid
     }
 
     if let Some(candidate) = continuation.as_mut() {
+        discard_pending_fallback(lane_key, candidate.turn_id);
         candidate.previous_response_id = None;
+        candidate.matched_candidate_rank = None;
+        candidate.candidate_count = 0;
+        candidate.response_affine_fork = false;
         candidate.input_delta = None;
         candidate.disabled_reason = Some("full_context_retry".to_string());
     }
@@ -2345,12 +2527,12 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
 }
 
 fn update_continuation_from_finish_metadata(
-    session_id: Option<&str>,
+    lane_key: Option<&RequestLaneKey>,
     turn_id: Option<u64>,
     request_body: &translate::request::ResponsesRequest,
     finish: Option<&FinishMetadata>,
 ) {
-    if session_id.is_none() || turn_id.is_none() {
+    if lane_key.is_none() || turn_id.is_none() {
         return;
     }
     // The upstream response id refers to the raw structured JSON, while the
@@ -2366,38 +2548,38 @@ fn update_continuation_from_finish_metadata(
         );
         crate::logging::create_logger("codex")
             .debug("Codex continuation was not recorded", Some(fields));
-        abort_continuation(session_id, turn_id);
+        abort_continuation(lane_key, turn_id);
         return;
     }
     match finish {
         Some(finish) if finish.continuation_eligible => {
             record_continuation(
-                session_id,
+                lane_key,
                 turn_id,
                 request_body,
                 finish.response_id.as_deref(),
                 &finish.output_items,
             );
         }
-        _ => abort_continuation(session_id, turn_id),
+        _ => abort_continuation(lane_key, turn_id),
     }
 }
 
 fn update_continuation_from_upstream(
-    session_id: Option<&str>,
+    lane_key: Option<&RequestLaneKey>,
     turn_id: Option<u64>,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
 ) {
-    if session_id.is_none() || turn_id.is_none() || request_body.schema_bridge.is_some() {
-        update_continuation_from_finish_metadata(session_id, turn_id, request_body, None);
+    if lane_key.is_none() || turn_id.is_none() || request_body.schema_bridge.is_some() {
+        update_continuation_from_finish_metadata(lane_key, turn_id, request_body, None);
         return;
     }
     let tool_policy = ToolCallPolicy::from_request(request_body);
     let finish = finish_metadata_from_upstream_with_tool_policy(upstream_body, &tool_policy)
         .ok()
         .flatten();
-    update_continuation_from_finish_metadata(session_id, turn_id, request_body, finish.as_ref());
+    update_continuation_from_finish_metadata(lane_key, turn_id, request_body, finish.as_ref());
 }
 
 // ---------------------------------------------------------------------------
@@ -2663,11 +2845,59 @@ mod tests {
     use http_body_util::BodyExt;
     use std::time::Duration;
 
+    fn test_lane_key(label: &str) -> RequestLaneKey {
+        RequestLaneKey::for_test(label)
+    }
+
     #[test]
     fn stream_heartbeat_is_clamped_to_safe_bounds() {
         assert_eq!(stream_heartbeat_duration(1), MIN_STREAM_HEARTBEAT);
         assert_eq!(stream_heartbeat_duration(5_000), DEFAULT_STREAM_HEARTBEAT);
         assert_eq!(stream_heartbeat_duration(120_000), MAX_STREAM_HEARTBEAT);
+    }
+
+    #[test]
+    fn http_transport_disables_and_cannot_publish_continuation_state() {
+        let _state_guard = CODEX_STATE_TEST_LOCK.blocking_lock();
+        continuation::clear_all_continuations_for_tests();
+        let lane_key = test_lane_key("http-continuation-disabled");
+        let request = live_test_request();
+
+        assert!(!continuation_enabled_for_transport(
+            true,
+            config::CodexTransport::Http,
+        ));
+        assert!(!continuation_enabled_for_transport(
+            false,
+            config::CodexTransport::WebSocket,
+        ));
+        assert!(continuation_enabled_for_transport(
+            true,
+            config::CodexTransport::WebSocket,
+        ));
+        assert!(continuation_enabled_for_transport(
+            true,
+            config::CodexTransport::Auto,
+        ));
+
+        let disabled = continuation_candidate(Some(&lane_key), &request, false);
+        assert!(disabled.turn_id.is_none());
+        assert!(disabled.previous_response_id.is_none());
+        update_continuation_from_finish_metadata(
+            Some(&lane_key),
+            disabled.turn_id,
+            &request,
+            Some(&FinishMetadata {
+                continuation_eligible: true,
+                response_id: Some("resp_http_unreachable".to_string()),
+                output_items: Vec::new(),
+            }),
+        );
+
+        let next = continuation_candidate(Some(&lane_key), &request, true);
+        assert!(next.previous_response_id.is_none());
+        assert_eq!(next.disabled_reason.as_deref(), Some("missing_state"));
+        continuation::clear_all_continuations_for_tests();
     }
 
     #[tokio::test]
@@ -2723,6 +2953,7 @@ mod tests {
         RequestContext {
             req_id: "live-retry-test".to_string(),
             session_id: None,
+            lane_key: None,
             session_seq: None,
             provider: "codex".to_string(),
             traffic: None,
@@ -2901,9 +3132,10 @@ mod tests {
     async fn structured_output_turn_does_not_record_inconsistent_continuation() {
         let _state_guard = CODEX_STATE_TEST_LOCK.lock().await;
         let session_id = "structured-continuation-test";
+        let lane_key = test_lane_key(session_id);
         let request = structured_continuation_test_request();
         assert!(request.schema_bridge.is_some());
-        let candidate = continuation_candidate(Some(session_id), &request, true);
+        let candidate = continuation_candidate(Some(&lane_key), &request, true);
         let turn_id = candidate
             .turn_id
             .expect("continuation turn should register");
@@ -2933,18 +3165,19 @@ mod tests {
         .collect::<String>();
 
         update_continuation_from_upstream(
-            Some(session_id),
+            Some(&lane_key),
             Some(turn_id),
             &request,
             upstream.as_bytes(),
         );
-        assert!(!continuation::has_continuation_for_tests(session_id));
+        assert!(!continuation::has_continuation_for_tests(&lane_key));
     }
 
     #[test]
     fn live_continuation_capture_only_exists_for_registered_turns() {
         let request = live_test_request();
-        let disabled = continuation_candidate(Some("disabled-session"), &request, false);
+        let disabled_lane = test_lane_key("disabled-session");
+        let disabled = continuation_candidate(Some(&disabled_lane), &request, false);
 
         assert!(disabled.turn_id.is_none());
         assert!(LiveContinuationCapture::for_turn(disabled.turn_id, &request, None).is_none());
@@ -3494,7 +3727,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_timing_ignores_control_events() {
+    fn generation_timing_ignores_control_lifecycle_and_failure_events() {
         assert!(!codex_generation_event(&serde_json::json!({
             "type": "codex.rate_limits"
         })));
@@ -3504,9 +3737,65 @@ mod tests {
         assert!(!codex_generation_event(&serde_json::json!({
             "type": "codex.response.metadata"
         })));
-        assert!(codex_generation_event(&serde_json::json!({
+        assert!(!codex_generation_event(&serde_json::json!({
+            "type": "response.metadata"
+        })));
+        assert!(!codex_generation_event(&serde_json::json!({
+            "type": "responsesapi.websocket_timing"
+        })));
+        assert!(!codex_generation_event(&serde_json::json!({
             "type": "response.created"
         })));
+        assert!(!codex_generation_event(&serde_json::json!({
+            "type": "response.in_progress"
+        })));
+        assert!(!codex_generation_event(&serde_json::json!({
+            "type": "response.queued"
+        })));
+        assert!(!codex_generation_event(&serde_json::json!({
+            "type": "response.failed"
+        })));
+        assert!(!codex_generation_event(&serde_json::json!({
+            "type": "response.metadata.v2"
+        })));
+        assert!(codex_generation_event(&serde_json::json!({
+            "type": "response.reasoning_summary_text.delta"
+        })));
+        assert!(codex_generation_event(&serde_json::json!({
+            "type": "response.output_item.added"
+        })));
+        assert!(codex_generation_event(&serde_json::json!({
+            "type": "response.completed"
+        })));
+    }
+
+    #[test]
+    fn continuation_request_log_fields_expose_state_without_identifiers() {
+        let continuation = continuation::ContinuationCandidate {
+            turn_id: Some(42),
+            previous_response_id: Some("resp_secret_identifier".to_string()),
+            matched_candidate_rank: Some(1),
+            candidate_count: 2,
+            response_affine_fork: false,
+            input_delta: None,
+            input_delta_count: 3,
+            disabled_reason: None,
+        };
+
+        let fields = codex_continuation_log_fields(true, &continuation);
+        assert_eq!(
+            fields,
+            serde_json::json!({
+                "enabled": true,
+                "usedPreviousResponse": true,
+                "matchedCandidateRank": 1,
+                "candidateCount": 2,
+                "responseAffineFork": false,
+                "inputDeltaCount": 3,
+                "disabledReason": null,
+            })
+        );
+        assert!(!fields.to_string().contains("resp_secret_identifier"));
     }
 
     #[test]
@@ -3556,6 +3845,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "request".to_string(),
             session_id: None,
+            lane_key: None,
             session_seq: None,
             provider: "codex".to_string(),
             traffic: None,
@@ -3708,13 +3998,14 @@ mod tests {
         let _state_guard = CODEX_STATE_TEST_LOCK.lock().await;
         continuation::clear_all_continuations_for_tests();
         let session_id = "post-output-failure";
+        let lane_key = test_lane_key(session_id);
         let request = live_test_request();
-        let candidate = continuation_candidate(Some(session_id), &request, true);
+        let candidate = continuation_candidate(Some(&lane_key), &request, true);
         let turn_id = candidate
             .turn_id
             .expect("continuation turn should register");
         assert!(continuation::is_current_turn(
-            Some(session_id),
+            Some(&lane_key),
             Some(turn_id)
         ));
         let continuation_capture = LiveContinuationCapture::for_turn(Some(turn_id), &request, None);
@@ -3726,6 +4017,7 @@ mod tests {
         let traffic_root = traffic.root().to_path_buf();
         let mut ctx = live_test_context();
         ctx.session_id = Some(session_id.to_string());
+        ctx.lane_key = Some(lane_key);
         ctx.traffic = Some(traffic);
 
         let events = post_output_failure_events(
@@ -3742,7 +4034,7 @@ mod tests {
         )
         .await;
         assert!(!continuation::is_current_turn(
-            Some(session_id),
+            Some(&lane_key),
             Some(turn_id)
         ));
         assert_eq!(
@@ -3857,6 +4149,9 @@ mod tests {
         let continuation = ContinuationCandidate {
             turn_id: Some(42),
             previous_response_id: Some("resp_failed_attempt".to_string()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 2,
+            response_affine_fork: true,
             input_delta: Some(request.input.clone()),
             input_delta_count: request.input.len(),
             disabled_reason: None,
@@ -3888,11 +4183,80 @@ mod tests {
         let continuation = state.continuation.expect("turn identity must be retained");
         assert_eq!(continuation.turn_id, Some(42));
         assert!(continuation.previous_response_id.is_none());
+        assert_eq!(continuation.matched_candidate_rank, None);
+        assert_eq!(continuation.candidate_count, 0);
+        assert!(!continuation.response_affine_fork);
         assert!(continuation.input_delta.is_none());
         assert_eq!(
             continuation.disabled_reason.as_deref(),
             Some("full_context_retry")
         );
+    }
+
+    #[test]
+    fn live_auto_http_fallback_aborts_unreachable_continuation_state() {
+        let _state_guard = CODEX_STATE_TEST_LOCK.blocking_lock();
+        continuation::clear_all_continuations_for_tests();
+        let lane_key = test_lane_key("live-auto-http-abort");
+        let mut ctx = live_test_context();
+        ctx.lane_key = Some(lane_key);
+        let request = live_test_request();
+        let candidate = continuation_candidate(Some(&lane_key), &request, true);
+        let turn_id = candidate.turn_id.expect("turn should be registered");
+        let client = Arc::new(CodexHttpClient::new_for_test(
+            "http://127.0.0.1:1/live-auto-http-abort".to_string(),
+            100,
+            100,
+            1_000,
+        ));
+        let circuit_key = client.websocket_circuit_key().to_string();
+        let mut state = LiveReplayState::new(
+            client,
+            "msg_live_auto_http_abort".to_string(),
+            "gpt-5.6-sol".to_string(),
+            request.clone(),
+            None,
+            candidate,
+        );
+        state.configured_transport = config::CodexTransport::Auto;
+        state.active_transport = config::CodexTransport::Auto;
+        state
+            .dispatch_budget
+            .reserve_model()
+            .expect("failed WebSocket attempt should already own one reservation");
+
+        state
+            .plan_retry(
+                &ctx,
+                client::CodexError {
+                    status: 0,
+                    message: "WebSocket connect failed before request".to_string(),
+                    detail: Some("websocket_pre_request".to_string()),
+                    retry_after: None,
+                    origin: client::CodexErrorOrigin::WebSocketHandshake,
+                },
+            )
+            .expect("Auto should switch a predispatch WebSocket failure to HTTP");
+
+        assert_eq!(state.active_transport, config::CodexTransport::Http);
+        assert!(state.continuation.is_none());
+        assert!(!continuation::is_current_turn(
+            Some(&lane_key),
+            Some(turn_id)
+        ));
+        // Emulate the outer HTTP success publication attempt. Turn gating must
+        // keep its unreachable response id out of the registry.
+        record_continuation(
+            Some(&lane_key),
+            Some(turn_id),
+            &request,
+            Some("resp_http_unreachable"),
+            &[],
+        );
+        let next = continuation_candidate(Some(&lane_key), &request, true);
+        assert!(next.previous_response_id.is_none());
+        websocket::record_codex_websocket_success(&circuit_key);
+        continuation::clear_all_continuations_for_tests();
     }
 
     #[tokio::test]
@@ -3936,12 +4300,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generation_start_after_heartbeat_closes_committed_replay_gate() {
+    async fn response_created_after_heartbeat_preserves_explicit_503_replay() {
         let request = live_test_request();
         let continuation = continuation_candidate(None, &request, true);
         let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
-            "must not appear",
-            "resp_forbidden_generation_replay",
+            "recovered after created",
+            "resp_created_replay",
         ))]);
         let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(3);
@@ -3954,8 +4318,9 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Upstream has begun generation after the transport-only ping. An explicit
-        // 503 must surface in-band without a second model dispatch.
+        // `response.created` has no Anthropic semantics and only a transport Ping is committed.
+        // An authoritative retryable failure can therefore still reopen with one full-context
+        // dispatch, matching buffered-mode behavior.
         upstream_tx
             .send(Ok(serde_json::json!({
                 "type": "response.created",
@@ -3974,43 +4339,39 @@ mod tests {
             axum::body::to_bytes(response.into_body(), usize::MAX),
         )
         .await
-        .expect("the committed generation barrier should finish without replay")
+        .expect("response.created explicit-failure replay should finish")
         .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("event: ping"), "{body}");
-        assert!(body.contains("event: error"), "{body}");
-        assert!(
-            body.contains("temporarily unavailable") || body.contains("server_error"),
-            "{body}"
-        );
-        assert!(!body.contains("must not appear"), "{body}");
+        assert!(body.contains("recovered after created"), "{body}");
+        assert!(!body.contains("event: error"), "{body}");
         assert_eq!(
             budget.snapshot().model,
-            1,
-            "generation start must keep the model dispatch count at 1"
+            2,
+            "created -> explicit 503 should use exactly one bounded replay"
         );
         assert_eq!(
             attempts
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .len(),
-            1,
-            "the scripted second attempt must remain unused"
+            0,
+            "the scripted recovery attempt must be consumed"
         );
     }
 
     #[tokio::test]
-    async fn generation_before_keepalive_commit_closes_post_ping_replay_gate() {
+    async fn response_created_before_heartbeat_commits_ping_and_preserves_explicit_503_replay() {
         let request = live_test_request();
         let continuation = continuation_candidate(None, &request, true);
         let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
-            "must not appear",
-            "resp_forbidden_pre_ping_generation_replay",
+            "recovered before heartbeat",
+            "resp_pre_heartbeat_replay",
         ))]);
         let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(3);
-        // Deliver generation before the keepalive grace expires so the commit
-        // path itself must drop the replay gate.
+        // Deliver response.created before the configured heartbeat. It should commit a Ping
+        // immediately and retain the authoritative explicit-failure replay gate.
         upstream_tx
             .send(Ok(serde_json::json!({
                 "type": "response.created",
@@ -4038,19 +4399,19 @@ mod tests {
             axum::body::to_bytes(response.into_body(), usize::MAX),
         )
         .await
-        .expect("generation before ping commit should still close post-ping replay")
+        .expect("pre-heartbeat response.created replay should finish")
         .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("event: ping"), "{body}");
-        assert!(body.contains("event: error"), "{body}");
-        assert!(!body.contains("must not appear"), "{body}");
-        assert_eq!(budget.snapshot().model, 1);
+        assert!(body.contains("recovered before heartbeat"), "{body}");
+        assert!(!body.contains("event: error"), "{body}");
+        assert_eq!(budget.snapshot().model, 2);
         assert_eq!(
             attempts
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .len(),
-            1
+            0
         );
     }
 
@@ -4255,8 +4616,9 @@ mod tests {
         let _state_guard = CODEX_STATE_TEST_LOCK.lock().await;
         continuation::clear_all_continuations_for_tests();
         let session_id = "post-ping-replay-capture";
+        let lane_key = test_lane_key(session_id);
         let request = live_test_request();
-        let continuation = continuation_candidate(Some(session_id), &request, true);
+        let continuation = continuation_candidate(Some(&lane_key), &request, true);
         let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
             "captured",
             "resp_second_attempt",
@@ -4265,6 +4627,7 @@ mod tests {
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(1);
         let mut ctx = live_test_context();
         ctx.session_id = Some(session_id.to_string());
+        ctx.lane_key = Some(lane_key);
         let response =
             start_scripted_heartbeat_response(upstream_rx, state, ctx, Duration::from_millis(20))
                 .await;
@@ -4278,12 +4641,12 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("captured"));
         assert_eq!(budget.snapshot().model, 2);
-        assert!(continuation::has_continuation_for_tests(session_id));
+        assert!(continuation::has_continuation_for_tests(&lane_key));
         continuation::clear_all_continuations_for_tests();
     }
 
     #[tokio::test]
-    async fn response_created_starts_downstream_after_retry_grace_with_transport_only_ping() {
+    async fn response_created_immediately_commits_transport_ping_before_heartbeat() {
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(4);
         upstream_tx
             .send(Ok(serde_json::json!({
@@ -4304,23 +4667,25 @@ mod tests {
                 None,
                 Instant::now(),
                 client::CodexRequestDeadline::from_timeout_ms(10_000),
-                Duration::from_millis(20),
+                Duration::from_secs(1),
             ),
         )
         .await
-        .expect("silent response should establish downstream SSE after its retry grace");
+        .expect("response.created should establish downstream SSE without heartbeat delay");
         let response = match response {
             LiveStreamStart::Response(response) => response,
-            LiveStreamStart::Retry { .. } => panic!("silent response should become a live stream"),
+            LiveStreamStart::Retry { .. } => {
+                panic!("accepted response should become a live stream")
+            }
         };
         let mut body = response.into_body();
         let first = tokio::time::timeout(Duration::from_millis(250), body.frame())
             .await
-            .expect("transport keepalive should be ready")
-            .expect("stream ended before transport keepalive")
-            .expect("transport keepalive frame failed")
+            .expect("transport ping should be ready")
+            .expect("stream ended before transport ping")
+            .expect("transport ping frame failed")
             .into_data()
-            .expect("transport keepalive was not data");
+            .expect("transport ping was not data");
         assert_eq!(first.as_ref(), DOWNSTREAM_PING);
         let events = crate::anthropic::sse::parse_sse_events(&first);
         assert_eq!(events.len(), 1);
@@ -4330,7 +4695,7 @@ mod tests {
         drop(body);
         tokio::time::timeout(Duration::from_millis(250), upstream_tx.closed())
             .await
-            .expect("dropping a heartbeat-only body should cancel the upstream stream");
+            .expect("dropping the accepted response body should cancel the upstream stream");
     }
 
     #[tokio::test]
@@ -4425,6 +4790,19 @@ mod tests {
             })))
             .await
             .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(monitor.snapshot().active.iter().all(|request| {
+            request.request_id != "live-retry-test" || request.generation_started_at.is_none()
+        }));
+
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"message", "id":"msg_after_ping"}
+            })))
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_millis(250), async {
             loop {
                 if monitor.snapshot().active.iter().any(|request| {
@@ -4437,7 +4815,7 @@ mod tests {
             }
         })
         .await
-        .expect("the first generation event after a ping was not recorded");
+        .expect("the first reducer-validated generation event after a ping was not recorded");
 
         drop(body);
         tokio::time::timeout(Duration::from_millis(250), upstream_tx.closed())
@@ -4449,10 +4827,6 @@ mod tests {
     async fn continuous_control_events_cannot_starve_the_ping_deadline() {
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(2);
         let producer = tokio::spawn(async move {
-            upstream_tx
-                .send(Ok(serde_json::json!({"type":"response.created"})))
-                .await
-                .unwrap();
             loop {
                 if upstream_tx
                     .send(Ok(serde_json::json!({"type":"keepalive"})))
@@ -4491,7 +4865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_created_keeps_retryable_error_recovery_during_grace() {
+    async fn response_created_transport_ping_reports_error_without_a_replay_state() {
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(4);
         upstream_tx
             .send(Ok(serde_json::json!({
@@ -4503,21 +4877,31 @@ mod tests {
         upstream_tx.send(Err(heartbeat_test_error())).await.unwrap();
         drop(upstream_tx);
 
-        assert!(matches!(
-            live_stream_response_once(
-                upstream_rx,
-                "msg_retry_grace".to_string(),
-                "gpt-5.6-sol",
-                live_test_context(),
-                None,
-                None,
-                Instant::now(),
-                client::CodexRequestDeadline::from_timeout_ms(10_000),
-                Duration::from_secs(1),
-            )
-            .await,
-            LiveStreamStart::Retry { .. }
-        ));
+        let response = live_stream_response_once(
+            upstream_rx,
+            "msg_retry_grace".to_string(),
+            "gpt-5.6-sol",
+            live_test_context(),
+            None,
+            None,
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(10_000),
+            Duration::from_secs(1),
+        )
+        .await;
+        let response = match response {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { .. } => {
+                panic!("response.created should commit a transport ping")
+            }
+        };
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("event: ping"), "{body}");
+        assert!(body.contains("event: error"), "{body}");
+        assert!(body.contains("heartbeat timed out"), "{body}");
     }
 
     #[tokio::test]

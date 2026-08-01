@@ -37,10 +37,50 @@ pub trait CliHandlers: Send + Sync {
     fn logout(&self) -> Result<()>;
 }
 
+/// Opaque, deterministic identity for one logical request lane inside a Claude session.
+///
+/// The raw session and agent identifiers are deliberately not retained here. Providers may use
+/// this value for isolated process-local state (for example continuation state or connection
+/// pools) and as opaque upstream cache affinity. It must not be treated as a reversible or
+/// user-visible identity.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestLaneKey([u8; 32]);
+
+impl RequestLaneKey {
+    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(label: &str) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let mut digest = Sha256::new();
+        digest.update(b"ccproxy-request-lane-test-v1\0");
+        digest.update(label.as_bytes());
+        Self(digest.finalize().into())
+    }
+}
+
+impl fmt::Debug for RequestLaneKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RequestLaneKey([opaque])")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub req_id: String,
     pub session_id: Option<String>,
+    pub lane_key: Option<RequestLaneKey>,
     pub session_seq: Option<u64>,
     pub provider: String,
     pub traffic: Option<Arc<TrafficCapture>>,

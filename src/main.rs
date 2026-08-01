@@ -131,6 +131,7 @@ struct ClaudeProfileConfig {
     haiku_model: &'static str,
     compaction_model: Option<&'static str>,
     context_tokens: &'static str,
+    auto_compact_window: &'static str,
     file_read_max_output_tokens: Option<&'static str>,
     workflow_size_guideline: Option<&'static str>,
     effort_level: &'static str,
@@ -160,6 +161,7 @@ impl ClaudeProfile {
                 haiku_model: "gpt-5.6-luna",
                 compaction_model: Some("gpt-5.6-terra"),
                 context_tokens: "272000",
+                auto_compact_window: "272000",
                 file_read_max_output_tokens: Some("8000"),
                 workflow_size_guideline: Some("small"),
                 // Default to high (not ultracode/xhigh) so ordinary co sessions
@@ -190,8 +192,11 @@ impl ClaudeProfile {
                 haiku_model: "grok-4.5-medium",
                 compaction_model: None,
                 context_tokens: "500000",
-                file_read_max_output_tokens: None,
-                workflow_size_guideline: None,
+                // Keep Grok's advertised capacity, but compact agent loops before full-history
+                // uploads grow into the slow 250K+ range observed in real cg sessions.
+                auto_compact_window: "272000",
+                file_read_max_output_tokens: Some("8000"),
+                workflow_size_guideline: Some("small"),
                 effort_level: "high",
                 ultracode: false,
                 explore_effort: "medium",
@@ -1498,6 +1503,11 @@ fn build_claude_command_for_profile_config(
         .arg("--agents")
         .arg(inline_agents);
     command.args(args).envs(environment);
+    if profile.compaction_model.is_none() {
+        // `Command` otherwise inherits the caller's environment. A stale GPT-profile compaction
+        // header would silently route a managed Grok compaction turn across provider families.
+        command.env_remove("ANTHROPIC_CUSTOM_HEADERS");
+    }
     if profile.file_read_max_output_tokens.is_none() {
         // Keep the Grok profile independent from a GPT-specific cap inherited
         // from the parent shell or from a previously configured launcher.
@@ -1649,7 +1659,7 @@ fn claude_profile_environment(
         ),
         (
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-            profile.context_tokens.to_string(),
+            profile.auto_compact_window.to_string(),
         ),
         ("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "90".to_string()),
         ("CLAUDE_CODE_DISABLE_1M_CONTEXT", "1".to_string()),
@@ -2639,7 +2649,7 @@ mod tests {
         assert_eq!(settings["model"], "grok-4.5");
         assert_eq!(settings["effortLevel"], "high");
         assert_eq!(settings["ultracode"], false);
-        assert!(settings.get("workflowSizeGuideline").is_none());
+        assert_eq!(settings["workflowSizeGuideline"], "small");
         assert!(
             PathBuf::from(command_env(&command, "CLAUDE_CONFIG_DIR"))
                 .ends_with(".claude-ccproxy/grok")
@@ -2663,7 +2673,7 @@ mod tests {
                 .iter()
                 .any(|model| model == "grok-composer-2.5-fast")
         );
-        assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "500000");
+        assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "272000");
         assert_eq!(command_env(&command, "ANTHROPIC_MODEL"), "grok-4.5");
         assert_eq!(
             command_env(&command, "ANTHROPIC_DEFAULT_FABLE_MODEL"),
@@ -2691,17 +2701,20 @@ mod tests {
         );
         assert_eq!(
             command_env(&command, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
-            "500000"
+            "272000"
         );
         assert_eq!(command_env(&command, "CLAUDE_CODE_DISABLE_1M_CONTEXT"), "1");
         assert_eq!(
             command_env(&command, "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"),
             "90"
         );
-        assert!(
-            command_env_optional(&command, "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS").is_none()
+        assert_eq!(
+            command_env(&command, "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"),
+            "8000"
         );
         assert!(command_env_optional(&command, "ANTHROPIC_CUSTOM_HEADERS").is_none());
+        assert!(command_env_is_removed(&command, "ANTHROPIC_CUSTOM_HEADERS"));
+        assert!(settings["env"].get("ANTHROPIC_CUSTOM_HEADERS").is_none());
     }
 
     #[test]
@@ -2850,6 +2863,12 @@ mod tests {
             })
             .flatten()
             .map(str::to_string)
+    }
+
+    fn command_env_is_removed(command: &Command, key: &str) -> bool {
+        command
+            .get_envs()
+            .any(|(name, value)| name == OsStr::new(key) && value.is_none())
     }
 
     fn command_inline_settings(command: &Command) -> serde_json::Value {

@@ -27,12 +27,29 @@ use tower::util::ServiceExt;
 
 static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
+struct IsolatedTestEnvironment {
+    _state_env: EnvGuard,
+    _state: TempDir,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
 /// Serialize all env-var-mutating tests so they never run concurrently.
-async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
+///
+/// The application records upstream failures under the process state directory.
+/// Give every smoke test an isolated state root as part of the same guard so a
+/// synthetic 502 cannot pollute the developer's real diagnostics directory.
+async fn env_lock() -> IsolatedTestEnvironment {
+    let lock = ENV_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
-        .await
+        .await;
+    let state = TempDir::new().expect("create isolated smoke-test state directory");
+    let state_env = isolate_state_dir(state.path());
+    IsolatedTestEnvironment {
+        _state_env: state_env,
+        _state: state,
+        _lock: lock,
+    }
 }
 
 /// Write a valid auth.json for `provider` under `config_dir`.

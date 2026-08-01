@@ -28,6 +28,9 @@ const CLAUDE_CODE_DEDICATED_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "Edit"];
 #[derive(Debug, Clone, Serialize)]
 pub struct GrokResponsesRequest {
     pub model: String,
+    /// Stable, opaque session affinity for xAI's automatic prompt cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     pub input: Vec<GrokInputItem>,
@@ -261,16 +264,21 @@ pub fn translate_request(
         .iter()
         .filter(|tool| tool.kind == "function")
         .count();
-    // Keep high-priority tool-calling policy ahead of the (often very large) Claude Code
-    // system prompt so Grok does not bury it under session context and serialize independent
-    // calls. Mention dedicated tools or Bash only when the effective tool choice permits them.
+    // Keep the topology-independent parallel policy ahead of the (often very large) Claude Code
+    // system prompt. This preserves a stable cache prefix as Claude dynamically expands its tool
+    // set. Topology-specific hints belong after the original system prompt so changing the set of
+    // dedicated tools does not invalidate that large static prefix.
     let hosted_web_search = guidance_tools.iter().any(|tool| tool.kind == "web_search");
     let dedicated_x_search = guidance_tools.iter().any(|tool| tool.kind == "x_search");
     if !internal_text_request && tool_calls_allowed {
         if parallel_tool_calls == Some(true) && function_tool_count >= 1 {
-            let guidance =
-                parallel_function_tool_guidance(&guidance_tools, forced_function_name.is_some());
-            prepend_guidance(&mut instructions, &guidance);
+            prepend_guidance(&mut instructions, PARALLEL_FUNCTION_TOOL_GUIDANCE);
+            if let Some(guidance) = parallel_function_tool_topology_guidance(
+                &guidance_tools,
+                forced_function_name.is_some(),
+            ) {
+                append_guidance(&mut instructions, &guidance);
+            }
         }
         if hosted_web_search {
             append_guidance(
@@ -346,6 +354,10 @@ pub fn translate_request(
     };
     Ok(GrokResponsesRequest {
         model,
+        // The provider owns session affinity because the Anthropic request body does not carry
+        // Claude Code's session header. `GrokProvider::handle_messages` fills this before the
+        // request is serialized.
+        prompt_cache_key: None,
         instructions,
         input,
         tools,
@@ -678,7 +690,10 @@ fn prepend_guidance(instructions: &mut Option<String>, guidance: &str) {
     });
 }
 
-fn parallel_function_tool_guidance(tools: &[&GrokTool], forced_function: bool) -> String {
+fn parallel_function_tool_topology_guidance(
+    tools: &[&GrokTool],
+    forced_function: bool,
+) -> Option<String> {
     let declared = tools
         .iter()
         .filter(|tool| tool.kind == "function")
@@ -690,23 +705,26 @@ fn parallel_function_tool_guidance(tools: &[&GrokTool], forced_function: bool) -
         .collect::<Vec<_>>();
     let has_bash = declared.contains("Bash");
 
-    let mut guidance = PARALLEL_FUNCTION_TOOL_GUIDANCE.to_owned();
+    let mut guidance = Vec::new();
     if forced_function {
-        guidance.push_str(
-            " Because this request forces one function, issue parallel calls only to that selected function.",
+        guidance.push(
+            "Because this request forces one function, issue parallel calls only to that selected function."
+                .to_string(),
         );
     }
     if has_bash && !dedicated.is_empty() {
-        guidance.push_str(" Prefer the declared dedicated tools (");
-        guidance.push_str(&dedicated.join(", "));
-        guidance.push_str(") over one large Bash script that combines independent lookups.");
+        guidance.push(format!(
+            "Prefer the declared dedicated tools ({}) over one large Bash script that combines independent lookups.",
+            dedicated.join(", ")
+        ));
     }
     if has_bash {
-        guidance.push_str(
-            " Keep each Bash command focused and avoid packing unrelated work into a single shell script.",
+        guidance.push(
+            "Keep each Bash command focused and avoid packing unrelated work into a single shell script."
+                .to_string(),
         );
     }
-    guidance
+    (!guidance.is_empty()).then(|| guidance.join(" "))
 }
 
 fn parse_system(value: Option<&Value>) -> anyhow::Result<Option<String>> {
@@ -1792,6 +1810,7 @@ mod tests {
         for forced in ["Read", "Bash"] {
             let request: MessagesRequest = serde_json::from_value(serde_json::json!({
                 "model":"grok-4.5",
+                "system":"STATIC FORCED SYSTEM",
                 "tools":[{
                     "name":"Read",
                     "strict":true,
@@ -1828,8 +1847,14 @@ mod tests {
             assert_eq!(translated["parallel_tool_calls"], true);
 
             let instructions = translated["instructions"].as_str().unwrap();
-            assert!(instructions.starts_with(PARALLEL_FUNCTION_TOOL_GUIDANCE));
+            let stable_prefix =
+                format!("{PARALLEL_FUNCTION_TOOL_GUIDANCE}\n\nSTATIC FORCED SYSTEM");
+            assert!(instructions.starts_with(&stable_prefix));
             assert!(instructions.contains("only to that selected function"));
+            assert!(
+                instructions.find("only to that selected function").unwrap()
+                    > instructions.find("STATIC FORCED SYSTEM").unwrap()
+            );
             assert!(instructions.contains(&format!("When calling {forced}")));
             for other in ["Read", "Grep", "Bash"]
                 .into_iter()
@@ -1857,9 +1882,10 @@ mod tests {
 
     #[test]
     fn grok_parallel_tool_guidance_is_prepended_before_large_system_prompt() {
+        let system = format!("SESSION CONTEXT {}", "x ".repeat(200));
         let request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model":"grok-4.5",
-            "system": format!("SESSION CONTEXT {}", "x ".repeat(200)),
+            "system":system,
             "tools":[
                 {"name":"Read","input_schema":{"type":"object"}},
                 {"name":"Bash","input_schema":{"type":"object"}},
@@ -1871,17 +1897,122 @@ mod tests {
 
         let translated = translate_request(&request, "grok-4.5".into()).unwrap();
         let instructions = translated.instructions.unwrap();
-        assert!(instructions.starts_with(PARALLEL_FUNCTION_TOOL_GUIDANCE));
-        assert!(instructions.contains("SESSION CONTEXT"));
+        let stable_prefix = format!("{PARALLEL_FUNCTION_TOOL_GUIDANCE}\n\n{system}");
+        assert!(instructions.starts_with(&stable_prefix));
         assert!(instructions.contains("declared dedicated tools (Read, Grep)"));
         assert!(instructions.contains("one large Bash script"));
         assert!(instructions.contains("Keep each Bash command focused"));
         assert!(!instructions.contains("Glob"));
         assert!(!instructions.contains("Edit"));
-        let guidance_end = PARALLEL_FUNCTION_TOOL_GUIDANCE.len();
         assert!(
-            instructions[guidance_end..].contains("SESSION CONTEXT"),
-            "session context should remain after the parallel-tool policy"
+            instructions.find("declared dedicated tools").unwrap() >= stable_prefix.len(),
+            "topology-specific guidance should follow the static system prompt"
+        );
+    }
+
+    #[test]
+    fn grok_parallel_guidance_keeps_large_system_prefix_across_tool_expansion() {
+        let system = format!(
+            "STATIC SESSION CONTEXT\n{}",
+            "repository rules\n".repeat(500)
+        );
+        let compact_tools = vec![
+            serde_json::json!({"name":"Read","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Grep","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Bash","input_schema":{"type":"object"}}),
+        ];
+        let mut expanded_tools = vec![
+            serde_json::json!({"name":"Read","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Grep","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Glob","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Edit","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Bash","input_schema":{"type":"object"}}),
+        ];
+        expanded_tools.extend((0..34).map(|index| {
+            serde_json::json!({
+                "name":format!("DynamicTool{index}"),
+                "description":format!("Dynamically loaded tool {index}"),
+                "input_schema":{"type":"object"}
+            })
+        }));
+        assert_eq!(expanded_tools.len(), 39);
+
+        let translate = |tools: Vec<Value>| {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "system":system,
+                "tools":tools,
+                "messages":[{"role":"user","content":"inspect the repository"}]
+            }))
+            .unwrap();
+            translate_request(&request, "grok-4.5".into())
+                .unwrap()
+                .instructions
+                .unwrap()
+        };
+        let compact = translate(compact_tools);
+        let expanded = translate(expanded_tools);
+        let stable_prefix = format!("{PARALLEL_FUNCTION_TOOL_GUIDANCE}\n\n{system}");
+
+        assert!(compact.starts_with(&stable_prefix));
+        assert!(expanded.starts_with(&stable_prefix));
+        assert_eq!(
+            &compact.as_bytes()[..stable_prefix.len()],
+            &expanded.as_bytes()[..stable_prefix.len()]
+        );
+        assert!(compact.contains("declared dedicated tools (Read, Grep)"));
+        assert!(!compact.contains("Glob"));
+        assert!(!compact.contains("Edit"));
+        assert!(expanded.contains("declared dedicated tools (Read, Grep, Glob, Edit)"));
+    }
+
+    #[test]
+    fn grok_parallel_guidance_is_byte_stable_and_not_duplicated_for_same_topology() {
+        let system = "STATIC SYSTEM";
+        let first_tools = vec![
+            serde_json::json!({"name":"Bash","description":"shell","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Read","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Grep","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Glob","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Edit","input_schema":{"type":"object"}}),
+        ];
+        let second_tools = vec![
+            serde_json::json!({"name":"Edit","description":"edit","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Glob","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Grep","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Read","description":"read","input_schema":{"type":"object"}}),
+            serde_json::json!({"name":"Bash","input_schema":{"type":"object"}}),
+        ];
+        let translate = |tools: Vec<Value>| {
+            let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model":"grok-4.5",
+                "system":system,
+                "tools":tools,
+                "messages":[{"role":"user","content":"inspect the repository"}]
+            }))
+            .unwrap();
+            translate_request(&request, "grok-4.5".into())
+                .unwrap()
+                .instructions
+                .unwrap()
+        };
+        let first = translate(first_tools);
+        let second = translate(second_tools);
+
+        assert_eq!(first, second);
+        assert_eq!(first.matches(PARALLEL_FUNCTION_TOOL_GUIDANCE).count(), 1);
+        assert_eq!(
+            first.matches("Prefer the declared dedicated tools").count(),
+            1
+        );
+        assert_eq!(first.matches("Keep each Bash command focused").count(), 1);
+        assert_eq!(
+            first,
+            format!(
+                "{PARALLEL_FUNCTION_TOOL_GUIDANCE}\n\n{system}\n\n\
+                 Prefer the declared dedicated tools (Read, Grep, Glob, Edit) over one large Bash script that combines independent lookups. \
+                 Keep each Bash command focused and avoid packing unrelated work into a single shell script."
+            )
         );
     }
 
@@ -2202,8 +2333,10 @@ mod tests {
         let value =
             serde_json::to_value(translate_request(&request, "grok-4.5".into()).unwrap()).unwrap();
         let instructions = value["instructions"].as_str().unwrap();
-        assert!(instructions.starts_with(PARALLEL_FUNCTION_TOOL_GUIDANCE));
-        assert!(instructions.ends_with("rules"));
+        assert!(instructions.starts_with(&format!("{PARALLEL_FUNCTION_TOOL_GUIDANCE}\n\nrules")));
+        assert!(instructions.ends_with(
+            "Because this request forces one function, issue parallel calls only to that selected function."
+        ));
         assert_eq!(value["input"][1]["type"], "function_call");
         assert_eq!(value["input"][2]["type"], "function_call_output");
         assert_eq!(value["tool_choice"]["type"], "function");

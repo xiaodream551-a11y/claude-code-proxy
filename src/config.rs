@@ -855,7 +855,7 @@ pub fn grok_client_version() -> String {
     {
         return version;
     }
-    "0.2.93".to_string()
+    "0.2.118".to_string()
 }
 
 fn grok_positive_u64(
@@ -1996,6 +1996,16 @@ mod tests {
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
         assert_eq!(codex_reasoning_summary().as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn grok_client_version_defaults_to_verified_native_cli_version() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(grok_client_version(), "0.2.118");
     }
 
     #[test]

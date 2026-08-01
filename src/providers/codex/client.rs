@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 use crate::anthropic::sse::{parse_sse_events, try_parse_sse_events};
 use crate::config;
 use crate::logging::create_logger;
-use crate::provider::RequestContext;
+use crate::provider::{RequestContext, RequestLaneKey};
 use crate::retry::{BackoffOutcome, ModelRetryBackoff, ReplaySafety, should_retry_status, sleep};
 use crate::traffic::TrafficCapture;
 
@@ -70,6 +70,10 @@ impl CodexError {
                 )
             )
         {
+            return ReplaySafety::DefinitelyNotDispatched;
+        }
+
+        if is_local_previous_response_unavailable(self) {
             return ReplaySafety::DefinitelyNotDispatched;
         }
 
@@ -322,9 +326,9 @@ impl CodexRequestDeadline {
 }
 
 struct CodexRequestGuard {
-    session_id: Option<String>,
+    lane_key: Option<RequestLaneKey>,
     turn_id: Option<u64>,
-    pool_key: Option<String>,
+    pool_key: Option<RequestLaneKey>,
     armed: bool,
 }
 
@@ -335,12 +339,12 @@ impl CodexRequestGuard {
         transport: crate::config::CodexTransport,
     ) -> Self {
         Self {
-            session_id: ctx.session_id.clone(),
+            lane_key: ctx.lane_key,
             turn_id: continuation.and_then(|candidate| candidate.turn_id),
             pool_key: if matches!(transport, crate::config::CodexTransport::Http) {
                 None
             } else {
-                websocket_pool_key(ctx, continuation).map(str::to_string)
+                websocket_pool_key(ctx, continuation).copied()
             },
             armed: true,
         }
@@ -359,10 +363,10 @@ impl Drop for CodexRequestGuard {
         // Invalidation is turn-gated, so it must run while the continuation
         // still owns the turn. Aborting first would make this a no-op and could
         // leave a partially consumed pooled socket available for reuse.
-        if let Some(key) = self.pool_key.as_deref() {
+        if let Some(key) = self.pool_key.as_ref() {
             super::websocket::invalidate_codex_websocket_pool_turn(key, self.turn_id);
         }
-        super::continuation::abort_continuation(self.session_id.as_deref(), self.turn_id);
+        super::continuation::abort_continuation(self.lane_key.as_ref(), self.turn_id);
     }
 }
 
@@ -601,12 +605,26 @@ impl CodexHttpClient {
         let mut active_continuation = continuation.cloned();
         // Auto may degrade to HTTP, but never switches back within this logical request.
         let mut active_transport = transport;
+        if active_transport == CodexTransport::Http {
+            abandon_buffered_continuation_for_http(
+                &mut active_continuation,
+                ctx.lane_key.as_ref(),
+                initial_pool_key,
+                turn_id,
+            );
+        }
         let mut auth_refresh_attempted = false;
         let mut reserved_model_replay: Option<CodexModelDispatchReservation> = None;
         let mut model_retry_backoff = ModelRetryBackoff::default();
         let mut serialized_http_body = None;
         let websocket_timeouts = super::websocket::CodexWebSocketTimeouts::configured();
+        let mut fresh_pool_reconnect_pending = false;
+        let mut local_pool_reconnect_attempted = false;
         loop {
+            // A stale/busy pooled socket is known not to have received response.create. Its one
+            // local retry must bypass both pool checkout and a half-open circuit lease acquired
+            // by this same logical request.
+            let force_fresh_websocket = std::mem::take(&mut fresh_pool_reconnect_pending);
             let reservation = match reserved_model_replay.take() {
                 Some(reservation) => reservation,
                 None => dispatch_budget
@@ -636,7 +654,7 @@ impl CodexHttpClient {
                     let ws_body = build_websocket_request(body, active_continuation.as_ref());
 
                     (
-                        super::websocket::codex_websocket_request(
+                        super::websocket::codex_websocket_request_with_pool_mode(
                             &self.base_url,
                             &ws_headers,
                             &ws_body,
@@ -645,6 +663,7 @@ impl CodexHttpClient {
                             pool_key,
                             websocket_timeouts,
                             active_continuation.as_ref(),
+                            force_fresh_websocket,
                         )
                         .await,
                         CodexTransport::WebSocket,
@@ -652,8 +671,16 @@ impl CodexHttpClient {
                 }
                 CodexTransport::Auto => {
                     let circuit_key = self.websocket_circuit_key();
-                    if super::websocket::codex_websocket_circuit_open(circuit_key) {
+                    if !force_fresh_websocket
+                        && super::websocket::codex_websocket_circuit_open(circuit_key)
+                    {
                         log_websocket_circuit_fallback(ctx);
+                        abandon_buffered_continuation_for_http(
+                            &mut active_continuation,
+                            ctx.lane_key.as_ref(),
+                            pool_key,
+                            turn_id,
+                        );
                         active_transport = CodexTransport::Http;
                         let body_json = cached_serialized_request(&mut serialized_http_body, body)?;
                         (
@@ -673,7 +700,7 @@ impl CodexHttpClient {
                         let ws_body = build_websocket_request(body, active_continuation.as_ref());
 
                         // Try WebSocket first.
-                        let ws_result = super::websocket::codex_websocket_request(
+                        let ws_result = super::websocket::codex_websocket_request_with_pool_mode(
                             &self.base_url,
                             &ws_headers,
                             &ws_body,
@@ -682,6 +709,7 @@ impl CodexHttpClient {
                             pool_key,
                             websocket_timeouts,
                             active_continuation.as_ref(),
+                            force_fresh_websocket,
                         )
                         .await;
 
@@ -702,13 +730,12 @@ impl CodexHttpClient {
                                     if delay.exceeds_budget {
                                         return Err(err);
                                     }
-                                    if let Some(key) = pool_key {
-                                        super::websocket::invalidate_codex_websocket_pool_turn(
-                                            key, turn_id,
-                                        );
-                                    }
-                                    active_continuation =
-                                        full_context_continuation(active_continuation.as_ref());
+                                    abandon_buffered_continuation_for_http(
+                                        &mut active_continuation,
+                                        ctx.lane_key.as_ref(),
+                                        pool_key,
+                                        turn_id,
+                                    );
                                     active_transport = CodexTransport::Http;
                                     if delay.wait_ms > 0 {
                                         sleep(delay.wait_ms).await;
@@ -755,11 +782,15 @@ impl CodexHttpClient {
                     Ok(new_auth) => {
                         auth = new_auth;
                         reserved_model_replay = Some(replay);
-                        if let Some(key) = pool_key {
+                        let discarded_selected_response = prepare_buffered_full_context_retry(
+                            &mut active_continuation,
+                            ctx.lane_key.as_ref(),
+                            pool_key,
+                            turn_id,
+                        );
+                        if !discarded_selected_response && let Some(key) = pool_key {
                             super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                         }
-                        active_continuation =
-                            full_context_continuation(active_continuation.as_ref());
                         continue;
                     }
                     Err(error) => return Err(auth_refresh_error(error)),
@@ -795,7 +826,12 @@ impl CodexHttpClient {
                         "upstream_event",
                         &failure.message,
                     );
-                    active_continuation = full_context_continuation(active_continuation.as_ref());
+                    prepare_buffered_full_context_retry(
+                        &mut active_continuation,
+                        ctx.lane_key.as_ref(),
+                        pool_key,
+                        turn_id,
+                    );
                     sleep(delay.wait_ms).await;
                     continue;
                 }
@@ -885,6 +921,12 @@ impl CodexHttpClient {
                             "upstream",
                             "rate limited",
                         );
+                        prepare_buffered_full_context_retry(
+                            &mut active_continuation,
+                            ctx.lane_key.as_ref(),
+                            pool_key,
+                            turn_id,
+                        );
                         sleep(delay.wait_ms).await;
                         continue;
                     }
@@ -927,6 +969,12 @@ impl CodexHttpClient {
                             "upstream",
                             "retryable upstream status",
                         );
+                        prepare_buffered_full_context_retry(
+                            &mut active_continuation,
+                            ctx.lane_key.as_ref(),
+                            pool_key,
+                            turn_id,
+                        );
                         sleep(delay.wait_ms).await;
                         continue;
                     }
@@ -944,17 +992,46 @@ impl CodexHttpClient {
                 }
                 Ok(response) => return Ok(response),
                 Err(err)
-                    if dispatch_budget.can_reserve_model()
-                        && should_retry_without_continuation(
-                            &err,
-                            active_continuation.as_ref(),
-                        ) =>
+                    if is_local_websocket_pool_predispatch_failure(&err)
+                        && !local_pool_reconnect_attempted =>
                 {
-                    if let Some(key) = pool_key {
-                        super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
-                    }
-                    active_continuation = full_context_continuation(active_continuation.as_ref());
-                    if err.detail.as_deref() != Some("previous_response_not_found") {
+                    // The pooled socket failed before response.create crossed the wire. Its
+                    // selected entry has already been detached by the WebSocket layer, so retry
+                    // once on a fresh socket with the same physical-dispatch reservation. Auto
+                    // must not turn a routine stale idle socket into a slower HTTP fallback.
+                    prepare_local_pool_reconnect_continuation(
+                        &mut active_continuation,
+                        ctx.lane_key.as_ref(),
+                    );
+                    local_pool_reconnect_attempted = true;
+                    fresh_pool_reconnect_pending = true;
+                    reserved_model_replay = Some(reservation);
+                    continue;
+                }
+                Err(err) if is_local_websocket_pool_predispatch_failure(&err) => {
+                    // The forced-fresh attempt cannot legitimately produce a pool checkout
+                    // failure. Fail closed instead of turning an invariant violation into an
+                    // extra model reservation or an eventual Auto HTTP fallback.
+                    return Err(err);
+                }
+                Err(err)
+                    if should_retry_without_continuation(&err, active_continuation.as_ref())
+                        && (is_local_previous_response_unavailable(&err)
+                            || dispatch_budget.can_reserve_model()) =>
+                {
+                    let discarded_selected_response = prepare_buffered_full_context_retry(
+                        &mut active_continuation,
+                        ctx.lane_key.as_ref(),
+                        pool_key,
+                        turn_id,
+                    );
+                    debug_assert!(discarded_selected_response);
+                    if is_local_previous_response_unavailable(&err) {
+                        // Pool lookup happened before any request frame was sent. The
+                        // reservation already held by this loop belongs to the ensuing
+                        // full-context physical dispatch; do not charge it twice.
+                        reserved_model_replay = Some(reservation);
+                    } else if err.detail.as_deref() != Some("previous_response_not_found") {
                         let delay = model_retry_backoff
                             .next_delay(err.replay_safety(), err.retry_after.as_deref())
                             .expect("replay-safe continuation recovery must have a retry delay");
@@ -984,6 +1061,12 @@ impl CodexHttpClient {
                             err.status,
                             codex_error_origin_name(err.origin),
                             &err.message,
+                        );
+                        prepare_buffered_full_context_retry(
+                            &mut active_continuation,
+                            ctx.lane_key.as_ref(),
+                            pool_key,
+                            turn_id,
                         );
                         sleep(delay.wait_ms).await;
                         continue;
@@ -1019,9 +1102,9 @@ impl CodexHttpClient {
             .map_err(auth_refresh_error)?;
 
         let turn_id = continuation.and_then(|candidate| candidate.turn_id);
-        let pool_key = websocket_pool_key(ctx, continuation).map(str::to_string);
+        let pool_key = websocket_pool_key(ctx, continuation).copied();
         if should_reset_websocket_pool(continuation)
-            && let Some(key) = pool_key.as_deref()
+            && let Some(key) = pool_key.as_ref()
         {
             super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
         }
@@ -1055,7 +1138,7 @@ impl CodexHttpClient {
         ctx: RequestContext,
         mut continuation: Option<super::continuation::ContinuationCandidate>,
         mut auth: StoredAuth,
-        pool_key: Option<String>,
+        pool_key: Option<RequestLaneKey>,
         dispatch_budget: CodexDispatchBudget,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
     ) {
@@ -1071,8 +1154,11 @@ impl CodexHttpClient {
         let mut reserved_model_replay: Option<CodexModelDispatchReservation> = None;
         let mut model_retry_backoff = ModelRetryBackoff::default();
         let websocket_timeouts = super::websocket::CodexWebSocketTimeouts::configured();
+        let mut fresh_pool_reconnect_pending = false;
+        let mut local_pool_reconnect_attempted = false;
 
         'attempt: loop {
+            let force_fresh_websocket = std::mem::take(&mut fresh_pool_reconnect_pending);
             let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
             {
                 Ok(headers) => super::websocket::codex_websocket_headers(&headers),
@@ -1098,26 +1184,41 @@ impl CodexHttpClient {
                 },
             };
             let _model_attempt = reservation.attempt;
-            let start = super::websocket::codex_websocket_event_stream(
+            let start = super::websocket::codex_websocket_event_stream_with_pool_mode(
                 &self.base_url,
                 &ws_headers,
                 &ws_body,
                 &ctx,
                 ctx.traffic.clone(),
-                pool_key.as_deref(),
+                pool_key.as_ref(),
                 websocket_timeouts,
                 continuation.as_ref(),
+                force_fresh_websocket,
             );
             let mut stream = tokio::select! {
                 _ = tx.closed() => {
-                    if let Some(key) = pool_key.as_deref() {
+                    if let Some(key) = pool_key.as_ref() {
                         super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                     }
-                    super::continuation::abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    super::continuation::abort_continuation(ctx.lane_key.as_ref(), turn_id);
                     return;
                 }
                 result = start => match result {
                     Ok(stream) => stream,
+                    Err(err)
+                        if is_local_websocket_pool_predispatch_failure(&err)
+                            && !local_pool_reconnect_attempted =>
+                    {
+                        prepare_local_pool_reconnect_continuation(
+                            &mut continuation,
+                            ctx.lane_key.as_ref(),
+                        );
+                        continuation_retry_available = false;
+                        local_pool_reconnect_attempted = true;
+                        fresh_pool_reconnect_pending = true;
+                        reserved_model_replay = Some(reservation);
+                        continue 'attempt;
+                    }
                     Err(err)
                         if err.status == 401
                             && !auth_refresh_attempted
@@ -1131,7 +1232,7 @@ impl CodexHttpClient {
                             }
                         };
                         auth_refresh_attempted = true;
-                        if let Some(key) = pool_key.as_deref() {
+                        if let Some(key) = pool_key.as_ref() {
                             super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                         }
                         let refresh = self
@@ -1140,7 +1241,7 @@ impl CodexHttpClient {
                         auth = tokio::select! {
                             _ = tx.closed() => {
                                 super::continuation::abort_continuation(
-                                    ctx.session_id.as_deref(),
+                                    ctx.lane_key.as_ref(),
                                     turn_id,
                                 );
                                 return;
@@ -1155,16 +1256,27 @@ impl CodexHttpClient {
                         };
                         reserved_model_replay = Some(replay);
                         continuation_retry_available = false;
-                        continuation = full_context_continuation(continuation.as_ref());
+                        continuation = full_context_continuation(
+                            continuation.as_ref(),
+                            ctx.lane_key.as_ref(),
+                        );
                         continue 'attempt;
                     }
                     Err(err) if continuation_retry_available && is_continuation_retry_error(&err) => {
+                        let local_pool_miss = is_local_previous_response_unavailable(&err);
                         continuation_retry_available = false;
-                        if let Some(key) = pool_key.as_deref() {
+                        if let Some(key) = pool_key.as_ref() {
                             super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                         }
-                        continuation = full_context_continuation(continuation.as_ref());
-                        if err.detail.as_deref() != Some("previous_response_not_found") {
+                        continuation = full_context_continuation(
+                            continuation.as_ref(),
+                            ctx.lane_key.as_ref(),
+                        );
+                        if local_pool_miss {
+                            // No response.create frame crossed the wire. Reuse this
+                            // reservation for the full-context physical dispatch.
+                            reserved_model_replay = Some(reservation);
+                        } else if err.detail.as_deref() != Some("previous_response_not_found") {
                             let delay = model_retry_backoff
                                 .next_delay(err.replay_safety(), err.retry_after.as_deref())
                                 .expect("replay-safe continuation recovery must have a retry delay");
@@ -1175,7 +1287,7 @@ impl CodexHttpClient {
                             tokio::select! {
                                 _ = tx.closed() => {
                                     super::continuation::abort_continuation(
-                                        ctx.session_id.as_deref(),
+                                        ctx.lane_key.as_ref(),
                                         turn_id,
                                     );
                                     return;
@@ -1195,11 +1307,11 @@ impl CodexHttpClient {
             loop {
                 let item = tokio::select! {
                     _ = tx.closed() => {
-                        if let Some(key) = pool_key.as_deref() {
+                        if let Some(key) = pool_key.as_ref() {
                             super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                         }
                         super::continuation::abort_continuation(
-                            ctx.session_id.as_deref(),
+                            ctx.lane_key.as_ref(),
                             turn_id,
                         );
                         return;
@@ -1223,7 +1335,7 @@ impl CodexHttpClient {
                         }
                     };
                     auth_refresh_attempted = true;
-                    if let Some(key) = pool_key.as_deref() {
+                    if let Some(key) = pool_key.as_ref() {
                         super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                     }
                     let refresh = self
@@ -1232,7 +1344,7 @@ impl CodexHttpClient {
                     auth = tokio::select! {
                         _ = tx.closed() => {
                             super::continuation::abort_continuation(
-                                ctx.session_id.as_deref(),
+                                ctx.lane_key.as_ref(),
                                 turn_id,
                             );
                             return;
@@ -1247,7 +1359,24 @@ impl CodexHttpClient {
                     };
                     reserved_model_replay = Some(replay);
                     continuation_retry_available = false;
-                    continuation = full_context_continuation(continuation.as_ref());
+                    continuation =
+                        full_context_continuation(continuation.as_ref(), ctx.lane_key.as_ref());
+                    continue 'attempt;
+                }
+
+                if let Err(err) = &item
+                    && is_local_websocket_pool_predispatch_failure(err)
+                    && !replay_window_closed
+                    && !local_pool_reconnect_attempted
+                {
+                    prepare_local_pool_reconnect_continuation(
+                        &mut continuation,
+                        ctx.lane_key.as_ref(),
+                    );
+                    continuation_retry_available = false;
+                    local_pool_reconnect_attempted = true;
+                    fresh_pool_reconnect_pending = true;
+                    reserved_model_replay = Some(reservation);
                     continue 'attempt;
                 }
 
@@ -1256,7 +1385,10 @@ impl CodexHttpClient {
                     && is_continuation_retry_error(err)
                     && !replay_window_closed
                 {
-                    let delay = if err.detail.as_deref() == Some("previous_response_not_found") {
+                    let local_pool_miss = is_local_previous_response_unavailable(err);
+                    let delay = if local_pool_miss
+                        || err.detail.as_deref() == Some("previous_response_not_found")
+                    {
                         None
                     } else {
                         let delay = model_retry_backoff
@@ -1269,15 +1401,19 @@ impl CodexHttpClient {
                         Some(delay.wait_ms)
                     };
                     continuation_retry_available = false;
-                    if let Some(key) = pool_key.as_deref() {
+                    if let Some(key) = pool_key.as_ref() {
                         super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                     }
-                    continuation = full_context_continuation(continuation.as_ref());
+                    continuation =
+                        full_context_continuation(continuation.as_ref(), ctx.lane_key.as_ref());
+                    if local_pool_miss {
+                        reserved_model_replay = Some(reservation);
+                    }
                     if let Some(wait_ms) = delay {
                         tokio::select! {
                             _ = tx.closed() => {
                                 super::continuation::abort_continuation(
-                                    ctx.session_id.as_deref(),
+                                    ctx.lane_key.as_ref(),
                                     turn_id,
                                 );
                                 return;
@@ -1295,10 +1431,10 @@ impl CodexHttpClient {
                     super::events::CodexTerminalKind::from_payload(payload).is_some()
                 });
                 if tx.send(item).await.is_err() {
-                    if let Some(key) = pool_key.as_deref() {
+                    if let Some(key) = pool_key.as_ref() {
                         super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
                     }
-                    super::continuation::abort_continuation(ctx.session_id.as_deref(), turn_id);
+                    super::continuation::abort_continuation(ctx.lane_key.as_ref(), turn_id);
                     return;
                 }
                 if terminal {
@@ -1759,11 +1895,11 @@ fn decode_codex_sse_record(
     let record = if stream_start {
         record.strip_prefix(UTF8_BOM).unwrap_or(record)
     } else {
-        if record.starts_with(UTF8_BOM) {
-            return Err("Codex SSE stream contained a UTF-8 BOM after stream start".to_string());
-        }
         record
     };
+    if super::events::contains_sse_line_start_bom(record) {
+        return Err("Codex SSE stream contained a UTF-8 BOM after stream start".to_string());
+    }
     let events = try_parse_sse_events(record).map_err(|error| {
         format!(
             "Codex SSE event contained invalid UTF-8 at byte {}",
@@ -1832,7 +1968,7 @@ fn validate_live_http_payload_batch(
     let mut terminal = None;
     for payload in payloads {
         if terminal.is_some() {
-            if super::translate::reducer::is_post_terminal_telemetry(&payload) {
+            if super::events::is_post_terminal_control_event(&payload) {
                 continue;
             }
             return Err(live_http_body_error(format!(
@@ -2504,6 +2640,16 @@ pub(super) fn record_auto_websocket_failure(
     circuit_key: &str,
     err: &CodexError,
 ) -> bool {
+    if is_local_websocket_pool_predispatch_failure(err) {
+        // A stale/busy pooled entry is neutral: it neither proves a fresh WebSocket unhealthy
+        // nor proves it healthy. Preserve any real failure history already held by the breaker.
+        return false;
+    }
+    if is_local_previous_response_unavailable(err) {
+        // A response-affinity lookup miss says nothing about current network
+        // health and happened before a connection or model request existed.
+        return false;
+    }
     if !is_websocket_transport_health_failure(err) {
         // A non-transport response proves the WebSocket path is reachable and
         // breaks a run of consecutive transport failures.
@@ -2532,11 +2678,34 @@ pub(super) fn record_auto_websocket_failure(
 }
 
 fn is_websocket_transport_health_failure(err: &CodexError) -> bool {
+    if is_local_websocket_pool_predispatch_failure(err) {
+        // A stale/busy idle entry says nothing about whether a fresh WebSocket can connect. The
+        // request coordinator detaches it and reconnects without charging another dispatch.
+        return false;
+    }
     matches!(
         err.origin,
         CodexErrorOrigin::WebSocket | CodexErrorOrigin::WebSocketHandshake
     ) && err.detail.as_deref() != Some("previous_response_not_found")
+        && !is_local_previous_response_unavailable(err)
         && is_retryable_transport_error(err)
+}
+
+fn is_local_previous_response_unavailable(err: &CodexError) -> bool {
+    err.detail.as_deref() == Some(super::websocket::PREVIOUS_RESPONSE_UNAVAILABLE_DETAIL)
+}
+
+fn is_local_websocket_pool_predispatch_failure(err: &CodexError) -> bool {
+    err.status == 0
+        && err.origin == CodexErrorOrigin::WebSocket
+        && matches!(
+            err.detail.as_deref(),
+            Some(
+                super::websocket::WEBSOCKET_POOL_HEALTHCHECK_DETAIL
+                    | super::websocket::WEBSOCKET_POOL_BUSY_DETAIL
+            )
+        )
+        && err.replay_safety() == ReplaySafety::DefinitelyNotDispatched
 }
 
 pub(super) fn is_retryable_transport_error(err: &CodexError) -> bool {
@@ -2698,32 +2867,105 @@ fn should_retry_without_continuation(
     is_continuation_retry_error(err)
 }
 
+fn prepare_buffered_full_context_retry(
+    continuation: &mut Option<super::continuation::ContinuationCandidate>,
+    lane_key: Option<&RequestLaneKey>,
+    pool_key: Option<&RequestLaneKey>,
+    turn_id: Option<u64>,
+) -> bool {
+    if continuation
+        .as_ref()
+        .and_then(|candidate| candidate.previous_response_id.as_deref())
+        .is_none()
+    {
+        return false;
+    }
+    if let Some(key) = pool_key {
+        super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+    }
+    *continuation = full_context_continuation(continuation.as_ref(), lane_key);
+    true
+}
+
+fn abandon_buffered_continuation_for_http(
+    continuation: &mut Option<super::continuation::ContinuationCandidate>,
+    lane_key: Option<&RequestLaneKey>,
+    pool_key: Option<&RequestLaneKey>,
+    turn_id: Option<u64>,
+) {
+    if let Some(key) = pool_key {
+        super::websocket::invalidate_codex_websocket_pool_turn(key, turn_id);
+    }
+    super::continuation::abort_continuation(lane_key, turn_id);
+    *continuation = None;
+}
+
 fn full_context_continuation(
     continuation: Option<&super::continuation::ContinuationCandidate>,
+    lane_key: Option<&RequestLaneKey>,
 ) -> Option<super::continuation::ContinuationCandidate> {
-    continuation.map(|candidate| super::continuation::ContinuationCandidate {
-        turn_id: candidate.turn_id,
-        previous_response_id: None,
-        input_delta: None,
-        input_delta_count: candidate.input_delta_count,
-        disabled_reason: Some("full_context_retry".to_string()),
+    continuation.map(|candidate| {
+        let discarded_selected_response = candidate.previous_response_id.is_some();
+        if discarded_selected_response {
+            super::continuation::discard_pending_fallback(lane_key, candidate.turn_id);
+        }
+        super::continuation::ContinuationCandidate {
+            turn_id: candidate.turn_id,
+            previous_response_id: None,
+            matched_candidate_rank: None,
+            candidate_count: if discarded_selected_response {
+                0
+            } else {
+                candidate.candidate_count
+            },
+            response_affine_fork: false,
+            input_delta: None,
+            input_delta_count: candidate.input_delta_count,
+            disabled_reason: Some("full_context_retry".to_string()),
+        }
     })
 }
 
+fn prepare_local_pool_reconnect_continuation(
+    continuation: &mut Option<super::continuation::ContinuationCandidate>,
+    lane_key: Option<&RequestLaneKey>,
+) {
+    let Some(candidate) = continuation.as_mut() else {
+        return;
+    };
+    if candidate.previous_response_id.is_none() {
+        return;
+    }
+
+    if candidate.response_affine_fork {
+        // A rank-0 hydration branch still has one exact alternate on a different socket. The
+        // selected socket was detached before dispatch, so preserve that alternate and open a
+        // fresh full-context branch instead of collapsing both candidates.
+        candidate.previous_response_id = None;
+        candidate.matched_candidate_rank = None;
+        candidate.candidate_count = candidate.candidate_count.saturating_sub(1).max(1);
+        candidate.input_delta = None;
+        candidate.disabled_reason = Some("full_context_retry".to_string());
+    } else {
+        *continuation = full_context_continuation(continuation.as_ref(), lane_key);
+    }
+}
+
 fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
-    // `response.created` confirms that the upstream generation exists, but the
-    // live translator emits no Anthropic bytes for it. Keep the recovery window
-    // open until an event can commit semantic output such as text or tool use.
-    !matches!(
-        payload.get("type").and_then(|value| value.as_str()),
-        Some("codex.rate_limits" | "codex.response.metadata" | "keepalive" | "response.created")
-    )
+    // `response.created` now commits only a transport-level downstream Ping. Keep recovery open
+    // until an event can commit Anthropic semantic output such as text or tool use.
+    !super::events::is_ignorable_control_event(payload)
+        && !matches!(
+            payload.get("type").and_then(|value| value.as_str()),
+            Some("codex.rate_limits" | "response.created")
+        )
 }
 
 fn is_continuation_retry_error(err: &CodexError) -> bool {
     // store:false continuation state is tied to its WebSocket. Once that
     // connection is lost or detached, the retry must send full context.
-    err.detail.as_deref() == Some("previous_response_not_found")
+    is_local_previous_response_unavailable(err)
+        || err.detail.as_deref() == Some("previous_response_not_found")
         || (err.replay_safety().permits_model_replay()
             && (super::websocket::is_retryable_transport_detail(err.detail.as_deref())
                 || (err.origin == CodexErrorOrigin::WebSocketHandshake
@@ -2733,11 +2975,11 @@ fn is_continuation_retry_error(err: &CodexError) -> bool {
 fn websocket_pool_key<'a>(
     ctx: &'a RequestContext,
     _continuation: Option<&super::continuation::ContinuationCandidate>,
-) -> Option<&'a str> {
+) -> Option<&'a RequestLaneKey> {
     // Transport reuse and server-side response continuation are independent.
     // Even with previousResponseId disabled, a session WebSocket can carry a
     // later full-context response.create request without changing its payload.
-    ctx.session_id.as_deref()
+    ctx.lane_key.as_ref()
 }
 
 fn should_reset_websocket_pool(
@@ -2746,7 +2988,7 @@ fn should_reset_websocket_pool(
     let Some(reason) = continuation.and_then(|c| c.disabled_reason.as_deref()) else {
         return false;
     };
-    reason != "disabled"
+    !matches!(reason, "disabled" | "not_append_only")
 }
 
 #[cfg(test)]
@@ -2754,6 +2996,10 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn test_lane_key(label: &str) -> RequestLaneKey {
+        RequestLaneKey::for_test(label)
+    }
 
     fn http_test_auth() -> StoredAuth {
         StoredAuth {
@@ -2768,6 +3014,7 @@ mod tests {
         RequestContext {
             req_id: "http-body-test".into(),
             session_id: None,
+            lane_key: None,
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
@@ -2860,6 +3107,262 @@ mod tests {
         assert!(!is_retryable_transport_error(&streamed));
     }
 
+    #[tokio::test]
+    async fn buffered_local_pool_miss_reuses_the_current_model_dispatch_reservation() {
+        use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_one_completed_websocket(
+            listener,
+            "resp_buffered_pool_miss",
+        ));
+
+        let mut request = buffered_test_request();
+        request.input = vec![ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "full context".into(),
+            }],
+        }];
+        let continuation = super::super::continuation::ContinuationCandidate {
+            turn_id: Some(41),
+            previous_response_id: Some("resp_unreachable".into()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 1,
+            response_affine_fork: false,
+            input_delta: Some(vec![ResponsesInputItem::Message {
+                role: "user".into(),
+                content: vec![ResponsesContentPart::InputText {
+                    text: "delta only".into(),
+                }],
+            }]),
+            input_delta_count: 1,
+            disabled_reason: None,
+        };
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let budget = CodexDispatchBudget::new();
+        for _ in 1..MAX_CODEX_MODEL_DISPATCHES {
+            budget.reserve_model().unwrap();
+        }
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.post_codex_with_transport_inner(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+                crate::config::CodexTransport::WebSocket,
+                &budget,
+            ),
+        )
+        .await
+        .expect("local pool miss recovery should not exhaust the model budget")
+        .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(budget.snapshot().model, MAX_CODEX_MODEL_DISPATCHES);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_local_pool_miss_reuses_the_current_model_dispatch_reservation() {
+        use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_one_completed_websocket(
+            listener,
+            "resp_live_pool_miss",
+        ));
+
+        let mut request = buffered_test_request();
+        request.input = vec![ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "full context".into(),
+            }],
+        }];
+        let continuation = super::super::continuation::ContinuationCandidate {
+            turn_id: Some(42),
+            previous_response_id: Some("resp_unreachable".into()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 1,
+            response_affine_fork: false,
+            input_delta: Some(vec![ResponsesInputItem::Message {
+                role: "user".into(),
+                content: vec![ResponsesContentPart::InputText {
+                    text: "delta only".into(),
+                }],
+            }]),
+            input_delta_count: 1,
+            disabled_reason: None,
+        };
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let budget = CodexDispatchBudget::new();
+        for _ in 1..MAX_CODEX_MODEL_DISPATCHES {
+            budget.reserve_model().unwrap();
+        }
+        let mut events = client
+            .stream_codex_websocket_events(
+                &request,
+                &http_test_context(),
+                Some(&continuation),
+                budget.clone(),
+            )
+            .await
+            .unwrap();
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("local pool miss recovery should not exhaust the model budget")
+            .expect("coordinator should produce a terminal event")
+            .unwrap();
+        assert_eq!(terminal["type"], "response.completed");
+        assert_eq!(budget.snapshot().model, MAX_CODEX_MODEL_DISPATCHES);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_explicit_http_clears_socket_and_cannot_publish_continuation_state() {
+        use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        super::super::continuation::clear_all_continuations_for_tests();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = futures_util::StreamExt::next(&mut websocket)
+                .await
+                .expect("seed WebSocket request should arrive")
+                .unwrap();
+            assert!(matches!(request, Message::Text(_)));
+            futures_util::SinkExt::send(
+                &mut websocket,
+                Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp_ws_bound","usage":{}}}"#
+                        .into(),
+                ),
+            )
+            .await
+            .unwrap();
+            loop {
+                match futures_util::StreamExt::next(&mut websocket)
+                    .await
+                    .expect("terminal pool probe should arrive")
+                    .unwrap()
+                {
+                    Message::Ping(payload) => {
+                        futures_util::SinkExt::send(&mut websocket, Message::Pong(payload))
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    Message::Pong(_) | Message::Frame(_) => {}
+                    other => panic!("unexpected terminal probe frame: {other:?}"),
+                }
+            }
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_complete_http_request(&mut stream).await;
+            assert!(request.starts_with("POST "));
+            assert!(request.contains("full context over http"));
+            write_test_http_response(
+                &mut stream,
+                "200 OK",
+                "text/event-stream",
+                "",
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http_unreachable\",\"usage\":{}}}\n\n",
+            )
+            .await;
+        });
+
+        let session_id = "buffered-explicit-http-abort";
+        let lane_key = test_lane_key(session_id);
+        let message = |text: &str| ResponsesInputItem::Message {
+            role: "user".to_string(),
+            content: vec![ResponsesContentPart::InputText {
+                text: text.to_string(),
+            }],
+        };
+        let mut seed_request = buffered_test_request();
+        seed_request.input = vec![message("seed websocket")];
+        let seed = super::super::continuation::continuation_candidate(
+            Some(&lane_key),
+            &seed_request,
+            true,
+        );
+        let seed_turn = seed.turn_id.expect("seed turn should be registered");
+        let mut ctx = http_test_context();
+        ctx.session_id = Some(session_id.to_string());
+        ctx.lane_key = Some(lane_key);
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let seed_response = client
+            .post_codex_with_transport(
+                &seed_request,
+                &ctx,
+                Some(&seed),
+                crate::config::CodexTransport::WebSocket,
+            )
+            .await
+            .unwrap();
+        assert_eq!(seed_response.status, 200);
+        assert!(super::super::websocket::codex_websocket_pool_contains_for_tests(session_id));
+        super::super::continuation::record_continuation(
+            Some(&lane_key),
+            Some(seed_turn),
+            &seed_request,
+            Some("resp_ws_bound"),
+            &[],
+        );
+
+        let mut request = seed_request;
+        request.input.push(message("full context over http"));
+        let continuation =
+            super::super::continuation::continuation_candidate(Some(&lane_key), &request, true);
+        assert_eq!(
+            continuation.previous_response_id.as_deref(),
+            Some("resp_ws_bound")
+        );
+        let turn_id = continuation.turn_id.expect("turn should be registered");
+        let response = client
+            .post_codex_with_transport(
+                &request,
+                &ctx,
+                Some(&continuation),
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert!(!super::super::websocket::codex_websocket_pool_contains_for_tests(session_id));
+        assert!(!super::super::continuation::is_current_turn(
+            Some(&lane_key),
+            Some(turn_id),
+        ));
+        super::super::continuation::record_continuation(
+            Some(&lane_key),
+            Some(turn_id),
+            &request,
+            Some("resp_http_unreachable"),
+            &[],
+        );
+        let next =
+            super::super::continuation::continuation_candidate(Some(&lane_key), &request, true);
+        assert!(next.previous_response_id.is_none());
+        super::super::continuation::abort_continuation(Some(&lane_key), next.turn_id);
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
+    }
+
     #[test]
     fn codex_http_success_requires_a_nonempty_sse_response() {
         let mut sse = reqwest::header::HeaderMap::new();
@@ -2922,6 +3425,7 @@ mod tests {
             reasoning: None,
             schema_bridge: None,
             hosted_web_search_max_uses: None,
+            deferred_tool_hydration: Default::default(),
         }
     }
 
@@ -3016,6 +3520,46 @@ mod tests {
         );
         stream.write_all(response.as_bytes()).await.unwrap();
         stream.write_all(body).await.unwrap();
+    }
+
+    async fn serve_one_completed_websocket(listener: TcpListener, response_id: &'static str) {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let request = futures_util::StreamExt::next(&mut websocket)
+            .await
+            .expect("full-context model request should arrive")
+            .unwrap()
+            .into_text()
+            .unwrap();
+        assert!(!request.contains("previous_response_id"), "{request}");
+        assert!(request.contains("full context"), "{request}");
+        assert!(!request.contains("delta only"), "{request}");
+        futures_util::SinkExt::send(
+            &mut websocket,
+            Message::Text(
+                format!(
+                    r#"{{"type":"response.completed","response":{{"id":"{response_id}","usage":{{}}}}}}"#
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+
+        while let Some(frame) = futures_util::StreamExt::next(&mut websocket).await {
+            match frame.unwrap() {
+                Message::Ping(payload) => {
+                    futures_util::SinkExt::send(&mut websocket, Message::Pong(payload))
+                        .await
+                        .unwrap();
+                    return;
+                }
+                Message::Pong(_) | Message::Frame(_) => {}
+                Message::Close(_) => return,
+                other => panic!("unexpected frame after terminal response: {other:?}"),
+            }
+        }
     }
 
     async fn assert_model_post_does_not_follow_redirect(status: &'static str) {
@@ -3417,6 +3961,302 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_auto_http_fallback_aborts_unreachable_continuation_state() {
+        use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
+
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        super::super::continuation::clear_all_continuations_for_tests();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut websocket, _) = listener.accept().await.unwrap();
+            let mut request_bytes = [0_u8; 16 * 1024];
+            let read = websocket.read(&mut request_bytes).await.unwrap();
+            assert!(String::from_utf8_lossy(&request_bytes[..read]).contains("Upgrade: websocket"));
+            websocket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            drop(websocket);
+
+            let (mut http, _) = listener.accept().await.unwrap();
+            let request = read_complete_http_request(&mut http).await;
+            assert!(request.starts_with("POST "));
+            assert!(request.contains("full context"));
+            write_test_http_response(
+                &mut http,
+                "200 OK",
+                "text/event-stream",
+                "",
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http_unreachable\",\"usage\":{}}}\n\n",
+            )
+            .await;
+        });
+
+        let lane_key = test_lane_key("buffered-auto-http-abort");
+        let mut request = buffered_test_request();
+        request.input = vec![ResponsesInputItem::Message {
+            role: "user".into(),
+            content: vec![ResponsesContentPart::InputText {
+                text: "full context".into(),
+            }],
+        }];
+        let continuation =
+            super::super::continuation::continuation_candidate(Some(&lane_key), &request, true);
+        let turn_id = continuation.turn_id.expect("turn should be registered");
+        let mut ctx = http_test_context();
+        ctx.lane_key = Some(lane_key);
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let circuit_key = client.websocket_circuit_key().to_string();
+        let response = client
+            .post_codex_with_transport(
+                &request,
+                &ctx,
+                Some(&continuation),
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert!(!super::super::continuation::is_current_turn(
+            Some(&lane_key),
+            Some(turn_id),
+        ));
+        super::super::continuation::record_continuation(
+            Some(&lane_key),
+            Some(turn_id),
+            &request,
+            Some("resp_http_unreachable"),
+            &[],
+        );
+        let next =
+            super::super::continuation::continuation_candidate(Some(&lane_key), &request, true);
+        assert!(next.previous_response_id.is_none());
+        super::super::websocket::record_codex_websocket_success(&circuit_key);
+        super::super::continuation::clear_all_continuations_for_tests();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn live_reconnects_fresh_websocket_after_predispatch_pool_health_failure() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        super::super::continuation::clear_all_continuations_for_tests();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first_closed_tx, first_closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first_closed_tx = Some(first_closed_tx);
+            for (index, response_id) in ["resp_first", "resp_reconnected"].into_iter().enumerate() {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("both attempts must use WebSocket, never HTTP");
+                let request = futures_util::StreamExt::next(&mut websocket)
+                    .await
+                    .expect("response.create should arrive")
+                    .unwrap();
+                assert!(matches!(request, Message::Text(_)));
+                futures_util::SinkExt::send(
+                    &mut websocket,
+                    Message::Text(
+                        format!(
+                            r#"{{"type":"response.completed","response":{{"id":"{response_id}","usage":{{}}}}}}"#
+                        ),
+                    ),
+                )
+                .await
+                .unwrap();
+                loop {
+                    match futures_util::StreamExt::next(&mut websocket)
+                        .await
+                        .expect("terminal pool probe should arrive")
+                        .unwrap()
+                    {
+                        Message::Ping(payload) => {
+                            futures_util::SinkExt::send(&mut websocket, Message::Pong(payload))
+                                .await
+                                .unwrap();
+                            break;
+                        }
+                        Message::Pong(_) | Message::Frame(_) => {}
+                        other => panic!("unexpected terminal probe frame: {other:?}"),
+                    }
+                }
+                if index == 0 {
+                    futures_util::SinkExt::send(&mut websocket, Message::Close(None))
+                        .await
+                        .unwrap();
+                    first_closed_tx.take().unwrap().send(()).unwrap();
+                }
+            }
+        });
+
+        let session_id = "auto-fresh-websocket-after-stale-pool";
+        let lane_key = test_lane_key(session_id);
+        let mut ctx = http_test_context();
+        ctx.session_id = Some(session_id.to_string());
+        ctx.lane_key = Some(lane_key);
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let request = buffered_test_request();
+        let first = client
+            .post_codex_with_transport(
+                &request,
+                &ctx,
+                None,
+                crate::config::CodexTransport::WebSocket,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status, 200);
+        first_closed_rx
+            .await
+            .expect("the first upstream socket should close after its terminal probe");
+        assert!(super::super::websocket::codex_websocket_pool_contains_for_tests(session_id));
+        super::super::websocket::expire_codex_websocket_pool_probe_credit_for_tests(session_id);
+
+        let budget = CodexDispatchBudget::new();
+        let mut reconnected = Arc::new(client)
+            .stream_codex_websocket_events(&request, &ctx, None, budget.clone())
+            .await
+            .unwrap();
+        let terminal = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), reconnected.recv())
+                .await
+                .expect("fresh WebSocket reconnect should complete promptly")
+                .expect("live event channel should remain open")
+                .expect("stale pool must reconnect instead of surfacing an error");
+            if event["type"] == "response.completed" {
+                break event;
+            }
+        };
+        assert_eq!(terminal["response"]["id"], "resp_reconnected");
+        assert_eq!(budget.snapshot().model, 1);
+        server.await.unwrap();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn buffered_half_open_probe_reconnects_fresh_after_stale_pool_once() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        super::super::continuation::clear_all_continuations_for_tests();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first_closed_tx, first_closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first_closed_tx = Some(first_closed_tx);
+            for (index, response_id) in ["resp_seed", "resp_half_open_fresh"]
+                .into_iter()
+                .enumerate()
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("the retry must stay on WebSocket rather than fall back to HTTP");
+                let request = futures_util::StreamExt::next(&mut websocket)
+                    .await
+                    .expect("response.create should arrive")
+                    .unwrap();
+                assert!(matches!(request, Message::Text(_)));
+                futures_util::SinkExt::send(
+                    &mut websocket,
+                    Message::Text(
+                        format!(
+                            r#"{{"type":"response.completed","response":{{"id":"{response_id}","usage":{{}}}}}}"#
+                        ),
+                    ),
+                )
+                .await
+                .unwrap();
+                loop {
+                    match futures_util::StreamExt::next(&mut websocket)
+                        .await
+                        .expect("terminal pool probe should arrive")
+                        .unwrap()
+                    {
+                        Message::Ping(payload) => {
+                            futures_util::SinkExt::send(&mut websocket, Message::Pong(payload))
+                                .await
+                                .unwrap();
+                            break;
+                        }
+                        Message::Pong(_) | Message::Frame(_) => {}
+                        other => panic!("unexpected terminal probe frame: {other:?}"),
+                    }
+                }
+                if index == 0 {
+                    futures_util::SinkExt::send(&mut websocket, Message::Close(None))
+                        .await
+                        .unwrap();
+                    first_closed_tx.take().unwrap().send(()).unwrap();
+                }
+            }
+        });
+
+        let session_id = "buffered-half-open-stale-pool";
+        let lane_key = test_lane_key(session_id);
+        let mut ctx = http_test_context();
+        ctx.session_id = Some(session_id.to_string());
+        ctx.lane_key = Some(lane_key);
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let request = buffered_test_request();
+        let seed = client
+            .post_codex_with_transport(
+                &request,
+                &ctx,
+                None,
+                crate::config::CodexTransport::WebSocket,
+            )
+            .await
+            .unwrap();
+        assert_eq!(seed.status, 200);
+        first_closed_rx
+            .await
+            .expect("the seed socket should close after its terminal probe");
+        super::super::websocket::expire_codex_websocket_pool_probe_credit_for_tests(session_id);
+
+        let circuit_key = client.websocket_circuit_key().to_string();
+        for _ in 0..super::super::websocket::WEBSOCKET_CIRCUIT_FAILURE_THRESHOLD {
+            super::super::websocket::record_codex_websocket_failure(&circuit_key);
+        }
+        super::super::websocket::expire_codex_websocket_circuit_for_tests(&circuit_key);
+
+        let budget = CodexDispatchBudget::new();
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.post_codex_with_transport_inner(
+                &request,
+                &ctx,
+                None,
+                crate::config::CodexTransport::Auto,
+                &budget,
+            ),
+        )
+        .await
+        .expect("same-request half-open reconnect should not stall")
+        .expect("the stale pooled socket must reconnect via a fresh WebSocket");
+        assert_eq!(response.status, 200);
+        assert!(String::from_utf8_lossy(&response.body).contains("resp_half_open_fresh"));
+        assert_eq!(budget.snapshot().model, 1);
+        assert!(!super::super::websocket::codex_websocket_circuit_open(
+            &circuit_key
+        ));
+        server.await.unwrap();
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
+    }
+
+    #[tokio::test]
     async fn auto_does_not_replay_after_websocket_request_closes_before_terminal() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3527,6 +4367,9 @@ mod tests {
         let continuation = super::super::continuation::ContinuationCandidate {
             turn_id: Some(7),
             previous_response_id: Some("resp_prev".into()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 1,
+            response_affine_fork: false,
             input_delta: Some(vec![delta_input]),
             input_delta_count: 1,
             disabled_reason: None,
@@ -3548,7 +4391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_websocket_401_refresh_replays_with_full_context() {
+    async fn live_websocket_401_after_response_created_refreshes_before_semantic_output() {
         use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
         use tokio_tungstenite::tungstenite::Message;
 
@@ -3567,9 +4410,9 @@ mod tests {
                 .unwrap()
                 .into_text()
                 .unwrap();
-            assert!(first.contains("\"previous_response_id\":\"resp_prev\""));
-            assert!(first.contains("delta only"));
-            assert!(!first.contains("full context"));
+            assert!(!first.contains("previous_response_id"));
+            assert!(first.contains("full context"));
+            assert!(!first.contains("delta only"));
             futures_util::SinkExt::send(
                 &mut websocket,
                 Message::Text(
@@ -3609,85 +4452,89 @@ mod tests {
             }
             drop(websocket);
 
-            let (mut oauth, _) = listener.accept().await.unwrap();
-            oauth_hits += 1;
-            let refresh_request = read_complete_http_request(&mut oauth).await;
-            assert!(refresh_request.starts_with("POST /oauth/token "));
-            assert!(refresh_request.contains("refresh_token=r0"));
-            write_test_http_response(
-                &mut oauth,
-                "200 OK",
-                "application/json",
-                "",
-                br#"{"access_token":"a1","refresh_token":"r1","expires_in":3600}"#,
-            )
-            .await;
+            if !event_closes_live_retry_window(&serde_json::json!({
+                "type": "response.created"
+            })) {
+                let (mut oauth, _) = listener.accept().await.unwrap();
+                oauth_hits += 1;
+                let refresh_request = read_complete_http_request(&mut oauth).await;
+                assert!(refresh_request.starts_with("POST /oauth/token "));
+                assert!(refresh_request.contains("refresh_token=r0"));
+                write_test_http_response(
+                    &mut oauth,
+                    "200 OK",
+                    "application/json",
+                    "",
+                    br#"{"access_token":"a1","refresh_token":"r1","expires_in":3600}"#,
+                )
+                .await;
 
-            let (stream, _) = listener.accept().await.unwrap();
-            model_hits += 1;
-            let mut retried_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let retried = futures_util::StreamExt::next(&mut retried_websocket)
+                let (stream, _) = listener.accept().await.unwrap();
+                model_hits += 1;
+                let mut retried_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let retried = futures_util::StreamExt::next(&mut retried_websocket)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap();
+                assert!(!retried.contains("previous_response_id"));
+                assert!(retried.contains("full context"));
+                assert!(!retried.contains("delta only"));
+                futures_util::SinkExt::send(
+                    &mut retried_websocket,
+                    Message::Text(
+                        r#"{"type":"response.completed","response":{"id":"resp_ok","usage":{}}}"#
+                            .into(),
+                    ),
+                )
                 .await
-                .unwrap()
-                .unwrap()
-                .into_text()
                 .unwrap();
-            assert!(!retried.contains("previous_response_id"));
-            assert!(retried.contains("full context"));
-            assert!(!retried.contains("delta only"));
-            futures_util::SinkExt::send(
-                &mut retried_websocket,
-                Message::Text(
-                    r#"{"type":"response.completed","response":{"id":"resp_ok","usage":{}}}"#
-                        .into(),
-                ),
-            )
-            .await
-            .unwrap();
-            let barrier_deadline = tokio::time::sleep(Duration::from_secs(4));
-            tokio::pin!(barrier_deadline);
-            let mut saw_barrier_ping = false;
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        accepted.unwrap();
-                        panic!("response.created followed by 401 must not trigger an extra replay");
-                    }
-                    frame = futures_util::StreamExt::next(&mut retried_websocket) => {
-                        match frame {
-                            Some(Ok(Message::Ping(payload))) => {
-                                futures_util::SinkExt::send(
-                                    &mut retried_websocket,
-                                    Message::Pong(payload),
-                                )
-                                .await
-                                .unwrap();
-                                saw_barrier_ping = true;
-                                barrier_deadline.as_mut().reset(
-                                    tokio::time::Instant::now() + Duration::from_millis(300),
-                                );
+                let barrier_deadline = tokio::time::sleep(Duration::from_secs(4));
+                tokio::pin!(barrier_deadline);
+                let mut saw_barrier_ping = false;
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            accepted.unwrap();
+                            panic!("response.created followed by 401 must not trigger an extra replay");
+                        }
+                        frame = futures_util::StreamExt::next(&mut retried_websocket) => {
+                            match frame {
+                                Some(Ok(Message::Ping(payload))) => {
+                                    futures_util::SinkExt::send(
+                                        &mut retried_websocket,
+                                        Message::Pong(payload),
+                                    )
+                                    .await
+                                    .unwrap();
+                                    saw_barrier_ping = true;
+                                    barrier_deadline.as_mut().reset(
+                                        tokio::time::Instant::now() + Duration::from_millis(300),
+                                    );
+                                }
+                                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                                Some(Ok(other)) => {
+                                    panic!("unexpected frame after terminal response: {other:?}");
+                                }
+                                Some(Err(_)) | None if saw_barrier_ping => break,
+                                Some(Err(error)) => panic!("terminal barrier stream failed: {error}"),
+                                None => panic!("terminal barrier connection closed"),
                             }
-                            Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
-                            Some(Ok(other)) => {
-                                panic!("unexpected frame after terminal response: {other:?}");
-                            }
-                            Some(Err(_)) | None if saw_barrier_ping => break,
-                            Some(Err(error)) => panic!("terminal barrier stream failed: {error}"),
-                            None => panic!("terminal barrier connection closed"),
+                        }
+                        () = &mut barrier_deadline => {
+                            assert!(saw_barrier_ping, "terminal ordering barrier Ping should arrive");
+                            break;
                         }
                     }
-                    () = &mut barrier_deadline => {
-                        assert!(saw_barrier_ping, "terminal ordering barrier Ping should arrive");
-                        break;
-                    }
                 }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err(),
+                    "response.created followed by 401 must not trigger an extra replay"
+                );
             }
-            assert!(
-                tokio::time::timeout(Duration::from_millis(150), listener.accept())
-                    .await
-                    .is_err(),
-                "response.created followed by 401 must not trigger an extra replay"
-            );
             (model_hits, oauth_hits)
         });
 
@@ -3697,20 +4544,17 @@ mod tests {
                 text: "full context".into(),
             }],
         };
-        let delta_input = ResponsesInputItem::Message {
-            role: "user".into(),
-            content: vec![ResponsesContentPart::InputText {
-                text: "delta only".into(),
-            }],
-        };
         let mut request = buffered_test_request();
         request.input = vec![full_input];
         let continuation = super::super::continuation::ContinuationCandidate {
             turn_id: Some(7),
-            previous_response_id: Some("resp_prev".into()),
-            input_delta: Some(vec![delta_input]),
-            input_delta_count: 1,
-            disabled_reason: None,
+            previous_response_id: None,
+            matched_candidate_rank: None,
+            candidate_count: 0,
+            response_affine_fork: false,
+            input_delta: None,
+            input_delta_count: request.input.len(),
+            disabled_reason: Some("missing_state".into()),
         };
         let temp = tempfile::TempDir::new().unwrap();
         let client = Arc::new(dispatch_budget_test_client(
@@ -3736,7 +4580,7 @@ mod tests {
             .unwrap();
         let created = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
-            .expect("response.created should be forwarded while recovery remains available")
+            .expect("response.created should be forwarded as the acceptance barrier")
             .unwrap()
             .unwrap();
         assert_eq!(created["type"], "response.created");
@@ -3804,11 +4648,13 @@ mod tests {
         });
 
         let session_id = "live-terminal-receiver-drop-pool-reuse";
+        let lane_key = test_lane_key(session_id);
         let request = buffered_test_request();
         let continuation =
-            super::super::continuation::continuation_candidate(Some(session_id), &request, true);
+            super::super::continuation::continuation_candidate(Some(&lane_key), &request, true);
         let mut ctx = http_test_context();
         ctx.session_id = Some(session_id.to_string());
+        ctx.lane_key = Some(lane_key);
         let client = Arc::new(authenticated_http_test_client(format!(
             "http://{addr}/responses"
         )));
@@ -3848,7 +4694,7 @@ mod tests {
         let _ = release_tx.send(());
         server.await.unwrap();
         super::super::websocket::clear_codex_websocket_pool_for_tests();
-        super::super::continuation::clear_continuation(Some(session_id));
+        super::super::continuation::clear_continuation(Some(&lane_key));
     }
 
     #[tokio::test]
@@ -3924,6 +4770,9 @@ mod tests {
         let continuation = super::super::continuation::ContinuationCandidate {
             turn_id: Some(8),
             previous_response_id: Some("resp_prev".into()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 1,
+            response_affine_fork: false,
             input_delta: Some(vec![delta_input]),
             input_delta_count: 1,
             disabled_reason: None,
@@ -4746,7 +5595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_http_allows_rate_limit_telemetry_after_terminal() {
+    async fn live_http_allows_exact_control_telemetry_after_terminal() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -4755,7 +5604,7 @@ mod tests {
             assert!(stream.read(&mut request).await.unwrap() > 0);
             stream
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true}}\n\n",
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true}}\n\ndata: {\"type\":\"codex.response.metadata\",\"headers\":{}}\n\ndata: {\"type\":\"response.metadata\",\"headers\":{}}\n\ndata: {\"type\":\"responsesapi.websocket_timing\",\"response_ms\":42}\n\ndata: {\"type\":\"keepalive\"}\n\n",
                 )
                 .await
                 .unwrap();
@@ -5045,15 +5894,40 @@ mod tests {
 
     #[test]
     fn incremental_http_sse_decoder_rejects_bom_after_stream_start() {
+        for later_record in [
+            b"\xef\xbb\xbfdata: {\"type\":\"response.completed\"}\n\n".as_slice(),
+            b"event: response.completed\n\xef\xbb\xbfdata: {\"type\":\"response.completed\"}\n\n",
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\"}\n\xef\xbb\xbfdata: {\"type\":\"response.completed\"}\n\n",
+        ] {
+            let mut decoder = CodexLiveSseDecoder::default();
+            decoder
+                .push(b"data: {\"type\":\"response.created\"}\n\n")
+                .unwrap();
+            let error = decoder.push(later_record).unwrap_err();
+
+            assert!(error.contains("BOM after stream start"));
+        }
+    }
+
+    #[test]
+    fn incremental_http_sse_decoder_rejects_nonleading_bom_in_first_record() {
         let mut decoder = CodexLiveSseDecoder::default();
-        decoder
-            .push(b"data: {\"type\":\"response.created\"}\n\n")
-            .unwrap();
         let error = decoder
-            .push(b"\xef\xbb\xbfdata: {\"type\":\"response.completed\"}\n\n")
+            .push(b"event: response.created\n\xef\xbb\xbfdata: {\"type\":\"response.created\"}\n\n")
             .unwrap_err();
 
         assert!(error.contains("BOM after stream start"));
+    }
+
+    #[test]
+    fn incremental_http_sse_decoder_allows_unicode_bom_inside_json_string() {
+        let mut decoder = CodexLiveSseDecoder::default();
+        let record =
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"left\u{feff}right\"}\n\n";
+        let events = decoder.push(record.as_bytes()).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["delta"], "left\u{feff}right");
     }
 
     #[test]
@@ -5302,6 +6176,7 @@ mod tests {
         });
 
         let session_id = "pooled-websocket-deadline-cleanup";
+        let lane_key = test_lane_key(session_id);
         let input = |text: &str| ResponsesInputItem::Message {
             role: "user".into(),
             content: vec![ResponsesContentPart::InputText { text: text.into() }],
@@ -5309,12 +6184,13 @@ mod tests {
         let mut first_request = buffered_test_request();
         first_request.input.push(input("first"));
         let first_continuation = super::super::continuation::continuation_candidate(
-            Some(session_id),
+            Some(&lane_key),
             &first_request,
             true,
         );
         let mut ctx = http_test_context();
         ctx.session_id = Some(session_id.to_string());
+        ctx.lane_key = Some(lane_key);
         let client =
             CodexHttpClient::new_for_test(format!("http://{addr}/responses"), 2_000, 2_000, 2_000);
         client.auth_manager().set_test_auth(http_test_auth());
@@ -5333,7 +6209,7 @@ mod tests {
         assert!(super::super::websocket::codex_websocket_pool_contains_for_tests(session_id));
 
         super::super::continuation::record_continuation(
-            Some(session_id),
+            Some(&lane_key),
             first_continuation.turn_id,
             &first_request,
             Some("resp_1"),
@@ -5342,7 +6218,7 @@ mod tests {
         let mut second_request = first_request.clone();
         second_request.input.push(input("second"));
         let second_continuation = super::super::continuation::continuation_candidate(
-            Some(session_id),
+            Some(&lane_key),
             &second_request,
             true,
         );
@@ -5375,7 +6251,7 @@ mod tests {
             "a timed-out pooled socket must not remain reusable"
         );
         assert!(!super::super::continuation::is_current_turn(
-            Some(session_id),
+            Some(&lane_key),
             second_continuation.turn_id
         ));
         server.abort();
@@ -5398,11 +6274,13 @@ mod tests {
         });
 
         let session_id = "buffered-cancel-cleans-continuation";
+        let lane_key = test_lane_key(session_id);
         let request = buffered_test_request();
         let continuation =
-            super::super::continuation::continuation_candidate(Some(session_id), &request, true);
+            super::super::continuation::continuation_candidate(Some(&lane_key), &request, true);
         let mut ctx = http_test_context();
         ctx.session_id = Some(session_id.to_string());
+        ctx.lane_key = Some(lane_key);
         let client = authenticated_http_test_client(format!("http://{addr}/responses"));
         let task = tokio::spawn(async move {
             client
@@ -5428,12 +6306,12 @@ mod tests {
         assert!(matches!(closed, Ok(0) | Err(_)));
 
         let next = super::super::continuation::continuation_candidate(
-            Some(session_id),
+            Some(&lane_key),
             &buffered_test_request(),
             true,
         );
         assert_eq!(next.disabled_reason.as_deref(), Some("missing_state"));
-        super::super::continuation::abort_continuation(Some(session_id), next.turn_id);
+        super::super::continuation::abort_continuation(Some(&lane_key), next.turn_id);
     }
 
     #[tokio::test]
@@ -5707,6 +6585,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             session_id: Some("s".into()),
+            lane_key: None,
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
@@ -5732,6 +6611,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             session_id: None,
+            lane_key: None,
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
@@ -5760,6 +6640,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             session_id: None,
+            lane_key: None,
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
@@ -5782,6 +6663,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             session_id: Some("bad\nsession".into()),
+            lane_key: None,
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
@@ -5825,6 +6707,7 @@ mod tests {
             reasoning: None,
             schema_bridge: None,
             hosted_web_search_max_uses: None,
+            deferred_tool_hydration: Default::default(),
         };
         let payload = build_websocket_request(&req, None);
         assert_eq!(
@@ -5836,10 +6719,165 @@ mod tests {
     }
 
     #[test]
+    fn continuation_websocket_request_keeps_current_tools_and_choice_with_delta_input() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.5",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "complete history"}]
+            }],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "Read",
+                    "parameters": {"type": "object"}
+                },
+                {
+                    "type": "function",
+                    "name": "Grep",
+                    "description": "loaded for this turn",
+                    "parameters": {"type": "object"}
+                }
+            ],
+            "tool_choice": "required",
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"}
+        }))
+        .unwrap();
+        let delta = vec![
+            super::super::translate::request::ResponsesInputItem::Message {
+                role: "user".to_string(),
+                content: vec![
+                    super::super::translate::request::ResponsesContentPart::InputText {
+                        text: "delta only".to_string(),
+                    },
+                ],
+            },
+        ];
+        let continuation = super::super::continuation::ContinuationCandidate {
+            turn_id: Some(7),
+            previous_response_id: Some("resp_previous".to_string()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 1,
+            response_affine_fork: false,
+            input_delta: Some(delta.clone()),
+            input_delta_count: delta.len(),
+            disabled_reason: None,
+        };
+
+        let payload = build_websocket_request(&req, Some(&continuation));
+        assert_eq!(payload["previous_response_id"], "resp_previous");
+        assert_eq!(payload["input"], serde_json::to_value(delta).unwrap());
+        assert_eq!(payload["tool_choice"], "required");
+        assert_eq!(payload["tools"].as_array().map(Vec::len), Some(2));
+        assert_eq!(payload["tools"][0]["name"], "Read");
+        assert_eq!(payload["tools"][1]["name"], "Grep");
+        assert!(payload.get("stream").is_none());
+    }
+
+    #[test]
+    fn dynamic_tool_contraction_sends_previous_call_output_with_current_tool_set() {
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.blocking_lock();
+        super::super::continuation::clear_all_continuations_for_tests();
+
+        let base = super::super::translate::request::ResponsesInputItem::Message {
+            role: "user".to_string(),
+            content: vec![
+                super::super::translate::request::ResponsesContentPart::InputText {
+                    text: "inspect the repository".to_string(),
+                },
+            ],
+        };
+        let expanded_tools = serde_json::Value::Array(
+            (0..15)
+                .map(|index| {
+                    serde_json::json!({
+                        "type": "function",
+                        "name": format!("DeferredTool{index}"),
+                        "parameters": {"type": "object"}
+                    })
+                })
+                .collect(),
+        );
+        let mut initial: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.5",
+            "input": [],
+            "tools": expanded_tools,
+            "tool_choice": "required",
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"}
+        }))
+        .unwrap();
+        initial.input = vec![base.clone()];
+
+        let lane_key = test_lane_key("contracted-tool-payload");
+        let first =
+            super::super::continuation::continuation_candidate(Some(&lane_key), &initial, true);
+        let previous_call = super::super::translate::request::ResponsesInputItem::FunctionCall {
+            call_id: "call_deferred".to_string(),
+            name: "DeferredTool14".to_string(),
+            arguments: r#"{"path":"src"}"#.to_string(),
+        };
+        super::super::continuation::record_continuation(
+            Some(&lane_key),
+            first.turn_id,
+            &initial,
+            Some("resp_with_deferred_call"),
+            std::slice::from_ref(&previous_call),
+        );
+
+        let call_output =
+            super::super::translate::request::ResponsesInputItem::FunctionCallOutput {
+                call_id: "call_deferred".to_string(),
+                output: super::super::translate::request::ResponsesFunctionCallOutput::Text(
+                    "completed safely".to_string(),
+                ),
+            };
+        let mut contracted = initial;
+        contracted.input = vec![base, previous_call, call_output.clone()];
+        contracted.tools = Some(
+            serde_json::from_value(serde_json::json!([
+                {"type": "function", "name": "Read", "parameters": {"type": "object"}},
+                {"type": "function", "name": "Grep", "parameters": {"type": "object"}},
+                {"type": "function", "name": "Glob", "parameters": {"type": "object"}}
+            ]))
+            .unwrap(),
+        );
+        contracted.tool_choice = Some(
+            serde_json::from_value(serde_json::json!("auto")).expect("auto is a valid tool choice"),
+        );
+
+        let candidate =
+            super::super::continuation::continuation_candidate(Some(&lane_key), &contracted, true);
+        assert_eq!(
+            candidate.previous_response_id.as_deref(),
+            Some("resp_with_deferred_call")
+        );
+        assert_eq!(candidate.disabled_reason, None);
+        assert_eq!(candidate.input_delta_count, 1);
+
+        let payload = build_websocket_request(&contracted, Some(&candidate));
+        assert_eq!(payload["previous_response_id"], "resp_with_deferred_call");
+        assert_eq!(payload["input"], serde_json::json!([call_output]));
+        assert_eq!(payload["tool_choice"], "auto");
+        assert_eq!(payload["tools"].as_array().map(Vec::len), Some(3));
+        assert_eq!(payload["tools"][0]["name"], "Read");
+        assert_eq!(payload["tools"][1]["name"], "Grep");
+        assert_eq!(payload["tools"][2]["name"], "Glob");
+    }
+
+    #[test]
     fn websocket_pool_key_is_independent_of_payload_continuation() {
+        let lane_key = test_lane_key("session");
         let ctx = RequestContext {
             req_id: "r".into(),
             session_id: Some("session".into()),
+            lane_key: Some(lane_key),
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
@@ -5849,6 +6887,9 @@ mod tests {
         let disabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            matched_candidate_rank: None,
+            candidate_count: 0,
+            response_affine_fork: false,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("disabled".into()),
@@ -5856,6 +6897,9 @@ mod tests {
         let first_enabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            matched_candidate_rank: None,
+            candidate_count: 0,
+            response_affine_fork: false,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("missing_state".into()),
@@ -5863,17 +6907,20 @@ mod tests {
         let append = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: Some("resp_1".into()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 1,
+            response_affine_fork: false,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: None,
         };
 
-        assert_eq!(websocket_pool_key(&ctx, Some(&disabled)), Some("session"));
+        assert_eq!(websocket_pool_key(&ctx, Some(&disabled)), Some(&lane_key));
         assert_eq!(
             websocket_pool_key(&ctx, Some(&first_enabled)),
-            Some("session")
+            Some(&lane_key)
         );
-        assert_eq!(websocket_pool_key(&ctx, Some(&append)), Some("session"));
+        assert_eq!(websocket_pool_key(&ctx, Some(&append)), Some(&lane_key));
     }
 
     #[test]
@@ -5893,6 +6940,9 @@ mod tests {
         let missing_state = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            matched_candidate_rank: None,
+            candidate_count: 0,
+            response_affine_fork: false,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("missing_state".into()),
@@ -5900,6 +6950,9 @@ mod tests {
         let disabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            matched_candidate_rank: None,
+            candidate_count: 0,
+            response_affine_fork: false,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("disabled".into()),
@@ -5907,13 +6960,27 @@ mod tests {
         let prompt_changed = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            matched_candidate_rank: None,
+            candidate_count: 0,
+            response_affine_fork: false,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("prompt_changed".into()),
         };
+        let not_append_only = super::super::continuation::ContinuationCandidate {
+            turn_id: None,
+            previous_response_id: None,
+            matched_candidate_rank: None,
+            candidate_count: 1,
+            response_affine_fork: false,
+            input_delta: None,
+            input_delta_count: 1,
+            disabled_reason: Some("not_append_only".into()),
+        };
 
         assert!(should_reset_websocket_pool(Some(&missing_state)));
         assert!(!should_reset_websocket_pool(Some(&disabled)));
+        assert!(!should_reset_websocket_pool(Some(&not_append_only)));
         assert!(should_reset_websocket_pool(Some(&prompt_changed)));
     }
 
@@ -5928,6 +6995,7 @@ mod tests {
         let ctx = RequestContext {
             req_id: "r".into(),
             session_id: None,
+            lane_key: None,
             session_seq: None,
             provider: "codex".into(),
             traffic: None,
@@ -6010,8 +7078,9 @@ mod tests {
         assert!(!should_refresh_after_unauthorized(&http_unauthorized, true));
         // Permanent 4xx handshake rejections are not transport fallback candidates.
         assert!(!should_fallback_to_http(rejected_handshake_err));
-        // Structured pre-output WebSocket transport failures fall back in auto mode.
-        assert!(should_fallback_to_http(&stale_pool));
+        // A stale pooled entry retries one fresh WebSocket before Auto considers HTTP.
+        assert!(is_local_websocket_pool_predispatch_failure(&stale_pool));
+        assert!(!should_fallback_to_http(&stale_pool));
     }
 
     #[test]
@@ -6092,6 +7161,36 @@ mod tests {
         assert!(!should_fallback_to_http(&service_429));
         assert!(!should_fallback_to_http(&service_503));
         assert!(!should_fallback_to_http(&missing_continuation));
+    }
+
+    #[tokio::test]
+    async fn stale_pool_probe_is_neutral_to_existing_websocket_circuit_failures() {
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let circuit_key = "stale-pool-neutral-circuit";
+        assert!(!super::super::websocket::record_codex_websocket_failure(
+            circuit_key
+        ));
+        assert!(!super::super::websocket::record_codex_websocket_failure(
+            circuit_key
+        ));
+
+        let stale_pool = CodexError {
+            status: 0,
+            message: "stale pooled connection".to_string(),
+            detail: Some(super::super::websocket::WEBSOCKET_POOL_HEALTHCHECK_DETAIL.to_string()),
+            retry_after: None,
+            origin: CodexErrorOrigin::WebSocket,
+        };
+        assert!(!record_auto_websocket_failure(
+            &http_test_context(),
+            circuit_key,
+            &stale_pool,
+        ));
+        assert!(super::super::websocket::record_codex_websocket_failure(
+            circuit_key
+        ));
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
     }
 
     #[test]
@@ -6191,7 +7290,18 @@ mod tests {
             "headers": {"openai-model": "gpt-5.6-sol"}
         })));
         assert!(!event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.metadata",
+            "headers": {"openai-model": "gpt-5.6-sol"}
+        })));
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
+            "type": "responsesapi.websocket_timing",
+            "response_ms": 42
+        })));
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "response.created"
+        })));
+        assert!(event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.metadata.v2"
         })));
         assert!(event_closes_live_retry_window(&serde_json::json!({
             "type": "response.output_text.delta",
@@ -6208,6 +7318,9 @@ mod tests {
         let append = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: Some("resp_1".into()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 1,
+            response_affine_fork: false,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: None,
@@ -6215,6 +7328,9 @@ mod tests {
         let initial = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            matched_candidate_rank: None,
+            candidate_count: 0,
+            response_affine_fork: false,
             input_delta: None,
             input_delta_count: 1,
             disabled_reason: Some("missing_state".into()),
@@ -6267,5 +7383,269 @@ mod tests {
         assert!(should_retry_without_continuation(&pool_busy, Some(&append)));
         assert!(!should_retry_without_continuation(&timeout, Some(&initial)));
         assert!(!should_retry_without_continuation(&timeout, None));
+    }
+
+    #[test]
+    fn local_pool_reconnect_preserves_only_a_genuine_affine_alternate() {
+        let request = buffered_test_request();
+        let mut fork = Some(super::super::continuation::ContinuationCandidate {
+            turn_id: Some(42),
+            previous_response_id: Some("resp_unavailable_branch".to_string()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 2,
+            response_affine_fork: true,
+            input_delta: Some(request.input.clone()),
+            input_delta_count: 3,
+            disabled_reason: None,
+        });
+        prepare_local_pool_reconnect_continuation(&mut fork, None);
+        let fork = fork.unwrap();
+        assert!(fork.previous_response_id.is_none());
+        assert_eq!(fork.matched_candidate_rank, None);
+        assert_eq!(fork.candidate_count, 1);
+        assert!(fork.response_affine_fork);
+        assert!(fork.input_delta.is_none());
+        assert_eq!(fork.disabled_reason.as_deref(), Some("full_context_retry"));
+
+        let mut ordinary = Some(super::super::continuation::ContinuationCandidate {
+            turn_id: Some(43),
+            previous_response_id: Some("resp_ordinary".to_string()),
+            matched_candidate_rank: Some(0),
+            candidate_count: 1,
+            response_affine_fork: false,
+            input_delta: Some(request.input),
+            input_delta_count: 1,
+            disabled_reason: None,
+        });
+        prepare_local_pool_reconnect_continuation(&mut ordinary, None);
+        let ordinary = ordinary.unwrap();
+        assert!(ordinary.previous_response_id.is_none());
+        assert_eq!(ordinary.candidate_count, 0);
+        assert!(!ordinary.response_affine_fork);
+        assert_eq!(
+            ordinary.disabled_reason.as_deref(),
+            Some("full_context_retry")
+        );
+    }
+
+    #[test]
+    fn full_context_retry_discards_alternate_only_after_a_selected_response() {
+        use super::super::translate::request::{
+            DeferredToolHydrationGroup, DeferredToolHydrationProvenance,
+            DeferredToolHydrationResult, ResponsesContentPart, ResponsesFunctionCallOutput,
+            ResponsesInputItem, UNAVAILABLE_TOOL_REFERENCES_OUTPUT,
+        };
+
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.blocking_lock();
+        super::super::continuation::clear_all_continuations_for_tests();
+        let item = |role: &str, text: &str| ResponsesInputItem::Message {
+            role: role.to_string(),
+            content: vec![ResponsesContentPart::InputText {
+                text: text.to_string(),
+            }],
+        };
+
+        let loaded_user = item("user", "loaded history");
+        let loaded_answer = item("assistant", "loaded answer");
+        let resume_one = item("user", "resume one");
+        let unavailable_answer = item("assistant", "unavailable answer");
+        let search_call = ResponsesInputItem::FunctionCall {
+            call_id: "search_1".to_string(),
+            name: "ToolSearch".to_string(),
+            arguments: r#"{"query":"select:Grep"}"#.to_string(),
+        };
+        let loaded_output = ResponsesInputItem::FunctionCallOutput {
+            call_id: "search_1".to_string(),
+            output: ResponsesFunctionCallOutput::Text("tool_reference: Grep".to_string()),
+        };
+        let unavailable_output = ResponsesInputItem::FunctionCallOutput {
+            call_id: "search_1".to_string(),
+            output: ResponsesFunctionCallOutput::Text(
+                UNAVAILABLE_TOOL_REFERENCES_OUTPUT.to_string(),
+            ),
+        };
+        let additional_tools = ResponsesInputItem::AdditionalTools {
+            id: None,
+            role: "developer".to_string(),
+            tools: vec![serde_json::json!({
+                "type": "function",
+                "name": "Grep",
+                "description": "deferred Grep",
+                "parameters": {"type": "object", "properties": {}}
+            })],
+        };
+        let mut loaded_request = buffered_test_request();
+        loaded_request.input = vec![
+            loaded_user.clone(),
+            search_call.clone(),
+            loaded_output.clone(),
+            additional_tools.clone(),
+        ];
+        loaded_request.deferred_tool_hydration = DeferredToolHydrationProvenance {
+            loaded_groups: vec![DeferredToolHydrationGroup {
+                results: vec![DeferredToolHydrationResult {
+                    tool_search_call_index: 1,
+                    output_index: 2,
+                }],
+                additional_tools_index: 3,
+            }],
+            unavailable_results: Vec::new(),
+            ambiguous: false,
+        };
+        let mut unavailable_request = buffered_test_request();
+        unavailable_request.input = vec![
+            loaded_user.clone(),
+            search_call.clone(),
+            unavailable_output,
+            loaded_answer.clone(),
+            resume_one.clone(),
+        ];
+        unavailable_request.deferred_tool_hydration = DeferredToolHydrationProvenance {
+            loaded_groups: Vec::new(),
+            unavailable_results: vec![DeferredToolHydrationResult {
+                tool_search_call_index: 1,
+                output_index: 2,
+            }],
+            ambiguous: false,
+        };
+
+        // A candidate that was already full-context did not try an old response id. Mapping it
+        // through a generic retry must therefore preserve its hidden exact alternate.
+        let lane = test_lane_key("full-context-retry-preserve");
+        let loaded =
+            super::super::continuation::continuation_candidate(Some(&lane), &loaded_request, true);
+        super::super::continuation::record_continuation(
+            Some(&lane),
+            loaded.turn_id,
+            &loaded_request,
+            Some("resp_loaded"),
+            std::slice::from_ref(&loaded_answer),
+        );
+        let unavailable = super::super::continuation::continuation_candidate(
+            Some(&lane),
+            &unavailable_request,
+            true,
+        );
+        assert!(unavailable.previous_response_id.is_none());
+        assert_eq!(unavailable.candidate_count, 1);
+        let mapped = full_context_continuation(Some(&unavailable), Some(&lane)).unwrap();
+        assert_eq!(mapped.candidate_count, 1);
+        super::super::continuation::record_continuation(
+            Some(&lane),
+            mapped.turn_id,
+            &unavailable_request,
+            Some("resp_unavailable"),
+            std::slice::from_ref(&unavailable_answer),
+        );
+        let mut hydrated_request = buffered_test_request();
+        hydrated_request.input = vec![
+            loaded_user.clone(),
+            search_call.clone(),
+            loaded_output.clone(),
+            additional_tools.clone(),
+            loaded_answer.clone(),
+            resume_one.clone(),
+            unavailable_answer.clone(),
+            item("user", "hydrated"),
+        ];
+        hydrated_request.deferred_tool_hydration = loaded_request.deferred_tool_hydration.clone();
+        let hydrated = super::super::continuation::continuation_candidate(
+            Some(&lane),
+            &hydrated_request,
+            true,
+        );
+        assert_eq!(
+            hydrated.previous_response_id.as_deref(),
+            Some("resp_loaded")
+        );
+        assert_eq!(hydrated.matched_candidate_rank, Some(1));
+        super::super::continuation::abort_continuation(Some(&lane), hydrated.turn_id);
+
+        // Once the newest branch really selects a response id, downgrading that turn invalidates
+        // both the selected response and its hidden alternate. The successful retry publishes
+        // only its fresh state, so later hydrated history cannot resurrect the old id.
+        let lane = test_lane_key("full-context-retry-discard");
+        let loaded =
+            super::super::continuation::continuation_candidate(Some(&lane), &loaded_request, true);
+        super::super::continuation::record_continuation(
+            Some(&lane),
+            loaded.turn_id,
+            &loaded_request,
+            Some("resp_loaded"),
+            std::slice::from_ref(&loaded_answer),
+        );
+        let unavailable = super::super::continuation::continuation_candidate(
+            Some(&lane),
+            &unavailable_request,
+            true,
+        );
+        super::super::continuation::record_continuation(
+            Some(&lane),
+            unavailable.turn_id,
+            &unavailable_request,
+            Some("resp_unavailable"),
+            std::slice::from_ref(&unavailable_answer),
+        );
+        let resume_two = item("user", "resume two");
+        let mut unavailable_request_two = unavailable_request.clone();
+        unavailable_request_two
+            .input
+            .extend([unavailable_answer.clone(), resume_two.clone()]);
+        let selected = super::super::continuation::continuation_candidate(
+            Some(&lane),
+            &unavailable_request_two,
+            true,
+        );
+        assert_eq!(
+            selected.previous_response_id.as_deref(),
+            Some("resp_unavailable")
+        );
+        assert_eq!(selected.matched_candidate_rank, Some(0));
+        assert_eq!(selected.candidate_count, 2);
+        let mut active = Some(selected);
+        let selected_turn = active.as_ref().and_then(|candidate| candidate.turn_id);
+        assert!(prepare_buffered_full_context_retry(
+            &mut active,
+            Some(&lane),
+            None,
+            selected_turn,
+        ));
+        let retry = active.unwrap();
+        assert!(retry.previous_response_id.is_none());
+        assert_eq!(retry.matched_candidate_rank, None);
+        assert_eq!(retry.candidate_count, 0);
+        let unavailable_answer_two = item("assistant", "unavailable answer two");
+        super::super::continuation::record_continuation(
+            Some(&lane),
+            retry.turn_id,
+            &unavailable_request_two,
+            Some("resp_retry"),
+            std::slice::from_ref(&unavailable_answer_two),
+        );
+        hydrated_request.input = vec![
+            loaded_user,
+            search_call,
+            loaded_output,
+            additional_tools,
+            loaded_answer,
+            resume_one,
+            unavailable_answer,
+            resume_two,
+            unavailable_answer_two,
+            item("user", "hydrated after retry"),
+        ];
+        let no_resurrection = super::super::continuation::continuation_candidate(
+            Some(&lane),
+            &hydrated_request,
+            true,
+        );
+        assert!(no_resurrection.previous_response_id.is_none());
+        assert_eq!(no_resurrection.matched_candidate_rank, None);
+        assert_eq!(no_resurrection.candidate_count, 1);
+        assert_eq!(
+            no_resurrection.disabled_reason.as_deref(),
+            Some("not_append_only")
+        );
+        super::super::continuation::abort_continuation(Some(&lane), no_resurrection.turn_id);
     }
 }

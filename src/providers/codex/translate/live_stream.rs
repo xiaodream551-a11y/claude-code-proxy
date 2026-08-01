@@ -5,7 +5,7 @@ use crate::anthropic::sse::encode_sse_event;
 use crate::providers::translate_shared::sanitize_external_error_detail;
 use crate::traffic::TrafficCapture;
 
-use super::super::events::validate_terminal_snapshot_status;
+use super::super::events::{is_ignorable_control_event, validate_terminal_snapshot_status};
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
@@ -188,6 +188,10 @@ impl LiveStreamTranslator {
         validate_terminal_snapshot_status(payload)?;
         let mut out = Vec::new();
 
+        if is_ignorable_control_event(payload) {
+            return Ok(out);
+        }
+
         match kind {
             "codex.rate_limits" => {
                 if payload
@@ -199,11 +203,6 @@ impl LiveStreamTranslator {
                     return Err("rate limit reached".to_string());
                 }
             }
-            // The Codex WebSocket gateway sends response-scoped headers in this
-            // control frame. They influence Codex's own UI/runtime behavior but
-            // have no Anthropic content mapping.
-            "codex.response.metadata" => {}
-            "keepalive" => {}
             "response.failed" | "response.error" | "response.cancelled" | "error" => {
                 return Err(error_message(payload));
             }
@@ -2402,7 +2401,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_live_rejects_terminal_tail_but_allows_rate_limit_telemetry() {
+    fn codex_live_rejects_semantic_terminal_tail_but_allows_exact_control_telemetry() {
         let terminal = json!({
             "type":"response.completed",
             "response":{"id":"resp_1","usage":{}}
@@ -2414,25 +2413,15 @@ mod tests {
                 .unwrap()
                 .contains("message_stop")
         );
-        assert!(
-            translator
-                .accept(
-                    &json!({"type":"codex.rate_limits","rate_limits":{"limit_reached":true}}),
-                    None
-                )
-                .unwrap()
-                .is_empty()
-        );
-        let error = translator
-            .accept(
-                &json!({
-                    "type":"codex.response.metadata",
-                    "headers":{"openai-model":"gpt-5.6-sol"}
-                }),
-                None,
-            )
-            .unwrap_err();
-        assert!(error.contains("after terminal"));
+        for control in [
+            json!({"type":"codex.rate_limits","rate_limits":{"limit_reached":true}}),
+            json!({"type":"codex.response.metadata","headers":{"openai-model":"gpt-5.6-sol"}}),
+            json!({"type":"response.metadata","headers":{"openai-model":"gpt-5.6-sol"}}),
+            json!({"type":"responsesapi.websocket_timing","response_ms":42}),
+            json!({"type":"keepalive"}),
+        ] {
+            assert!(translator.accept(&control, None).unwrap().is_empty());
+        }
         let error = translator
             .accept(
                 &json!({
@@ -2440,6 +2429,13 @@ mod tests {
                     "output_index":0,
                     "delta":"late"
                 }),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("after terminal"));
+        let error = translator
+            .accept(
+                &json!({"type":"responsesapi.websocket_timing.v2","value":1}),
                 None,
             )
             .unwrap_err();
@@ -2455,6 +2451,14 @@ mod tests {
                     "openai-model":"gpt-5.6-sol",
                     "x-codex-safety-buffering-enabled":"true"
                 }
+            }),
+            json!({
+                "type":"response.metadata",
+                "headers":{"openai-model":"gpt-5.6-sol"}
+            }),
+            json!({
+                "type":"responsesapi.websocket_timing",
+                "response_ms":42
             }),
             json!({
                 "type":"response.created",
@@ -2484,6 +2488,7 @@ mod tests {
         assert!(out.contains("metadata survived"));
         assert!(out.contains("message_stop"));
         assert!(!out.contains("codex.response.metadata"));
+        assert!(!out.contains("responsesapi.websocket_timing"));
         assert!(!out.contains("x-codex-safety-buffering-enabled"));
     }
 
@@ -2513,6 +2518,12 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("unsupported Codex semantic event"));
+        for event_type in ["response.metadata.v2", "responsesapi.websocket_timing.v2"] {
+            let error = translator
+                .accept(&json!({"type":event_type,"value":1}), None)
+                .unwrap_err();
+            assert!(error.contains("unsupported Codex semantic event"));
+        }
 
         let mut translator = LiveStreamTranslator::new("msg_2", "gpt-5.6-sol");
         translator

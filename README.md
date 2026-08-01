@@ -356,19 +356,21 @@ ANTHROPIC_MODEL=grok-4.5-high \
 ANTHROPIC_DEFAULT_HAIKU_MODEL=grok-4.5-medium \
 ANTHROPIC_SMALL_FAST_MODEL=grok-4.5-medium \
 CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000 \
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000 \
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90 \
+CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=8000 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
   claude
 
 ```
 
-The managed `co` launcher additionally sets
+The managed `co` and `cg` launchers additionally set
 `workflowSizeGuideline: "small"` in Claude Code's inline settings. Together
-with the 8K `Read` cap, this keeps broad dynamic workflows from filling a
-272K GPT context with a few whole-file tool results. These GPT-specific
-guards are not applied to the 500K `cg` profile.
+with the 8K `Read` cap, this keeps broad dynamic workflows from filling the
+context with a few whole-file tool results. `cg` still advertises Grok's 500K
+raw capacity, but uses the same 272K auto-compaction window as `co` so long
+agent loops do not repeatedly upload 250K+ full-history requests.
 
 Claude Code sends automatic and manual compaction with the main-loop model.
 The `co` profile already routes recognized compaction to GPT-5.6 Terra. For a
@@ -440,9 +442,9 @@ the bundled catalog's 272K capacity.
 Claude Code 2.1.212 reserves up to 20K tokens for output before applying the
 configured compaction percentage. With the settings above, the current 90%
 trigger is therefore approximately `(272K - 20K) * 90% = 226.8K`, rather than
-the simpler `272K * 90%` estimate. The Grok launch profile uses a 500K raw and
-auto-compact window, which triggers at approximately 432K under the same
-reserve and percentage.
+the simpler `272K * 90%` estimate. The Grok launch profile keeps a 500K raw
+window while using this 272K auto-compact window and approximately 226.8K
+effective trigger.
 
 If you'd rather disable auto-compact completely, set
 `DISABLE_AUTO_COMPACT=1` in your env or `~/.claude/settings.json`. Manual
@@ -565,8 +567,15 @@ tools, tool results, structured output, thinking, token
 counts, and streaming events. Recognized compaction requests do not receive the
 otherwise-default hosted search tool.
 The CLI endpoint's plaintext reasoning summaries are suppressed because they are
-not signed Anthropic thinking blocks and can contain draft answers; periodic
-Anthropic `ping` events preserve downstream liveness while Grok reasons.
+not signed Anthropic thinking blocks and can contain draft answers. The first
+reasoning delta starts the ordinary Anthropic message without a content block,
+so Claude Code can show immediate progress without exposing or fabricating
+thinking; periodic Anthropic `ping` events preserve downstream liveness during
+longer reasoning phases.
+When Claude Code supplies a session ID, the proxy sends xAI a stable, opaque
+`prompt_cache_key` digest. The same session and `resume` command retain cache
+affinity across proxy restarts without disclosing the raw session ID; cache hits
+still require an unchanged prompt prefix.
 Failures delivered inside an HTTP 200 stream (`error`, `response.error`, or
 `response.failed`) retain their upstream status, message, and `Retry-After`.
 Retryable 429/500/502/503/504/529 failures rebuild the request only before semantic output;
@@ -628,7 +637,7 @@ sequenceDiagram
         AUTH-->>P: new access (+ rotated refresh)
     end
 
-    P->>P: translate request<br/>• strip Anthropic-only fields<br/>• system blocks → instructions / system message<br/>• tool_use / tool_result ↔ provider-specific shapes<br/>• prompt_cache_key = session id
+    P->>P: translate request<br/>• strip Anthropic-only fields<br/>• system blocks → instructions / system message<br/>• tool_use / tool_result ↔ provider-specific shapes<br/>• prompt_cache_key = opaque session digest
     P->>U: POST upstream<br/>Bearer + provider-specific headers
     U-->>P: provider Responses stream
     P->>P: reducer: typed events<br/>(thinking / text / tool start/delta/stop, finish)
@@ -927,7 +936,7 @@ or delete the old file. `CCP_CONFIG_DIR` disables the fallback.
   },
   "grok": {
     "baseUrl": "https://cli-chat-proxy.grok.com/v1",
-    "clientVersion": "0.2.93",
+    "clientVersion": "0.2.118",
     "connectTimeoutMs": 10000,
     "headerTimeoutMs": 60000,
     "firstByteTimeoutMs": 60000,
@@ -986,7 +995,7 @@ or delete the old file. `CCP_CONFIG_DIR` disables the fallback.
 | `CCP_CODEX_ORIGINATOR`           | `codex.originator`         | `claude-code-proxy`                               | Override the `originator` header sent to Codex                                                                                                                                    |
 | `CCP_CODEX_USER_AGENT`           | `codex.userAgent`          | `claude-code-proxy/<version>`                     | Override the `User-Agent` header sent to Codex                                                                                                                                    |
 | `CCP_GROK_BASE_URL`              | `grok.baseUrl`             | `https://cli-chat-proxy.grok.com/v1`              | Override the Grok Responses API base URL                                                                                                                                          |
-| `CCP_GROK_CLIENT_VERSION`        | `grok.clientVersion`       | `0.2.93`                                          | Override the Grok client version header                                                                                                                                           |
+| `CCP_GROK_CLIENT_VERSION`        | `grok.clientVersion`       | `0.2.118`                                         | Override the Grok client version header                                                                                                                                           |
 | `CCP_GROK_CONNECT_TIMEOUT_MS`    | `grok.connectTimeoutMs`    | `10000`                                           | Maximum time to establish the Grok TCP/TLS connection                                                                                                                             |
 | `CCP_GROK_HEADER_TIMEOUT_MS`     | `grok.headerTimeoutMs`     | `60000`                                           | Maximum time to receive Grok response headers; a timeout has an ambiguous POST outcome and is not replayed                                                                         |
 | `CCP_GROK_FIRST_BYTE_TIMEOUT_MS` | `grok.firstByteTimeoutMs`  | `60000`                                           | Maximum time to receive the first Grok response body byte; a timeout terminates the request without replay                                                                         |
@@ -1380,8 +1389,9 @@ if [ -f "$HOME/.claude/claude-code-proxy-enabled" ]; then
       ;;
     grok-4.5|grok-4.5-high|grok-4.5-medium)
       export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-500000}"
-      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-500000}"
+      export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-272000}"
       export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
+      export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS:-8000}"
       ;;
   esac
 fi

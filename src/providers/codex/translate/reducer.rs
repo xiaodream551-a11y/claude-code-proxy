@@ -2,7 +2,9 @@ use serde_json::Value;
 
 use crate::providers::translate_shared::{JsonObjectError, parse_json_object};
 
-use super::super::events::validate_terminal_snapshot_status;
+use super::super::events::{
+    is_ignorable_control_event, is_post_terminal_control_event, validate_terminal_snapshot_status,
+};
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
@@ -55,7 +57,7 @@ pub(super) fn event_type(payload: &Value) -> Result<&str, String> {
 }
 
 pub(crate) fn is_post_terminal_telemetry(payload: &Value) -> bool {
-    payload.get("type").and_then(Value::as_str) == Some("codex.rate_limits")
+    is_post_terminal_control_event(payload)
 }
 
 pub(super) fn parse_output_item_added(
@@ -820,9 +822,8 @@ pub(crate) fn reduce_upstream_bytes_with_tool_policy(
             continue;
         }
 
-        if matches!(t.as_str(), "keepalive" | "codex.response.metadata") {
-            // `codex.response.metadata` carries response-scoped gateway
-            // headers. It is an acknowledged control frame, not model output.
+        if is_ignorable_control_event(&p) {
+            // Exact, acknowledged control frames carry no model output.
             out.push(ReducerEvent::Progress);
             continue;
         }
@@ -2324,6 +2325,54 @@ mod tests {
     }
 
     #[test]
+    fn buffered_reducer_ignores_exact_gateway_control_frames() {
+        for (event_type, fields) in [
+            (
+                "response.metadata",
+                json!({"headers":{"openai-model":"gpt-5.6-sol"}}),
+            ),
+            (
+                "responsesapi.websocket_timing",
+                json!({"response_ms":42,"first_byte_ms":7}),
+            ),
+        ] {
+            let upstream = format!(
+                "{}{}{}{}{}{}",
+                sse(event_type, fields),
+                sse(
+                    "response.created",
+                    json!({"response":{"id":"resp_1","status":"in_progress"}})
+                ),
+                sse(
+                    "response.output_item.added",
+                    json!({"output_index":0,"item":{"type":"message","id":"msg_up"}})
+                ),
+                sse(
+                    "response.output_text.delta",
+                    json!({"output_index":0,"delta":"control survived"})
+                ),
+                sse(
+                    "response.output_item.done",
+                    json!({"output_index":0,"item":{"type":"message","id":"msg_up"}})
+                ),
+                sse(
+                    "response.completed",
+                    json!({"response":{"id":"resp_1","status":"completed","usage":{}}})
+                ),
+            );
+
+            let reduced = reduce_upstream_bytes(upstream.as_bytes())
+                .unwrap_or_else(|error| panic!("{event_type}: {error:?}"));
+            assert!(
+                reduced
+                    .iter()
+                    .any(|event| matches!(event, ReducerEvent::Progress))
+            );
+            assert!(matches!(reduced.last(), Some(ReducerEvent::Finish { .. })));
+        }
+    }
+
+    #[test]
     fn buffered_reducer_accepts_stream_start_bom_and_rejects_invalid_utf8() {
         let with_bom = b"\xef\xbb\xbfdata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{}}}\n\n";
         let reduced = reduce_upstream_bytes(with_bom).unwrap();
@@ -2673,17 +2722,30 @@ mod tests {
     }
 
     #[test]
-    fn terminal_tail_only_allows_rate_limit_telemetry() {
+    fn terminal_tail_only_allows_exact_control_telemetry() {
         let terminal = sse(
             "response.completed",
             json!({"response":{"id":"resp_1","usage":{}}}),
         );
-        let telemetry = sse(
-            "codex.rate_limits",
-            json!({"rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30}}}),
-        );
-        let completed_with_telemetry = format!("{terminal}{telemetry}");
-        assert!(reduce_upstream_bytes(completed_with_telemetry.as_bytes()).is_ok());
+        for telemetry in [
+            sse(
+                "codex.rate_limits",
+                json!({"rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":30}}}),
+            ),
+            sse(
+                "codex.response.metadata",
+                json!({"headers":{"openai-model":"gpt-5.6-sol"}}),
+            ),
+            sse(
+                "response.metadata",
+                json!({"headers":{"openai-model":"gpt-5.6-sol"}}),
+            ),
+            sse("responsesapi.websocket_timing", json!({"response_ms":42})),
+            sse("keepalive", json!({})),
+        ] {
+            let completed_with_telemetry = format!("{terminal}{telemetry}");
+            assert!(reduce_upstream_bytes(completed_with_telemetry.as_bytes()).is_ok());
+        }
 
         for tail in [
             sse(
@@ -2701,10 +2763,8 @@ mod tests {
                 "response.completed",
                 json!({"response":{"id":"resp_2","usage":{}}}),
             ),
-            sse(
-                "codex.response.metadata",
-                json!({"headers":{"openai-model":"gpt-5.6-sol"}}),
-            ),
+            sse("response.metadata.v2", json!({"value":1})),
+            sse("responsesapi.websocket_timing.v2", json!({"value":1})),
             sse("future.semantic.event", json!({"value":1})),
         ] {
             let input = format!("{terminal}{tail}");

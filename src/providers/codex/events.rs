@@ -2,6 +2,13 @@ use serde_json::Value;
 
 const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
+pub(crate) fn contains_sse_line_start_bom(bytes: &[u8]) -> bool {
+    bytes.starts_with(UTF8_BOM)
+        || bytes
+            .windows(UTF8_BOM.len() + 1)
+            .any(|window| matches!(window[0], b'\r' | b'\n') && &window[1..] == UTF8_BOM)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexTerminalKind {
     Completed,
@@ -37,6 +44,83 @@ impl CodexTerminalKind {
     pub(crate) fn is_reusable(self) -> bool {
         matches!(self, Self::Completed | Self::Done)
     }
+}
+
+/// Return whether an upstream frame is an exact, acknowledged control event with no
+/// Anthropic-visible semantics.
+///
+/// Keep this allowlist exact. Prefix matching here would silently swallow future `response.*`
+/// events that may carry model output or otherwise change response semantics.
+pub(crate) fn is_ignorable_control_event(payload: &Value) -> bool {
+    matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some(
+            "keepalive"
+                | "codex.response.metadata"
+                | "response.metadata"
+                | "responsesapi.websocket_timing"
+        )
+    )
+}
+
+/// Control frames that are safe to consume after an authoritative terminal event.
+///
+/// A trailing rate-limit snapshot is telemetry once the response has completed, even though a
+/// pre-terminal `limit_reached=true` frame remains a request failure.
+pub(crate) fn is_post_terminal_control_event(payload: &Value) -> bool {
+    is_ignorable_control_event(payload)
+        || payload.get("type").and_then(Value::as_str) == Some("codex.rate_limits")
+}
+
+/// Return whether the buffered retry pre-scan understands an event type well enough to decide
+/// that replay remains eligible.
+///
+/// This mirrors the exact event surface accepted by the live and buffered translators. A newly
+/// observed event must remain fail-closed here until its semantics are understood: an unknown
+/// event could represent a hosted side effect that must not be repeated.
+fn is_known_retry_prescan_event(payload: &Value) -> bool {
+    if is_ignorable_control_event(payload) || CodexTerminalKind::from_payload(payload).is_some() {
+        return true;
+    }
+    if matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some("response.output_item.added" | "response.output_item.done")
+    ) {
+        if payload
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .is_none()
+        {
+            return false;
+        }
+        return matches!(
+            payload.pointer("/item/type").and_then(Value::as_str),
+            Some("message" | "reasoning" | "function_call" | "web_search_call")
+        );
+    }
+    matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some(
+            "codex.rate_limits"
+                | "response.created"
+                | "response.in_progress"
+                | "response.queued"
+                | "response.content_part.added"
+                | "response.content_part.done"
+                | "response.output_text.delta"
+                | "response.output_text.done"
+                | "response.output_text.annotation.added"
+                | "response.function_call_arguments.delta"
+                | "response.function_call_arguments.done"
+                | "response.reasoning_summary_part.added"
+                | "response.reasoning_summary_part.done"
+                | "response.reasoning_summary_text.delta"
+                | "response.reasoning_summary_text.done"
+                | "response.web_search_call.in_progress"
+                | "response.web_search_call.searching"
+                | "response.web_search_call.completed"
+        )
+    )
 }
 
 /// Validate an optional terminal response snapshot status against the event that carries it.
@@ -450,11 +534,20 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
     // request. The reducer will surface the decode failure to the caller.
     for event in parse_codex_sse_events(body).ok()? {
         if event.data == "[DONE]" {
-            continue;
+            // `[DONE]` is an ordering barrier, not ignorable telemetry. The reducer rejects it
+            // before an authoritative response terminal, and no later frame may resurrect replay
+            // eligibility after it.
+            return None;
         }
         let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
-            continue;
+            return None;
         };
+        if !is_known_retry_prescan_event(&payload) {
+            return None;
+        }
+        if is_ignorable_control_event(&payload) {
+            continue;
+        }
         if starts_hosted_side_effect(&payload) {
             hosted_side_effect_started = true;
             first_failure = None;
@@ -513,10 +606,7 @@ pub(crate) fn parse_codex_sse_events(
     body: &[u8],
 ) -> Result<Vec<crate::anthropic::sse::SseEvent>, String> {
     let body = body.strip_prefix(UTF8_BOM).unwrap_or(body);
-    if body
-        .windows(UTF8_BOM.len())
-        .any(|window| window == UTF8_BOM)
-    {
+    if contains_sse_line_start_bom(body) {
         return Err("Codex SSE response contained a UTF-8 BOM after stream start".to_string());
     }
     crate::anthropic::sse::try_parse_sse_events(body).map_err(|error| {
@@ -623,6 +713,33 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn control_event_allowlist_is_exact() {
+        for event_type in [
+            "keepalive",
+            "codex.response.metadata",
+            "response.metadata",
+            "responsesapi.websocket_timing",
+        ] {
+            assert!(
+                is_ignorable_control_event(&serde_json::json!({"type": event_type})),
+                "expected {event_type:?} to be an acknowledged control event"
+            );
+        }
+
+        for event_type in [
+            "response.metadata.v2",
+            "responsesapi.websocket_timing.v2",
+            "response.Metadata",
+            "future.control.event",
+        ] {
+            assert!(
+                !is_ignorable_control_event(&serde_json::json!({"type": event_type})),
+                "unexpectedly acknowledged {event_type:?}"
+            );
+        }
     }
 
     #[test]
@@ -891,12 +1008,75 @@ mod tests {
 
     #[test]
     fn response_metadata_does_not_close_buffered_retry_prescan() {
-        let body = b"data: {\"type\":\"codex.response.metadata\",\"headers\":{\"openai-model\":\"gpt-5.6-sol\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"status\":503,\"message\":\"busy\"}}}\n\n";
+        for control in [
+            r#"{"type":"codex.response.metadata","headers":{"openai-model":"gpt-5.6-sol"}}"#,
+            r#"{"type":"response.metadata","headers":{"openai-model":"gpt-5.6-sol"}}"#,
+            r#"{"type":"responsesapi.websocket_timing","response_ms":42}"#,
+        ] {
+            let body = format!(
+                "data: {control}\n\ndata: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"status\":503,\"message\":\"busy\"}}}}}}\n\n"
+            );
+            assert_eq!(
+                first_retryable_failure(body.as_bytes()).map(|failure| failure.status),
+                Some(503),
+                "control event {control} hid the retryable failure"
+            );
+        }
+    }
 
-        assert_eq!(
-            first_retryable_failure(body).map(|failure| failure.status),
-            Some(503)
-        );
+    #[test]
+    fn unknown_event_before_retryable_failure_disables_buffered_replay() {
+        for unknown in [
+            r#"{"type":"response.metadata.v2","value":1}"#,
+            r#"{"type":"responsesapi.websocket_timing.v2","value":1}"#,
+            r#"{"type":"future.semantic.event","value":1}"#,
+            r#"{"value":"missing type"}"#,
+        ] {
+            for failure in [
+                r#"{"type":"response.failed","response":{"status":"failed","error":{"status":503,"message":"busy"}}}"#,
+                r#"{"type":"codex.rate_limits","rate_limits":{"limit_reached":true,"primary":{"reset_after_seconds":1}}}"#,
+            ] {
+                let body = format!("data: {unknown}\n\ndata: {failure}\n\n");
+                assert!(
+                    first_retryable_failure(body.as_bytes()).is_none(),
+                    "unknown event {unknown} allowed replay for {failure}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn known_generated_output_keeps_buffered_retry_eligible() {
+        for item_type in ["message", "reasoning", "function_call"] {
+            let body = format!(
+                "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_1\"}}}}\n\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"{item_type}\",\"call_id\":\"call_1\",\"name\":\"Read\"}}}}\n\ndata: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"status\":503,\"message\":\"busy\"}}}}}}\n\n"
+            );
+            assert_eq!(
+                first_retryable_failure(body.as_bytes()).map(|failure| failure.status),
+                Some(503),
+                "known output item {item_type:?} unexpectedly disabled replay"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_malformed_output_item_disables_buffered_replay() {
+        for output_item in [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"computer_call","id":"computer_1"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"code_interpreter_call","id":"code_1"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"mcp_call","id":"mcp_1"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"unknown_1"}}"#,
+            r#"{"type":"response.output_item.added","item":{"type":"message","id":"msg_1"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":null}"#,
+        ] {
+            let body = format!(
+                "data: {output_item}\n\ndata: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"status\":503,\"message\":\"busy\"}}}}}}\n\n"
+            );
+            assert!(
+                first_retryable_failure(body.as_bytes()).is_none(),
+                "unsafe output item allowed replay: {output_item}"
+            );
+        }
     }
 
     #[test]
@@ -920,5 +1100,22 @@ mod tests {
 
         let later_bom = b"data: {\"type\":\"response.created\"}\n\n\xef\xbb\xbfdata: {\"type\":\"response.failed\",\"error\":{\"status\":503,\"message\":\"busy\"}}\n\n";
         assert!(first_retryable_failure(later_bom).is_none());
+
+        let malformed_json = b"data: {\"type\":\"response.created\"\n\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"status\":503,\"message\":\"busy\"}}}\n\n";
+        assert!(first_retryable_failure(malformed_json).is_none());
+
+        let done_then_failure = b"data: [DONE]\n\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"status\":503,\"message\":\"busy\"}}}\n\n";
+        assert!(first_retryable_failure(done_then_failure).is_none());
+    }
+
+    #[test]
+    fn buffered_sse_allows_unicode_bom_inside_json_string() {
+        let body =
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"left\u{feff}right\"}\n\n";
+        let events = parse_codex_sse_events(body.as_bytes()).unwrap();
+
+        assert_eq!(events.len(), 1);
+        let payload: Value = serde_json::from_str(&events[0].data).unwrap();
+        assert_eq!(payload["delta"], "left\u{feff}right");
     }
 }

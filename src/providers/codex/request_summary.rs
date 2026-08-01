@@ -259,6 +259,7 @@ mod tests {
             reasoning: None,
             schema_bridge: None,
             hosted_web_search_max_uses: None,
+            deferred_tool_hydration: Default::default(),
         };
         let summary = summarize_codex_request_size(&req);
         assert_eq!(summary.input_item_count, 1);
