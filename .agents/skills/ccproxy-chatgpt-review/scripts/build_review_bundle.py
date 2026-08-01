@@ -536,8 +536,9 @@ def write_manifest(
 
 ## Upload together
 
-Upload `01-REVIEW-PROMPT.md` and every digest file below to one ChatGPT Pro
-conversation. Then paste the text of `01-REVIEW-PROMPT.md` as your message.
+Upload this `00-MANIFEST.md`, `01-REVIEW-PROMPT.md`, and every digest file below
+to one ChatGPT Pro conversation. Then paste the text of `01-REVIEW-PROMPT.md`
+as your message.
 
 {os.linesep.join(digest_lines)}
 
