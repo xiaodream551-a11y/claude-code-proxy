@@ -11,10 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 pub const LOG_QUEUE_CAPACITY: usize = 4_096;
+const ROTATED_LOG_RETENTION: usize = 5;
 
 static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static LOG_WRITER: OnceLock<Option<LogWriter>> = OnceLock::new();
+static LOG_RETENTION_INITIALIZED: OnceLock<()> = OnceLock::new();
 static LOG_DIRECTORY_PERMISSION_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 static LOG_FILE_PERMISSION_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
@@ -310,6 +312,12 @@ where
 
 fn enqueue_log_line(line: String) -> io::Result<()> {
     let file = log_file();
+    LOG_RETENTION_INITIALIZED.get_or_init(|| {
+        let _guard = LOG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_rotated_logs(&file, ROTATED_LOG_RETENTION);
+    });
     match LOG_WRITER.get_or_init(|| LogWriter::spawn(LOG_QUEUE_CAPACITY).ok()) {
         Some(writer) => match writer.enqueue(file, line) {
             EnqueueResult::Enqueued | EnqueueResult::Dropped => Ok(()),
@@ -384,9 +392,90 @@ fn rotate_file(path: &Path) -> io::Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let rotated = path.with_extension(format!("{ts}"));
-    fs::rename(path, rotated)?;
+    rotate_file_at(path, ts)?;
     Ok(())
+}
+
+fn rotate_file_at(path: &Path, timestamp: u128) -> io::Result<PathBuf> {
+    let rotated = next_rotated_log_path(path, timestamp)?;
+    fs::rename(path, &rotated)?;
+    prune_rotated_logs(path, ROTATED_LOG_RETENTION);
+    Ok(rotated)
+}
+
+fn next_rotated_log_path(path: &Path, timestamp: u128) -> io::Result<PathBuf> {
+    let next_after_existing = rotated_log_files(path)
+        .into_iter()
+        .map(|(timestamp, _)| timestamp)
+        .max()
+        .map(|timestamp| {
+            timestamp.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "rotated log timestamp space is exhausted",
+                )
+            })
+        })
+        .transpose()?;
+    let mut timestamp = next_after_existing.map_or(timestamp, |next| next.max(timestamp));
+
+    loop {
+        let candidate = path.with_extension(timestamp.to_string());
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => return Err(error),
+            Ok(_) => {
+                timestamp = timestamp.checked_add(1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "rotated log timestamp space is exhausted",
+                    )
+                })?;
+            }
+        }
+    }
+}
+
+fn prune_rotated_logs(path: &Path, retention: usize) {
+    let mut files = rotated_log_files(path);
+    files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let remove = files.len().saturating_sub(retention);
+    for (_, path) in files.into_iter().take(remove) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn rotated_log_files(path: &Path) -> Vec<(u128, PathBuf)> {
+    let Some(stem) = path.file_stem() else {
+        return Vec::new();
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let candidate = entry.path();
+            if candidate == path || candidate.file_stem() != Some(stem) {
+                return None;
+            }
+            let suffix = candidate.extension()?.to_str()?;
+            if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let timestamp = suffix.parse::<u128>().ok()?;
+            let metadata = fs::symlink_metadata(&candidate).ok()?;
+            metadata
+                .file_type()
+                .is_file()
+                .then_some((timestamp, candidate))
+        })
+        .collect()
 }
 
 fn create_dir(path: &Path, mode: u32) -> io::Result<()> {
@@ -722,6 +811,94 @@ mod tests {
         let mut successful_sink = |_file: &Path, _line: &str| Ok(());
         write_dropped_summary(&dropped, 8, Path::new("proxy.log"), &mut successful_sink).unwrap();
         assert_eq!(dropped.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn rotated_log_cleanup_keeps_only_matching_newest_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("proxy.log");
+        fs::write(&current, b"current").unwrap();
+        for timestamp in 1..=7_u128 {
+            fs::write(
+                current.with_extension(timestamp.to_string()),
+                timestamp.to_string(),
+            )
+            .unwrap();
+        }
+        let backup = temp.path().join("proxy.backup");
+        let extra_extension = temp.path().join("proxy.8.tmp");
+        let other_log = temp.path().join("other.1");
+        let matching_directory = temp.path().join("proxy.0");
+        fs::write(&backup, b"backup").unwrap();
+        fs::write(&extra_extension, b"extra").unwrap();
+        fs::write(&other_log, b"other").unwrap();
+        fs::create_dir(&matching_directory).unwrap();
+
+        prune_rotated_logs(&current, ROTATED_LOG_RETENTION);
+
+        assert_eq!(fs::read(&current).unwrap(), b"current");
+        for timestamp in 1..=2_u128 {
+            assert!(!current.with_extension(timestamp.to_string()).exists());
+        }
+        for timestamp in 3..=7_u128 {
+            assert!(current.with_extension(timestamp.to_string()).is_file());
+        }
+        assert!(backup.is_file());
+        assert!(extra_extension.is_file());
+        assert!(other_log.is_file());
+        assert!(matching_directory.is_dir());
+    }
+
+    #[test]
+    fn consecutive_rotations_are_unique_and_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("proxy.log");
+
+        for sequence in 0..7_u128 {
+            fs::write(&current, sequence.to_string()).unwrap();
+            let rotated = rotate_file_at(&current, 1_000).unwrap();
+            assert!(rotated.is_file());
+            assert!(!current.exists());
+        }
+        fs::write(&current, b"current").unwrap();
+
+        let mut rotated = rotated_log_files(&current);
+        rotated.sort_by_key(|(timestamp, _)| *timestamp);
+        assert_eq!(
+            rotated
+                .iter()
+                .map(|(timestamp, _)| *timestamp)
+                .collect::<Vec<_>>(),
+            vec![1_002, 1_003, 1_004, 1_005, 1_006]
+        );
+        assert_eq!(rotated.len(), ROTATED_LOG_RETENTION);
+        for (sequence, (_, path)) in (2_u128..=6).zip(rotated) {
+            assert_eq!(fs::read_to_string(path).unwrap(), sequence.to_string());
+        }
+        assert_eq!(fs::read(&current).unwrap(), b"current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotated_log_cleanup_never_follows_a_numeric_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("proxy.log");
+        let target = temp.path().join("must-survive");
+        let link = current.with_extension("1");
+        fs::write(&target, b"outside rotation set").unwrap();
+        symlink(&target, &link).unwrap();
+
+        prune_rotated_logs(&current, 0);
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"outside rotation set");
     }
 
     #[cfg(unix)]

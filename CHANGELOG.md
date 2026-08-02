@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Stop an in-band Anthropic SSE error at its exact event boundary, discarding any text, tool, or
+  false `message_stop` tail that arrived in the same upstream body frame. Parse ordinary stream
+  events through narrow diagnostic probes so large semantic deltas are not materialized as full
+  JSON trees solely for lifecycle logging.
+- Inspect at most 256 request-side tool-result candidate blocks and accept at most 256
+  per-response tool starts, with at most 512 pending non-terminal stream events plus one terminal
+  marker; overflow releases retained state, emits one metadata-only truncation summary, and leaves
+  downstream SSE bytes and completion semantics unchanged.
+- Close Grok replay before reduction for every decoded event outside the explicit pre-generation
+  lifecycle/failure allowlist, including unknown or structurally incomplete future events. Retain
+  only the newest five rotated proxy logs and report provider request-translation time as bounded
+  `request_configuration.translateMs` metadata.
 - Close Codex buffered and live whole-request replay as soon as a validated semantic response
   event advances generation, including events that temporarily render no Anthropic bytes, while
   keeping `response.created`, `response.in_progress`, and `response.queued` lifecycle frames

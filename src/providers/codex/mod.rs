@@ -188,6 +188,7 @@ impl Provider for CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
+        let translate_started_at = Instant::now();
         let translated = match translate_codex_request_for_provider(
             body,
             TranslateOptions {
@@ -209,6 +210,7 @@ impl Provider for CodexProvider {
             Ok(t) => t,
             Err(response) => return response,
         };
+        let translate_ms = translate_started_at.elapsed().as_millis();
         // `store:false` response ids are WebSocket-affine. HTTP cannot publish a
         // response id that a later request can reach, so keep both explicit HTTP
         // and Auto decisions that resolved to HTTP out of the continuation registry.
@@ -234,6 +236,7 @@ impl Provider for CodexProvider {
                 enabled: previous_response_id_enabled,
                 candidate: &continuation,
                 prompt_changed_fields: &continuation_decision.prompt_changed_fields,
+                translate_ms,
             },
         );
         let turn_id = continuation.turn_id;
@@ -1322,6 +1325,7 @@ struct CodexContinuationLog<'a> {
     enabled: bool,
     candidate: &'a continuation::ContinuationCandidate,
     prompt_changed_fields: &'a [&'static str],
+    translate_ms: u128,
 }
 
 fn log_codex_request_configuration(
@@ -1392,6 +1396,10 @@ fn log_codex_request_configuration(
         "request_configuration",
         Some(serde_json::Map::from_iter([
             ("reqId".to_string(), serde_json::json!(ctx.req_id)),
+            (
+                "translateMs".to_string(),
+                serde_json::json!(continuation.translate_ms),
+            ),
             ("model".to_string(), serde_json::json!(request.model)),
             ("serviceTier".to_string(), serde_json::json!(service_tier)),
             (

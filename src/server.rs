@@ -19,9 +19,10 @@ use axum::{
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, StreamBody};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::future::Future;
@@ -54,6 +55,9 @@ const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const CLAUDE_CODE_PARENT_AGENT_ID_HEADER: &str = "x-claude-code-parent-agent-id";
 const REQUEST_LANE_KEY_DOMAIN: &[u8] = b"ccproxy-request-lane-key-v1\0";
 const INCOMPLETE_SSE_ERROR: &str = "SSE response ended before message_stop";
+const MAX_TRACKED_CLIENT_TOOL_RESULTS: usize = 256;
+const MAX_TRACKED_TOOL_BLOCK_STARTS: usize = 256;
+const MAX_PENDING_TOOL_LIFECYCLE_EVENTS: usize = MAX_TRACKED_TOOL_BLOCK_STARTS * 2;
 
 fn compaction_model_override(
     headers: &HeaderMap,
@@ -1588,6 +1592,9 @@ fn monitor_response_body(
         sse_detector: is_event_stream.then(SseErrorDetector::default),
         open_tool_blocks: HashMap::new(),
         provisionally_closed_tool_blocks: HashMap::new(),
+        observed_tool_block_starts: 0,
+        tool_tracking_truncated: false,
+        tool_tracking_disabled: false,
         saw_message_stop: false,
         _permits: permits,
         terminal: false,
@@ -1601,9 +1608,12 @@ fn monitor_response_body(
             match body.frame().await {
                 Some(Ok(frame)) => {
                     if let Some(data) = frame.data_ref()
-                        && let Some(error) = lifecycle.detect_sse_error(data)
+                        && let Some((error, consumed_bytes)) = lifecycle.detect_sse_error(data)
                     {
                         lifecycle.failed(error, true);
+                        let frame =
+                            frame.map_data(|data| data.slice(..consumed_bytes.min(data.len())));
+                        return Some((Ok(frame), (body, lifecycle)));
                     }
                     Some((Ok(frame), (body, lifecycle)))
                 }
@@ -1653,23 +1663,27 @@ struct ResponseBodyLifecycle {
     sse_detector: Option<SseErrorDetector>,
     open_tool_blocks: HashMap<u64, ToolBlockTrace>,
     provisionally_closed_tool_blocks: HashMap<u64, ToolBlockTrace>,
+    observed_tool_block_starts: usize,
+    tool_tracking_truncated: bool,
+    tool_tracking_disabled: bool,
     saw_message_stop: bool,
     _permits: RequestPermits,
     terminal: bool,
 }
 
 impl ResponseBodyLifecycle {
-    fn detect_sse_error(&mut self, bytes: &[u8]) -> Option<String> {
-        let (error, tool_events) = {
+    fn detect_sse_error(&mut self, bytes: &[u8]) -> Option<(String, usize)> {
+        let (error, error_consumed_bytes, tool_events) = {
             let detector = self.sse_detector.as_mut()?;
             let error = detector.push(bytes);
+            let error_consumed_bytes = detector.take_error_consumed_bytes();
             let tool_events = detector.take_tool_events();
-            (error, tool_events)
+            (error, error_consumed_bytes, tool_events)
         };
         for event in tool_events {
             self.observe_tool_event(event);
         }
-        error
+        error.map(|error| (error, error_consumed_bytes.unwrap_or(bytes.len())))
     }
 
     fn completed(&mut self) {
@@ -1700,6 +1714,14 @@ impl ResponseBodyLifecycle {
     fn observe_tool_event(&mut self, event: SseToolEvent) {
         match event {
             SseToolEvent::Started(tool) => {
+                if self.tool_tracking_disabled {
+                    return;
+                }
+                if self.observed_tool_block_starts >= MAX_TRACKED_TOOL_BLOCK_STARTS {
+                    self.disable_tool_tracking(ToolTrackingTruncationCause::BlockStartLimit);
+                    return;
+                }
+                self.observed_tool_block_starts += 1;
                 if let Some(previous) = self.provisionally_closed_tool_blocks.remove(&tool.index) {
                     log_tool_block_event(
                         &self.log_context,
@@ -1719,6 +1741,9 @@ impl ResponseBodyLifecycle {
                 log_tool_block_event(&self.log_context, "tool_block_started", &tool, None);
             }
             SseToolEvent::Stopped { index } => {
+                if self.tool_tracking_disabled {
+                    return;
+                }
                 if let Some(tool) = self.open_tool_blocks.remove(&index) {
                     self.provisionally_closed_tool_blocks.insert(index, tool);
                 }
@@ -1731,7 +1756,55 @@ impl ResponseBodyLifecycle {
                 }
                 self.interrupt_open_tools("message_stop_before_block_stop");
             }
+            SseToolEvent::TrackingTruncated => {
+                self.disable_tool_tracking(ToolTrackingTruncationCause::PendingEventLimit);
+            }
         }
+    }
+
+    fn disable_tool_tracking(&mut self, cause: ToolTrackingTruncationCause) {
+        self.tool_tracking_disabled = true;
+        self.interrupt_open_tools("tracking_capacity_exceeded");
+        self.mark_tool_tracking_truncated(cause);
+    }
+
+    fn mark_tool_tracking_truncated(&mut self, cause: ToolTrackingTruncationCause) {
+        if std::mem::replace(&mut self.tool_tracking_truncated, true) {
+            return;
+        }
+        self.log_context.log.info(
+            "tool_block_tracking_truncated",
+            Some(serde_json::Map::from_iter([
+                (
+                    "reqId".to_string(),
+                    serde_json::json!(self.log_context.req_id),
+                ),
+                (
+                    "provider".to_string(),
+                    serde_json::json!(self.log_context.provider),
+                ),
+                (
+                    "model".to_string(),
+                    serde_json::json!(self.log_context.model),
+                ),
+                (
+                    "elapsedMs".to_string(),
+                    serde_json::json!(self.log_context.started_at.elapsed().as_millis()),
+                ),
+                (
+                    "blockStartLimit".to_string(),
+                    serde_json::json!(MAX_TRACKED_TOOL_BLOCK_STARTS),
+                ),
+                (
+                    "pendingEventLimit".to_string(),
+                    serde_json::json!(MAX_PENDING_TOOL_LIFECYCLE_EVENTS),
+                ),
+                (
+                    "truncationCause".to_string(),
+                    serde_json::json!(cause.as_str()),
+                ),
+            ])),
+        );
     }
 
     fn interrupt_open_tools(&mut self, reason: &'static str) {
@@ -1771,6 +1844,22 @@ enum SseToolEvent {
     Started(ToolBlockTrace),
     Stopped { index: u64 },
     MessageStopped,
+    TrackingTruncated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolTrackingTruncationCause {
+    BlockStartLimit,
+    PendingEventLimit,
+}
+
+impl ToolTrackingTruncationCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockStartLimit => "block_start_limit",
+            Self::PendingEventLimit => "pending_event_limit",
+        }
+    }
 }
 
 fn log_tool_block_event(
@@ -1855,16 +1944,60 @@ fn log_client_tool_results(
     req_id: &str,
     request: &crate::anthropic::schema::MessagesRequest,
 ) {
-    let Some((message_index, message)) = request.messages.iter().enumerate().next_back() else {
-        return;
-    };
-    let Some(blocks) = message.content.as_array() else {
-        return;
-    };
+    let truncated_message_index = visit_client_tool_results(request, |result| {
+        log.info(
+            "client_tool_result",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(req_id)),
+                ("messageIndex".to_string(), json!(result.message_index)),
+                ("blockIndex".to_string(), json!(result.block_index)),
+                ("callIdHash".to_string(), json!(result.call_id_hash)),
+                ("isError".to_string(), json!(result.is_error)),
+                ("contentBytes".to_string(), json!(result.content_bytes)),
+            ])),
+        );
+    });
+    if let Some((message_index, logged_count)) = truncated_message_index {
+        log.info(
+            "client_tool_result_tracking_truncated",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(req_id)),
+                ("messageIndex".to_string(), json!(message_index)),
+                (
+                    "resultLimit".to_string(),
+                    json!(MAX_TRACKED_CLIENT_TOOL_RESULTS),
+                ),
+                ("loggedCount".to_string(), json!(logged_count)),
+            ])),
+        );
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ClientToolResultTrace {
+    message_index: usize,
+    block_index: usize,
+    call_id_hash: String,
+    is_error: bool,
+    content_bytes: u64,
+}
+
+fn visit_client_tool_results(
+    request: &crate::anthropic::schema::MessagesRequest,
+    mut observe: impl FnMut(ClientToolResultTrace),
+) -> Option<(usize, usize)> {
+    let (message_index, message) = request.messages.iter().enumerate().next_back()?;
+    let blocks = message.content.as_array()?;
+    let mut inspected_results = 0_usize;
+    let mut logged_results = 0_usize;
     for (block_index, block) in blocks.iter().enumerate() {
         if block.get("type").and_then(Value::as_str) != Some("tool_result") {
             continue;
         }
+        if inspected_results >= MAX_TRACKED_CLIENT_TOOL_RESULTS {
+            return Some((message_index, logged_results));
+        }
+        inspected_results += 1;
         let Some(call_id_hash) = block
             .get("tool_use_id")
             .and_then(Value::as_str)
@@ -1873,33 +2006,111 @@ fn log_client_tool_results(
             continue;
         };
         let content = block.get("content").unwrap_or(&Value::Null);
-        log.info(
-            "client_tool_result",
-            Some(serde_json::Map::from_iter([
-                ("reqId".to_string(), json!(req_id)),
-                ("messageIndex".to_string(), json!(message_index)),
-                ("blockIndex".to_string(), json!(block_index)),
-                ("callIdHash".to_string(), json!(call_id_hash)),
-                (
-                    "isError".to_string(),
-                    json!(
-                        block
-                            .get("is_error")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                    ),
-                ),
-                (
-                    "contentBytes".to_string(),
-                    json!(serialized_value_size(content)),
-                ),
-            ])),
-        );
+        observe(ClientToolResultTrace {
+            message_index,
+            block_index,
+            call_id_hash,
+            is_error: block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            content_bytes: serialized_value_size(content),
+        });
+        logged_results += 1;
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct SseTypeProbe<'a> {
+    #[serde(rename = "type", borrow)]
+    event_type: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct SseToolStartProbe<'a> {
+    index: Option<u64>,
+    #[serde(borrow)]
+    content_block: Option<SseToolBlockProbe<'a>>,
+}
+
+#[derive(Deserialize)]
+struct SseToolBlockProbe<'a> {
+    #[serde(rename = "type", borrow)]
+    tool_kind: Option<Cow<'a, str>>,
+    name: Option<Value>,
+    id: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct SseIndexProbe {
+    index: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct SseErrorMessageProbe {
+    error: Option<Value>,
+    message: Option<Value>,
+}
+
+fn sse_event_type<'a>(data: &'a str) -> Option<Cow<'a, str>> {
+    match serde_json::from_str::<SseTypeProbe<'a>>(data) {
+        Ok(payload) => payload.event_type,
+        Err(_) => {
+            // Preserve serde_json::Value's historical last-key-wins behavior for malformed
+            // duplicate fields without paying for a full JSON tree on normal stream events.
+            let payload = serde_json::from_str::<Value>(data).ok()?;
+            payload
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|event_type| Cow::Owned(event_type.to_string()))
+        }
     }
 }
 
-fn sse_tool_event(payload: &Value) -> Option<SseToolEvent> {
-    match payload.get("type").and_then(Value::as_str)? {
+fn sse_tool_event(event_type: &str, data: &str) -> Option<SseToolEvent> {
+    match event_type {
+        "content_block_start" => match serde_json::from_str::<SseToolStartProbe<'_>>(data) {
+            Ok(payload) => sse_tool_start_event(payload),
+            Err(_) => sse_tool_event_from_value(event_type, data),
+        },
+        "content_block_stop" => match serde_json::from_str::<SseIndexProbe>(data) {
+            Ok(payload) => Some(SseToolEvent::Stopped {
+                index: payload.index?,
+            }),
+            Err(_) => sse_tool_event_from_value(event_type, data),
+        },
+        "message_stop" => Some(SseToolEvent::MessageStopped),
+        _ => None,
+    }
+}
+
+fn sse_tool_start_event(payload: SseToolStartProbe<'_>) -> Option<SseToolEvent> {
+    let index = payload.index?;
+    let block = payload.content_block?;
+    let tool_kind = block.tool_kind?.into_owned();
+    if !matches!(tool_kind.as_str(), "tool_use" | "server_tool_use") {
+        return None;
+    }
+    Some(SseToolEvent::Started(ToolBlockTrace {
+        index,
+        tool_kind,
+        tool_name_metadata: block
+            .name
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(safe_tool_name_metadata),
+        call_id_hash: block
+            .id
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(diagnostic_identifier_hash),
+    }))
+}
+
+fn sse_tool_event_from_value(event_type: &str, data: &str) -> Option<SseToolEvent> {
+    let payload = serde_json::from_str::<Value>(data).ok()?;
+    match event_type {
         "content_block_start" => {
             let index = payload.get("index").and_then(Value::as_u64)?;
             let block = payload.get("content_block")?.as_object()?;
@@ -1923,9 +2134,31 @@ fn sse_tool_event(payload: &Value) -> Option<SseToolEvent> {
         "content_block_stop" => Some(SseToolEvent::Stopped {
             index: payload.get("index").and_then(Value::as_u64)?,
         }),
-        "message_stop" => Some(SseToolEvent::MessageStopped),
         _ => None,
     }
+}
+
+fn sse_error_message(data: &str) -> Option<String> {
+    let payload = match serde_json::from_str::<SseErrorMessageProbe>(data) {
+        Ok(payload) => payload,
+        Err(_) => {
+            let payload = serde_json::from_str::<Value>(data).ok()?;
+            return payload
+                .pointer("/error/message")
+                .or_else(|| payload.get("message"))
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .map(str::to_string);
+        }
+    };
+    payload
+        .error
+        .as_ref()
+        .and_then(|error| error.get("message"))
+        .or(payload.message.as_ref())
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(str::to_string)
 }
 
 const MAX_SSE_ERROR_EVENT_BYTES: usize = 256 * 1024;
@@ -1940,11 +2173,16 @@ struct SseErrorDetector {
     discard_event: bool,
     skip_lf: bool,
     tool_events: Vec<SseToolEvent>,
+    pending_tool_lifecycle_events: usize,
+    tool_events_truncated: bool,
+    message_stop_queued: bool,
+    error_consumed_bytes: Option<usize>,
 }
 
 impl SseErrorDetector {
     fn push(&mut self, bytes: &[u8]) -> Option<String> {
-        for &byte in bytes {
+        self.error_consumed_bytes = None;
+        for (offset, &byte) in bytes.iter().enumerate() {
             if self.skip_lf {
                 self.skip_lf = false;
                 if byte == b'\n' {
@@ -1961,6 +2199,7 @@ impl SseErrorDetector {
                 }
                 if self.discard_event {
                     if let Some(error) = self.finish_event() {
+                        self.error_consumed_bytes = Some(offset + 1);
                         return Some(error);
                     }
                     continue;
@@ -1968,6 +2207,7 @@ impl SseErrorDetector {
                 let line = String::from_utf8_lossy(&self.line).into_owned();
                 self.line.clear();
                 if let Some(error) = self.process_line(&line) {
+                    self.error_consumed_bytes = Some(offset + 1);
                     return Some(error);
                 }
                 continue;
@@ -1991,8 +2231,34 @@ impl SseErrorDetector {
         None
     }
 
+    fn take_error_consumed_bytes(&mut self) -> Option<usize> {
+        self.error_consumed_bytes.take()
+    }
+
     fn take_tool_events(&mut self) -> Vec<SseToolEvent> {
-        std::mem::take(&mut self.tool_events)
+        self.pending_tool_lifecycle_events = 0;
+        self.message_stop_queued = false;
+        let mut events = std::mem::take(&mut self.tool_events);
+        if std::mem::take(&mut self.tool_events_truncated) {
+            events.insert(0, SseToolEvent::TrackingTruncated);
+        }
+        events
+    }
+
+    fn queue_tool_event(&mut self, event: SseToolEvent) {
+        if matches!(event, SseToolEvent::MessageStopped) {
+            if !self.message_stop_queued {
+                self.message_stop_queued = true;
+                self.tool_events.push(event);
+            }
+            return;
+        }
+        if self.pending_tool_lifecycle_events < MAX_PENDING_TOOL_LIFECYCLE_EVENTS {
+            self.pending_tool_lifecycle_events += 1;
+            self.tool_events.push(event);
+        } else {
+            self.tool_events_truncated = true;
+        }
     }
 
     fn process_line(&mut self, line: &str) -> Option<String> {
@@ -2035,34 +2301,22 @@ impl SseErrorDetector {
             return None;
         }
 
-        let payload = serde_json::from_str::<Value>(&data).ok();
-        if let Some(tool_event) = payload.as_ref().and_then(sse_tool_event) {
-            self.tool_events.push(tool_event);
+        let payload_type = sse_event_type(&data);
+        if let Some(tool_event) = payload_type
+            .as_deref()
+            .and_then(|event_type| sse_tool_event(event_type, &data))
+        {
+            self.queue_tool_event(tool_event);
         }
-        let is_error = event.as_deref() == Some("error")
-            || payload
-                .as_ref()
-                .and_then(|value| value.get("type"))
-                .and_then(Value::as_str)
-                == Some("error");
+        let is_error =
+            event.as_deref() == Some("error") || payload_type.as_deref() == Some("error");
         if !is_error {
             return None;
         }
 
         Some(
-            payload
-                .as_ref()
-                .and_then(|value| value.pointer("/error/message"))
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    payload
-                        .as_ref()
-                        .and_then(|value| value.get("message"))
-                        .and_then(Value::as_str)
-                })
-                .filter(|message| !message.trim().is_empty())
-                .unwrap_or("Upstream stream returned an error event")
-                .to_string(),
+            sse_error_message(&data)
+                .unwrap_or_else(|| "Upstream stream returned an error event".to_string()),
         )
     }
 }
@@ -2783,6 +3037,24 @@ mod tests {
         )
     }
 
+    fn response_lifecycle(req_id: &str) -> ResponseBodyLifecycle {
+        let monitor = started_monitor(req_id);
+        ResponseBodyLifecycle {
+            guard: request_guard(monitor, req_id),
+            log_context: response_log_context(req_id),
+            status: StatusCode::OK,
+            sse_detector: Some(SseErrorDetector::default()),
+            open_tool_blocks: HashMap::new(),
+            provisionally_closed_tool_blocks: HashMap::new(),
+            observed_tool_block_starts: 0,
+            tool_tracking_truncated: false,
+            tool_tracking_disabled: false,
+            saw_message_stop: false,
+            _permits: RequestPermits::default(),
+            terminal: false,
+        }
+    }
+
     #[tokio::test]
     async fn response_body_stays_active_until_message_stop_and_eof() {
         let req_id = "stream-success";
@@ -2973,6 +3245,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_frame_in_band_sse_error_drops_every_trailing_event() {
+        let req_id = "same-frame-stream-error";
+        let monitor = started_monitor(req_id);
+        let bytes = Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n\
+event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"bounded failure\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"MUST_NOT_ESCAPE\"}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(bytes))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            request_guard(monitor.clone(), req_id),
+            response_log_context(req_id),
+            RequestPermits::default(),
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("message_start"));
+        assert!(body.contains("bounded failure"));
+        assert!(!body.contains("MUST_NOT_ESCAPE"));
+        assert!(!body.contains("message_stop"));
+
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent[0].status,
+            crate::monitor::RequestStatus::Failed
+        );
+        assert_eq!(state.recent[0].error.as_deref(), Some("bounded failure"));
+    }
+
+    #[tokio::test]
     async fn in_band_sse_error_keeps_client_bytes_but_redacts_monitor_detail() {
         let req_id = "stream-secret-error";
         let monitor = started_monitor(req_id);
@@ -3084,6 +3397,65 @@ mod tests {
     }
 
     #[test]
+    fn data_type_error_without_event_field_is_detected() {
+        let mut detector = SseErrorDetector::default();
+        let error = detector
+            .push(b"data: {\"type\":\"error\",\"message\":\"top-level failure\"}\n\n")
+            .expect("the JSON type must identify an error without an event field");
+
+        assert_eq!(error, "top-level failure");
+    }
+
+    #[test]
+    fn malformed_error_detail_uses_the_bounded_fallback() {
+        let mut detector = SseErrorDetector::default();
+        let error = detector
+            .push(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":17}}\n\n")
+            .expect("the SSE event field must still identify an error");
+
+        assert_eq!(error, "Upstream stream returned an error event");
+    }
+
+    #[test]
+    fn narrow_probe_preserves_duplicate_key_and_message_whitespace_semantics() {
+        let mut detector = SseErrorDetector::default();
+        let error = detector
+            .push(
+                b"data: {\"type\":\"message_stop\",\"type\":\"error\",\"message\":\"  last wins  \"}\n\n",
+            )
+            .expect("the final duplicate type must retain Value last-wins behavior");
+        assert_eq!(error, "  last wins  ");
+
+        assert!(detector
+            .push(
+                b"data: {\"type\":\"content_block_start\",\"index\":1,\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-two\",\"name\":\"Read\"}}\n\n"
+            )
+            .is_none());
+        let events = detector.take_tool_events();
+        let [SseToolEvent::Started(tool)] = events.as_slice() else {
+            panic!("expected one tool start from the final duplicate index");
+        };
+        assert_eq!(tool.index, 2);
+
+        let error = detector
+            .push(
+                b"event: error\ndata: {\"type\":\"error\",\"message\":\"first\",\"message\":\"second\"}\n\n",
+            )
+            .expect("the final duplicate message must be retained");
+        assert_eq!(error, "second");
+    }
+
+    #[test]
+    fn whitespace_only_error_message_uses_the_bounded_fallback() {
+        let mut detector = SseErrorDetector::default();
+        let error = detector
+            .push(b"event: error\ndata: {\"type\":\"error\",\"message\":\"   \"}\n\n")
+            .expect("the event field must identify the error");
+
+        assert_eq!(error, "Upstream stream returned an error event");
+    }
+
+    #[test]
     fn sse_tool_lifecycle_keeps_only_safe_metadata() {
         let mut detector = SseErrorDetector::default();
         assert!(
@@ -3156,22 +3528,88 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
     }
 
     #[test]
-    fn tool_stop_is_provisional_until_a_clean_message_stop() {
-        fn lifecycle(req_id: &str) -> ResponseBodyLifecycle {
-            let monitor = started_monitor(req_id);
-            ResponseBodyLifecycle {
-                guard: request_guard(monitor, req_id),
-                log_context: response_log_context(req_id),
-                status: StatusCode::OK,
-                sse_detector: Some(SseErrorDetector::default()),
-                open_tool_blocks: HashMap::new(),
-                provisionally_closed_tool_blocks: HashMap::new(),
-                saw_message_stop: false,
-                _permits: RequestPermits::default(),
-                terminal: false,
-            }
-        }
+    fn client_tool_result_diagnostics_stop_before_log_formatting_can_amplify() {
+        let blocks = (0..(MAX_TRACKED_CLIENT_TOOL_RESULTS + 5))
+            .map(|index| {
+                json!({
+                    "type":"tool_result",
+                    "tool_use_id":format!("call-{index}"),
+                    "content":format!("result-{index}"),
+                    "is_error":index % 2 == 0
+                })
+            })
+            .collect::<Vec<_>>();
+        let request: crate::anthropic::schema::MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "max_tokens":32,
+            "messages":[{"role":"user","content":blocks}]
+        }))
+        .unwrap();
+        let mut exact_request = request.clone();
+        exact_request
+            .messages
+            .last_mut()
+            .unwrap()
+            .content
+            .as_array_mut()
+            .unwrap()
+            .truncate(MAX_TRACKED_CLIENT_TOOL_RESULTS);
+        let mut exact_count = 0_usize;
+        assert_eq!(
+            visit_client_tool_results(&exact_request, |_| exact_count += 1),
+            None
+        );
+        assert_eq!(exact_count, MAX_TRACKED_CLIENT_TOOL_RESULTS);
 
+        let mut observed = Vec::new();
+
+        let truncated_message_index =
+            visit_client_tool_results(&request, |result| observed.push(result));
+
+        assert_eq!(
+            truncated_message_index,
+            Some((0, MAX_TRACKED_CLIENT_TOOL_RESULTS))
+        );
+        assert_eq!(observed.len(), MAX_TRACKED_CLIENT_TOOL_RESULTS);
+        assert_eq!(observed.first().unwrap().block_index, 0);
+        assert_eq!(
+            observed.last().unwrap().block_index,
+            MAX_TRACKED_CLIENT_TOOL_RESULTS - 1
+        );
+        assert!(
+            observed
+                .iter()
+                .all(|result| result.call_id_hash.len() == 16)
+        );
+        assert!(observed.iter().all(|result| result.content_bytes > 0));
+    }
+
+    #[test]
+    fn malformed_tool_results_cannot_bypass_the_request_diagnostic_cap() {
+        let mut blocks = (0..MAX_TRACKED_CLIENT_TOOL_RESULTS)
+            .map(|_| json!({"type":"tool_result","content":"missing id"}))
+            .collect::<Vec<_>>();
+        blocks.push(json!({
+            "type":"tool_result",
+            "tool_use_id":"call-after-budget",
+            "content":"must not be inspected"
+        }));
+        let request: crate::anthropic::schema::MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "max_tokens":32,
+            "messages":[{"role":"user","content":blocks}]
+        }))
+        .unwrap();
+        let mut observed = Vec::new();
+
+        let truncated = visit_client_tool_results(&request, |result| observed.push(result));
+
+        assert_eq!(truncated, Some((0, 0)));
+        assert!(observed.is_empty());
+    }
+
+    #[test]
+    fn tool_stop_is_provisional_until_a_clean_message_stop() {
         let tool = ToolBlockTrace {
             index: 2,
             tool_kind: "tool_use".to_string(),
@@ -3179,7 +3617,7 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
             call_id_hash: Some("1234abcd".to_string()),
         };
 
-        let mut failed = lifecycle("provisional-tool-failure");
+        let mut failed = response_lifecycle("provisional-tool-failure");
         failed.observe_tool_event(SseToolEvent::Started(tool.clone()));
         failed.observe_tool_event(SseToolEvent::Stopped { index: 2 });
         assert!(failed.open_tool_blocks.is_empty());
@@ -3187,13 +3625,256 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
         failed.failed("upstream closed".to_string(), true);
         assert!(failed.provisionally_closed_tool_blocks.is_empty());
 
-        let mut completed = lifecycle("provisional-tool-success");
+        let mut completed = response_lifecycle("provisional-tool-success");
         completed.observe_tool_event(SseToolEvent::Started(tool));
         completed.observe_tool_event(SseToolEvent::Stopped { index: 2 });
         completed.observe_tool_event(SseToolEvent::MessageStopped);
         assert!(completed.open_tool_blocks.is_empty());
         assert!(completed.provisionally_closed_tool_blocks.is_empty());
         completed.completed();
+    }
+
+    #[test]
+    fn pending_tool_events_are_bounded_without_losing_message_stop() {
+        let mut detector = SseErrorDetector::default();
+        for index in 0..(MAX_PENDING_TOOL_LIFECYCLE_EVENTS + 5) {
+            let event = format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"call-{index}\",\"name\":\"Read\"}}}}\n\n"
+            );
+            assert!(detector.push(event.as_bytes()).is_none());
+        }
+        assert!(
+            detector
+                .push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                .is_none()
+        );
+
+        let events = detector.take_tool_events();
+        assert_eq!(events.len(), MAX_PENDING_TOOL_LIFECYCLE_EVENTS + 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SseToolEvent::Started(_)))
+                .count(),
+            MAX_PENDING_TOOL_LIFECYCLE_EVENTS
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SseToolEvent::MessageStopped))
+                .count(),
+            1
+        );
+        assert_eq!(events.first(), Some(&SseToolEvent::TrackingTruncated));
+
+        let mut lifecycle = response_lifecycle("pending-tool-event-overflow");
+        for event in events {
+            lifecycle.observe_tool_event(event);
+        }
+        assert!(lifecycle.tool_tracking_disabled);
+        assert!(lifecycle.tool_tracking_truncated);
+        assert!(lifecycle.saw_message_stop);
+        assert!(lifecycle.open_tool_blocks.is_empty());
+        assert!(lifecycle.provisionally_closed_tool_blocks.is_empty());
+
+        assert!(detector
+            .push(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":999,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-reset\",\"name\":\"Read\"}}\n\n"
+            )
+            .is_none());
+        let reset_events = detector.take_tool_events();
+        assert_eq!(reset_events.len(), 1);
+        assert!(matches!(reset_events[0], SseToolEvent::Started(_)));
+    }
+
+    #[tokio::test]
+    async fn tool_event_overflow_preserves_downstream_bytes_and_clean_completion() {
+        let req_id = "tool-overflow-stream";
+        let monitor = started_monitor(req_id);
+        let mut raw = String::new();
+        for index in 0..(MAX_PENDING_TOOL_LIFECYCLE_EVENTS + 5) {
+            raw.push_str(&format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"call-{index}\",\"name\":\"Read\"}}}}\n\n"
+            ));
+        }
+        raw.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        let raw = Bytes::from(raw);
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(raw.clone()))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            request_guard(monitor.clone(), req_id),
+            response_log_context(req_id),
+            RequestPermits::default(),
+        );
+
+        let downstream = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(downstream, raw);
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty());
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent[0].status,
+            crate::monitor::RequestStatus::Completed
+        );
+        assert_eq!(state.recent[0].http_status, Some(200));
+    }
+
+    #[test]
+    fn response_tool_tracking_has_a_hard_event_and_state_cap() {
+        let mut lifecycle = response_lifecycle("bounded-tool-tracking");
+        for index in 0..MAX_TRACKED_TOOL_BLOCK_STARTS {
+            lifecycle.observe_tool_event(SseToolEvent::Started(ToolBlockTrace {
+                index: index as u64,
+                tool_kind: "tool_use".to_string(),
+                tool_name_metadata: safe_tool_name_metadata("Read"),
+                call_id_hash: Some(format!("{index:016x}")),
+            }));
+            if index < MAX_TRACKED_TOOL_BLOCK_STARTS / 2 {
+                lifecycle.observe_tool_event(SseToolEvent::Stopped {
+                    index: index as u64,
+                });
+            }
+        }
+
+        assert_eq!(
+            lifecycle.open_tool_blocks.len(),
+            MAX_TRACKED_TOOL_BLOCK_STARTS / 2
+        );
+        assert_eq!(
+            lifecycle.provisionally_closed_tool_blocks.len(),
+            MAX_TRACKED_TOOL_BLOCK_STARTS / 2
+        );
+        assert!(!lifecycle.tool_tracking_truncated);
+        assert!(!lifecycle.tool_tracking_disabled);
+
+        lifecycle.observe_tool_event(SseToolEvent::Started(ToolBlockTrace {
+            index: MAX_TRACKED_TOOL_BLOCK_STARTS as u64,
+            tool_kind: "tool_use".to_string(),
+            tool_name_metadata: safe_tool_name_metadata("Read"),
+            call_id_hash: Some("ffffffffffffffff".to_string()),
+        }));
+        assert_eq!(
+            lifecycle.observed_tool_block_starts,
+            MAX_TRACKED_TOOL_BLOCK_STARTS
+        );
+        assert!(lifecycle.open_tool_blocks.is_empty());
+        assert!(lifecycle.tool_tracking_truncated);
+        assert!(lifecycle.tool_tracking_disabled);
+
+        lifecycle.observe_tool_event(SseToolEvent::Started(ToolBlockTrace {
+            index: u64::MAX,
+            tool_kind: "tool_use".to_string(),
+            tool_name_metadata: safe_tool_name_metadata("Read"),
+            call_id_hash: Some("eeeeeeeeeeeeeeee".to_string()),
+        }));
+        lifecycle.observe_tool_event(SseToolEvent::Stopped { index: u64::MAX });
+        assert!(lifecycle.open_tool_blocks.is_empty());
+        assert!(lifecycle.provisionally_closed_tool_blocks.is_empty());
+
+        lifecycle.observe_tool_event(SseToolEvent::MessageStopped);
+        assert!(lifecycle.saw_message_stop);
+        assert!(lifecycle.open_tool_blocks.is_empty());
+        assert!(lifecycle.provisionally_closed_tool_blocks.is_empty());
+        lifecycle.completed();
+    }
+
+    #[test]
+    fn index_reuse_cannot_bypass_the_cumulative_start_cap() {
+        let mut lifecycle = response_lifecycle("bounded-index-reuse");
+        let tool = ToolBlockTrace {
+            index: 7,
+            tool_kind: "tool_use".to_string(),
+            tool_name_metadata: safe_tool_name_metadata("Read"),
+            call_id_hash: Some("7777777777777777".to_string()),
+        };
+        for _ in 0..MAX_TRACKED_TOOL_BLOCK_STARTS {
+            lifecycle.observe_tool_event(SseToolEvent::Started(tool.clone()));
+        }
+        assert_eq!(lifecycle.open_tool_blocks.len(), 1);
+        assert!(!lifecycle.tool_tracking_disabled);
+
+        lifecycle.observe_tool_event(SseToolEvent::Started(tool));
+        assert_eq!(
+            lifecycle.observed_tool_block_starts,
+            MAX_TRACKED_TOOL_BLOCK_STARTS
+        );
+        assert!(lifecycle.open_tool_blocks.is_empty());
+        assert!(lifecycle.tool_tracking_disabled);
+        assert!(lifecycle.tool_tracking_truncated);
+        lifecycle.completed();
+    }
+
+    #[test]
+    fn message_stop_does_not_reset_the_cumulative_start_cap() {
+        let mut lifecycle = response_lifecycle("bounded-multiple-message-stops");
+        for window in 0..2_u64 {
+            for offset in 0..(MAX_TRACKED_TOOL_BLOCK_STARTS / 2) as u64 {
+                let index = window * 1_000 + offset;
+                lifecycle.observe_tool_event(SseToolEvent::Started(ToolBlockTrace {
+                    index,
+                    tool_kind: "tool_use".to_string(),
+                    tool_name_metadata: safe_tool_name_metadata("Read"),
+                    call_id_hash: Some(format!("{index:016x}")),
+                }));
+                lifecycle.observe_tool_event(SseToolEvent::Stopped { index });
+            }
+            lifecycle.observe_tool_event(SseToolEvent::MessageStopped);
+        }
+        assert_eq!(
+            lifecycle.observed_tool_block_starts,
+            MAX_TRACKED_TOOL_BLOCK_STARTS
+        );
+        assert!(!lifecycle.tool_tracking_disabled);
+
+        lifecycle.observe_tool_event(SseToolEvent::Started(ToolBlockTrace {
+            index: u64::MAX,
+            tool_kind: "tool_use".to_string(),
+            tool_name_metadata: safe_tool_name_metadata("Read"),
+            call_id_hash: Some("ffffffffffffffff".to_string()),
+        }));
+        assert!(lifecycle.tool_tracking_disabled);
+        assert!(lifecycle.open_tool_blocks.is_empty());
+        assert!(lifecycle.provisionally_closed_tool_blocks.is_empty());
+        lifecycle.completed();
+    }
+
+    #[test]
+    fn tracked_stops_do_not_consume_the_cumulative_start_budget() {
+        let mut lifecycle = response_lifecycle("bounded-start-budget");
+        for index in 0..MAX_TRACKED_TOOL_BLOCK_STARTS {
+            lifecycle.observe_tool_event(SseToolEvent::Started(ToolBlockTrace {
+                index: index as u64,
+                tool_kind: "tool_use".to_string(),
+                tool_name_metadata: safe_tool_name_metadata("Read"),
+                call_id_hash: Some(format!("{index:016x}")),
+            }));
+            lifecycle.observe_tool_event(SseToolEvent::Stopped {
+                index: index as u64,
+            });
+        }
+
+        assert_eq!(
+            lifecycle.observed_tool_block_starts,
+            MAX_TRACKED_TOOL_BLOCK_STARTS
+        );
+        assert!(!lifecycle.tool_tracking_disabled);
+        assert!(!lifecycle.tool_tracking_truncated);
+        assert!(lifecycle.open_tool_blocks.is_empty());
+        assert_eq!(
+            lifecycle.provisionally_closed_tool_blocks.len(),
+            MAX_TRACKED_TOOL_BLOCK_STARTS
+        );
+
+        lifecycle.observe_tool_event(SseToolEvent::MessageStopped);
+        assert!(lifecycle.saw_message_stop);
+        assert!(lifecycle.provisionally_closed_tool_blocks.is_empty());
+        lifecycle.completed();
     }
 
     #[test]
@@ -3247,6 +3928,21 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
             )
             .expect("the parser should recover after the oversized event boundary");
         assert_eq!(error, "recovered");
+    }
+
+    #[test]
+    fn large_semantic_delta_is_ignored_by_the_narrow_diagnostic_probe() {
+        let mut detector = SseErrorDetector::default();
+        let partial_json = "x".repeat(200 * 1024);
+        let event = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{partial_json}\"}}}}\n\n"
+        );
+
+        assert!(detector.push(event.as_bytes()).is_none());
+        assert!(detector.take_tool_events().is_empty());
+        assert!(detector.take_error_consumed_bytes().is_none());
+        assert!(detector.line.is_empty());
+        assert!(detector.data.is_empty());
     }
 
     #[test]

@@ -743,9 +743,11 @@ fn allowed_event(event: &str) -> bool {
             | "request_failed"
             | "request_abandoned"
             | "client_tool_result"
+            | "client_tool_result_tracking_truncated"
             | "tool_block_started"
             | "tool_block_completed"
             | "tool_block_interrupted"
+            | "tool_block_tracking_truncated"
             | "request_configuration"
             | "native_web_search_phase"
             | "upstream_first_event"
@@ -847,6 +849,7 @@ fn sanitize_field(event: &str, key: &str, value: &Value) -> Option<(String, Valu
                 "response_body_error",
                 "downstream_dropped",
                 "message_stop_before_block_stop",
+                "tracking_capacity_exceeded",
             ],
         )
         .map(|value| (key.into(), value)),
@@ -1053,6 +1056,7 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
         | "waitMs"
         | "deadlineRemainingMs"
         | "heartbeatIntervalMs" => 7 * 24 * 60 * 60 * 1_000,
+        "translateMs" => 7 * 24 * 60 * 60 * 1_000,
         "bytes" | "contentBytes" => 1_u64 << 40,
         "anthropicMaxTokens" | "estimatedInputTokens" => 1_000_000_000,
         "candidateRank" => 1,
@@ -1073,9 +1077,11 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
         | "attempts"
         | "transientFailures"
         | "failures"
+        | "loggedCount"
         | "chunks"
         | "count"
         | "queueCapacity" => 1_000_000_000,
+        "resultLimit" | "blockStartLimit" | "pendingEventLimit" => 1_000_000,
         _ => 0,
     };
     if numeric_limit > 0 {
@@ -1124,6 +1130,7 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
             "full_responses",
         ],
         "outputBudgetEnforcement" => &["unsupported_by_private_codex_gateway"],
+        "truncationCause" => &["block_start_limit", "pending_event_limit"],
         "replaySafety" => &[
             "definitely_not_dispatched",
             "explicitly_retryable_response",
@@ -1230,6 +1237,9 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "isError",
             "contentBytes",
         ],
+        "client_tool_result_tracking_truncated" => {
+            &["reqId", "messageIndex", "resultLimit", "loggedCount"]
+        }
         "tool_block_started" | "tool_block_completed" | "tool_block_interrupted" => &[
             "reqId",
             "provider",
@@ -1241,6 +1251,15 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "callIdHash",
             "elapsedMs",
             "interruptReason",
+        ],
+        "tool_block_tracking_truncated" => &[
+            "reqId",
+            "provider",
+            "model",
+            "elapsedMs",
+            "blockStartLimit",
+            "pendingEventLimit",
+            "truncationCause",
         ],
         "request_configuration" => &[
             "reqId",
@@ -1268,6 +1287,7 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "anthropicMaxTokens",
             "outputBudgetEnforcement",
             "estimatedInputTokens",
+            "translateMs",
         ],
         "native_web_search_phase" => &["reqId", "phase", "elapsedMs"],
         "upstream_first_event" => &["reqId", "event", "elapsedMs"],
@@ -2145,6 +2165,7 @@ fn sanitized_field_value(event: &str, key: &str, value: &Value) -> bool {
                     | "response_body_error"
                     | "downstream_dropped"
                     | "message_stop_before_block_stop"
+                    | "tracking_capacity_exceeded"
             )
         ),
         "event" | "sourceEvent" => matches!(
@@ -2538,6 +2559,7 @@ mod tests {
             ("tool_block_started", None),
             ("tool_block_completed", None),
             ("tool_block_interrupted", Some("downstream_dropped")),
+            ("tool_block_interrupted", Some("tracking_capacity_exceeded")),
         ] {
             let mut fields = json!({
                 "reqId":"request-1",
@@ -2586,6 +2608,56 @@ mod tests {
     }
 
     #[test]
+    fn tool_tracking_truncation_keeps_only_a_bounded_limit() {
+        let event = sanitize_event(
+            &serde_json::from_str(&log(
+                "tool_block_tracking_truncated",
+                json!({
+                    "reqId":"request-1",
+                    "provider":"codex",
+                    "model":"gpt-5.6-sol",
+                    "elapsedMs":731,
+                    "blockStartLimit":256,
+                    "pendingEventLimit":512,
+                    "truncationCause":"pending_event_limit",
+                    "unexpected":"CANARY_SECRET"
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(event["fields"]["blockStartLimit"], 256);
+        assert_eq!(event["fields"]["pendingEventLimit"], 512);
+        assert_eq!(event["fields"]["truncationCause"], "pending_event_limit");
+        assert_eq!(event["fields"]["elapsedMs"], 731);
+        assert!(event["fields"].get("unexpected").is_none());
+        assert!(!event.to_string().contains("CANARY_SECRET"));
+        assert!(is_sanitized_event(&event));
+
+        let client = sanitize_event(
+            &serde_json::from_str(&log(
+                "client_tool_result_tracking_truncated",
+                json!({
+                    "reqId":"request-2",
+                    "messageIndex":9,
+                    "resultLimit":256,
+                    "loggedCount":255,
+                    "toolResult":"CANARY_SECRET"
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(client["fields"]["messageIndex"], 9);
+        assert_eq!(client["fields"]["resultLimit"], 256);
+        assert_eq!(client["fields"]["loggedCount"], 255);
+        assert!(client["fields"].get("toolResult").is_none());
+        assert!(!client.to_string().contains("CANARY_SECRET"));
+        assert!(is_sanitized_event(&client));
+    }
+
+    #[test]
     fn request_configuration_keeps_only_safe_continuation_and_cache_affinity_metadata() {
         let codex = sanitize_event(
             &serde_json::from_str(&log(
@@ -2593,6 +2665,7 @@ mod tests {
                 json!({
                     "reqId":"request-1",
                     "model":"gpt-5.6-sol",
+                    "translateMs":17,
                     "hydrationLoadedGroupCount":1,
                     "hydrationLoadedResultCount":2,
                     "hydrationUnavailableResultCount":0,
@@ -2632,6 +2705,7 @@ mod tests {
         assert_eq!(codex["fields"]["hydrationLoadedResultCount"], 2);
         assert_eq!(codex["fields"]["hydrationUnavailableResultCount"], 0);
         assert_eq!(codex["fields"]["hydrationAmbiguous"], false);
+        assert_eq!(codex["fields"]["translateMs"], 17);
         assert!(!codex.to_string().contains("secret_identifier"));
         assert!(!codex.to_string().contains("secret prompt"));
         assert!(is_sanitized_event(&codex));
@@ -2644,6 +2718,7 @@ mod tests {
             "fields":{
                 "reqId":"request-2",
                 "model":"grok-4.5",
+                "translateMs":23,
                 "promptCacheKeyPresent":true,
                 "promptCacheKeyFingerprint":"abcdef012345",
                 "promptCacheKey":"full-secret-cache-key"
@@ -2652,6 +2727,7 @@ mod tests {
         let grok = sanitize_event(&grok_raw).unwrap();
         assert_eq!(grok["fields"]["promptCacheKeyPresent"], true);
         assert_eq!(grok["fields"]["promptCacheKeyFingerprint"], "abcdef012345");
+        assert_eq!(grok["fields"]["translateMs"], 23);
         assert!(!grok.to_string().contains("full-secret-cache-key"));
         assert!(is_sanitized_event(&grok));
 

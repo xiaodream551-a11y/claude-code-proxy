@@ -683,7 +683,9 @@ excluded from the session rate. Session throughput combines the matched token an
 duration samples retained by the monitor. Use `--no-monitor` to run with plain
 terminal output.
 
-Logs are written to the platform state directory and rotated at 20 MiB. Set
+Logs are written to the platform state directory and rotated at 20 MiB. The
+current log and the newest five numeric rotation artifacts are retained; older
+matching rotations are pruned on startup and after rotation. Set
 `CCP_LOG_STDERR=1` to mirror log lines to stderr while running without the
 monitor.
 
@@ -1195,7 +1197,11 @@ consumes a transient slot and therefore reduces the remaining model retries. If
 a Grok stream fails after any Anthropic text or tool event has been sent, the
 proxy returns a stream error without replaying the request. Starting a hosted
 web or X search closes the same replay window before downstream semantic output,
-so reconnect cannot repeat the external search. Grok has no
+so reconnect cannot repeat the external search. Before reducer validation, any
+decoded event outside the explicit `response.created`, `response.in_progress`,
+and failure-envelope allowlist also closes replay conservatively; an unknown or
+incomplete future event can therefore fail closed but cannot hide behind a
+retryable failure in the same batch and trigger a second model dispatch. Grok has no
 `previous_response_id` continuation and never silently falls back to another
 provider. The configurable total budget is capped at 24 hours; values at or above
 the caller's own timeout lose the useful guarantee that the proxy fails first.
@@ -1233,7 +1239,19 @@ Request lifecycle logs distinguish response headers from a finished stream:
 responses must first contain a complete Anthropic `message_stop`. A clean
 channel EOF without that terminal event is surfaced as a body error and recorded
 as `request_failed`. HTTP and in-band SSE errors are also recorded as failed,
-while `request_abandoned` records downstream cancellation before completion.
+while `request_abandoned` records downstream cancellation before completion. An
+in-band error stops forwarding at that event boundary even when later text or a
+false terminal was coalesced into the same body frame. Request-side diagnostics
+inspect at most 256 candidate `tool_result` blocks, while response-side tracking
+accepts at most 256 tool starts; stream inspection queues at most 512 non-terminal
+events plus one `message_stop` marker per frame. Overflow releases retained
+diagnostic state and emits one bounded truncation summary without rewriting
+response bytes or changing a valid `message_stop`. The bounded
+`request_configuration.translateMs` field measures only the provider's request
+translation call. It does not include later wire serialization, continuation or
+retry setup, authentication, connection, header wait, or generation time, so it
+can expose local translation regressions without being confused with upstream
+latency.
 
 ### Files
 
@@ -1242,7 +1260,8 @@ directories. Sensitive traffic/error capture fails closed if that boundary
 cannot be established; ordinary redacted logging reports a permission warning
 but remains available. Windows relies on the profile directories' ACLs.
 
-- `proxy.log` — JSON-lines log, rotated at 20 MiB. It lives at
+- `proxy.log` — JSON-lines log, rotated at 20 MiB with the newest five rotations
+  retained. It lives at
   `$XDG_STATE_HOME/claude-code-proxy/proxy.log` on macOS/Linux and at
   `%LOCALAPPDATA%\claude-code-proxy\proxy.log` on Windows (falling back to
   `%USERPROFILE%\AppData\Local`). Secrets (`authorization`, `access`,

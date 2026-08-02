@@ -127,11 +127,13 @@ impl Provider for GrokProvider {
                 error.to_string(),
             );
         }
+        let translate_started_at = Instant::now();
         let mut translated =
             match translate_request_for_provider(body, resolved.model.clone()).await {
                 Ok(value) => value,
                 Err(response) => return response,
             };
+        let translate_ms = translate_started_at.elapsed().as_millis();
         translated.prompt_cache_key = grok_prompt_cache_key(ctx.session_id.as_deref());
         if let Some(effort) = resolved.reasoning_effort {
             translated.reasoning = Some(GrokReasoning {
@@ -189,6 +191,7 @@ impl Provider for GrokProvider {
             "request_configuration",
             Some(serde_json::Map::from_iter([
                 ("reqId".into(), serde_json::json!(ctx.req_id)),
+                ("translateMs".into(), serde_json::json!(translate_ms)),
                 ("model".into(), serde_json::json!(resolved.model)),
                 (
                     "reasoningEffort".into(),
@@ -857,6 +860,25 @@ fn grok_event_starts_generation(value: &serde_json::Value) -> bool {
     }
 }
 
+/// Return whether a decoded event permanently closes the model replay window.
+///
+/// Only lifecycle acknowledgements and explicit failure envelopes are proven safe before model
+/// generation. Every other shape, including an unknown, missing, or non-string `type`, closes the
+/// window conservatively. This scan runs across the entire decoded HTTP chunk before reduction so
+/// a retryable failure cannot hide an unsafe tail by short-circuiting the reducer first.
+fn grok_event_closes_replay_window(value: &serde_json::Value) -> bool {
+    !matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "response.created"
+                | "response.in_progress"
+                | "error"
+                | "response.failed"
+                | "response.error"
+        )
+    )
+}
+
 struct GrokStreamState {
     upstream: GrokByteStream,
     decoder: SseDecoder,
@@ -869,8 +891,8 @@ struct GrokStreamState {
     error_sent: bool,
     downstream_emitted: bool,
     generation_started: bool,
-    /// Irreversible replay boundary set from decoded semantic events before transactional
-    /// reduction. Keep it separate from validated TTFT and monitor observability.
+    /// Irreversible replay boundary set from decoded semantic or unrecognized events before
+    /// transactional reduction. Keep it separate from validated TTFT and monitor observability.
     generation_replay_barrier: bool,
     /// Logical-request replay barrier. Unlike reducer state, this must survive any attempt reset:
     /// observing a hosted search means a retry could repeat a real external action and its cost.
@@ -938,13 +960,20 @@ impl GrokStreamState {
     }
 
     fn observe_generation_replay_barrier(&mut self, event_type: Option<&str>) -> bool {
-        if self.generation_replay_barrier || event_type.is_none() {
+        if event_type.is_none() {
+            return false;
+        }
+        self.close_replay_window()
+    }
+
+    fn close_replay_window(&mut self) -> bool {
+        if self.generation_replay_barrier {
             return false;
         }
         self.generation_replay_barrier = true;
-        // A decoded semantic event proves that model generation began. A second model dispatch
-        // could now duplicate work even if transactional reduction later rejects this batch, so
-        // release replay state before the reducer can enter its retryable-failure path.
+        // A decoded semantic or unrecognized event makes a second model dispatch unsafe even if
+        // transactional reduction later rejects this batch, so release replay state before the
+        // reducer can enter its retryable-failure path.
         if let Some(reconnect) = self.reconnect.as_mut() {
             reconnect.replay.take();
             reconnect.request_byte_lease.take();
@@ -1055,9 +1084,8 @@ impl GrokStreamState {
             }
 
             // A retryable failure in the same decoded batch rolls reducer state back. Observe
-            // irreversible hosted and generation boundaries before reduction so transactional
-            // rollback can never reopen the logical request's replay window after model work or
-            // an external action has already started.
+            // irreversible hosted, generation, and fail-closed protocol boundaries before
+            // reduction so a failure cannot hide a later event by short-circuiting the reducer.
             self.observe_hosted_side_effects(&values);
             let generation_event = if self.generation_started {
                 None
@@ -1069,7 +1097,9 @@ impl GrokStreamState {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
             };
-            self.observe_generation_replay_barrier(generation_event.as_deref());
+            if values.iter().any(grok_event_closes_replay_window) {
+                self.close_replay_window();
+            }
 
             // Validate and render the entire decoded chunk transactionally. In particular, a
             // terminal followed by text/tool/unknown data in the same chunk must not leak the
@@ -1764,6 +1794,29 @@ mod tests {
             serde_json::json!({"transport":"body_bytes"}),
         ] {
             assert!(!grok_event_starts_generation(&value), "{value}");
+        }
+    }
+
+    #[test]
+    fn replay_classifier_only_allows_known_pregeneration_events() {
+        for value in [
+            serde_json::json!({"type":"response.created"}),
+            serde_json::json!({"type":"response.in_progress"}),
+            serde_json::json!({"type":"response.failed","response":{"error":{"type":"overloaded_error"}}}),
+            serde_json::json!({"type":"response.error"}),
+            serde_json::json!({"type":"error"}),
+        ] {
+            assert!(!grok_event_closes_replay_window(&value), "{value}");
+        }
+
+        for value in [
+            serde_json::json!({"type":"response.output_text.delta","delta":"answer"}),
+            serde_json::json!({"type":"response.future_semantic_event","delta":"opaque"}),
+            serde_json::json!({"delta":"missing type"}),
+            serde_json::json!({"type":17,"delta":"non-string type"}),
+            serde_json::json!({"type":"response.output_item.added","item":{}}),
+        ] {
+            assert!(grok_event_closes_replay_window(&value), "{value}");
         }
     }
 
@@ -2507,6 +2560,7 @@ mod tests {
         assert_eq!(record["fields"]["model"], "grok-4.5");
         assert_eq!(record["fields"]["transport"], "http");
         assert_eq!(record["fields"]["promptCacheKeyPresent"], true);
+        assert!(record["fields"]["translateMs"].as_u64().is_some());
 
         release_response_tx.send(()).unwrap();
         let response = tokio::time::timeout(Duration::from_secs(3), request_task)
@@ -3580,7 +3634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_created_before_retryable_failure_keeps_replay_window_open() {
+    async fn response_lifecycle_before_retryable_failure_keeps_replay_window_open() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -3620,7 +3674,7 @@ mod tests {
             1,
         ));
         let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
-            b"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"failed before output\"},\"retry_after\":0}}\n\n",
+            b"data: {\"type\":\"response.created\"}\n\ndata: {\"type\":\"response.in_progress\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"failed before output\"},\"retry_after\":0}}\n\n",
         ))]);
 
         let body = stream_body_with_policy(
@@ -3641,7 +3695,10 @@ mod tests {
         .to_bytes();
         let body = String::from_utf8_lossy(&body);
 
-        assert!(server.await.unwrap(), "response.created must permit replay");
+        assert!(
+            server.await.unwrap(),
+            "known response lifecycle events must permit replay"
+        );
         assert_eq!(body.matches("recovered after created").count(), 1, "{body}");
         assert_eq!(body.matches("event: message_start").count(), 1, "{body}");
         assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
@@ -3812,6 +3869,100 @@ mod tests {
             assert!(body.contains("event: error"), "{label}: {body}");
             assert!(
                 body.contains("capacity after silent generation"),
+                "{label}: {body}"
+            );
+            assert!(!body.contains("incorrect replay"), "{label}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn same_batch_failure_before_unknown_or_malformed_tail_never_rebuilds() {
+        for (label, tail) in [
+            (
+                "future_event",
+                r#"{"type":"response.future_semantic_event","delta":"opaque"}"#,
+            ),
+            ("missing_type", r#"{"delta":"opaque"}"#),
+            ("non_string_type", r#"{"type":17,"delta":"opaque"}"#),
+            (
+                "malformed_output_item",
+                r#"{"type":"response.output_item.added","item":{}}"#,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let Ok(Ok((mut stream, _))) =
+                    tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+                else {
+                    return false;
+                };
+                let _ = read_complete_http_request(&mut stream).await;
+                let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"incorrect replay\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+                true
+            });
+
+            let (client, _temp) = test_client(
+                &format!("http://{addr}/v1"),
+                GrokTimeouts {
+                    connect_ms: 500,
+                    header_ms: 500,
+                    first_byte_ms: 500,
+                    body_idle_ms: 500,
+                },
+            )
+            .await;
+            let deadline = GrokRequestDeadline::after(Duration::from_secs(2));
+            let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+            let retry_observer = retry.clone();
+            let reconnect = Some(GrokReconnectContext::new(
+                Arc::new(client),
+                prepared_request(false),
+                None,
+                retry,
+                1,
+            ));
+            let upstream = futures_util::stream::iter(vec![Ok(Bytes::from(format!(
+                "data: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"type\":\"overloaded_error\",\"message\":\"capacity before unknown tail\"}},\"retry_after\":0}}}}\n\ndata: {tail}\n\n"
+            )))]);
+
+            let body = stream_body_with_policy(
+                upstream,
+                format!("msg_unknown_tail_barrier_{label}"),
+                "grok-4.5".into(),
+                None,
+                format!("req_unknown_tail_barrier_{label}"),
+                None,
+                reconnect,
+                deadline,
+                Duration::from_millis(20),
+            )
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+            let body = String::from_utf8_lossy(&body);
+
+            assert_eq!(retry_observer.lock().await.wire_attempt(), 0, "{label}");
+            assert_eq!(
+                retry_observer.lock().await.transient_failures(),
+                0,
+                "{label}"
+            );
+            assert!(
+                !server.await.unwrap(),
+                "{label} must close replay before reducer short-circuits"
+            );
+            assert!(body.contains("event: error"), "{label}: {body}");
+            assert!(
+                body.contains("capacity before unknown tail"),
                 "{label}: {body}"
             );
             assert!(!body.contains("incorrect replay"), "{label}: {body}");
