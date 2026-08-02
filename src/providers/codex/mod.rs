@@ -25,6 +25,7 @@ use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext, R
 use crate::providers::downstream_queue::{
     self, BudgetedChunk, ByteBudget, SendOutcome as LiveChunkSendOutcome,
 };
+use crate::providers::stream_progress::{StreamProgress, StreamProgressPhase};
 use crate::providers::token_count_admission::{self, TokenCountAdmissionError};
 use crate::providers::translate_shared::{
     ImageDecodeAdmissionError, acquire_image_decode_slot, is_claude_code_compaction_request,
@@ -52,6 +53,8 @@ use self::translate::model_allowlist::{
     assert_allowed_model, resolve_model_request, uses_responses_lite,
 };
 use self::translate::reducer::{FinishMetadata, finish_metadata_from_upstream_with_tool_policy};
+#[cfg(test)]
+use self::translate::request::ServiceTierSource;
 use self::translate::request::{
     ServiceTier, TranslateOptions, TranslationOverrides, has_hosted_web_search,
     has_parallel_callable_function, translate_request_with_overrides,
@@ -200,6 +203,7 @@ impl Provider for CodexProvider {
                     .map(RequestLaneKey::to_hex)
                     .or_else(|| ctx.session_id.clone()),
                 service_tier: resolved.service_tier.clone(),
+                service_tier_source: resolved.service_tier_source,
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
@@ -348,6 +352,7 @@ impl Provider for CodexProvider {
             TranslateOptions {
                 session_id: None,
                 service_tier: resolved.service_tier.clone(),
+                service_tier_source: resolved.service_tier_source,
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
@@ -883,6 +888,13 @@ async fn live_stream_response(
         Ok(response) => response,
         Err(_) => {
             abort_continuation(ctx.lane_key.as_ref(), turn_id);
+            record_codex_stream_failure(
+                &ctx,
+                "deadline",
+                "total_timeout",
+                provider_started_at,
+                None,
+            );
             map_codex_error_to_response(&client::codex_total_timeout_error(
                 transport,
                 deadline.timeout_ms(),
@@ -1083,6 +1095,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
     );
     let mut generation_started = false;
     let mut hosted_side_effect_started = false;
+    let mut stream_progress = StreamProgress::new(provider_started_at);
     // Start the downstream grace window as soon as either live transport is ready.
     // Waiting for the first WebSocket generation event can otherwise leave Claude with
     // no bytes for the full response-start timeout and trigger a false interruption warning.
@@ -1103,6 +1116,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                     if hosted_side_effect_started || generation_started {
                         replay_state = None;
                     }
+                    stream_progress.observe_local_heartbeat();
                     return LiveStreamStart::Response(remaining_live_stream_response_with_replay(
                         upstream_events,
                         translator,
@@ -1115,6 +1129,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                         generation_started,
                         keepalive_delay,
                         replay_state,
+                        stream_progress,
                     ));
                 },
                 item = upstream_events.recv() => item,
@@ -1182,6 +1197,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                 ));
             }
         };
+        stream_progress.observe_upstream_event(codex_generation_event(&payload));
         // A reducer-validated event can prove model work or advance response state without
         // yielding Anthropic bytes (reasoning-only and structured-output buffering are common
         // examples). Close replay independently of downstream commitment. Response lifecycle
@@ -1197,6 +1213,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
             // semantic output uncommitted. This removes the fixed heartbeat floor without
             // sacrificing the existing created -> explicit retryable-failure recovery contract.
             record_codex_response_created_commit(&ctx, provider_started_at, replay_state.is_some());
+            stream_progress.observe_local_heartbeat();
             return LiveStreamStart::Response(remaining_live_stream_response_with_replay(
                 upstream_events,
                 translator,
@@ -1209,16 +1226,19 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                 generation_started,
                 keepalive_delay,
                 replay_state,
+                stream_progress,
             ));
         }
         if !chunk.is_empty() {
             replay_state = None;
             record_live_stream_progress(&ctx, &chunk);
+            stream_progress.observe_downstream_chunk(chunk.len());
             if terminal {
                 record_codex_terminal_resolution(
                     &ctx,
                     "authoritative",
                     payload.get("type").and_then(serde_json::Value::as_str),
+                    provider_started_at,
                 );
                 update_live_continuation_from_capture(
                     ctx.lane_key.as_ref(),
@@ -1239,6 +1259,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                 generation_started,
                 keepalive_delay,
                 replay_state,
+                stream_progress,
             ));
         }
         if terminal {
@@ -1246,6 +1267,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                 &ctx,
                 "authoritative",
                 payload.get("type").and_then(serde_json::Value::as_str),
+                provider_started_at,
             );
             update_live_continuation_from_capture(
                 ctx.lane_key.as_ref(),
@@ -1402,6 +1424,10 @@ fn log_codex_request_configuration(
             ),
             ("model".to_string(), serde_json::json!(request.model)),
             ("serviceTier".to_string(), serde_json::json!(service_tier)),
+            (
+                "serviceTierSource".to_string(),
+                serde_json::json!(request.service_tier_source.as_str()),
+            ),
             (
                 "reasoningEffort".to_string(),
                 serde_json::json!(reasoning_effort),
@@ -1643,13 +1669,16 @@ fn record_codex_terminal_resolution(
     ctx: &RequestContext,
     authority: &'static str,
     source_event: Option<&str>,
+    provider_started_at: Instant,
 ) {
+    let elapsed_ms = provider_started_at.elapsed().as_millis();
     crate::logging::create_logger("codex").info(
         "terminal_resolution",
         Some(serde_json::Map::from_iter([
             ("reqId".to_string(), serde_json::json!(ctx.req_id)),
             ("authority".to_string(), serde_json::json!(authority)),
             ("sourceEvent".to_string(), serde_json::json!(source_event)),
+            ("elapsedMs".to_string(), serde_json::json!(elapsed_ms)),
         ])),
     );
     if let Some(traffic) = ctx.traffic.as_deref() {
@@ -1658,9 +1687,33 @@ fn record_codex_terminal_resolution(
             &serde_json::json!({
                 "authority": authority,
                 "sourceEvent": source_event,
+                "elapsedMs": elapsed_ms,
             }),
         );
     }
+}
+
+fn record_codex_stream_failure(
+    ctx: &RequestContext,
+    stage: &'static str,
+    kind: &'static str,
+    provider_started_at: Instant,
+    wait_ms: Option<u128>,
+) {
+    let mut fields = serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(ctx.req_id)),
+        ("outcome".to_string(), serde_json::json!("failed")),
+        ("stage".to_string(), serde_json::json!(stage)),
+        ("kind".to_string(), serde_json::json!(kind)),
+        (
+            "elapsedMs".to_string(),
+            serde_json::json!(provider_started_at.elapsed().as_millis()),
+        ),
+    ]);
+    if let Some(wait_ms) = wait_ms {
+        fields.insert("waitMs".to_string(), serde_json::json!(wait_ms));
+    }
+    crate::logging::create_logger("codex").info("stream_terminal", Some(fields));
 }
 
 #[derive(Clone, Copy)]
@@ -1738,8 +1791,16 @@ fn finish_live_stream_after_downstream_stall(
     translator: &mut LiveStreamTranslator,
     ctx: &RequestContext,
     turn_id: Option<u64>,
+    provider_started_at: Instant,
 ) {
     abort_continuation(ctx.lane_key.as_ref(), turn_id);
+    record_codex_stream_failure(
+        ctx,
+        "downstream",
+        "consumer_stalled",
+        provider_started_at,
+        Some(DOWNSTREAM_STALL_TIMEOUT.as_millis()),
+    );
     let chunk = translator.error_chunk(
         "Claude Code did not consume the proxy response for 60 seconds",
         "api_error",
@@ -1761,8 +1822,10 @@ fn finish_live_stream_at_deadline(
     ctx: &RequestContext,
     turn_id: Option<u64>,
     deadline: client::CodexRequestDeadline,
+    provider_started_at: Instant,
 ) {
     abort_continuation(ctx.lane_key.as_ref(), turn_id);
+    record_codex_stream_failure(ctx, "deadline", "total_timeout", provider_started_at, None);
     let error =
         client::codex_total_timeout_error(config::CodexTransport::WebSocket, deadline.timeout_ms());
     let chunk = translator.error_chunk(&error.message, "api_error", ctx.traffic.as_deref());
@@ -1784,9 +1847,14 @@ enum LiveHeartbeatWait<T> {
     TooLarge,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_live_future_with_heartbeat<T>(
     future: impl std::future::Future<Output = T>,
     heartbeat: &mut tokio::time::Interval,
+    stream_progress: &mut StreamProgress,
+    stream_progress_timer: &mut tokio::time::Interval,
+    ctx: &RequestContext,
+    generation_started: bool,
     tx: &tokio::sync::mpsc::Sender<Result<BudgetedChunk, std::io::Error>>,
     byte_budget: &ByteBudget,
     deadline: client::CodexRequestDeadline,
@@ -1799,6 +1867,14 @@ async fn wait_live_future_with_heartbeat<T>(
             _ = tokio::time::sleep_until(deadline.at()) => {
                 return LiveHeartbeatWait::Deadline;
             }
+            _ = stream_progress_timer.tick() => {
+                stream_progress.log(
+                    "codex",
+                    &ctx.req_id,
+                    generation_started,
+                    StreamProgressPhase::Rebuild,
+                );
+            }
             _ = heartbeat.tick() => {
                 match send_live_chunk_before_deadline(
                     tx,
@@ -1806,7 +1882,7 @@ async fn wait_live_future_with_heartbeat<T>(
                     DOWNSTREAM_PING.to_vec(),
                     deadline,
                 ).await {
-                    LiveChunkSendOutcome::Sent => {}
+                    LiveChunkSendOutcome::Sent => stream_progress.observe_local_heartbeat(),
                     LiveChunkSendOutcome::Closed => return LiveHeartbeatWait::Closed,
                     LiveChunkSendOutcome::Deadline => return LiveHeartbeatWait::Deadline,
                     LiveChunkSendOutcome::Stalled => return LiveHeartbeatWait::Stalled,
@@ -1827,11 +1903,15 @@ enum LiveReopenOutcome {
     TooLarge,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reopen_live_stream_after_commit(
     mut error: client::CodexError,
     replay_state: &mut LiveReplayState,
     ctx: &RequestContext,
     heartbeat: &mut tokio::time::Interval,
+    stream_progress: &mut StreamProgress,
+    stream_progress_timer: &mut tokio::time::Interval,
+    generation_started: bool,
     tx: &tokio::sync::mpsc::Sender<Result<BudgetedChunk, std::io::Error>>,
     byte_budget: &ByteBudget,
     deadline: client::CodexRequestDeadline,
@@ -1850,6 +1930,7 @@ async fn reopen_live_stream_after_commit(
                     replay_safety,
                     Some(wait_ms),
                 );
+                stream_progress.observe_rebuild();
                 wait_ms
             }
             Err(error) => {
@@ -1868,6 +1949,10 @@ async fn reopen_live_stream_after_commit(
             match wait_live_future_with_heartbeat(
                 tokio::time::sleep(Duration::from_millis(wait_ms)),
                 heartbeat,
+                stream_progress,
+                stream_progress_timer,
+                ctx,
+                generation_started,
                 tx,
                 byte_budget,
                 deadline,
@@ -1887,6 +1972,10 @@ async fn reopen_live_stream_after_commit(
         match wait_live_future_with_heartbeat(
             replay_state.open_upstream(ctx, deadline),
             heartbeat,
+            stream_progress,
+            stream_progress_timer,
+            ctx,
+            generation_started,
             tx,
             byte_budget,
             deadline,
@@ -1970,6 +2059,12 @@ fn remaining_live_stream_response_with_heartbeat(
     generation_started: bool,
     heartbeat_interval: Duration,
 ) -> Response {
+    let mut stream_progress = StreamProgress::new(provider_started_at);
+    if first_chunk.as_slice() == DOWNSTREAM_PING {
+        stream_progress.observe_local_heartbeat();
+    } else if !first_chunk.is_empty() {
+        stream_progress.observe_downstream_chunk(first_chunk.len());
+    }
     remaining_live_stream_response_with_replay(
         upstream_events,
         translator,
@@ -1982,6 +2077,7 @@ fn remaining_live_stream_response_with_heartbeat(
         generation_started,
         heartbeat_interval,
         None,
+        stream_progress,
     )
 }
 
@@ -1998,12 +2094,14 @@ fn remaining_live_stream_response_with_replay(
     mut generation_started: bool,
     heartbeat_interval: Duration,
     mut replay_state: Option<Box<LiveReplayState>>,
+    mut stream_progress: StreamProgress,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<BudgetedChunk, std::io::Error>>(
         LIVE_EVENT_CHANNEL_CAPACITY,
     );
     let byte_budget = ByteBudget::new(MAX_DOWNSTREAM_QUEUE_BYTES);
     tokio::spawn(async move {
+        let mut stream_progress_timer = stream_progress.timer();
         let mut terminal_permit = match tx.clone().try_reserve_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
@@ -2026,6 +2124,7 @@ fn remaining_live_stream_response_with_replay(
                             &ctx,
                             turn_id,
                             deadline,
+                            provider_started_at,
                         );
                         return;
                     }
@@ -2035,6 +2134,7 @@ fn remaining_live_stream_response_with_replay(
                             &mut translator,
                             &ctx,
                             turn_id,
+                            provider_started_at,
                         );
                         return;
                     }
@@ -2071,6 +2171,9 @@ fn remaining_live_stream_response_with_replay(
                         .expect("open replay gate must retain replay state"),
                     &ctx,
                     &mut heartbeat,
+                    &mut stream_progress,
+                    &mut stream_progress_timer,
+                    generation_started,
                     &tx,
                     &byte_budget,
                     deadline,
@@ -2099,6 +2202,7 @@ fn remaining_live_stream_response_with_replay(
                                 false,
                             ),
                             None,
+                            provider_started_at,
                         );
                         let error_type = codex_stream_error_type(&error);
                         let chunk = translator.error_chunk(
@@ -2125,6 +2229,7 @@ fn remaining_live_stream_response_with_replay(
                             &ctx,
                             turn_id,
                             deadline,
+                            provider_started_at,
                         );
                         return;
                     }
@@ -2135,6 +2240,7 @@ fn remaining_live_stream_response_with_replay(
                             &mut translator,
                             &ctx,
                             turn_id,
+                            provider_started_at,
                         );
                         return;
                     }
@@ -2162,6 +2268,7 @@ fn remaining_live_stream_response_with_replay(
                     &ctx,
                     turn_id,
                     deadline,
+                    provider_started_at,
                 );
                 return;
             }
@@ -2178,13 +2285,24 @@ fn remaining_live_stream_response_with_replay(
                         &ctx,
                         turn_id,
                         deadline,
+                        provider_started_at,
                     );
                     return;
+                }
+                _ = stream_progress_timer.tick() => {
+                    stream_progress.log(
+                        "codex",
+                        &ctx.req_id,
+                        generation_started,
+                        StreamProgressPhase::Upstream,
+                    );
+                    continue;
                 }
                 _ = heartbeat.tick() => {
                     // Anthropic ping events keep event-aware clients and intermediaries connected.
                     // They bypass semantic translation, monitoring, and traffic capture.
                     send_chunk_or_stop!(DOWNSTREAM_PING.to_vec());
+                    stream_progress.observe_local_heartbeat();
                     continue;
                 }
                 item = upstream_events.recv() => item,
@@ -2234,6 +2352,7 @@ fn remaining_live_stream_response_with_replay(
                                 return;
                             }
                         };
+                    stream_progress.observe_upstream_event(codex_generation_event(&payload));
                     // Keep TTFT tied to a reducer-validated generation event. A transport ping,
                     // response lifecycle acknowledgement, or malformed failure is not output.
                     record_codex_generation_start(
@@ -2251,6 +2370,7 @@ fn remaining_live_stream_response_with_replay(
                     if !chunk.is_empty() {
                         replay_state = None;
                         record_live_stream_progress(&ctx, &chunk);
+                        stream_progress.observe_downstream_chunk(chunk.len());
                         send_chunk_or_stop!(chunk);
                     }
                     if terminal {
@@ -2258,6 +2378,7 @@ fn remaining_live_stream_response_with_replay(
                             &ctx,
                             "authoritative",
                             payload.get("type").and_then(serde_json::Value::as_str),
+                            provider_started_at,
                         );
                         update_live_continuation_from_capture(
                             ctx.lane_key.as_ref(),
@@ -2285,6 +2406,7 @@ fn remaining_live_stream_response_with_replay(
                                 true,
                             ),
                             None,
+                            provider_started_at,
                         );
                         record_live_stream_progress(&ctx, &chunk);
                         send_chunk_or_stop!(chunk);
@@ -2297,6 +2419,7 @@ fn remaining_live_stream_response_with_replay(
                             false,
                         ),
                         None,
+                        provider_started_at,
                     );
                     let error_type = codex_stream_error_type(&err);
                     let chunk = translator.error_chunk(
@@ -2323,6 +2446,7 @@ fn remaining_live_stream_response_with_replay(
                 &ctx,
                 non_authoritative_close_authority(NonAuthoritativeClose::StreamClose, true),
                 None,
+                provider_started_at,
             );
             record_live_stream_progress(&ctx, &chunk);
             send_chunk_or_stop!(chunk);
@@ -2332,6 +2456,7 @@ fn remaining_live_stream_response_with_replay(
             &ctx,
             non_authoritative_close_authority(NonAuthoritativeClose::StreamClose, false),
             None,
+            provider_started_at,
         );
         let chunk = translator.error_chunk(
             "WebSocket connection closed before terminal Codex response event",
@@ -2993,6 +3118,7 @@ mod tests {
             TranslateOptions {
                 session_id: None,
                 service_tier: None,
+                service_tier_source: ServiceTierSource::None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: true,
             },
@@ -3024,6 +3150,7 @@ mod tests {
             TranslateOptions {
                 session_id: Some("structured-continuation-test".to_string()),
                 service_tier: None,
+                service_tier_source: ServiceTierSource::None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: false,
             },
@@ -3577,6 +3704,7 @@ mod tests {
                 TranslateOptions {
                     session_id: None,
                     service_tier: None,
+                    service_tier_source: ServiceTierSource::None,
                     model,
                     use_responses_lite: lite,
                 },
@@ -3628,6 +3756,7 @@ mod tests {
                 TranslateOptions {
                     session_id: None,
                     service_tier: None,
+                    service_tier_source: ServiceTierSource::None,
                     model,
                     use_responses_lite: lite,
                 },

@@ -219,24 +219,9 @@ async fn serve_listener_with_timeout(
 ) -> anyhow::Result<()> {
     initialize_process_identity();
     let local_addr = listener.local_addr()?;
-    let port = local_addr.port();
     create_logger("server").info(
         "server listening",
-        Some(serde_json::Map::from_iter([
-            ("port".to_string(), json!(port)),
-            (
-                "bindAddress".to_string(),
-                json!(local_addr.ip().to_string()),
-            ),
-            (
-                "logDir".to_string(),
-                json!(
-                    crate::paths::log_file()
-                        .parent()
-                        .map(|path| path.display().to_string())
-                ),
-            ),
-        ])),
+        Some(server_listening_fields(local_addr)),
     );
     let limits = ServerLimits::configured();
     initialize_config_fingerprint(
@@ -259,6 +244,16 @@ async fn serve_listener_with_timeout(
     .await;
     let _ = crate::logging::flush(Duration::from_secs(2));
     result
+}
+
+fn server_listening_fields(local_addr: std::net::SocketAddr) -> Map<String, Value> {
+    Map::from_iter([
+        ("port".to_string(), json!(local_addr.port())),
+        (
+            "bindAddress".to_string(),
+            json!(local_addr.ip().to_string()),
+        ),
+    ])
 }
 
 async fn await_server_with_grace_timeout(
@@ -808,7 +803,6 @@ async fn dispatch_request_with_id(
         ..
     } = parts;
     let path = uri.path().to_string();
-    let query = redacted_query(&uri);
     let endpoint = if count_tokens {
         EndpointKind::CountTokens
     } else {
@@ -816,12 +810,7 @@ async fn dispatch_request_with_id(
     };
     log.info(
         "request",
-        Some(serde_json::Map::from_iter([
-            ("reqId".to_string(), json!(&req_id)),
-            ("method".to_string(), json!(method.as_str())),
-            ("path".to_string(), json!(&path)),
-            ("query".to_string(), json!(&query)),
-        ])),
+        Some(request_log_fields(&req_id, &method, &path, &uri)),
     );
     let parsed_session_id = session_id_from_headers(&headers);
     let monitored_session_id = parsed_session_id.as_ref().ok().cloned().flatten();
@@ -1293,6 +1282,7 @@ async fn dispatch_request_with_id(
     .map(Arc::new);
 
     if let Some(capture) = traffic.as_ref() {
+        let query = redacted_query(&uri);
         if let Some(monitor) = state.monitor.as_ref() {
             monitor.traffic_capture_path(&req_id, capture.root().to_path_buf());
         }
@@ -2879,6 +2869,28 @@ fn redacted_query(uri: &http::Uri) -> Value {
     Value::Object(out)
 }
 
+fn request_log_fields(
+    req_id: &str,
+    method: &http::Method,
+    path: &str,
+    uri: &http::Uri,
+) -> Map<String, Value> {
+    let query_parameter_count = uri
+        .query()
+        .map(|query| url::form_urlencoded::parse(query.as_bytes()).count())
+        .unwrap_or(0);
+    Map::from_iter([
+        ("reqId".to_string(), json!(req_id)),
+        ("method".to_string(), json!(method.as_str())),
+        ("path".to_string(), json!(path)),
+        ("queryPresent".to_string(), json!(uri.query().is_some())),
+        (
+            "queryParameterCount".to_string(),
+            json!(query_parameter_count),
+        ),
+    ])
+}
+
 fn parse_json_body<T>(body: &[u8]) -> Result<T, Box<Response>>
 where
     T: DeserializeOwned,
@@ -2915,6 +2927,16 @@ mod tests {
     use futures_util::stream;
 
     #[test]
+    fn server_listening_log_keeps_only_bounded_network_metadata() {
+        let fields = server_listening_fields("127.0.0.1:18765".parse().unwrap());
+
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields["bindAddress"], "127.0.0.1");
+        assert_eq!(fields["port"], 18_765);
+        assert!(!fields.contains_key("logDir"));
+    }
+
+    #[test]
     fn request_query_redacts_all_shared_sensitive_keys_case_insensitively() {
         let uri: http::Uri = "/v1/messages?safe=value&client_secret=top-secret&PaSsWoRd=hunter2"
             .parse()
@@ -2924,6 +2946,22 @@ mod tests {
         assert_eq!(query["safe"], "value");
         assert_eq!(query["client_secret"], "[redacted len=10]");
         assert_eq!(query["PaSsWoRd"], "[redacted len=7]");
+    }
+
+    #[test]
+    fn ordinary_request_log_omits_dynamic_query_names_and_values() {
+        let uri: http::Uri = "/v1/messages?customer-secret=CANARY_VALUE&safe=project-name"
+            .parse()
+            .unwrap();
+        let fields = request_log_fields("request-id", &http::Method::POST, "/v1/messages", &uri);
+        let encoded = serde_json::to_string(&fields).unwrap();
+
+        assert_eq!(fields["queryPresent"], true);
+        assert_eq!(fields["queryParameterCount"], 2);
+        assert!(!fields.contains_key("query"));
+        assert!(!encoded.contains("customer-secret"));
+        assert!(!encoded.contains("CANARY_VALUE"));
+        assert!(!encoded.contains("project-name"));
     }
 
     #[test]

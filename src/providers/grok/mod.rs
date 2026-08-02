@@ -33,6 +33,7 @@ use crate::provider::{CliHandlers, Provider, RequestByteLease, RequestContext};
 use crate::providers::downstream_queue::{
     self, BudgetedChunk, ByteBudget, SendOutcome as GrokChunkSendOutcome,
 };
+use crate::providers::stream_progress::{StreamProgress, StreamProgressPhase};
 use crate::providers::token_count_admission::{self, TokenCountAdmissionError};
 use crate::retry::sleep;
 use crate::timeutil::now_ms;
@@ -652,6 +653,8 @@ where
     let estimated_input_tokens = reconnect
         .as_ref()
         .map(|reconnect| reconnect.estimated_input_tokens);
+    let stream_progress = StreamProgress::new(provider_started_at);
+    let stream_progress_timer = stream_progress.timer();
     let state = GrokStreamState {
         upstream: Box::pin(upstream),
         decoder: SseDecoder::default(),
@@ -682,6 +685,8 @@ where
         deadline,
         heartbeat_interval,
         next_heartbeat,
+        stream_progress,
+        stream_progress_timer,
         provider_started_at,
     };
     let (tx, rx) = mpsc::channel(GROK_DOWNSTREAM_CHANNEL_CAPACITY);
@@ -913,6 +918,8 @@ struct GrokStreamState {
     deadline: GrokRequestDeadline,
     heartbeat_interval: Duration,
     next_heartbeat: tokio::time::Instant,
+    stream_progress: StreamProgress,
+    stream_progress_timer: tokio::time::Interval,
     provider_started_at: Instant,
 }
 
@@ -981,6 +988,19 @@ impl GrokStreamState {
         true
     }
 
+    fn release_upstream_resources(&mut self) {
+        // Cancellation and terminal handling must close network work and release request-sized
+        // replay material before traffic capture performs synchronous filesystem I/O.
+        drop(self.rebuild.take());
+        let upstream =
+            std::mem::replace(&mut self.upstream, Box::pin(futures_util::stream::empty()));
+        drop(upstream);
+        if let Some(reconnect) = self.reconnect.as_mut() {
+            drop(reconnect.replay.take());
+            drop(reconnect.request_byte_lease.take());
+        }
+    }
+
     fn observe_hosted_side_effects(&mut self, values: &[serde_json::Value]) {
         if self.hosted_side_effect_started
             || !values.iter().any(grok_event_starts_hosted_side_effect)
@@ -1015,7 +1035,12 @@ impl GrokStreamState {
                         self.reset_attempt(upstream);
                         continue;
                     }
+                    GrokRebuildPoll::Progress => {
+                        self.log_periodic_stream_progress(StreamProgressPhase::Rebuild);
+                        continue;
+                    }
                     GrokRebuildPoll::Heartbeat => {
+                        self.stream_progress.observe_local_heartbeat();
                         let ping = stream_ping();
                         self.capture_downstream(&ping);
                         return Some(ping);
@@ -1027,7 +1052,12 @@ impl GrokStreamState {
             }
             let chunk = match self.next_upstream_chunk().await {
                 Ok(GrokStreamPoll::Chunk(chunk)) => chunk,
+                Ok(GrokStreamPoll::Progress) => {
+                    self.log_periodic_stream_progress(StreamProgressPhase::Upstream);
+                    continue;
+                }
                 Ok(GrokStreamPoll::Heartbeat) => {
+                    self.stream_progress.observe_local_heartbeat();
                     let ping = stream_ping();
                     self.capture_downstream(&ping);
                     return Some(ping);
@@ -1097,6 +1127,11 @@ impl GrokStreamState {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
             };
+            let generation_events = values
+                .iter()
+                .filter(|value| grok_event_starts_generation(value))
+                .count();
+            let upstream_events = values.len();
             if values.iter().any(grok_event_closes_replay_window) {
                 self.close_replay_window();
             }
@@ -1149,6 +1184,8 @@ impl GrokStreamState {
                     }
                 }
             };
+            self.stream_progress
+                .observe_upstream_events(upstream_events, generation_events);
             let generation_started_now = self.observe_generation_start(generation_event.as_deref());
             if self.generation_started
                 && let Some(monitor) = self.monitor.as_ref()
@@ -1206,11 +1243,15 @@ impl GrokStreamState {
                     .unwrap_or("completed");
                 self.log_stream_terminal(outcome, stop_reason.as_deref(), None, None);
                 self.capture_downstream(&out);
+                if !out.is_empty() {
+                    self.stream_progress.observe_downstream_chunk(out.len());
+                }
                 self.finish_capture(true);
                 return (!out.is_empty()).then_some(out);
             }
             if !out.is_empty() {
                 self.capture_downstream(&out);
+                self.stream_progress.observe_downstream_chunk(out.len());
                 self.schedule_next_heartbeat();
                 return Some(out);
             }
@@ -1226,6 +1267,7 @@ impl GrokStreamState {
                 }
                 Err(GrokError::deadline_exceeded(client::GrokErrorStage::Stream))
             }
+            _ = self.stream_progress_timer.tick() => Ok(GrokStreamPoll::Progress),
             _ = tokio::time::sleep_until(self.next_heartbeat) => {
                 self.schedule_next_heartbeat();
                 Ok(GrokStreamPoll::Heartbeat)
@@ -1317,12 +1359,14 @@ impl GrokStreamState {
             fail_stage,
             fail_kind,
         });
+        self.stream_progress.observe_rebuild();
         Ok(())
     }
 
     async fn next_rebuild_poll(&mut self) -> GrokRebuildPoll {
         enum WaitResult {
             Deadline,
+            Progress,
             Heartbeat,
             Finished(Result<GrokByteStream, GrokError>),
         }
@@ -1332,6 +1376,7 @@ impl GrokStreamState {
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(self.deadline.at()) => WaitResult::Deadline,
+                _ = self.stream_progress_timer.tick() => WaitResult::Progress,
                 _ = tokio::time::sleep_until(self.next_heartbeat) => WaitResult::Heartbeat,
                 result = &mut rebuild.future => WaitResult::Finished(result),
             }
@@ -1349,6 +1394,7 @@ impl GrokStreamState {
                     client::GrokErrorStage::Stream,
                 ))
             }
+            WaitResult::Progress => GrokRebuildPoll::Progress,
             WaitResult::Heartbeat => {
                 self.schedule_next_heartbeat();
                 GrokRebuildPoll::Heartbeat
@@ -1374,6 +1420,11 @@ impl GrokStreamState {
         self.upstream_incomplete_reason = None;
         self.error_sent = false;
         self.terminal = false;
+    }
+
+    fn log_periodic_stream_progress(&mut self, phase: StreamProgressPhase) {
+        self.stream_progress
+            .log("grok", &self.req_id, self.generation_started, phase);
     }
 
     fn fail_mapped(&mut self, error: GrokError, stage: &str, kind: &str) -> Vec<u8> {
@@ -1406,6 +1457,10 @@ impl GrokStreamState {
             capture.malformed(stage, kind);
         }
         self.capture_downstream(&bytes);
+        // The failure artifacts below are synchronous filesystem writes. Close any live
+        // upstream/rebuild work and release request-sized replay material before entering that
+        // path so a slow capture filesystem cannot pin model resources after failure.
+        self.release_upstream_resources();
         if let Some(traffic) = self.traffic.as_ref() {
             let mut fields = serde_json::Map::from_iter([
                 ("stage".into(), serde_json::json!(stage)),
@@ -1455,6 +1510,7 @@ impl GrokStreamState {
     }
 
     fn finish_capture(&mut self, completed: bool) {
+        self.release_upstream_resources();
         if let (Some(capture), Some(traffic)) = (self.stream_capture.take(), self.traffic.as_ref())
         {
             capture.finish(
@@ -1570,18 +1626,21 @@ struct GrokPendingRebuild {
 
 enum GrokRebuildPoll {
     Rebuilt(GrokByteStream),
+    Progress,
     Heartbeat,
     Failed(GrokError),
 }
 
 enum GrokStreamPoll {
     Chunk(Bytes),
+    Progress,
     Heartbeat,
     End,
 }
 
 impl Drop for GrokStreamState {
     fn drop(&mut self) {
+        self.release_upstream_resources();
         if self.terminal || self.stream_capture.is_none() {
             return;
         }
@@ -1721,7 +1780,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::monitor::{EndpointKind, MonitorHandle};
-    use crate::traffic::test_capture;
+    use crate::traffic::{test_capture, test_capture_with_write_gate};
     use http_body_util::BodyExt;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3180,6 +3239,157 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(250), tx.closed())
             .await
             .expect("dropping downstream must cancel the upstream producer");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn downstream_drop_releases_resources_before_blocked_capture() {
+        let (client, _client_temp) = test_client(
+            "http://127.0.0.1:1/v1",
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let request_byte_budget = Arc::new(Semaphore::new(1));
+        let request_byte_lease =
+            RequestByteLease::new(request_byte_budget.clone().try_acquire_owned().unwrap(), 1);
+        let reconnect = Some(
+            GrokReconnectContext::new(Arc::new(client), prepared_request(false), None, retry, 1)
+                .with_request_byte_lease(Some(request_byte_lease)),
+        );
+        assert!(request_byte_budget.clone().try_acquire_owned().is_err());
+
+        let capture_temp = TempDir::new().unwrap();
+        let (capture, capture_gate, capture_release) =
+            test_capture_with_write_gate(capture_temp.path().join("traffic"));
+        let traffic = Arc::new(capture);
+        let traffic_weak = Arc::downgrade(&traffic);
+        let (upstream_tx, upstream_rx) = mpsc::channel(1);
+        let response = stream_body_with_policy(
+            ChannelStream(upstream_rx),
+            "msg_cancel_before_capture".into(),
+            "grok-4.5".into(),
+            None,
+            "req_cancel_before_capture".into(),
+            Some(traffic.clone()),
+            reconnect,
+            GrokRequestDeadline::after(Duration::from_secs(5)),
+            Duration::from_millis(20),
+        );
+        let mut body = response.into_body();
+        upstream_tx
+            .send(Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_pending\"}}\n\n",
+            )))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(250), body.frame())
+            .await
+            .expect("neutral upstream event should be followed by a heartbeat")
+            .expect("stream ended before cancellation")
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("event: ping"));
+
+        capture_gate.arm();
+        drop(body);
+        drop(traffic);
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !capture_gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled Grok capture did not reach the blocking test gate");
+        tokio::time::timeout(Duration::from_millis(250), upstream_tx.closed())
+            .await
+            .expect("upstream stream remained alive behind blocked traffic capture");
+        assert!(
+            request_byte_budget.clone().try_acquire_owned().is_ok(),
+            "request-byte replay lease remained charged behind blocked traffic capture"
+        );
+
+        drop(capture_release);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while traffic_weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Grok capture task did not finish after its gate was released");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_failure_releases_resources_before_blocked_capture() {
+        let (client, _client_temp) = test_client(
+            "http://127.0.0.1:1/v1",
+            GrokTimeouts {
+                connect_ms: 1_000,
+                header_ms: 1_000,
+                first_byte_ms: 1_000,
+                body_idle_ms: 1_000,
+            },
+        )
+        .await;
+        let retry = Arc::new(Mutex::new(GrokRetryState::new()));
+        let request_byte_budget = Arc::new(Semaphore::new(1));
+        let request_byte_lease =
+            RequestByteLease::new(request_byte_budget.clone().try_acquire_owned().unwrap(), 1);
+        let reconnect = Some(
+            GrokReconnectContext::new(Arc::new(client), prepared_request(false), None, retry, 1)
+                .with_request_byte_lease(Some(request_byte_lease)),
+        );
+        assert!(request_byte_budget.clone().try_acquire_owned().is_err());
+
+        let capture_temp = TempDir::new().unwrap();
+        let (capture, capture_gate, capture_release) =
+            test_capture_with_write_gate(capture_temp.path().join("traffic"));
+        capture_gate.arm();
+        let traffic = Arc::new(capture);
+        let (upstream_tx, upstream_rx) = mpsc::channel(1);
+        let response = stream_body_with_policy(
+            ChannelStream(upstream_rx),
+            "msg_failure_before_capture".into(),
+            "grok-4.5".into(),
+            None,
+            "req_failure_before_capture".into(),
+            Some(traffic),
+            reconnect,
+            GrokRequestDeadline::after(Duration::from_millis(40)),
+            Duration::from_secs(1),
+        );
+        let mut body = response.into_body();
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !capture_gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed Grok stream did not reach the blocking capture gate");
+        tokio::time::timeout(Duration::from_millis(250), upstream_tx.closed())
+            .await
+            .expect("failed Grok stream kept its upstream alive behind blocked capture");
+        assert!(
+            request_byte_budget.clone().try_acquire_owned().is_ok(),
+            "failed Grok stream kept its request-byte replay lease behind blocked capture"
+        );
+
+        drop(capture_release);
+        let failure = tokio::time::timeout(Duration::from_millis(500), body.frame())
+            .await
+            .expect("failure chunk was not published after capture resumed")
+            .expect("stream ended before its failure chunk")
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&failure).contains("event: error"));
     }
 
     #[tokio::test]

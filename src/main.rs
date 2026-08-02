@@ -17,7 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SESSION_END_HELPER_ARG: &str = "--ccproxy-session-end-hook";
@@ -29,6 +29,8 @@ const MAX_ANTHROPIC_CUSTOM_HEADERS_BYTES: usize = 64 * 1024;
 const CCP_COMPACTION_HEADER_NAME: &str = "x-ccproxy-compaction-model";
 const CLAUDE_PROFILE_ROOT_DIR: &str = ".claude-ccproxy";
 const CLAUDE_PROFILE_LOCK_FILE: &str = ".ccproxy-profile.lock";
+const CLAUDE_PROFILE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const CLAUDE_PROFILE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const CLAUDE_PROFILE_INITIALIZED_FILE: &str = ".ccproxy-profile-initialized";
 const CLAUDE_PROFILE_MANAGED_ENV: &str = "CCP_CLAUDE_PROFILE_MANAGED";
 const CLAUDE_SHARED_CONFIG_ENTRIES: &[&str] = &[
@@ -907,7 +909,7 @@ fn prepare_claude_profile_config(profile: ClaudeProfile) -> Result<PathBuf> {
 
     let lock_path = profile_directory.join(CLAUDE_PROFILE_LOCK_FILE);
     let lock = open_private_lock_file(&lock_path)?;
-    fs2::FileExt::lock_exclusive(&lock).with_context(|| {
+    lock_claude_profile_with_timeout(&lock, CLAUDE_PROFILE_LOCK_TIMEOUT).with_context(|| {
         format!(
             "failed to lock Claude Code profile directory {}",
             profile_directory.display()
@@ -1036,6 +1038,72 @@ fn open_private_lock_file(path: &Path) -> Result<File> {
     options
         .open(path)
         .with_context(|| format!("failed to open profile lock {}", path.display()))
+}
+
+fn lock_claude_profile_with_timeout(lock: &File, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    let mut first_attempt = true;
+    loop {
+        // Preserve one immediate acquisition attempt even for a zero timeout, but never acquire
+        // the lock after a waiter has crossed its advertised wall-clock deadline.
+        if !first_attempt && started.elapsed() >= timeout {
+            anyhow::bail!(
+                "timed out after {} ms waiting for another co/cg launcher to finish profile initialization",
+                timeout.as_millis()
+            );
+        }
+        let was_first_attempt = first_attempt;
+        first_attempt = false;
+        match fs2::FileExt::try_lock_exclusive(lock) {
+            Ok(()) => {
+                // `try_lock_exclusive` is non-blocking, but the deadline can still pass between
+                // the pre-attempt check and a successful system call. Do not report an acquisition
+                // that happened after the advertised deadline. A zero timeout intentionally keeps
+                // its single immediate probe.
+                if profile_lock_acquisition_missed_deadline(
+                    was_first_attempt,
+                    timeout,
+                    started.elapsed(),
+                ) {
+                    fs2::FileExt::unlock(lock)
+                        .context("failed to release a profile lock acquired after its deadline")?;
+                    anyhow::bail!(
+                        "timed out after {} ms waiting for another co/cg launcher to finish profile initialization",
+                        timeout.as_millis()
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) if profile_lock_is_busy(&error) => {
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
+                    anyhow::bail!(
+                        "timed out after {} ms waiting for another co/cg launcher to finish profile initialization",
+                        timeout.as_millis()
+                    );
+                }
+                let remaining = timeout.saturating_sub(elapsed);
+                std::thread::sleep(remaining.min(CLAUDE_PROFILE_LOCK_RETRY_INTERVAL));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn profile_lock_acquisition_missed_deadline(
+    first_attempt: bool,
+    timeout: Duration,
+    elapsed: Duration,
+) -> bool {
+    elapsed >= timeout && !(first_attempt && timeout.is_zero())
+}
+
+fn profile_lock_is_busy(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    error.raw_os_error().is_some()
+        && error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 fn read_optional_json_file(path: &Path) -> Result<Option<serde_json::Value>> {
@@ -1956,6 +2024,82 @@ mod tests {
             claude_profile_config_directory(home, ClaudeProfile::Grok),
             PathBuf::from("/home/tester/.claude-ccproxy/grok")
         );
+    }
+
+    #[test]
+    fn profile_lock_wait_times_out_instead_of_blocking_forever() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(CLAUDE_PROFILE_LOCK_FILE);
+        let owner = open_private_lock_file(&lock_path).unwrap();
+        let waiter = open_private_lock_file(&lock_path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&owner).unwrap();
+
+        let error = lock_claude_profile_with_timeout(&waiter, Duration::from_millis(75))
+            .expect_err("a second launcher must not wait forever for the same profile");
+
+        assert!(
+            error.to_string().contains("timed out after 75 ms"),
+            "{error:#}"
+        );
+        fs2::FileExt::unlock(&owner).unwrap();
+    }
+
+    #[test]
+    fn profile_lock_busy_classifier_uses_fs2s_canonical_contention_error() {
+        assert!(profile_lock_is_busy(&fs2::lock_contended_error()));
+        assert!(!profile_lock_is_busy(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied"
+        )));
+        assert!(!profile_lock_is_busy(&std::io::Error::from_raw_os_error(
+            32
+        )));
+    }
+
+    #[test]
+    fn profile_lock_rejects_success_that_crossed_the_deadline() {
+        assert!(!profile_lock_acquisition_missed_deadline(
+            false,
+            Duration::from_millis(75),
+            Duration::from_millis(74),
+        ));
+        assert!(profile_lock_acquisition_missed_deadline(
+            true,
+            Duration::from_millis(75),
+            Duration::from_millis(75),
+        ));
+        assert!(profile_lock_acquisition_missed_deadline(
+            false,
+            Duration::from_millis(75),
+            Duration::from_millis(75),
+        ));
+        assert!(!profile_lock_acquisition_missed_deadline(
+            true,
+            Duration::ZERO,
+            Duration::from_millis(1),
+        ));
+    }
+
+    #[test]
+    fn profile_lock_wait_succeeds_when_the_owner_releases() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join(CLAUDE_PROFILE_LOCK_FILE);
+        let owner = open_private_lock_file(&lock_path).unwrap();
+        let waiter = open_private_lock_file(&lock_path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&owner).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = lock_claude_profile_with_timeout(&waiter, Duration::from_secs(2));
+            tx.send(result).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(75));
+        fs2::FileExt::unlock(&owner).unwrap();
+
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("profile waiter must wake after the owner releases")
+            .unwrap();
+        thread.join().unwrap();
     }
 
     #[test]

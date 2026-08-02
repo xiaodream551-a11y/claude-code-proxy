@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
+#[cfg(test)]
+use std::sync::Condvar;
+
 #[cfg(not(unix))]
 use crate::fsutil;
 use crate::logging::is_sensitive_payload_key;
@@ -22,6 +25,75 @@ pub struct TrafficCapture {
     disabled: AtomicBool,
     artifact_counter: Mutex<usize>,
     event_counter: Mutex<usize>,
+    #[cfg(test)]
+    write_gate: Option<Arc<TestTrafficWriteGate>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestTrafficWriteGate {
+    armed: AtomicBool,
+    entered: AtomicBool,
+    released: Mutex<bool>,
+    released_cv: Condvar,
+}
+
+#[cfg(test)]
+impl TestTrafficWriteGate {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
+            released: Mutex::new(false),
+            released_cv: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn entered(&self) -> bool {
+        self.entered.load(Ordering::Acquire)
+    }
+
+    fn wait_if_armed(&self) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        self.entered.store(true, Ordering::Release);
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .released_cv
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *released = true;
+        self.released_cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestTrafficWriteGateRelease {
+    gate: Arc<TestTrafficWriteGate>,
+}
+
+#[cfg(test)]
+impl Drop for TestTrafficWriteGateRelease {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
 }
 
 pub const DEFAULT_TRAFFIC_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
@@ -535,6 +607,8 @@ fn create_traffic_capture_with_quota(
         disabled: AtomicBool::new(false),
         artifact_counter: Mutex::new(0),
         event_counter: Mutex::new(0),
+        #[cfg(test)]
+        write_gate: None,
     })
 }
 
@@ -581,6 +655,11 @@ impl TrafficCapture {
     }
 
     fn write_reserved(&self, path: PathBuf, value: &[u8]) {
+        #[cfg(test)]
+        if let Some(gate) = self.write_gate.as_deref() {
+            gate.wait_if_armed();
+        }
+
         if self.disabled.load(Ordering::Acquire) {
             return;
         }
@@ -666,7 +745,23 @@ pub(crate) fn test_capture(root: PathBuf) -> TrafficCapture {
         disabled: AtomicBool::new(false),
         artifact_counter: Mutex::new(0),
         event_counter: Mutex::new(0),
+        write_gate: None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_capture_with_write_gate(
+    root: PathBuf,
+) -> (
+    TrafficCapture,
+    Arc<TestTrafficWriteGate>,
+    TestTrafficWriteGateRelease,
+) {
+    let gate = Arc::new(TestTrafficWriteGate::new());
+    let release = TestTrafficWriteGateRelease { gate: gate.clone() };
+    let mut capture = test_capture(root);
+    capture.write_gate = Some(gate.clone());
+    (capture, gate, release)
 }
 
 struct TrafficWriteFailure {
@@ -1320,6 +1415,7 @@ mod quota_tests {
             disabled: AtomicBool::new(false),
             artifact_counter: Mutex::new(0),
             event_counter: Mutex::new(0),
+            write_gate: None,
         }
     }
 

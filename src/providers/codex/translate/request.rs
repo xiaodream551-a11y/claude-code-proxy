@@ -70,6 +70,28 @@ pub enum ServiceTier {
     Flex,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ServiceTierSource {
+    #[default]
+    None,
+    FastSuffix,
+    Config,
+    Env,
+    CallerStandardOnly,
+}
+
+impl ServiceTierSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::FastSuffix => "fast_suffix",
+            Self::Config => "config",
+            Self::Env => "env",
+            Self::CallerStandardOnly => "caller_standard_only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesToolChoiceMode {
@@ -115,6 +137,10 @@ pub struct ResponsesRequest {
     pub client_metadata: Option<std::collections::HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+    /// Bounded provenance for local request diagnostics. This is deliberately
+    /// excluded from both the Codex wire request and continuation signatures.
+    #[serde(skip)]
+    pub(crate) service_tier_source: ServiceTierSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
     pub text: ResponsesText,
@@ -338,6 +364,7 @@ struct ToolPlan {
 pub struct TranslateOptions {
     pub session_id: Option<String>,
     pub service_tier: Option<ServiceTier>,
+    pub service_tier_source: ServiceTierSource,
     pub model: String,
     pub use_responses_lite: bool,
 }
@@ -346,7 +373,7 @@ pub struct TranslateOptions {
 /// tests never depend on a developer's process environment or config file.
 #[derive(Debug, Clone, Default)]
 pub struct TranslationOverrides {
-    pub service_tier: Option<String>,
+    pub service_tier: Option<config::SourcedConfigValue<String>>,
     pub effort: Option<String>,
     pub reasoning_summary: Option<String>,
 }
@@ -354,7 +381,7 @@ pub struct TranslationOverrides {
 impl TranslationOverrides {
     pub fn configured() -> Self {
         Self {
-            service_tier: config::codex_service_tier(),
+            service_tier: config::codex_service_tier_with_source(),
             effort: config::codex_effort(),
             reasoning_summary: config::codex_reasoning_summary(),
         }
@@ -463,13 +490,26 @@ fn normalize_service_tier(tier: &str) -> Result<ServiceTier, anyhow::Error> {
 }
 
 fn resolve_service_tier(
+    caller_standard_only: bool,
     model_tier: Option<ServiceTier>,
-    override_tier: Option<&str>,
-) -> Result<Option<ServiceTier>, anyhow::Error> {
-    match override_tier {
-        Some(val) => Ok(Some(normalize_service_tier(val)?)),
-        None => Ok(model_tier),
+    model_tier_source: ServiceTierSource,
+    override_tier: Option<&config::SourcedConfigValue<String>>,
+) -> Result<(Option<ServiceTier>, ServiceTierSource), anyhow::Error> {
+    if caller_standard_only {
+        return Ok((None, ServiceTierSource::CallerStandardOnly));
     }
+    if let Some(override_tier) = override_tier {
+        let tier = normalize_service_tier(&override_tier.value)?;
+        let source = match override_tier.source {
+            config::ConfigValueSource::Environment => ServiceTierSource::Env,
+            config::ConfigValueSource::ConfigFile => ServiceTierSource::Config,
+        };
+        return Ok((Some(tier), source));
+    }
+    Ok(match model_tier {
+        Some(tier) => (Some(tier), model_tier_source),
+        None => (None, ServiceTierSource::None),
+    })
 }
 
 /// Hosted tools (web_search) are rejected by the Responses Lite lane. Count
@@ -633,6 +673,7 @@ pub fn translate_request_with_overrides(
         include: Some(vec!["reasoning.encrypted_content".to_string()]),
         client_metadata: None,
         service_tier: None,
+        service_tier_source: ServiceTierSource::None,
         prompt_cache_key: None,
         reasoning: None,
         schema_bridge,
@@ -722,15 +763,14 @@ pub fn translate_request_with_overrides(
     // Anthropic's `standard_only` is a hard caller constraint. Omitting the
     // OpenAI service_tier is the standard-lane representation and must override
     // a local `-fast` alias or priority configuration.
-    let service_tier =
-        if req.extra.get("service_tier").and_then(Value::as_str) == Some("standard_only") {
-            None
-        } else {
-            resolve_service_tier(opts.service_tier, overrides.service_tier.as_deref())?
-        };
-    if let Some(ref tier) = service_tier {
-        out.service_tier = Some(tier.clone());
-    }
+    let (service_tier, service_tier_source) = resolve_service_tier(
+        req.extra.get("service_tier").and_then(Value::as_str) == Some("standard_only"),
+        opts.service_tier,
+        opts.service_tier_source,
+        overrides.service_tier.as_ref(),
+    )?;
+    out.service_tier = service_tier;
+    out.service_tier_source = service_tier_source;
 
     let effort = read_effort(req)?;
     // Compaction is a structured summary pass, so max reasoning only adds
@@ -2860,8 +2900,19 @@ mod tests {
         TranslateOptions {
             session_id: None,
             service_tier: None,
+            service_tier_source: ServiceTierSource::None,
             model: "gpt-5.5".to_string(),
             use_responses_lite: false,
+        }
+    }
+
+    fn service_tier_override(
+        value: &str,
+        source: config::ConfigValueSource,
+    ) -> config::SourcedConfigValue<String> {
+        config::SourcedConfigValue {
+            value: value.to_string(),
+            source,
         }
     }
 
@@ -2883,6 +2934,7 @@ mod tests {
             TranslateOptions {
                 session_id: Some("s".into()),
                 service_tier: None,
+                service_tier_source: ServiceTierSource::None,
                 model: "gpt-5.5".to_string(),
                 use_responses_lite: false,
             },
@@ -3460,6 +3512,7 @@ mod tests {
             TranslateOptions {
                 session_id: None,
                 service_tier: None,
+                service_tier_source: ServiceTierSource::None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: true,
             },
@@ -3489,6 +3542,7 @@ mod tests {
             TranslateOptions {
                 session_id: None,
                 service_tier: None,
+                service_tier_source: ServiceTierSource::None,
                 model: "gpt-5.6-sol".to_string(),
                 use_responses_lite: false,
             },
@@ -4370,7 +4424,10 @@ mod tests {
             &req,
             opts(),
             TranslationOverrides {
-                service_tier: Some("priority".to_string()),
+                service_tier: Some(service_tier_override(
+                    "priority",
+                    config::ConfigValueSource::ConfigFile,
+                )),
                 effort: Some("max".to_string()),
                 reasoning_summary: Some("off".to_string()),
             },
@@ -4382,6 +4439,87 @@ mod tests {
         ));
         assert_eq!(overridden.reasoning.unwrap().summary, None);
         assert_eq!(overridden.service_tier, Some(ServiceTier::Priority));
+        assert_eq!(overridden.service_tier_source, ServiceTierSource::Config);
+    }
+
+    #[test]
+    fn service_tier_provenance_follows_effective_precedence() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"hello"}]
+        }))
+        .unwrap();
+
+        let baseline = translate_request(&req, opts()).unwrap();
+        assert_eq!(baseline.service_tier, None);
+        assert_eq!(baseline.service_tier_source, ServiceTierSource::None);
+
+        let mut fast_options = opts();
+        fast_options.service_tier = Some(ServiceTier::Priority);
+        fast_options.service_tier_source = ServiceTierSource::FastSuffix;
+        let fast = translate_request(&req, fast_options).unwrap();
+        assert_eq!(fast.service_tier, Some(ServiceTier::Priority));
+        assert_eq!(fast.service_tier_source, ServiceTierSource::FastSuffix);
+
+        let mut fast_options = opts();
+        fast_options.service_tier = Some(ServiceTier::Priority);
+        fast_options.service_tier_source = ServiceTierSource::FastSuffix;
+        let configured = translate_request_with_overrides(
+            &req,
+            fast_options,
+            TranslationOverrides {
+                service_tier: Some(service_tier_override(
+                    "flex",
+                    config::ConfigValueSource::ConfigFile,
+                )),
+                effort: None,
+                reasoning_summary: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(configured.service_tier, Some(ServiceTier::Flex));
+        assert_eq!(configured.service_tier_source, ServiceTierSource::Config);
+
+        let mut fast_options = opts();
+        fast_options.service_tier = Some(ServiceTier::Priority);
+        fast_options.service_tier_source = ServiceTierSource::FastSuffix;
+        let environment = translate_request_with_overrides(
+            &req,
+            fast_options,
+            TranslationOverrides {
+                service_tier: Some(service_tier_override(
+                    "fast",
+                    config::ConfigValueSource::Environment,
+                )),
+                effort: None,
+                reasoning_summary: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(environment.service_tier, Some(ServiceTier::Priority));
+        assert_eq!(environment.service_tier_source, ServiceTierSource::Env);
+
+        let auto_req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"hello"}],
+            "service_tier":"auto"
+        }))
+        .unwrap();
+        let auto = translate_request_with_overrides(
+            &auto_req,
+            opts(),
+            TranslationOverrides {
+                service_tier: Some(service_tier_override(
+                    "flex",
+                    config::ConfigValueSource::ConfigFile,
+                )),
+                effort: None,
+                reasoning_summary: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(auto.service_tier, Some(ServiceTier::Flex));
+        assert_eq!(auto.service_tier_source, ServiceTierSource::Config);
     }
 
     #[test]
@@ -4398,6 +4536,28 @@ mod tests {
     }
 
     #[test]
+    fn service_tier_source_never_crosses_the_codex_wire() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol-fast",
+            "messages":[{"role":"user", "content":"hello"}]
+        }))
+        .unwrap();
+        let mut options = opts();
+        options.service_tier = Some(ServiceTier::Priority);
+        options.service_tier_source = ServiceTierSource::FastSuffix;
+        let translated = translate_request(&req, options).unwrap();
+        assert_eq!(
+            translated.service_tier_source,
+            ServiceTierSource::FastSuffix
+        );
+
+        let wire = serde_json::to_value(&translated).unwrap();
+        assert_eq!(wire["service_tier"], "priority");
+        assert!(wire.get("service_tier_source").is_none());
+        assert!(wire.get("serviceTierSource").is_none());
+    }
+
+    #[test]
     fn request_standard_only_overrides_local_priority_tier() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model":"gpt-5.6-sol",
@@ -4408,17 +4568,54 @@ mod tests {
         .unwrap();
         let mut options = opts();
         options.service_tier = Some(ServiceTier::Priority);
+        options.service_tier_source = ServiceTierSource::FastSuffix;
         let translated = translate_request_with_overrides(
             &req,
             options,
             TranslationOverrides {
-                service_tier: Some("priority".to_string()),
+                // The caller constraint must continue to suppress even an
+                // invalid local setting rather than changing failure behavior.
+                service_tier: Some(service_tier_override(
+                    "invalid-local-tier",
+                    config::ConfigValueSource::Environment,
+                )),
                 effort: None,
                 reasoning_summary: None,
             },
         )
         .unwrap();
         assert_eq!(translated.service_tier, None);
+        assert_eq!(
+            translated.service_tier_source,
+            ServiceTierSource::CallerStandardOnly
+        );
+    }
+
+    #[test]
+    fn invalid_service_tier_override_keeps_existing_failure() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user", "content":"hello"}]
+        }))
+        .unwrap();
+        let error = translate_request_with_overrides(
+            &req,
+            opts(),
+            TranslationOverrides {
+                service_tier: Some(service_tier_override(
+                    "invalid-local-tier",
+                    config::ConfigValueSource::Environment,
+                )),
+                effort: None,
+                reasoning_summary: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "Invalid service tier override: \"invalid-local-tier\". Must be one of: fast, priority, flex"
+        );
     }
 
     #[test]

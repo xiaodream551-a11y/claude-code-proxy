@@ -1,7 +1,7 @@
 use crate::config;
 use crate::registry::CODEX_MODELS;
 
-use super::request::ServiceTier;
+use super::request::{ServiceTier, ServiceTierSource};
 
 pub const ALLOWED_MODELS: &[&str] = CODEX_MODELS;
 
@@ -24,6 +24,7 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
 pub struct ResolvedModel {
     pub model: String,
     pub service_tier: Option<ServiceTier>,
+    pub service_tier_source: ServiceTierSource,
 }
 
 fn fast_model_base(model: &str) -> Option<&str> {
@@ -37,11 +38,13 @@ fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
         ResolvedModel {
             model: base.to_string(),
             service_tier: Some(ServiceTier::Priority),
+            service_tier_source: ServiceTierSource::FastSuffix,
         }
     } else {
         ResolvedModel {
             model: model.to_string(),
             service_tier: None,
+            service_tier_source: ServiceTierSource::None,
         }
     }
 }
@@ -61,15 +64,21 @@ pub fn resolve_model_request(model: &str) -> ResolvedModel {
         _ => requested.clone(),
     };
 
+    let service_tier = if requested.service_tier == Some(ServiceTier::Priority)
+        || resolved.service_tier == Some(ServiceTier::Priority)
+    {
+        Some(ServiceTier::Priority)
+    } else {
+        resolved.service_tier
+    };
     ResolvedModel {
         model: resolved.model,
-        service_tier: if requested.service_tier == Some(ServiceTier::Priority)
-            || resolved.service_tier == Some(ServiceTier::Priority)
-        {
-            Some(ServiceTier::Priority)
+        service_tier_source: if service_tier.is_some() {
+            ServiceTierSource::FastSuffix
         } else {
-            resolved.service_tier
+            ServiceTierSource::None
         },
+        service_tier,
     }
 }
 
@@ -161,6 +170,7 @@ mod tests {
         let r = resolve_model_request("gpt-5.6-sol-fast");
         assert_eq!(r.model, "gpt-5.6-sol");
         assert_eq!(r.service_tier, Some(ServiceTier::Priority));
+        assert_eq!(r.service_tier_source, ServiceTierSource::FastSuffix);
     }
 
     #[test]
@@ -168,6 +178,7 @@ mod tests {
         let resolved = resolve_model_request("gpt-5.6-sol-fast-fast");
         assert_eq!(resolved.model, "gpt-5.6-sol-fast-fast");
         assert_eq!(resolved.service_tier, None);
+        assert_eq!(resolved.service_tier_source, ServiceTierSource::None);
         assert!(!is_valid_model_for_codex("gpt-5.6-sol-fast-fast"));
         assert!(!is_valid_model_for_codex("unknown-fast-fast"));
     }

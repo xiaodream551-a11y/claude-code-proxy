@@ -751,6 +751,7 @@ fn allowed_event(event: &str) -> bool {
             | "request_configuration"
             | "native_web_search_phase"
             | "upstream_first_event"
+            | "stream_progress"
             | "stream_committed_before_semantic"
             | "stream_committed_on_response_created"
             | "terminal_resolution"
@@ -1057,7 +1058,7 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
         | "deadlineRemainingMs"
         | "heartbeatIntervalMs" => 7 * 24 * 60 * 60 * 1_000,
         "translateMs" => 7 * 24 * 60 * 60 * 1_000,
-        "bytes" | "contentBytes" => 1_u64 << 40,
+        "bytes" | "contentBytes" | "downstreamBytes" => 1_u64 << 40,
         "anthropicMaxTokens" | "estimatedInputTokens" => 1_000_000_000,
         "candidateRank" => 1,
         "candidateCount" => 2,
@@ -1079,6 +1080,11 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
         | "failures"
         | "loggedCount"
         | "chunks"
+        | "upstreamEvents"
+        | "generationEvents"
+        | "downstreamChunks"
+        | "localHeartbeats"
+        | "rebuilds"
         | "count"
         | "queueCapacity" => 1_000_000_000,
         "resultLimit" | "blockStartLimit" | "pendingEventLimit" => 1_000_000,
@@ -1116,7 +1122,16 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
         ],
         "toolKind" => &["tool_use", "server_tool_use"],
         "downstreamEvent" => &["ping"],
+        "streamPhase" => &["upstream", "rebuild"],
+        "upstreamActivity" => &["generation", "control", "none"],
         "serviceTier" => &["priority", "flex"],
+        "serviceTierSource" => &[
+            "none",
+            "fast_suffix",
+            "config",
+            "env",
+            "caller_standard_only",
+        ],
         "transportReason" => &[
             "system_proxy",
             "environment_proxy_unsupported",
@@ -1265,6 +1280,7 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "reqId",
             "model",
             "serviceTier",
+            "serviceTierSource",
             "reasoningEffort",
             "transport",
             "transportRequested",
@@ -1291,6 +1307,19 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
         ],
         "native_web_search_phase" => &["reqId", "phase", "elapsedMs"],
         "upstream_first_event" => &["reqId", "event", "elapsedMs"],
+        "stream_progress" => &[
+            "reqId",
+            "elapsedMs",
+            "streamPhase",
+            "upstreamActivity",
+            "generationStarted",
+            "upstreamEvents",
+            "generationEvents",
+            "downstreamChunks",
+            "downstreamBytes",
+            "localHeartbeats",
+            "rebuilds",
+        ],
         "stream_committed_before_semantic" => &[
             "reqId",
             "generationStarted",
@@ -1304,7 +1333,7 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "downstreamEvent",
             "replayWindowOpen",
         ],
-        "terminal_resolution" => &["reqId", "authority", "sourceEvent"],
+        "terminal_resolution" => &["reqId", "authority", "sourceEvent", "elapsedMs"],
         "buffered_transport_retry" | "live_transport_retry" => &[
             "reqId",
             "transport",
@@ -1401,6 +1430,8 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "origin",
             "errorStage",
             "usage",
+            "elapsedMs",
+            "waitMs",
         ],
         "log_records_dropped" => &["count", "queueCapacity"],
         _ => &[],
@@ -2665,6 +2696,8 @@ mod tests {
                 json!({
                     "reqId":"request-1",
                     "model":"gpt-5.6-sol",
+                    "serviceTier":"priority",
+                    "serviceTierSource":"fast_suffix",
                     "translateMs":17,
                     "hydrationLoadedGroupCount":1,
                     "hydrationLoadedResultCount":2,
@@ -2706,6 +2739,8 @@ mod tests {
         assert_eq!(codex["fields"]["hydrationUnavailableResultCount"], 0);
         assert_eq!(codex["fields"]["hydrationAmbiguous"], false);
         assert_eq!(codex["fields"]["translateMs"], 17);
+        assert_eq!(codex["fields"]["serviceTier"], "priority");
+        assert_eq!(codex["fields"]["serviceTierSource"], "fast_suffix");
         assert!(!codex.to_string().contains("secret_identifier"));
         assert!(!codex.to_string().contains("secret prompt"));
         assert!(is_sanitized_event(&codex));
@@ -2760,6 +2795,40 @@ mod tests {
         let mut forged_fingerprint = grok;
         forged_fingerprint["fields"]["promptCacheKeyFingerprint"] = json!("not-a-short-hash");
         assert!(!is_sanitized_event(&forged_fingerprint));
+    }
+
+    #[test]
+    fn request_configuration_service_tier_source_is_a_bounded_enum() {
+        for source in [
+            "none",
+            "fast_suffix",
+            "config",
+            "env",
+            "caller_standard_only",
+        ] {
+            let event = sanitize_event(
+                &serde_json::from_str(&log(
+                    "request_configuration",
+                    json!({"serviceTierSource":source}),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(event["fields"]["serviceTierSource"], source);
+            assert!(is_sanitized_event(&event));
+        }
+
+        let event = sanitize_event(
+            &serde_json::from_str(&log(
+                "request_configuration",
+                json!({"serviceTierSource":"CANARY_SECRET"}),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(event["fields"].get("serviceTierSource").is_none());
+        assert!(!event.to_string().contains("CANARY_SECRET"));
+        assert!(is_sanitized_event(&event));
     }
 
     #[test]
@@ -2936,6 +3005,66 @@ mod tests {
     }
 
     #[test]
+    fn stream_progress_keeps_only_bounded_cumulative_metadata() {
+        let event = sanitize_event(
+            &serde_json::from_str(&log(
+                "stream_progress",
+                json!({
+                    "reqId":"request-secret",
+                    "elapsedMs":60_001,
+                    "streamPhase":"rebuild",
+                    "upstreamActivity":"generation",
+                    "generationStarted":true,
+                    "upstreamEvents":42,
+                    "generationEvents":17,
+                    "downstreamChunks":11,
+                    "downstreamBytes":8192,
+                    "localHeartbeats":4,
+                    "rebuilds":2,
+                    "eventType":"response.output_text.delta",
+                    "prompt":"CANARY_SECRET"
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(event["fields"]["streamPhase"], "rebuild");
+        assert_eq!(event["fields"]["upstreamActivity"], "generation");
+        assert_eq!(event["fields"]["generationStarted"], true);
+        assert_eq!(event["fields"]["upstreamEvents"], 42);
+        assert_eq!(event["fields"]["generationEvents"], 17);
+        assert_eq!(event["fields"]["downstreamChunks"], 11);
+        assert_eq!(event["fields"]["downstreamBytes"], 8192);
+        assert_eq!(event["fields"]["localHeartbeats"], 4);
+        assert_eq!(event["fields"]["rebuilds"], 2);
+        assert!(event["fields"].get("eventType").is_none());
+        assert!(!event.to_string().contains("request-secret"));
+        assert!(!event.to_string().contains("CANARY_SECRET"));
+        assert!(is_sanitized_event(&event));
+
+        let mut forged = event;
+        forged["fields"]["upstreamActivity"] = json!("CANARY_SECRET");
+        assert!(!is_sanitized_event(&forged));
+
+        let over_limit = sanitize_event(
+            &serde_json::from_str(&log(
+                "stream_progress",
+                json!({
+                    "streamPhase":"unknown",
+                    "upstreamActivity":"unknown",
+                    "upstreamEvents":1_000_000_001_u64,
+                    "downstreamBytes":(1_u64 << 40) + 1
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(over_limit["fields"], json!({}));
+        assert!(is_sanitized_event(&over_limit));
+    }
+
+    #[test]
     fn response_created_stream_commit_keeps_only_bounded_timing_evidence() {
         let event = sanitize_event(
             &serde_json::from_str(&log(
@@ -2965,6 +3094,62 @@ mod tests {
 
         let mut forged = event;
         forged["fields"]["downstreamEvent"] = json!("message_start");
+        assert!(!is_sanitized_event(&forged));
+    }
+
+    #[test]
+    fn codex_terminal_timing_and_stall_reason_keep_only_bounded_metadata() {
+        let terminal = sanitize_event(
+            &serde_json::from_str(&log(
+                "terminal_resolution",
+                json!({
+                    "reqId":"request-secret",
+                    "authority":"authoritative",
+                    "sourceEvent":"response.completed",
+                    "elapsedMs":731,
+                    "responseId":"resp_secret_identifier",
+                    "prompt":"CANARY_SECRET"
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(terminal["fields"]["authority"], "authoritative");
+        assert_eq!(terminal["fields"]["elapsedMs"], 731);
+        assert!(!terminal.to_string().contains("request-secret"));
+        assert!(!terminal.to_string().contains("resp_secret_identifier"));
+        assert!(!terminal.to_string().contains("CANARY_SECRET"));
+        assert!(is_sanitized_event(&terminal));
+
+        let stalled = sanitize_event(
+            &serde_json::from_str(&log(
+                "stream_terminal",
+                json!({
+                    "reqId":"request-secret",
+                    "outcome":"failed",
+                    "stage":"downstream",
+                    "kind":"consumer_stalled",
+                    "elapsedMs":60_731,
+                    "waitMs":60_000,
+                    "sessionId":"session-secret",
+                    "detail":"CANARY_SECRET"
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stalled["fields"]["outcome"], "failed");
+        assert_eq!(stalled["fields"]["stage"], "downstream");
+        assert_eq!(stalled["fields"]["kind"], "consumer_stalled");
+        assert_eq!(stalled["fields"]["elapsedMs"], 60_731);
+        assert_eq!(stalled["fields"]["waitMs"], 60_000);
+        assert!(!stalled.to_string().contains("request-secret"));
+        assert!(!stalled.to_string().contains("session-secret"));
+        assert!(!stalled.to_string().contains("CANARY_SECRET"));
+        assert!(is_sanitized_event(&stalled));
+
+        let mut forged = stalled;
+        forged["fields"]["kind"] = json!("private-secret");
         assert!(!is_sanitized_event(&forged));
     }
 

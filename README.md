@@ -304,9 +304,12 @@ On first use, each profile receives a private snapshot of the current user
 settings, permissions, plugin metadata, skills, hooks, and global state. The
 snapshot keeps user-scoped MCP definitions such as Brave Search but removes
 every prior `lastSessionId`; it never copies transcript, prompt-history, task,
-or other session directories. Later profile configuration changes stay inside
-the active profile. Installed plugin files can still be referenced from
-Claude's user-level plugin cache when its metadata contains absolute paths;
+or other session directories. Concurrent first-use launchers serialize this
+snapshot; a waiter exits with an explicit error after 30 seconds instead of
+blocking indefinitely behind a stalled initializer. Later profile configuration
+changes stay inside the active profile. Installed plugin files can still be
+referenced from Claude's user-level plugin cache when its metadata contains
+absolute paths;
 this does not merge the profiles' transcript or prompt-history storage. Apply
 a shared configuration change to both profiles explicitly when needed. Because
 the launcher owns this boundary, an externally supplied `CLAUDE_CONFIG_DIR` is
@@ -469,7 +472,9 @@ without restarting the proxy. For example, `gpt-5.6-sol-fast` is sent upstream a
 model `gpt-5.6-sol` with `service_tier: "priority"`. An explicit
 `codex.serviceTier` / `CCP_CODEX_SERVICE_TIER` override normally takes precedence,
 but an incoming `service_tier: "standard_only"` request suppresses every local
-priority/fast override and omits the upstream priority tier.
+priority/fast override and omits the upstream priority tier. Ordinary `co`
+requests do not set a service tier: leave both overrides unset and use a model
+without `-fast` to keep the provider's standard/default service.
 
 The private Codex gateway rejects `max_output_tokens`, `max_tokens`, and
 `max_completion_tokens`. `/v1/messages` therefore requires a positive Anthropic
@@ -926,7 +931,6 @@ or delete the old file. `CCP_CONFIG_DIR` disables the fallback.
     "model": "gpt-5.4",
     "effort": "medium",
     "reasoningSummary": "auto",
-    "serviceTier": "fast",
     "responsesLite": true,
     "parallelTools": false,
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
@@ -1251,7 +1255,12 @@ response bytes or changing a valid `message_stop`. The bounded
 translation call. It does not include later wire serialization, continuation or
 retry setup, authentication, connection, header wait, or generation time, so it
 can expose local translation regressions without being confused with upstream
-latency.
+latency. Long Codex and Grok streams emit a bounded `stream_progress` summary
+about once per minute. Its counters distinguish real upstream generation or
+control events from proxy-local heartbeats and mark retry rebuild phases, while
+omitting response content and dynamic provider identifiers. Codex terminal
+records also include elapsed time and bounded stage/kind metadata for total
+deadlines or a downstream consumer that stopped reading.
 
 ### Files
 
@@ -1292,6 +1301,9 @@ but remains available. Windows relies on the profile directories' ACLs.
   first recursive scan runs on a blocking worker and does not hold the global
   quota registry lock. A full quota disables the new capture or its remaining
   artifacts and emits one metadata-only warning; the model request continues.
+  Codex WebSocket events are deferred through 8 MiB and 1,024-complete-event
+  in-memory bounds before filesystem finalization. The fixed capture summary
+  reports cancellation and either form of truncation explicitly.
   This is not TTL pruning: ccproxy never deletes an existing capture
   automatically, and files left by an earlier process restart count against the
   next process's totals. Overrides must be positive counts; the process clamps

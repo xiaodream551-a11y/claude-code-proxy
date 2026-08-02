@@ -63,6 +63,7 @@ const MAX_CONFIGURED_IDLE_POOL_ENTRIES: usize = 4_096;
 const MAX_CONFIGURED_POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_IDLE_POOL_ENTRIES_PER_LANE: usize = 2;
 const MAX_RESPONSE_AFFINITY_BYTES: usize = 512;
+const WEBSOCKET_CLOSE_TIMEOUT_MS: u64 = 250;
 const MIN_POOL_REAPER_INTERVAL_MS: u64 = 1_000;
 const MAX_POOL_REAPER_INTERVAL_MS: u64 = 30_000;
 pub(super) const PREVIOUS_RESPONSE_UNAVAILABLE_DETAIL: &str = "previous_response_unavailable";
@@ -721,13 +722,19 @@ fn pool_insert_for_turn(
 ) {
     let response_affinity_present = response_affinity.is_some();
     let inserted_entry = entry.clone();
+    // Configuration refresh may stat/read the config file. Resolve it before taking the global
+    // continuation registry lock so a slow filesystem cannot serialize every lane behind this
+    // one pool insertion.
+    let config = WebSocketPoolConfig::configured();
+    let now = now_ms();
     let outcome = super::continuation::if_current_turn(Some(&key), turn_id, || {
-        pool_insert(key, entry, response_affinity, policy)
+        pool_insert(key, entry, response_affinity, policy, config, now)
     });
     let Some(outcome) = outcome else {
         inserted_entry.invalidate();
         return;
     };
+    ensure_pool_reaper_started();
     invalidate_continuation_affinities(outcome.invalidated);
     if !outcome.inserted_retained || !response_affinity_present {
         // A zero/tiny configured pool or global eviction can make the just-produced store:false
@@ -742,6 +749,8 @@ fn pool_insert(
     entry: Arc<PoolEntry>,
     response_affinity: Option<ResponseAffinity>,
     policy: PoolInsertPolicy,
+    config: WebSocketPoolConfig,
+    now: u64,
 ) -> PoolInsertOutcome {
     let mut invalidated = Vec::new();
     if !entry.is_valid() {
@@ -753,9 +762,7 @@ fn pool_insert(
             inserted_retained: false,
         };
     }
-    let config = WebSocketPoolConfig::configured();
-    let now = now_ms();
-    {
+    let inserted_retained = {
         let mut guard = WS_POOL.lock().unwrap();
         if let Some(old_affinity) = entry.replace_response_affinity(response_affinity)
             && entry.response_affinity().as_ref() != Some(&old_affinity)
@@ -783,13 +790,12 @@ fn pool_insert(
             }
         }
         invalidated.extend(reap_idle_pool(&mut guard, now, config));
-    }
-    ensure_pool_reaper_started();
-    let inserted_retained = WS_POOL.lock().unwrap().get(&key).is_some_and(|entries| {
-        entries
-            .iter()
-            .any(|idle| Arc::ptr_eq(&idle.connection, &entry))
-    });
+        guard.get(&key).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|idle| Arc::ptr_eq(&idle.connection, &entry))
+        })
+    };
     PoolInsertOutcome {
         invalidated,
         inserted_retained,
@@ -987,10 +993,14 @@ pub fn codex_websocket_headers(http_headers: &HeaderMap) -> HeaderMap {
 
 fn encode_sse(text: &str) -> Vec<u8> {
     let mut out = String::new();
-    for line in text.lines() {
-        out.push_str("data: ");
-        out.push_str(line);
-        out.push('\n');
+    if text.is_empty() {
+        out.push_str("data: \n");
+    } else {
+        for line in text.lines() {
+            out.push_str("data: ");
+            out.push_str(line);
+            out.push('\n');
+        }
     }
     out.push('\n');
     out.into_bytes()
@@ -1043,7 +1053,7 @@ pub async fn codex_websocket_request(
     headers: &HeaderMap,
     body_value: &serde_json::Value,
     ctx: &RequestContext,
-    traffic: Option<&TrafficCapture>,
+    traffic: Option<Arc<TrafficCapture>>,
     pool_key: Option<&RequestLaneKey>,
     timeouts: CodexWebSocketTimeouts,
     continuation: Option<&ContinuationCandidate>,
@@ -1068,7 +1078,7 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
     headers: &HeaderMap,
     body_value: &serde_json::Value,
     ctx: &RequestContext,
-    traffic: Option<&TrafficCapture>,
+    traffic: Option<Arc<TrafficCapture>>,
     pool_key: Option<&RequestLaneKey>,
     timeouts: CodexWebSocketTimeouts,
     continuation: Option<&ContinuationCandidate>,
@@ -1083,7 +1093,7 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
     })?;
     let expected_pool_identity = pool_identity(&ws_url, headers);
     let body_json = serde_json::to_string(body_value).unwrap_or_default();
-    if let Some(tc) = traffic {
+    if let Some(tc) = traffic.as_deref() {
         tc.write_json("020-upstream-request", body_value);
         tc.write_json(
             "021-upstream-request-metadata",
@@ -1131,9 +1141,10 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
     }
 
     if let Some(entry) = pooled {
+        let ws = entry.ws.clone();
         let lock = tokio::time::timeout(
             Duration::from_millis(timeouts.pool_probe_ms),
-            entry.ws.lock(),
+            ws.lock_owned(),
         )
         .await;
         let mut ws_guard = match lock {
@@ -1175,9 +1186,36 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
             return Err(err);
         }
 
-        let (sse_body, terminal_event) =
-            collect_ws_events(&mut ws_guard, timeouts, pool_key, Some(&entry), traffic).await?;
+        let outcome = collect_ws_events(
+            &mut ws_guard,
+            timeouts,
+            pool_key,
+            Some(&entry),
+            traffic.is_some(),
+        )
+        .await;
+        let keep_socket_open = outcome
+            .result
+            .as_ref()
+            .ok()
+            .and_then(|(_, terminal)| terminal.as_ref())
+            .is_some_and(|terminal| terminal.connection_reusable && terminal.kind.is_reusable());
+        if !keep_socket_open {
+            close_websocket_before_capture(&mut ws_guard).await;
+        }
+        drop(ws_guard);
+        let capture = outcome.capture;
+        let (sse_body, terminal_event) = match outcome.result {
+            Ok(result) => result,
+            Err(error) => {
+                drop(entry);
+                write_partial_websocket_capture(traffic, capture, false).await;
+                return Err(error);
+            }
+        };
         let Some(terminal_event) = terminal_event else {
+            drop(entry);
+            write_partial_websocket_capture(traffic, capture, false).await;
             return Err(missing_terminal_error());
         };
 
@@ -1185,6 +1223,8 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
             if let Some(key) = pool_key {
                 invalidate_pool_entry(key, &entry);
             }
+            drop(entry);
+            write_partial_websocket_capture(traffic, capture, false).await;
             return Err(previous_response_not_found_error());
         }
 
@@ -1195,7 +1235,6 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
         };
         let terminal_success = terminal_event.kind.is_reusable();
         let reusable = terminal_event.connection_reusable && terminal_success;
-        drop(ws_guard);
         if reusable && let Some(key) = pool_key {
             pool_insert_for_turn(
                 *key,
@@ -1218,9 +1257,23 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
             invalidate_pool_entry(key, &entry);
         }
 
-        if let Some(tc) = traffic {
-            write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, true);
-            write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
+        // A reusable socket is now retained by the pool. A non-reusable socket must lose this
+        // request's final Arc before synchronous traffic capture can block on the filesystem.
+        drop(entry);
+
+        if let Some(traffic) = traffic {
+            write_completed_websocket_capture(CompletedWebSocketCapture {
+                traffic,
+                ws_url: ws_url.clone(),
+                pool_key: pool_key.copied(),
+                continuation: WebSocketContinuationCapture::from_candidate(continuation),
+                pooled: true,
+                status,
+                elapsed: started_at.elapsed(),
+                sse_body: sse_body.clone(),
+                events: capture,
+            })
+            .await;
         }
 
         return Ok(CodexResponse {
@@ -1249,9 +1302,36 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
         )
         .await?;
 
-        let (sse_body, terminal_event) =
-            collect_ws_events(&mut ws_guard, timeouts, pool_key, Some(&entry), traffic).await?;
+        let outcome = collect_ws_events(
+            &mut ws_guard,
+            timeouts,
+            pool_key,
+            Some(&entry),
+            traffic.is_some(),
+        )
+        .await;
+        let keep_socket_open = outcome
+            .result
+            .as_ref()
+            .ok()
+            .and_then(|(_, terminal)| terminal.as_ref())
+            .is_some_and(|terminal| terminal.connection_reusable && terminal.kind.is_reusable());
+        if !keep_socket_open {
+            close_websocket_before_capture(&mut ws_guard).await;
+        }
+        drop(ws_guard);
+        let capture = outcome.capture;
+        let (sse_body, terminal_event) = match outcome.result {
+            Ok(result) => result,
+            Err(error) => {
+                drop(entry);
+                write_partial_websocket_capture(traffic, capture, false).await;
+                return Err(error);
+            }
+        };
         let Some(terminal_event) = terminal_event else {
+            drop(entry);
+            write_partial_websocket_capture(traffic, capture, false).await;
             return Err(missing_terminal_error());
         };
 
@@ -1259,6 +1339,8 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
             if let Some(key) = pool_key {
                 invalidate_pool_entry(key, &entry);
             }
+            drop(entry);
+            write_partial_websocket_capture(traffic, capture, false).await;
             return Err(previous_response_not_found_error());
         }
 
@@ -1269,7 +1351,6 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
         };
         let terminal_success = terminal_event.kind.is_reusable();
         let reusable = terminal_event.connection_reusable && terminal_success;
-        drop(ws_guard);
         if reusable && let Some(key) = pool_key {
             pool_insert_for_turn(
                 *key,
@@ -1290,10 +1371,24 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
             invalidate_pool_entry(key, &entry);
         }
 
+        // The pool owns reusable entries. Release the request-local Arc for every other terminal
+        // outcome before any synchronous traffic artifact is written.
+        drop(entry);
+
         // Write traffic metadata
-        if let Some(tc) = traffic {
-            write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, false);
-            write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
+        if let Some(traffic) = traffic {
+            write_completed_websocket_capture(CompletedWebSocketCapture {
+                traffic,
+                ws_url: ws_url.clone(),
+                pool_key: pool_key.copied(),
+                continuation: WebSocketContinuationCapture::from_candidate(continuation),
+                pooled: false,
+                status,
+                elapsed: started_at.elapsed(),
+                sse_body: sse_body.clone(),
+                events: capture,
+            })
+            .await;
         }
 
         Ok(CodexResponse {
@@ -1398,7 +1493,8 @@ pub(super) async fn codex_websocket_event_stream_with_pool_mode(
     };
 
     if let Some(tc) = traffic.as_deref() {
-        write_websocket_metadata_capture(tc, &ws_url, pool_key, continuation, used_pooled);
+        let continuation_capture = WebSocketContinuationCapture::from_candidate(continuation);
+        write_websocket_metadata_capture(tc, &ws_url, pool_key, &continuation_capture, used_pooled);
     }
 
     let (tx, rx) = mpsc::channel(super::LIVE_EVENT_CHANNEL_CAPACITY);
@@ -1412,97 +1508,143 @@ pub(super) async fn codex_websocket_event_stream_with_pool_mode(
     let cancel_entry = entry.clone();
     let terminal_forwarded = Arc::new(AtomicBool::new(false));
     let work_terminal_forwarded = terminal_forwarded.clone();
+    let deferred_capture = traffic
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(DeferredWebSocketCapture::default())));
+    let work_capture = deferred_capture.clone();
     tokio::spawn(async move {
-        let work = async move {
-            let lock_timeout_ms = if used_pooled {
-                timeouts.pool_probe_ms
-            } else {
-                timeouts.pong_ms
-            };
-            let lock =
-                tokio::time::timeout(Duration::from_millis(lock_timeout_ms), ws.lock_owned()).await;
-            let mut ws_guard = match lock {
-                Ok(guard) => guard,
-                Err(_) => {
-                    // Do not let an abandoned reader block the next turn until the
-                    // business idle timeout; its Arc remains valid while detached.
-                    invalidate_pool_owner(pool_key.as_ref(), Some(&entry));
-                    let err = pool_busy_error(lock_timeout_ms);
+        let (outcome, cancelled) = {
+            let mut work = Box::pin(async move {
+                let lock_timeout_ms = if used_pooled {
+                    timeouts.pool_probe_ms
+                } else {
+                    timeouts.pong_ms
+                };
+                let lock =
+                    tokio::time::timeout(Duration::from_millis(lock_timeout_ms), ws.lock_owned())
+                        .await;
+                let mut ws_guard = match lock {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        // Do not let an abandoned reader block the next turn until the
+                        // business idle timeout; its Arc remains valid while detached.
+                        invalidate_pool_owner(pool_key.as_ref(), Some(&entry));
+                        let err = pool_busy_error(lock_timeout_ms);
+                        log_websocket_pool_refresh(&ctx, &err.message);
+                        let _ = tx.send(Err(err)).await;
+                        return None;
+                    }
+                };
+                if !entry.is_valid() {
+                    let err = pool_healthcheck_error(
+                        "connection was invalidated while waiting for its previous turn"
+                            .to_string(),
+                    );
                     log_websocket_pool_refresh(&ctx, &err.message);
                     let _ = tx.send(Err(err)).await;
-                    return;
+                    return None;
                 }
+                let freshly_probed = used_pooled
+                    && entry.consume_fresh_probe(Duration::from_millis(timeouts.pool_probe_ms));
+                if used_pooled
+                    && !freshly_probed
+                    && let Err(err) =
+                        probe_pooled_connection(&mut ws_guard, timeouts.pool_probe_ms).await
+                {
+                    invalidate_pool_owner(pool_key.as_ref(), Some(&entry));
+                    log_websocket_pool_refresh(&ctx, &err.message);
+                    let _ = tx.send(Err(err)).await;
+                    return None;
+                }
+                if let Err(err) = send_ws_frame(
+                    &mut ws_guard,
+                    Message::Text(body_json),
+                    timeouts.pong_ms,
+                    "request",
+                    WEBSOCKET_CONNECTION_ERROR_DETAIL,
+                )
+                .await
+                {
+                    invalidate_pool_owner(pool_key.as_ref(), Some(&entry));
+                    let _ = tx.send(Err(err)).await;
+                    return None;
+                }
+
+                let outcome = stream_ws_events(
+                    &mut ws_guard,
+                    timeouts,
+                    StreamWsOptions {
+                        pool_key: pool_key.as_ref(),
+                        pool_entry: Some(&entry),
+                        turn_id,
+                        pool_insert_policy,
+                        capture: work_capture,
+                        terminal_forwarded: Some(&work_terminal_forwarded),
+                    },
+                    tx,
+                )
+                .await;
+                let reusable = outcome.reusable;
+                if !reusable {
+                    close_websocket_before_capture(&mut ws_guard).await;
+                }
+                drop(ws_guard);
+
+                // A reusable connection is published exactly once, at the terminal
+                // event before it is forwarded downstream. Publishing it again here
+                // can race with an immediate next turn that has already checked out
+                // the same Arc, falsely marking an active socket as idle.
+                if !reusable && let Some(key) = pool_key.as_ref() {
+                    invalidate_pool_entry(key, &entry);
+                }
+                Some(outcome)
+            });
+            let selected = tokio::select! {
+                _ = cancel_tx.closed() => {
+                    if terminal_forwarded.load(Ordering::Acquire) {
+                        // The authoritative terminal is already downstream. Let the bounded
+                        // ordering barrier finish so an immediate receiver drop cannot destroy a
+                        // healthy continuation socket already reserved for the next turn.
+                        ((&mut work).await, false)
+                    } else {
+                        invalidate_pool_owner(cancel_pool_key.as_ref(), Some(&cancel_entry));
+                        (None, true)
+                    }
+                }
+                outcome = &mut work => (outcome, false)
             };
-            if !entry.is_valid() {
-                let err = pool_healthcheck_error(
-                    "connection was invalidated while waiting for its previous turn".to_string(),
-                );
-                log_websocket_pool_refresh(&ctx, &err.message);
-                let _ = tx.send(Err(err)).await;
-                return;
-            }
-            let freshly_probed = used_pooled
-                && entry.consume_fresh_probe(Duration::from_millis(timeouts.pool_probe_ms));
-            if used_pooled
-                && !freshly_probed
-                && let Err(err) =
-                    probe_pooled_connection(&mut ws_guard, timeouts.pool_probe_ms).await
-            {
-                invalidate_pool_owner(pool_key.as_ref(), Some(&entry));
-                log_websocket_pool_refresh(&ctx, &err.message);
-                let _ = tx.send(Err(err)).await;
-                return;
-            }
-            if let Err(err) = send_ws_frame(
-                &mut ws_guard,
-                Message::Text(body_json),
-                timeouts.pong_ms,
-                "request",
-                WEBSOCKET_CONNECTION_ERROR_DETAIL,
-            )
-            .await
-            {
-                invalidate_pool_owner(pool_key.as_ref(), Some(&entry));
-                let _ = tx.send(Err(err)).await;
-                return;
-            }
-
-            let reusable = stream_ws_events(
-                &mut ws_guard,
-                timeouts,
-                StreamWsOptions {
-                    pool_key: pool_key.as_ref(),
-                    pool_entry: Some(&entry),
-                    turn_id,
-                    pool_insert_policy,
-                    traffic,
-                    terminal_forwarded: Some(&work_terminal_forwarded),
-                },
-                tx,
-            )
-            .await;
-
-            // A reusable connection is published exactly once, at the terminal
-            // event before it is forwarded downstream. Publishing it again here
-            // can race with an immediate next turn that has already checked out
-            // the same Arc, falsely marking an active socket as idle.
-            if !reusable && let Some(key) = pool_key.as_ref() {
-                invalidate_pool_entry(key, &entry);
-            }
+            // Explicitly destroy the selected or cancelled work future here. It owns the
+            // request-local WebSocket Arc and any in-flight mutex guard, so neither may survive
+            // into the potentially slow capture flush below.
+            drop(work);
+            selected
         };
-        tokio::pin!(work);
-        tokio::select! {
-            _ = cancel_tx.closed() => {
-                if terminal_forwarded.load(Ordering::Acquire) {
-                    // The authoritative terminal is already downstream. Let the bounded ordering
-                    // barrier finish so an immediate receiver drop cannot destroy a healthy
-                    // continuation socket that has already been reserved for the next turn.
-                    work.await;
-                } else {
-                    invalidate_pool_owner(cancel_pool_key.as_ref(), Some(&cancel_entry));
+
+        // The inner future owns every request-local socket Arc and guard. It is dropped at the end
+        // of the block above, before a potentially slow synchronous traffic flush. The outer
+        // cancellation clone is the final non-pool Arc for a non-reusable connection.
+        drop(cancel_tx);
+        drop(cancel_entry);
+
+        if let (Some(traffic), Some(capture)) = (
+            traffic,
+            take_shared_websocket_capture(deferred_capture.as_ref()),
+        ) {
+            let capture_cancelled = cancelled
+                || outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.downstream_cancelled);
+            let response_capture = outcome.map(|outcome| (outcome.status, outcome.elapsed));
+            // Traffic capture is deliberately synchronous for crash-local artifacts. Keep that
+            // filesystem work off Tokio's worker threads now that all network resources have
+            // already been released or published to the pool.
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some((status, elapsed)) = response_capture {
+                    write_websocket_response_capture(&traffic, status, elapsed, &capture.sse);
                 }
-            }
-            _ = &mut work => {}
+                capture.write_events(&traffic, capture_cancelled);
+            })
+            .await;
         }
     });
     Ok(rx)
@@ -1749,11 +1891,21 @@ async fn probe_pooled_connection(
     }
 }
 
+async fn close_websocket_before_capture(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
+    // Failure, cancellation, and protocol-error sockets must stop consuming upstream resources
+    // before debug capture can block on a slow filesystem. Transport shutdown is best-effort and
+    // tightly bounded; dropping the last stream Arc remains the fallback.
+    let _ = tokio::time::timeout(
+        Duration::from_millis(WEBSOCKET_CLOSE_TIMEOUT_MS),
+        tokio::io::AsyncWriteExt::shutdown(ws.get_mut()),
+    )
+    .await;
+}
+
 async fn confirm_terminal_ordering_barrier<F>(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     timeout_ms: u64,
     max_event_bytes: usize,
-    traffic: Option<&TrafficCapture>,
     mut capture_text: F,
 ) -> Result<WebSocketPingBarrierOutcome, CodexError>
 where
@@ -1771,22 +1923,10 @@ where
             }
             capture_text(text)?;
             let parsed = serde_json::from_str::<serde_json::Value>(text).map_err(|error| {
-                if let Some(traffic) = traffic {
-                    traffic.write_json_event(
-                        "040-upstream-event",
-                        &serde_json::json!({
-                            "unparseable": true,
-                            "data": text,
-                        }),
-                    );
-                }
                 terminal_barrier_error(format!(
                     "post-terminal event contained malformed JSON: {error}"
                 ))
             })?;
-            if let Some(traffic) = traffic {
-                traffic.write_json_event("040-upstream-event", &parsed);
-            }
             let event_type = parsed.get("type").and_then(serde_json::Value::as_str);
             if super::events::is_post_terminal_control_event(&parsed) {
                 Ok(())
@@ -1829,7 +1969,7 @@ fn write_websocket_metadata_capture(
     traffic: &TrafficCapture,
     ws_url: &str,
     pool_key: Option<&RequestLaneKey>,
-    continuation: Option<&ContinuationCandidate>,
+    continuation: &WebSocketContinuationCapture,
     pooled: bool,
 ) {
     traffic.write_json(
@@ -1841,16 +1981,34 @@ fn write_websocket_metadata_capture(
             "poolKeyPresent": pool_key.is_some(),
             "pooled": pooled,
             "continuation": {
-                "previousResponseId": continuation
-                    .and_then(|c| c.previous_response_id.as_deref()),
-                "inputDeltaCount": continuation
-                    .and_then(|c| c.input_delta.as_ref())
-                    .map(|items| items.len()),
-                "disabledReason": continuation
-                    .and_then(|c| c.disabled_reason.as_deref()),
+                "previousResponseId": continuation.previous_response_id.as_deref(),
+                "inputDeltaCount": continuation.input_delta_count,
+                "disabledReason": continuation.disabled_reason.as_deref(),
             },
         }),
     );
+}
+
+/// Minimal owned snapshot for a deferred traffic writer. A continuation candidate may retain a
+/// multi-megabyte input delta containing prompts and tool results; the capture metadata needs only
+/// these three already-bounded fields and must not clone or pin that request material.
+struct WebSocketContinuationCapture {
+    previous_response_id: Option<String>,
+    input_delta_count: Option<usize>,
+    disabled_reason: Option<String>,
+}
+
+impl WebSocketContinuationCapture {
+    fn from_candidate(candidate: Option<&ContinuationCandidate>) -> Self {
+        Self {
+            previous_response_id: candidate
+                .and_then(|candidate| candidate.previous_response_id.clone()),
+            input_delta_count: candidate
+                .and_then(|candidate| candidate.input_delta.as_ref())
+                .map(Vec::len),
+            disabled_reason: candidate.and_then(|candidate| candidate.disabled_reason.clone()),
+        }
+    }
 }
 
 fn write_websocket_response_capture(
@@ -2156,59 +2314,196 @@ struct WsEvent {
     connection_reusable: bool,
 }
 
+struct CollectedWsEvents {
+    result: Result<(Vec<u8>, Option<WsEvent>), CodexError>,
+    capture: Option<DeferredWebSocketCapture>,
+}
+
+#[derive(Default)]
+struct DeferredWebSocketCapture {
+    sse: Vec<u8>,
+    captured_events: u64,
+    truncated_events: u64,
+}
+
+impl DeferredWebSocketCapture {
+    fn append(&mut self, text: &str) {
+        let encoded = encode_sse(text);
+        if self.captured_events
+            < u64::try_from(crate::traffic::MAX_STREAM_CAPTURE_EVENTS).unwrap_or(u64::MAX)
+            && self.sse.len().saturating_add(encoded.len()) <= crate::traffic::MAX_SSE_CAPTURE_BYTES
+        {
+            self.sse.extend_from_slice(&encoded);
+            self.captured_events = self.captured_events.saturating_add(1);
+        } else {
+            self.truncated_events = self.truncated_events.saturating_add(1);
+        }
+    }
+
+    fn write_events(&self, traffic: &TrafficCapture, cancelled: bool) {
+        write_websocket_event_capture(traffic, &self.sse);
+        traffic.write_json(
+            "033-upstream-websocket-event-capture",
+            &self.summary(cancelled),
+        );
+    }
+
+    fn summary(&self, cancelled: bool) -> serde_json::Value {
+        serde_json::json!({
+            "transport": "websocket",
+            "cancelled": cancelled,
+            "limitBytes": crate::traffic::MAX_SSE_CAPTURE_BYTES,
+            "limitEvents": crate::traffic::MAX_STREAM_CAPTURE_EVENTS,
+            "capturedBytes": self.sse.len(),
+            "capturedEvents": self.captured_events,
+            "truncated": self.truncated_events > 0,
+            "truncatedEvents": self.truncated_events,
+        })
+    }
+}
+
+type SharedDeferredWebSocketCapture = Arc<Mutex<DeferredWebSocketCapture>>;
+
+fn append_shared_websocket_capture(capture: Option<&SharedDeferredWebSocketCapture>, text: &str) {
+    if let Some(capture) = capture {
+        capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .append(text);
+    }
+}
+
+fn take_shared_websocket_capture(
+    capture: Option<&SharedDeferredWebSocketCapture>,
+) -> Option<DeferredWebSocketCapture> {
+    capture.map(|capture| {
+        std::mem::take(
+            &mut *capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    })
+}
+
+fn write_optional_websocket_event_capture(
+    traffic: Option<&TrafficCapture>,
+    capture: Option<&DeferredWebSocketCapture>,
+    cancelled: bool,
+) {
+    if let (Some(traffic), Some(capture)) = (traffic, capture) {
+        capture.write_events(traffic, cancelled);
+    }
+}
+
+async fn write_partial_websocket_capture(
+    traffic: Option<Arc<TrafficCapture>>,
+    capture: Option<DeferredWebSocketCapture>,
+    cancelled: bool,
+) {
+    let (Some(traffic), Some(capture)) = (traffic, capture) else {
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || capture.write_events(&traffic, cancelled)).await;
+}
+
+struct CompletedWebSocketCapture {
+    traffic: Arc<TrafficCapture>,
+    ws_url: String,
+    pool_key: Option<RequestLaneKey>,
+    continuation: WebSocketContinuationCapture,
+    pooled: bool,
+    status: u16,
+    elapsed: Duration,
+    sse_body: Vec<u8>,
+    events: Option<DeferredWebSocketCapture>,
+}
+
+async fn write_completed_websocket_capture(capture: CompletedWebSocketCapture) {
+    let _ = tokio::task::spawn_blocking(move || {
+        write_optional_websocket_event_capture(
+            Some(&capture.traffic),
+            capture.events.as_ref(),
+            false,
+        );
+        write_websocket_metadata_capture(
+            &capture.traffic,
+            &capture.ws_url,
+            capture.pool_key.as_ref(),
+            &capture.continuation,
+            capture.pooled,
+        );
+        write_websocket_response_capture(
+            &capture.traffic,
+            capture.status,
+            capture.elapsed,
+            &capture.sse_body,
+        );
+    })
+    .await;
+}
+
 async fn collect_ws_events(
     ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     timeouts: CodexWebSocketTimeouts,
     pool_key: Option<&RequestLaneKey>,
     pool_entry: Option<&Arc<PoolEntry>>,
-    traffic: Option<&TrafficCapture>,
-) -> Result<(Vec<u8>, Option<WsEvent>), CodexError> {
+    capture_traffic: bool,
+) -> CollectedWsEvents {
     let mut sse_body: Vec<u8> = Vec::new();
+    let mut capture = capture_traffic.then(DeferredWebSocketCapture::default);
     let mut terminal_event: Option<WsEvent> = None;
     let mut watchdog = WebSocketWatchdog::new(timeouts);
 
     loop {
-        let frame = watchdog.next_frame(ws).await.inspect_err(|_| {
-            invalidate_pool_owner(pool_key, pool_entry);
-        })?;
+        let frame = match watchdog.next_frame(ws).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                invalidate_pool_owner(pool_key, pool_entry);
+                return CollectedWsEvents {
+                    result: Err(error),
+                    capture,
+                };
+            }
+        };
 
         match frame {
             Some(Message::Text(text)) => {
                 if text.len() > crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES {
                     invalidate_pool_owner(pool_key, pool_entry);
-                    return Err(CodexError {
-                        status: 0,
-                        message: "Codex WebSocket event exceeded the buffered response limit"
-                            .to_string(),
-                        detail: Some("websocket_event_size_limit".to_string()),
-                        retry_after: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    });
+                    return CollectedWsEvents {
+                        result: Err(CodexError {
+                            status: 0,
+                            message: "Codex WebSocket event exceeded the buffered response limit"
+                                .to_string(),
+                            detail: Some("websocket_event_size_limit".to_string()),
+                            retry_after: None,
+                            origin: CodexErrorOrigin::WebSocket,
+                        }),
+                        capture,
+                    };
+                }
+                if let Some(capture) = capture.as_mut() {
+                    capture.append(&text);
                 }
                 // Parse JSON
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(error) => {
-                        if let Some(tc) = traffic {
-                            tc.write_json_event(
-                                "040-upstream-event",
-                                &serde_json::json!({
-                                    "unparseable": true,
-                                    "data": text,
-                                }),
-                            );
-                        }
                         invalidate_pool_owner(pool_key, pool_entry);
-                        return Err(malformed_event_error(&error));
+                        return CollectedWsEvents {
+                            result: Err(malformed_event_error(&error)),
+                            capture,
+                        };
                     }
                 };
 
                 // Convert to SSE bytes
-                append_buffered_sse(&mut sse_body, &text).inspect_err(|_| {
+                if let Err(error) = append_buffered_sse(&mut sse_body, &text) {
                     invalidate_pool_owner(pool_key, pool_entry);
-                })?;
-                if let Some(tc) = traffic {
-                    tc.write_json_event("040-upstream-event", &parsed);
+                    return CollectedWsEvents {
+                        result: Err(error),
+                        capture,
+                    };
                 }
 
                 if is_response_event(&parsed) {
@@ -2221,8 +2516,12 @@ async fn collect_ws_events(
                         ws,
                         timeouts.pool_probe_ms,
                         crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES,
-                        traffic,
-                        |_| Ok(()),
+                        |text| {
+                            if let Some(capture) = capture.as_mut() {
+                                capture.append(text);
+                            }
+                            Ok(())
+                        },
                     )
                     .await;
                     // The terminal payload is authoritative for the response. A failed
@@ -2250,13 +2549,16 @@ async fn collect_ws_events(
             Some(Message::Binary(_)) => {
                 // Reject binary frames
                 invalidate_pool_owner(pool_key, pool_entry);
-                return Err(CodexError {
-                    status: 0,
-                    message: "WebSocket binary frames not supported".to_string(),
-                    detail: None,
-                    retry_after: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                });
+                return CollectedWsEvents {
+                    result: Err(CodexError {
+                        status: 0,
+                        message: "WebSocket binary frames not supported".to_string(),
+                        detail: None,
+                        retry_after: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    }),
+                    capture,
+                };
             }
             Some(Message::Close(_)) => {
                 // Connection closed - invalidate pool
@@ -2272,7 +2574,10 @@ async fn collect_ws_events(
         }
     }
 
-    Ok((sse_body, terminal_event))
+    CollectedWsEvents {
+        result: Ok((sse_body, terminal_event)),
+        capture,
+    }
 }
 
 fn append_buffered_sse(buffer: &mut Vec<u8>, text: &str) -> Result<(), CodexError> {
@@ -2296,8 +2601,15 @@ struct StreamWsOptions<'a> {
     pool_entry: Option<&'a Arc<PoolEntry>>,
     turn_id: Option<u64>,
     pool_insert_policy: PoolInsertPolicy,
-    traffic: Option<Arc<TrafficCapture>>,
+    capture: Option<SharedDeferredWebSocketCapture>,
     terminal_forwarded: Option<&'a AtomicBool>,
+}
+
+struct StreamWsOutcome {
+    reusable: bool,
+    status: u16,
+    elapsed: Duration,
+    downstream_cancelled: bool,
 }
 
 async fn stream_ws_events(
@@ -2305,24 +2617,25 @@ async fn stream_ws_events(
     timeouts: CodexWebSocketTimeouts,
     options: StreamWsOptions<'_>,
     tx: mpsc::Sender<Result<serde_json::Value, CodexError>>,
-) -> bool {
+) -> StreamWsOutcome {
     let StreamWsOptions {
         pool_key,
         pool_entry,
         turn_id,
         pool_insert_policy,
-        traffic,
+        capture,
         terminal_forwarded,
     } = options;
     let started_at = Instant::now();
-    let mut sse_body = traffic.as_ref().map(|_| Vec::new());
     let mut watchdog = WebSocketWatchdog::new(timeouts);
     let mut status = 200u16;
     let mut reusable = false;
+    let mut downstream_cancelled = false;
 
     loop {
         let frame = tokio::select! {
             _ = tx.closed() => {
+                downstream_cancelled = true;
                 invalidate_pool_owner(pool_key, pool_entry);
                 break;
             }
@@ -2330,7 +2643,7 @@ async fn stream_ws_events(
                 Ok(frame) => frame,
                 Err(err) => {
                     invalidate_pool_owner(pool_key, pool_entry);
-                    let _ = tx.send(Err(err)).await;
+                    downstream_cancelled = tx.send(Err(err)).await.is_err();
                     break;
                 }
             }
@@ -2340,7 +2653,7 @@ async fn stream_ws_events(
             Some(Message::Text(text)) => {
                 if text.len() > super::MAX_LIVE_EVENT_BYTES {
                     invalidate_pool_owner(pool_key, pool_entry);
-                    let _ = tx
+                    downstream_cancelled = tx
                         .send(Err(CodexError {
                             status: 0,
                             message: "Codex WebSocket event exceeded the live event size limit"
@@ -2349,32 +2662,22 @@ async fn stream_ws_events(
                             retry_after: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }))
-                        .await;
+                        .await
+                        .is_err();
                     break;
                 }
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(error) => {
-                        if let Some(tc) = traffic.as_deref() {
-                            tc.write_json_event(
-                                "040-upstream-event",
-                                &serde_json::json!({
-                                    "unparseable": true,
-                                    "data": text,
-                                }),
-                            );
-                        }
-                        append_live_capture_sse(&mut sse_body, &text);
+                        append_shared_websocket_capture(capture.as_ref(), &text);
                         invalidate_pool_owner(pool_key, pool_entry);
-                        let _ = tx.send(Err(malformed_event_error(&error))).await;
+                        downstream_cancelled =
+                            tx.send(Err(malformed_event_error(&error))).await.is_err();
                         break;
                     }
                 };
 
-                append_live_capture_sse(&mut sse_body, &text);
-                if let Some(tc) = traffic.as_deref() {
-                    tc.write_json_event("040-upstream-event", &parsed);
-                }
+                append_shared_websocket_capture(capture.as_ref(), &text);
 
                 if is_response_event(&parsed) {
                     watchdog.note_response_event();
@@ -2387,7 +2690,7 @@ async fn stream_ws_events(
                 let terminal = terminal_kind.is_some();
                 if terminal && is_previous_response_missing(&parsed) {
                     invalidate_pool_owner(pool_key, pool_entry);
-                    let _ = tx
+                    downstream_cancelled = tx
                         .send(Err(CodexError {
                             status: 0,
                             message: "Previous response not found".to_string(),
@@ -2395,7 +2698,8 @@ async fn stream_ws_events(
                             retry_after: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }))
-                        .await;
+                        .await
+                        .is_err();
                     break;
                 }
                 let terminal_kind_reusable =
@@ -2422,6 +2726,7 @@ async fn stream_ws_events(
                     terminal_forwarded.store(true, Ordering::Release);
                 }
                 if tx.send(Ok(parsed)).await.is_err() {
+                    downstream_cancelled = true;
                     invalidate_pool_owner(pool_key, pool_entry);
                     break;
                 }
@@ -2430,9 +2735,8 @@ async fn stream_ws_events(
                         ws,
                         timeouts.pool_probe_ms,
                         super::MAX_LIVE_EVENT_BYTES,
-                        traffic.as_deref(),
                         |text| {
-                            append_live_capture_sse(&mut sse_body, text);
+                            append_shared_websocket_capture(capture.as_ref(), text);
                             Ok(())
                         },
                     )
@@ -2454,7 +2758,7 @@ async fn stream_ws_events(
             }
             Some(Message::Binary(_)) => {
                 invalidate_pool_owner(pool_key, pool_entry);
-                let _ = tx
+                downstream_cancelled = tx
                     .send(Err(CodexError {
                         status: 0,
                         message: "WebSocket binary frames not supported".to_string(),
@@ -2462,31 +2766,40 @@ async fn stream_ws_events(
                         retry_after: None,
                         origin: CodexErrorOrigin::WebSocket,
                     }))
-                    .await;
+                    .await
+                    .is_err();
                 break;
             }
             Some(Message::Close(_)) | None => {
                 invalidate_pool_owner(pool_key, pool_entry);
-                let _ = tx.send(Err(missing_terminal_error())).await;
+                downstream_cancelled = tx.send(Err(missing_terminal_error())).await.is_err();
                 break;
             }
             Some(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => continue,
         }
     }
 
-    if let (Some(tc), Some(sse_body)) = (traffic.as_deref(), sse_body.as_deref()) {
-        write_websocket_response_capture(tc, status, started_at.elapsed(), sse_body);
+    StreamWsOutcome {
+        reusable,
+        status,
+        elapsed: started_at.elapsed(),
+        downstream_cancelled,
     }
-    reusable
 }
 
-fn append_live_capture_sse(capture: &mut Option<Vec<u8>>, text: &str) {
-    let Some(capture) = capture.as_mut() else {
-        return;
-    };
-    let encoded = encode_sse(text);
-    if capture.len().saturating_add(encoded.len()) <= crate::traffic::MAX_SSE_CAPTURE_BYTES {
-        capture.extend_from_slice(&encoded);
+fn write_websocket_event_capture(traffic: &TrafficCapture, sse_body: &[u8]) {
+    for event in crate::anthropic::sse::parse_sse_events(sse_body) {
+        match serde_json::from_str::<serde_json::Value>(&event.data) {
+            Ok(value) => traffic.write_json_event("040-upstream-event", &value),
+            Err(_) => traffic.write_json_event(
+                "040-upstream-event",
+                &serde_json::json!({
+                    "event": event.event,
+                    "unparseable": true,
+                    "data": event.data,
+                }),
+            ),
+        }
     }
 }
 
@@ -2526,6 +2839,109 @@ mod tests {
 
     fn test_lane_key(label: &str) -> RequestLaneKey {
         RequestLaneKey::for_test(label)
+    }
+
+    async fn spawn_failure_terminal_websocket_server() -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_terminal_tx, release_terminal_rx) = tokio::sync::oneshot::channel();
+        let (connection_closed_tx, connection_closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut request_seen_tx = Some(request_seen_tx);
+            let mut release_terminal_rx = Some(release_terminal_rx);
+            while let Some(frame) = ws.next().await {
+                match frame {
+                    Ok(Message::Ping(payload)) => {
+                        if ws.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Text(_)) => {
+                        if let Some(request_seen_tx) = request_seen_tx.take() {
+                            let _ = request_seen_tx.send(());
+                        }
+                        if let Some(release_terminal_rx) = release_terminal_rx.take() {
+                            let _ = release_terminal_rx.await;
+                            if ws
+                                .send(Message::Text(
+                                    r#"{"type":"response.failed","response":{"id":"resp_failed_capture","status":"failed","error":{"type":"server_error","message":"failed"}}}"#
+                                        .into(),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = connection_closed_tx.send(());
+        });
+        (
+            addr,
+            request_seen_rx,
+            release_terminal_tx,
+            connection_closed_rx,
+            server,
+        )
+    }
+
+    #[test]
+    fn deferred_websocket_capture_reports_bounded_truncation() {
+        let mut capture = DeferredWebSocketCapture::default();
+        // `encode_sse` adds exactly `"data: "` plus the trailing blank line for this
+        // newline-free payload, filling the configured byte budget without manufacturing an
+        // internally inconsistent capture state.
+        capture.append(&"x".repeat(crate::traffic::MAX_SSE_CAPTURE_BYTES - 8));
+        capture.append(r#"{"type":"response.output_text.delta","delta":"late"}"#);
+
+        let summary = capture.summary(true);
+        assert_eq!(summary["cancelled"], true);
+        assert_eq!(summary["limitBytes"], crate::traffic::MAX_SSE_CAPTURE_BYTES);
+        assert_eq!(
+            summary["capturedBytes"],
+            crate::traffic::MAX_SSE_CAPTURE_BYTES
+        );
+        assert_eq!(summary["capturedEvents"], 1);
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(summary["truncatedEvents"], 1);
+    }
+
+    #[test]
+    fn deferred_websocket_capture_bounds_tiny_event_fanout() {
+        let mut capture = DeferredWebSocketCapture::default();
+        for _ in 0..crate::traffic::MAX_STREAM_CAPTURE_EVENTS {
+            capture.append("");
+        }
+        capture.append("");
+
+        let summary = capture.summary(false);
+        assert_eq!(
+            summary["capturedEvents"],
+            crate::traffic::MAX_STREAM_CAPTURE_EVENTS
+        );
+        assert_eq!(
+            summary["limitEvents"],
+            crate::traffic::MAX_STREAM_CAPTURE_EVENTS
+        );
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(summary["truncatedEvents"], 1);
+        assert!(
+            summary["capturedBytes"].as_u64().unwrap()
+                < u64::try_from(crate::traffic::MAX_SSE_CAPTURE_BYTES).unwrap()
+        );
     }
 
     fn idle_pool_entry(
@@ -2881,6 +3297,15 @@ mod tests {
             String::from_utf8(result).unwrap(),
             "data: line1\ndata: line2\n\n"
         );
+    }
+
+    #[test]
+    fn encode_sse_empty_text_remains_a_capturable_event() {
+        let result = encode_sse("");
+        assert_eq!(result, b"data: \n\n");
+        let events = crate::anthropic::sse::parse_sse_events(&result);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "");
     }
 
     #[test]
@@ -4221,13 +4646,14 @@ mod tests {
             .await
             .unwrap();
         let (tx, mut rx) = mpsc::channel(super::super::LIVE_EVENT_CHANNEL_CAPACITY);
-        let reusable = stream_ws_events(
+        let outcome = stream_ws_events(
             &mut ws,
             test_timeouts(1_000, 1_000),
             StreamWsOptions::default(),
             tx,
         )
         .await;
+        let reusable = outcome.reusable;
         let mut items = Vec::new();
         while let Some(item) = rx.recv().await {
             items.push(item);
@@ -4313,7 +4739,7 @@ mod tests {
         let entry = Arc::new(PoolEntry::new(ws, PoolIdentity::TEST));
         let lane_key = test_lane_key("timing-pool-session");
         let (tx, mut rx) = mpsc::channel(super::super::LIVE_EVENT_CHANNEL_CAPACITY);
-        let reusable = {
+        let outcome = {
             let mut ws = entry.ws.lock().await;
             stream_ws_events(
                 &mut ws,
@@ -4328,7 +4754,7 @@ mod tests {
             .await
         };
 
-        assert!(reusable);
+        assert!(outcome.reusable);
         assert_eq!(
             rx.recv().await.unwrap().unwrap()["type"],
             "response.completed"
@@ -4378,7 +4804,9 @@ mod tests {
         let mut timeouts = test_timeouts(1_000, 1_000);
         timeouts.pool_probe_ms = 500;
         let producer = tokio::spawn(async move {
-            stream_ws_events(&mut ws, timeouts, StreamWsOptions::default(), tx).await
+            stream_ws_events(&mut ws, timeouts, StreamWsOptions::default(), tx)
+                .await
+                .reusable
         });
 
         let terminal = tokio::time::timeout(Duration::from_millis(250), rx.recv())
@@ -4733,10 +5161,11 @@ mod tests {
         timeouts.pong_ms = 20;
         let err = tokio::time::timeout(
             Duration::from_millis(250),
-            collect_ws_events(&mut ws, timeouts, None, None, None),
+            collect_ws_events(&mut ws, timeouts, None, None, false),
         )
         .await
         .expect("heartbeat watchdog should finish promptly")
+        .result
         .expect_err("silent peer must fail the heartbeat");
         assert_eq!(
             err.detail.as_deref(),
@@ -4777,10 +5206,11 @@ mod tests {
         timeouts.pong_ms = 100;
         let (_, terminal) = tokio::time::timeout(
             Duration::from_millis(250),
-            collect_ws_events(&mut ws, timeouts, None, None, None),
+            collect_ws_events(&mut ws, timeouts, None, None, false),
         )
         .await
         .expect("matching Pong should keep the stream alive")
+        .result
         .unwrap();
         assert_eq!(
             terminal.as_ref().map(|event| event.kind),
@@ -4881,6 +5311,669 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_continuation_reuses_same_socket_before_blocked_capture_releases() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_terminal_tx, release_terminal_rx) = tokio::sync::oneshot::channel();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut release_terminal_rx = Some(release_terminal_rx);
+            let mut request_count = 0_u8;
+            while let Some(Ok(frame)) = ws.next().await {
+                match frame {
+                    Message::Ping(payload) => {
+                        ws.send(Message::Pong(payload)).await.unwrap();
+                        if request_count == 2 {
+                            return request_count;
+                        }
+                    }
+                    Message::Text(text) => {
+                        request_count += 1;
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        request_tx.send((request_count, request)).unwrap();
+                        ws.send(Message::Text(
+                            serde_json::json!({
+                                "type": "response.created",
+                                "response": {"id": format!("resp_capture_{request_count}")}
+                            })
+                            .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                        if request_count == 1 {
+                            release_terminal_rx.take().unwrap().await.unwrap();
+                        }
+                        ws.send(Message::Text(
+                            serde_json::json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": format!("resp_capture_{request_count}"),
+                                    "usage": {}
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            request_count
+        });
+
+        let lane_key = test_lane_key("blocked-capture-session");
+        let temp = tempfile::TempDir::new().unwrap();
+        let (capture, capture_gate, capture_release) =
+            crate::traffic::test_capture_with_write_gate(temp.path().join("traffic"));
+        let traffic = Arc::new(capture);
+        let ctx = RequestContext {
+            req_id: "blocked-capture-request".to_string(),
+            session_id: Some("blocked-capture-session".to_string()),
+            lane_key: Some(lane_key),
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: Some(traffic.clone()),
+            monitor: None,
+            request_byte_lease: None,
+        };
+        let first_request = continuation_request(&["first"]);
+        let first = super::super::continuation::continuation_candidate(
+            Some(&lane_key),
+            &first_request,
+            true,
+        );
+        let first_wire =
+            super::super::client::build_websocket_request(&first_request, Some(&first));
+
+        let mut receiver = codex_websocket_event_stream(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &first_wire,
+            &ctx,
+            Some(traffic.clone()),
+            Some(&lane_key),
+            test_timeouts(1_000, 1_000),
+            Some(&first),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+                .await
+                .expect("first response.created timed out")
+                .unwrap()
+                .unwrap()["type"],
+            "response.created"
+        );
+        let (request_number, first_sent) =
+            tokio::time::timeout(Duration::from_millis(500), request_rx.recv())
+                .await
+                .expect("first request did not reach the WebSocket")
+                .unwrap();
+        assert_eq!(request_number, 1);
+        assert!(first_sent.get("previous_response_id").is_none());
+
+        capture_gate.arm();
+        release_terminal_tx.send(()).unwrap();
+        let terminal = tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+            .await
+            .expect("first terminal timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal["response"]["id"], "resp_capture_1");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !capture_gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("WebSocket capture did not reach the blocking test gate");
+
+        super::super::continuation::record_continuation(
+            Some(&lane_key),
+            first.turn_id,
+            &first_request,
+            Some("resp_capture_1"),
+            &[],
+        );
+        let second_request = continuation_request(&["first", "second"]);
+        let second = super::super::continuation::continuation_candidate(
+            Some(&lane_key),
+            &second_request,
+            true,
+        );
+        assert_eq!(
+            second.previous_response_id.as_deref(),
+            Some("resp_capture_1"),
+            "continuation miss: reason={:?}, first_turn={:?}, second_turn={:?}, candidates={}",
+            second.disabled_reason,
+            first.turn_id,
+            second.turn_id,
+            second.candidate_count
+        );
+        assert_eq!(second.previous_response_owner_turn_id, first.turn_id);
+        let second_wire =
+            super::super::client::build_websocket_request(&second_request, Some(&second));
+        let mut second_events = codex_websocket_event_stream(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &second_wire,
+            &ctx,
+            None,
+            Some(&lane_key),
+            test_timeouts(1_000, 1_000),
+            Some(&second),
+        )
+        .await
+        .expect("response-affine continuation could not check out the retained socket");
+        let (request_number, second_sent) =
+            tokio::time::timeout(Duration::from_millis(500), request_rx.recv())
+                .await
+                .expect("blocked first capture prevented same-socket continuation")
+                .unwrap();
+        assert_eq!(request_number, 2);
+        assert_eq!(
+            second_sent["previous_response_id"], "resp_capture_1",
+            "the second request must be the response-affine delta, not a fresh full-context dispatch"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), second_events.recv())
+                .await
+                .expect("second response.created timed out")
+                .unwrap()
+                .unwrap()["type"],
+            "response.created"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), second_events.recv())
+                .await
+                .expect("second terminal timed out")
+                .unwrap()
+                .unwrap()["response"]["id"],
+            "resp_capture_2"
+        );
+
+        drop(capture_release);
+        drop(receiver);
+        drop(second_events);
+        drop(ctx);
+        drop(traffic);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), server)
+                .await
+                .expect("same-socket continuation server did not finish")
+                .unwrap(),
+            2
+        );
+        clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preterminal_cancel_closes_socket_and_preserves_partial_capture() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(matches!(ws.next().await, Some(Ok(Message::Text(_)))));
+            ws.send(Message::Text(
+                r#"{"type":"response.created","response":{"id":"resp_partial"}}"#.into(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Ping(payload))) => {
+                        ws.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let traffic_root = temp.path().join("traffic");
+        let (capture, capture_gate, capture_release) =
+            crate::traffic::test_capture_with_write_gate(traffic_root.clone());
+        let traffic = Arc::new(capture);
+        let traffic_weak = Arc::downgrade(&traffic);
+        let mut receiver = codex_websocket_event_stream(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &serde_json::json!({"type":"response.create","input":[]}),
+            &test_context(),
+            Some(traffic.clone()),
+            None,
+            test_timeouts(1_000, 1_000),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            receiver.recv().await.unwrap().unwrap()["type"],
+            "response.created"
+        );
+
+        capture_gate.arm();
+        drop(receiver);
+        drop(traffic);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !capture_gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pre-terminal cancellation discarded its deferred capture");
+        tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("blocked partial capture kept the upstream WebSocket open")
+            .unwrap();
+
+        drop(capture_release);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while traffic_weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("partial WebSocket capture did not finish after gate release");
+
+        let summary_path = std::fs::read_dir(&traffic_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("033-upstream-websocket-event-capture"))
+            })
+            .expect("partial capture summary was not written");
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(summary_path).unwrap()).unwrap();
+        assert_eq!(summary["cancelled"], true);
+        assert_eq!(summary["capturedEvents"], 1);
+        assert_eq!(summary["truncated"], false);
+
+        let event_path = std::fs::read_dir(traffic_root.join("events"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("040-upstream-event"))
+            })
+            .expect("partial upstream event was not written");
+        let event: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(event_path).unwrap()).unwrap();
+        assert_eq!(event["type"], "response.created");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffered_websocket_reuses_socket_before_blocked_capture() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let (release_first_terminal_tx, release_first_terminal_rx) =
+            tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut request_count = 0_u8;
+            let mut release_first_terminal_rx = Some(release_first_terminal_rx);
+            while let Some(Ok(frame)) = ws.next().await {
+                match frame {
+                    Message::Ping(payload) => {
+                        ws.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    Message::Text(_) => {
+                        request_count += 1;
+                        request_tx.send(request_count).unwrap();
+                        if request_count == 1 {
+                            release_first_terminal_rx.take().unwrap().await.unwrap();
+                        }
+                        ws.send(Message::Text(
+                            serde_json::json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": format!("resp_capture_{request_count}"),
+                                    "usage": {}
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let (capture, capture_gate, capture_release) =
+            crate::traffic::test_capture_with_write_gate(temp.path().join("traffic"));
+        let traffic = Arc::new(capture);
+        let lane_key = test_lane_key("buffered-blocked-capture-session");
+        let first_traffic = traffic.clone();
+        let first = tokio::spawn(async move {
+            codex_websocket_request(
+                &format!("http://{addr}/responses"),
+                &HeaderMap::new(),
+                &serde_json::json!({"type":"response.create","input":[]}),
+                &test_context(),
+                Some(first_traffic),
+                Some(&lane_key),
+                test_timeouts(1_000, 1_000),
+                None,
+            )
+            .await
+        });
+        assert_eq!(request_rx.recv().await, Some(1));
+
+        capture_gate.arm();
+        release_first_terminal_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !capture_gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("buffered WebSocket capture did not reach the blocking test gate");
+
+        let second = tokio::spawn(async move {
+            codex_websocket_request(
+                &format!("http://{addr}/responses"),
+                &HeaderMap::new(),
+                &serde_json::json!({"type":"response.create","input":[]}),
+                &test_context(),
+                None,
+                Some(&lane_key),
+                test_timeouts(1_000, 1_000),
+                None,
+            )
+            .await
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), request_rx.recv())
+                .await
+                .expect("blocked traffic capture prevented reuse of the buffered socket"),
+            Some(2)
+        );
+        assert_eq!(second.await.unwrap().unwrap().status, 200);
+
+        drop(capture_release);
+        assert_eq!(first.await.unwrap().unwrap().status, 200);
+        drop(traffic);
+        server.abort();
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_non_reusable_websocket_closes_before_blocked_capture() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        let (addr, request_seen, release_terminal, connection_closed, server) =
+            spawn_failure_terminal_websocket_server().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let (capture, capture_gate, capture_release) =
+            crate::traffic::test_capture_with_write_gate(temp.path().join("traffic"));
+        let traffic = Arc::new(capture);
+        let lane_key = test_lane_key("live-failed-blocked-capture");
+        let ctx = test_context();
+        let mut receiver = codex_websocket_event_stream(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &serde_json::json!({"type":"response.create","input":[]}),
+            &ctx,
+            Some(traffic.clone()),
+            Some(&lane_key),
+            test_timeouts(1_000, 1_000),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), request_seen)
+            .await
+            .expect("live WebSocket server did not receive the request")
+            .unwrap();
+        capture_gate.arm();
+        release_terminal.send(()).unwrap();
+        let terminal = tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+            .await
+            .expect("live WebSocket did not forward its failure terminal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal["type"], "response.failed");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !capture_gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed live WebSocket capture did not reach the blocking gate");
+        tokio::time::timeout(Duration::from_millis(500), connection_closed)
+            .await
+            .expect("non-reusable live WebSocket remained open behind blocked capture")
+            .unwrap();
+
+        drop(capture_release);
+        drop(receiver);
+        drop(traffic);
+        tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("failure WebSocket server did not stop after client close")
+            .unwrap();
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn buffered_non_reusable_websocket_closes_before_blocked_capture() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        let (addr, request_seen, release_terminal, connection_closed, server) =
+            spawn_failure_terminal_websocket_server().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let (capture, capture_gate, capture_release) =
+            crate::traffic::test_capture_with_write_gate(temp.path().join("traffic"));
+        let traffic = Arc::new(capture);
+        let lane_key = test_lane_key("buffered-failed-blocked-capture");
+        let request_traffic = traffic.clone();
+        let request = tokio::spawn(async move {
+            codex_websocket_request(
+                &format!("http://{addr}/responses"),
+                &HeaderMap::new(),
+                &serde_json::json!({"type":"response.create","input":[]}),
+                &test_context(),
+                Some(request_traffic),
+                Some(&lane_key),
+                test_timeouts(1_000, 1_000),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_millis(500), request_seen)
+            .await
+            .expect("buffered WebSocket server did not receive the request")
+            .unwrap();
+
+        capture_gate.arm();
+        release_terminal.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !capture_gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed buffered WebSocket capture did not reach the blocking gate");
+        tokio::time::timeout(Duration::from_millis(500), connection_closed)
+            .await
+            .expect("non-reusable buffered WebSocket remained open behind blocked capture")
+            .unwrap();
+        assert!(!request.is_finished());
+
+        drop(capture_release);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), request)
+                .await
+                .expect("buffered WebSocket request did not finish after capture release")
+                .unwrap()
+                .unwrap()
+                .status,
+            500
+        );
+        drop(traffic);
+        tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("failure WebSocket server did not stop after client close")
+            .unwrap();
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_websocket_cancellation_flushes_partial_events_after_socket_close() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events_sent_tx, events_sent_rx) = tokio::sync::oneshot::channel();
+        let (connection_closed_tx, connection_closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut events_sent_tx = Some(events_sent_tx);
+            while let Some(frame) = ws.next().await {
+                match frame {
+                    Ok(Message::Text(_)) => {
+                        ws.send(Message::Text(
+                            r#"{"type":"response.created","response":{"id":"resp_cancel_capture"}}"#
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                        ws.send(Message::Text(
+                            r#"{"type":"response.output_text.delta","delta":"partial"}"#.into(),
+                        ))
+                        .await
+                        .unwrap();
+                        if let Some(events_sent_tx) = events_sent_tx.take() {
+                            let _ = events_sent_tx.send(());
+                        }
+                    }
+                    Ok(Message::Ping(payload)) => {
+                        if ws.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            let _ = connection_closed_tx.send(());
+        });
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let traffic_root = temp.path().join("traffic");
+        let (capture, capture_gate, capture_release) =
+            crate::traffic::test_capture_with_write_gate(traffic_root.clone());
+        let traffic = Arc::new(capture);
+        let traffic_weak = Arc::downgrade(&traffic);
+        let lane_key = test_lane_key("cancelled-partial-capture");
+        let ctx = test_context();
+        let mut receiver = codex_websocket_event_stream(
+            &format!("http://{addr}/responses"),
+            &HeaderMap::new(),
+            &serde_json::json!({"type":"response.create","input":[]}),
+            &ctx,
+            Some(traffic.clone()),
+            Some(&lane_key),
+            test_timeouts(1_000, 1_000),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), events_sent_rx)
+            .await
+            .expect("partial WebSocket server did not send its events")
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+                .await
+                .expect("cancel test did not receive response.created")
+                .unwrap()
+                .unwrap()["type"],
+            "response.created"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+                .await
+                .expect("cancel test did not receive response.output_text.delta")
+                .unwrap()
+                .unwrap()["type"],
+            "response.output_text.delta"
+        );
+
+        capture_gate.arm();
+        drop(receiver);
+        drop(traffic);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !capture_gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled live WebSocket did not flush its deferred capture");
+        tokio::time::timeout(Duration::from_millis(500), connection_closed_rx)
+            .await
+            .expect("cancelled live WebSocket remained open behind blocked capture")
+            .unwrap();
+
+        drop(capture_release);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while traffic_weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled WebSocket capture did not finish after gate release");
+        tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("cancelled WebSocket server did not stop after client close")
+            .unwrap();
+
+        let mut artifacts = String::new();
+        for entry in std::fs::read_dir(&traffic_root).unwrap() {
+            let path = entry.unwrap().path();
+            artifacts.push_str(&path.file_name().unwrap().to_string_lossy());
+            artifacts.push('\n');
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                artifacts.push_str(&contents);
+            }
+        }
+        for entry in std::fs::read_dir(traffic_root.join("events")).unwrap() {
+            let path = entry.unwrap().path();
+            artifacts.push_str(&path.file_name().unwrap().to_string_lossy());
+            artifacts.push('\n');
+            artifacts.push_str(&std::fs::read_to_string(path).unwrap());
+        }
+        assert!(artifacts.contains("response.created"));
+        assert!(artifacts.contains("response.output_text.delta"));
+        assert!(artifacts.contains("033-upstream-websocket-event-capture"));
+        assert!(artifacts.contains("\"cancelled\": true"));
+        clear_codex_websocket_pool_for_tests();
+    }
+
     #[tokio::test]
     async fn websocket_connect_401_is_pre_request_handshake_error() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4977,9 +6070,10 @@ mod tests {
             test_timeouts(1_000, 1_000),
             Some(&lane_key),
             None,
-            None,
+            false,
         )
         .await
+        .result
         {
             Ok(_) => panic!("expected binary frame to fail"),
             Err(err) => err,
@@ -5031,7 +6125,7 @@ mod tests {
         );
 
         let (tx, mut rx) = mpsc::channel(super::super::LIVE_EVENT_CHANNEL_CAPACITY);
-        let reusable = {
+        let outcome = {
             let mut ws = entry.ws.lock().await;
             stream_ws_events(
                 &mut ws,
@@ -5046,7 +6140,7 @@ mod tests {
             .await
         };
 
-        assert!(!reusable);
+        assert!(!outcome.reusable);
         let first = rx
             .recv()
             .await
@@ -5130,9 +6224,10 @@ mod tests {
                 test_timeouts(1_000, 1_000),
                 Some(&lane_key),
                 Some(&entry),
-                None,
+                false,
             )
             .await
+            .result
             .expect_err("malformed buffered JSON must fail before a success terminal")
         };
 
@@ -5188,9 +6283,10 @@ mod tests {
             test_timeouts(50, 1_000),
             Some(&lane_key),
             None,
-            None,
+            false,
         )
         .await
+        .result
         {
             Ok(_) => panic!("expected response start timeout"),
             Err(err) => err,
@@ -5241,9 +6337,10 @@ mod tests {
             test_timeouts(1_000, 50),
             Some(&lane_key),
             None,
-            None,
+            false,
         )
         .await
+        .result
         {
             Ok(_) => panic!("expected response idle timeout"),
             Err(err) => err,

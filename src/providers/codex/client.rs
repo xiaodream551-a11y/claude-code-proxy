@@ -18,6 +18,8 @@ use super::dispatch_budget::{
     CodexModelDispatchReservation, MAX_CODEX_MODEL_DISPATCHES,
 };
 use super::translate::request::ResponsesRequest;
+#[cfg(test)]
+use super::translate::request::ServiceTierSource;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -659,7 +661,7 @@ impl CodexHttpClient {
                             &ws_headers,
                             &ws_body,
                             ctx,
-                            ctx.traffic.as_deref(),
+                            ctx.traffic.clone(),
                             pool_key,
                             websocket_timeouts,
                             active_continuation.as_ref(),
@@ -705,7 +707,7 @@ impl CodexHttpClient {
                             &ws_headers,
                             &ws_body,
                             ctx,
-                            ctx.traffic.as_deref(),
+                            ctx.traffic.clone(),
                             pool_key,
                             websocket_timeouts,
                             active_continuation.as_ref(),
@@ -2210,22 +2212,34 @@ async fn forward_live_http_response(
         }
     }
 
-    if let Some(traffic) = ctx.traffic.as_deref() {
-        write_upstream_response_capture(
-            traffic,
-            status,
-            started_at.elapsed(),
-            &headers,
-            captured_body.as_deref().unwrap_or_default(),
-        );
-        if capture_truncated {
-            traffic.write_json(
-                "033-upstream-response-truncated",
-                &serde_json::json!({
-                    "limitBytes": crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES,
-                }),
-            );
-        }
+    // Release or close the upstream response and the request-byte lease before traffic capture
+    // performs synchronous file I/O. In particular, downstream cancellation must not leave model
+    // work or request-sized replay material alive while a large capture is split into per-event
+    // artifacts on a slow filesystem.
+    let traffic = ctx.traffic.clone();
+    drop(response);
+    drop(ctx);
+
+    if let Some(traffic) = traffic {
+        // Let reqwest/hyper process the dropped response-body cancellation before capture work
+        // is scheduled. The normal capture-disabled path keeps its existing scheduling behavior.
+        tokio::task::yield_now().await;
+        let elapsed = started_at.elapsed();
+        let captured_body = captured_body.unwrap_or_default();
+        // Traffic capture intentionally waits for its crash-local artifacts, but filesystem work
+        // must not occupy an async runtime worker after the network resources are gone.
+        let _ = tokio::task::spawn_blocking(move || {
+            write_upstream_response_capture(&traffic, status, elapsed, &headers, &captured_body);
+            if capture_truncated {
+                traffic.write_json(
+                    "033-upstream-response-truncated",
+                    &serde_json::json!({
+                        "limitBytes": crate::traffic::MAX_STREAM_CAPTURE_EVENT_BYTES,
+                    }),
+                );
+            }
+        })
+        .await;
     }
     if !cancelled && let Some(error) = final_error {
         if error.detail.as_deref() == Some(CODEX_TOTAL_TIMEOUT_DETAIL) {
@@ -3435,6 +3449,7 @@ mod tests {
             include: None,
             client_metadata: None,
             service_tier: None,
+            service_tier_source: ServiceTierSource::None,
             prompt_cache_key: None,
             text: super::super::translate::request::ResponsesText {
                 verbosity: None,
@@ -5891,8 +5906,8 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn dropping_live_http_receiver_closes_the_upstream_socket() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_live_http_receiver_releases_request_resources_before_blocked_capture() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -5911,22 +5926,65 @@ mod tests {
                 .expect("dropping the receiver should close the HTTP response")
                 .unwrap()
         });
+        let temp = tempfile::TempDir::new().unwrap();
+        let (capture, capture_gate, capture_release) =
+            crate::traffic::test_capture_with_write_gate(temp.path().join("traffic"));
+        let traffic = Arc::new(capture);
+        let traffic_weak = Arc::downgrade(&traffic);
+        let mut ctx = http_test_context();
+        ctx.traffic = Some(traffic.clone());
+        let request_byte_budget = Arc::new(tokio::sync::Semaphore::new(1));
+        ctx.request_byte_lease = Some(crate::provider::RequestByteLease::new(
+            request_byte_budget.clone().try_acquire_owned().unwrap(),
+            1,
+        ));
+        assert!(request_byte_budget.clone().try_acquire_owned().is_err());
         let client = Arc::new(authenticated_http_test_client(format!(
             "http://{addr}/responses"
         )));
         let mut events = client
             .stream_codex_http_events(
                 &buffered_test_request(),
-                &http_test_context(),
+                &ctx,
                 CodexRequestDeadline::from_timeout_ms(1_000),
                 CodexDispatchBudget::new(),
             )
             .await
             .unwrap();
         assert!(events.recv().await.unwrap().is_ok());
+        capture_gate.arm();
         drop(events);
+        drop(ctx);
+        drop(traffic);
 
-        assert_eq!(server.await.unwrap(), 0);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !capture_gate.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled HTTP capture did not reach the blocking test gate");
+        assert!(
+            request_byte_budget.clone().try_acquire_owned().is_ok(),
+            "request-byte lease remained charged behind blocked traffic capture"
+        );
+        let upstream_read = tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("upstream did not observe HTTP response close before capture release")
+            .unwrap();
+        assert_eq!(
+            upstream_read, 0,
+            "upstream connection remained readable before capture release"
+        );
+
+        drop(capture_release);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while traffic_weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HTTP capture task did not finish after its gate was released");
     }
 
     #[test]
@@ -6787,6 +6845,7 @@ mod tests {
             include: None,
             client_metadata: None,
             service_tier: None,
+            service_tier_source: ServiceTierSource::None,
             prompt_cache_key: None,
             text: super::super::translate::request::ResponsesText {
                 verbosity: Some("low".to_string()),

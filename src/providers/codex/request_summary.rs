@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+#[cfg(test)]
+use super::translate::request::ServiceTierSource;
 use super::translate::request::{
     ResponsesContentPart, ResponsesInputItem, ResponsesRequest, ResponsesTool,
 };
@@ -251,6 +253,7 @@ mod tests {
             include: None,
             client_metadata: None,
             service_tier: None,
+            service_tier_source: ServiceTierSource::None,
             prompt_cache_key: None,
             text: super::super::translate::request::ResponsesText {
                 verbosity: Some("low".to_string()),

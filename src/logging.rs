@@ -354,12 +354,7 @@ fn write_log_line_to(file: &Path, line: &str) -> io::Result<()> {
     if existing_metadata.is_some()
         && let Err(error) = fsutil::set_mode_checked(file, 0o600)
     {
-        warn_log_permission_error(
-            &LOG_FILE_PERMISSION_WARNING_EMITTED,
-            "log file",
-            file,
-            &error,
-        );
+        warn_log_permission_error(&LOG_FILE_PERMISSION_WARNING_EMITTED, "log file", &error);
     }
     if existing_metadata.is_some_and(|meta| meta.len() > MAX_LOG_BYTES) {
         rotate_file(file)?;
@@ -374,12 +369,7 @@ fn write_log_line_to(file: &Path, line: &str) -> io::Result<()> {
     }
     let mut out = options.open(file)?;
     if let Err(error) = fsutil::set_mode_checked(file, 0o600) {
-        warn_log_permission_error(
-            &LOG_FILE_PERMISSION_WARNING_EMITTED,
-            "log file",
-            file,
-            &error,
-        );
+        warn_log_permission_error(&LOG_FILE_PERMISSION_WARNING_EMITTED, "log file", &error);
     }
     let mut record = Vec::with_capacity(line.len() + 1);
     record.extend_from_slice(line.as_bytes());
@@ -488,7 +478,6 @@ fn create_dir(path: &Path, mode: u32) -> io::Result<()> {
             warn_log_permission_error(
                 &LOG_DIRECTORY_PERMISSION_WARNING_EMITTED,
                 "log directory",
-                path,
                 &error,
             );
             Ok(())
@@ -497,16 +486,20 @@ fn create_dir(path: &Path, mode: u32) -> io::Result<()> {
     }
 }
 
-fn warn_log_permission_error(emitted: &AtomicBool, target: &str, path: &Path, error: &io::Error) {
+fn warn_log_permission_error(emitted: &AtomicBool, target: &str, error: &io::Error) {
     if emitted
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        eprintln!(
-            "ccproxy warning: could not restrict {target} permissions at {}: {error}",
-            path.display()
-        );
+        eprintln!("{}", log_permission_warning_message(target, error));
     }
+}
+
+fn log_permission_warning_message(target: &str, error: &io::Error) -> String {
+    format!(
+        "ccproxy warning: could not restrict {target} permissions (error kind: {:?})",
+        error.kind()
+    )
 }
 
 /// Return a bounded error category suitable for ordinary structured logs.
@@ -713,6 +706,22 @@ mod tests {
         );
         assert_eq!(safe_persistence_error_kind(&malformed), "serialization");
         assert_eq!(safe_persistence_error_kind(&backend), "storage");
+    }
+
+    #[test]
+    fn permission_warning_omits_dynamic_path_and_error_text() {
+        let error = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "/home/alice/private/proxy.log",
+        );
+        let warning = log_permission_warning_message("log file", &error);
+
+        assert_eq!(
+            warning,
+            "ccproxy warning: could not restrict log file permissions (error kind: PermissionDenied)"
+        );
+        assert!(!warning.contains("alice"));
+        assert!(!warning.contains("proxy.log"));
     }
 
     #[test]

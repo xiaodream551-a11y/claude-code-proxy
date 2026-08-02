@@ -239,6 +239,24 @@ fn traffic_json(files: &[PathBuf], suffix: &str) -> Value {
     serde_json::from_slice(&std::fs::read(traffic_file(files, suffix)).unwrap()).unwrap()
 }
 
+async fn wait_for_traffic_file(state_dir: &Path, suffix: &str) -> Vec<PathBuf> {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let files = traffic_files(state_dir);
+            if files.iter().any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(suffix))
+            }) {
+                return files;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for traffic artifact ending in {suffix}"))
+}
+
 /// Spawn a mock axum HTTP server that accepts requests at any path, calls
 /// `handler(request_json)` and returns the handler's response body as a 200
 /// with `content-type: text/event-stream`.
@@ -1616,7 +1634,9 @@ async fn smoke_codex_http_stream_traffic_captures_downstream_events() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("message_stop"), "stream body: {text}");
 
-    let files = traffic_files(state.path());
+    // The upstream capture is finalized on a blocking worker after network resources are
+    // released. Keep the temporary state root alive until that owned writer has completed.
+    let files = wait_for_traffic_file(state.path(), "032-upstream-response-body.sse").await;
     let downstream = traffic_json(&files, "050-downstream-event.json");
     assert!(downstream.get("event").is_some());
     assert!(downstream.get("data").is_some());

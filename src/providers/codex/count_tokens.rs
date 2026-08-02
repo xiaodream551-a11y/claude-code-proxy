@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::translate::request::ServiceTierSource;
 use super::translate::request::{
     ResponsesContentPart, ResponsesFunctionCallOutput, ResponsesFunctionCallOutputContent,
     ResponsesInputItem, ResponsesRequest, ResponsesTool,
@@ -139,6 +141,7 @@ mod tests {
             TranslateOptions {
                 session_id: None,
                 service_tier: None,
+                service_tier_source: ServiceTierSource::None,
                 model: "gpt-5.5".to_string(),
                 use_responses_lite: false,
             },

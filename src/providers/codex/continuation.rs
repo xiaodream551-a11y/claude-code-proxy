@@ -2226,6 +2226,20 @@ mod tests {
     }
 
     #[test]
+    fn service_tier_source_does_not_change_the_continuation_signature() {
+        let request = request_with_input(vec![user_message("history")], None);
+        let signature = prompt_signature(&request).unwrap();
+        let mut with_diagnostic_source = request;
+        with_diagnostic_source.service_tier_source =
+            super::super::translate::request::ServiceTierSource::FastSuffix;
+
+        assert_eq!(
+            signature,
+            prompt_signature(&with_diagnostic_source).unwrap()
+        );
+    }
+
+    #[test]
     fn prompt_signature_diagnostics_report_only_fixed_changed_fields() {
         fn changed_fields(
             base: &ResponsesRequest,

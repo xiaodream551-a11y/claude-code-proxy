@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Report the bounded effective source of each Codex service-tier decision in
+  `request_configuration` without changing the provider wire request or continuation
+  signature. Document that ordinary `co` requests leave the tier unset, and keep fast mode an
+  explicit `-fast`, config, or environment choice.
+- Bound managed `co`/`cg` profile-initialization lock waits to 30 seconds so a stalled launcher
+  cannot make every later same-profile invocation block forever before reaching the proxy.
+- Release cancelled Codex HTTP and Grok upstream work plus Grok replay byte reservations before
+  synchronous traffic-capture finalization. Codex live and buffered WebSocket capture now also
+  releases and, when reusable, publishes the socket before writing event artifacts, so a slow
+  capture filesystem cannot keep model sockets or request-sized replay material unavailable.
+  WebSocket events are deferred through 8 MiB and 1,024-event memory bounds, partial cancellation
+  captures are retained, and a fixed summary reports any truncation before blocking writes run
+  off Tokio's worker threads. Deferred writers retain only a small continuation metadata snapshot
+  rather than cloning request-sized input deltas.
+- Emit at most one bounded `stream_progress` summary per minute for long Codex and Grok streams,
+  distinguishing real upstream generation or control activity from proxy-local heartbeats and
+  retry rebuilds without logging response content or provider identifiers. Codex terminal logs
+  now also include bounded elapsed time and identify total-deadline or downstream-consumer stalls.
+- Omit dynamic filesystem paths and raw OS error text from log-permission warnings and startup
+  records. Ordinary request logs now retain only query presence and parameter count; query keys
+  and values remain confined to explicit traffic captures.
 - Stop an in-band Anthropic SSE error at its exact event boundary, discarding any text, tool, or
   false `message_stop` tail that arrived in the same upstream body frame. Parse ordinary stream
   events through narrow diagnostic probes so large semantic deltas are not materialized as full

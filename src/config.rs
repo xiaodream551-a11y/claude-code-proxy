@@ -22,6 +22,18 @@ fn environment_value(key: &str) -> Option<String> {
     std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigValueSource {
+    Environment,
+    ConfigFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedConfigValue<T> {
+    pub value: T,
+    pub source: ConfigValueSource,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub bind_address: String,
@@ -1006,17 +1018,28 @@ pub fn codex_unsafe_salvage_tool_call_on_close() -> bool {
         .unwrap_or(false)
 }
 
-pub fn codex_service_tier() -> Option<String> {
+pub fn codex_service_tier_with_source() -> Option<SourcedConfigValue<String>> {
     if let Some(raw) = environment_value("CCP_CODEX_SERVICE_TIER") {
-        return Some(raw);
+        return Some(SourcedConfigValue {
+            value: raw,
+            source: ConfigValueSource::Environment,
+        });
     }
     let config_dir = paths::config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
+        && let Some(value) = codex.service_tier
     {
-        return codex.service_tier;
+        return Some(SourcedConfigValue {
+            value,
+            source: ConfigValueSource::ConfigFile,
+        });
     }
     None
+}
+
+pub fn codex_service_tier() -> Option<String> {
+    codex_service_tier_with_source().map(|setting| setting.value)
 }
 
 pub fn codex_responses_lite() -> bool {
@@ -2110,6 +2133,13 @@ mod tests {
 
         assert_eq!(codex_model().as_deref(), Some("file-model"));
         assert_eq!(codex_service_tier().as_deref(), Some("flex"));
+        assert_eq!(
+            codex_service_tier_with_source(),
+            Some(SourcedConfigValue {
+                value: "flex".to_string(),
+                source: ConfigValueSource::ConfigFile,
+            })
+        );
         assert_eq!(codex_effort().as_deref(), Some("medium"));
         assert_eq!(codex_reasoning_summary().as_deref(), Some("auto"));
         assert!(codex_previous_response_id());
@@ -2125,6 +2155,13 @@ mod tests {
 
             assert_eq!(codex_model().as_deref(), Some("env-model"));
             assert_eq!(codex_service_tier().as_deref(), Some("priority"));
+            assert_eq!(
+                codex_service_tier_with_source(),
+                Some(SourcedConfigValue {
+                    value: "priority".to_string(),
+                    source: ConfigValueSource::Environment,
+                })
+            );
             assert_eq!(codex_effort().as_deref(), Some("high"));
             assert_eq!(codex_reasoning_summary().as_deref(), Some("detailed"));
             assert!(!codex_previous_response_id());
@@ -2133,10 +2170,40 @@ mod tests {
 
         assert_eq!(codex_model().as_deref(), Some("file-model"));
         assert_eq!(codex_service_tier().as_deref(), Some("flex"));
+        assert_eq!(
+            codex_service_tier_with_source(),
+            Some(SourcedConfigValue {
+                value: "flex".to_string(),
+                source: ConfigValueSource::ConfigFile,
+            })
+        );
         assert_eq!(codex_effort().as_deref(), Some("medium"));
         assert_eq!(codex_reasoning_summary().as_deref(), Some("auto"));
         assert!(codex_previous_response_id());
         assert_eq!(requested_codex_transport(), CodexTransport::Http);
+    }
+
+    #[test]
+    fn empty_service_tier_environment_value_keeps_existing_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared_env = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"serviceTier":"flex"}}"#,
+        )
+        .unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _tier_env = EnvGuard::set("CCP_CODEX_SERVICE_TIER", "");
+
+        assert_eq!(
+            codex_service_tier_with_source(),
+            Some(SourcedConfigValue {
+                value: String::new(),
+                source: ConfigValueSource::Environment,
+            })
+        );
+        assert_eq!(codex_service_tier().as_deref(), Some(""));
     }
 
     #[test]
