@@ -2966,7 +2966,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_http_request(&mut stream).await;
+            let _ = read_http_request_body(&mut stream).await;
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
@@ -2980,7 +2980,7 @@ mod tests {
                 {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(80)).await;
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
             }
             let _ = stream.write_all(b"0\r\n\r\n").await;
         });
@@ -2989,14 +2989,14 @@ mod tests {
             &format!("http://{addr}/v1"),
             GrokTimeouts {
                 connect_ms: 1_000,
-                header_ms: 100,
-                first_byte_ms: 200,
-                body_idle_ms: 200,
+                header_ms: 5_000,
+                first_byte_ms: 2_000,
+                body_idle_ms: 2_000,
             },
         )
         .await;
         let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(
-            GrokRequestDeadline::after(Duration::from_millis(130)),
+            GrokRequestDeadline::after(Duration::from_secs(2)),
         )));
         let response = client
             .post_with_retry(&sample_body(), None, retry.clone())
@@ -3017,10 +3017,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_http_request(&mut stream).await;
+            let _ = read_http_request_body(&mut stream).await;
             stream
                 .write_all(
-                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nretry-after: 5\r\nconnection: close\r\n\r\n",
                 )
                 .await
                 .unwrap();
@@ -3029,14 +3029,14 @@ mod tests {
             &format!("http://{addr}/v1"),
             GrokTimeouts {
                 connect_ms: 1_000,
-                header_ms: 1_000,
+                header_ms: 5_000,
                 first_byte_ms: 1_000,
                 body_idle_ms: 1_000,
             },
         )
         .await;
         let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(
-            GrokRequestDeadline::after(Duration::from_millis(50)),
+            GrokRequestDeadline::after(Duration::from_secs(2)),
         )));
 
         let error = match client
@@ -3050,7 +3050,7 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.origin, GrokErrorOrigin::Http);
-        assert_eq!(error.retry_after.as_deref(), Some("0"));
+        assert_eq!(error.retry_after.as_deref(), Some("5"));
         assert!(error.message.contains("remaining request deadline"));
         assert!(!error.is_retryable());
         let state = retry.lock().await;
