@@ -39,9 +39,11 @@ use self::auth::device::DeviceAuthClient;
 use self::auth::manager::CodexAuthManager;
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
+#[cfg(test)]
+use self::continuation::continuation_candidate;
 use self::continuation::{
-    ContinuationCandidate, abort_continuation, continuation_candidate, discard_pending_fallback,
-    record_continuation,
+    ContinuationCandidate, abort_continuation, continuation_candidate_with_diagnostics,
+    discard_pending_fallback, record_continuation,
 };
 use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic_schema_tool_policy_and_metadata;
@@ -215,11 +217,12 @@ impl Provider for CodexProvider {
             config::codex_previous_response_id(),
             transport_decision.effective(),
         );
-        let continuation = continuation_candidate(
+        let continuation_decision = continuation_candidate_with_diagnostics(
             ctx.lane_key.as_ref(),
             &translated,
             previous_response_id_enabled,
         );
+        let continuation = continuation_decision.candidate;
         log_codex_request_configuration(
             &ctx,
             &translated,
@@ -230,6 +233,7 @@ impl Provider for CodexProvider {
             CodexContinuationLog {
                 enabled: previous_response_id_enabled,
                 candidate: &continuation,
+                prompt_changed_fields: &continuation_decision.prompt_changed_fields,
             },
         );
         let turn_id = continuation.turn_id;
@@ -1317,6 +1321,7 @@ fn record_codex_generation_start(
 struct CodexContinuationLog<'a> {
     enabled: bool,
     candidate: &'a continuation::ContinuationCandidate,
+    prompt_changed_fields: &'a [&'static str],
 }
 
 fn log_codex_request_configuration(
@@ -1460,7 +1465,11 @@ fn log_codex_request_configuration(
             ),
             (
                 "continuation".to_string(),
-                codex_continuation_log_fields(continuation.enabled, continuation.candidate),
+                codex_continuation_log_fields(
+                    continuation.enabled,
+                    continuation.candidate,
+                    continuation.prompt_changed_fields,
+                ),
             ),
             (
                 "outputBudgetEnforcement".to_string(),
@@ -1473,6 +1482,7 @@ fn log_codex_request_configuration(
 fn codex_continuation_log_fields(
     enabled: bool,
     continuation: &continuation::ContinuationCandidate,
+    prompt_changed_fields: &[&'static str],
 ) -> serde_json::Value {
     serde_json::json!({
         "enabled": enabled,
@@ -1482,6 +1492,7 @@ fn codex_continuation_log_fields(
         "responseAffineFork": continuation.response_affine_fork,
         "inputDeltaCount": continuation.input_delta_count,
         "disabledReason": continuation.disabled_reason.as_deref(),
+        "promptChangedFields": prompt_changed_fields,
     })
 }
 
@@ -3783,7 +3794,8 @@ mod tests {
             disabled_reason: None,
         };
 
-        let fields = codex_continuation_log_fields(true, &continuation);
+        let fields =
+            codex_continuation_log_fields(true, &continuation, &["instructions", "text_format"]);
         assert_eq!(
             fields,
             serde_json::json!({
@@ -3794,6 +3806,7 @@ mod tests {
                 "responseAffineFork": false,
                 "inputDeltaCount": 3,
                 "disabledReason": null,
+                "promptChangedFields": ["instructions", "text_format"],
             })
         );
         assert!(!fields.to_string().contains("resp_secret_identifier"));

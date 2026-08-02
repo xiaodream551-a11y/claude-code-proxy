@@ -1334,7 +1334,11 @@ fn render_session_detail(
 ) {
     let lines = if let Some(session) = state.sessions.get(selected) {
         vec![
-            detail_line("session", session.label(), WHITE),
+            detail_line(
+                "session",
+                display_session_id(session.session_id.as_deref()),
+                WHITE,
+            ),
             detail_line("project", session.project.as_deref().unwrap_or("-"), TEAL),
             detail_line("active requests", session.active_count.to_string(), YELLOW),
             detail_line(
@@ -2464,6 +2468,30 @@ mod tests {
             detail_text.contains("upstream unavailable"),
             "{detail_text}"
         );
+    }
+
+    #[test]
+    fn session_detail_fingerprints_atypical_session_id() {
+        let raw_session = "customer-production-session-private";
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "request-1",
+            Some(raw_session.to_string()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        let state = monitor.snapshot();
+
+        let detail = draw(120, 20, |frame| {
+            render_session_detail(frame, frame.area(), &state, 0)
+        });
+        let detail_text = buffer_text(&detail);
+
+        assert!(
+            detail_text.contains(&display_session_id(Some(raw_session))),
+            "{detail_text}"
+        );
+        assert!(!detail_text.contains(raw_session), "{detail_text}");
     }
 
     #[test]

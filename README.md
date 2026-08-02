@@ -477,9 +477,16 @@ The private Codex gateway rejects `max_output_tokens`, `max_tokens`, and
 from the upstream request; the requested ceiling cannot be enforced by this
 gateway. Missing `max_tokens` and `max_tokens: 0` (Anthropic's cache-only shape)
 return HTTP 400 before any model request is dispatched. Sampling controls
-(`temperature`, `top_p`, or `top_k`) and non-empty `stop_sequences` are likewise
-rejected before dispatch instead of being silently ignored. An empty
-`stop_sequences` array is accepted as a no-op.
+(`temperature`, `top_p`, or `top_k`) and arbitrary non-empty `stop_sequences`
+are likewise rejected before dispatch instead of being silently ignored. An
+empty `stop_sequences` array is accepted as a no-op. The only non-empty
+compatibility exception is Claude Code's non-streaming, tool-free auto-mode XML
+safety classifier using exactly `</block>` or `</severity>`: current Responses
+reasoning models cannot receive that stop parameter, while Claude Code's
+bounded parser accepts an ordinary `end_turn` after the same closing tag and
+keeps its blocking path when no classification can be parsed. The exception
+matches only Claude Code 2.1.220's complete generated final-text suffixes and
+rejects marker substrings, arbitrary trailing text, and later messages.
 
 Reasoning effort: Claude Code's `output_config.effort` value (the one you see in
 the UI as `◐ medium · /effort`) is normally forwarded one-to-one as Codex
@@ -1118,6 +1125,12 @@ state, an explicit `previous_response_not_found`, or a replay-safe pre-request
 setup failure, the proxy clears unsafe continuation state and sends the full
 request instead. A connection failure after the request frame is sent has an
 ambiguous outcome and terminates without full-context replay.
+`request_configuration.continuation.promptChangedFields` reports only fixed
+field categories such as `instructions`, `text_format`, or `reasoning`; it never
+records field values or their digests. A pre-dispatch stale pooled socket also
+emits `websocket_pool_reconnect_scheduled`, distinguishing a full-context retry
+from retaining an independent hydration fallback and confirming that the same
+model-dispatch reservation was reused.
 Structured-output turns deliberately do not record continuation state: the
 SchemaBridge can remove synthetic `null` fields before Claude Code persists the
 assistant text, while the upstream response id still names the raw response.
@@ -1233,7 +1246,9 @@ but remains available. Windows relies on the profile directories' ACLs.
   `$XDG_STATE_HOME/claude-code-proxy/proxy.log` on macOS/Linux and at
   `%LOCALAPPDATA%\claude-code-proxy\proxy.log` on Windows (falling back to
   `%USERPROFILE%\AppData\Local`). Secrets (`authorization`, `access`,
-  `refresh`, `id_token`, `ChatGPT-Account-Id`, …) are redacted before write.
+  `refresh`, `id_token`, `ChatGPT-Account-Id`, …) and untrusted provider error
+  details are redacted before write. Dynamic tool names are stored only as a
+  bounded category plus a short correlation fingerprint.
 - `errors/` - redacted provider 5xx responses captured as JSON files under the
   state directory. A single background writer keeps at most 128 files; local
   validation/load-shed failures and provider 4xx responses are log-only so an
@@ -1579,7 +1594,9 @@ within the active profile family.
   rules. Function and hosted calls share one downstream tool-use ID namespace.
 - **GPT/Grok — request controls:** unknown fields, malformed compatibility
   metadata, fixed thinking budgets, disabled reasoning, sampling controls, and
-  non-empty stop sequences fail before dispatch. Claude Code's current adaptive
+  arbitrary non-empty stop sequences fail before dispatch. The sole bounded
+  exception is Claude Code's non-streaming auto-mode XML classifier described
+  above. Claude Code's current adaptive
   thinking plus null or empty `context_management.edits` remain accepted. Its
   exact `clear_thinking_20251015` marker with `keep: "all"` is also accepted
   because it removes no history. Context edits that can modify conversation

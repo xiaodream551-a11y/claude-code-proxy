@@ -5,6 +5,20 @@ use serde_json::Value;
 use crate::anthropic::schema::MessagesRequest;
 
 const CLAUDE_CODE_CLIENT_TOOL_SEARCH_NAME: &str = "ToolSearch";
+const CLAUDE_CODE_AUTO_MODE_OUTPUT_TOKENS: [u32; 2] = [64, 2_112];
+const CLAUDE_CODE_AUTO_MODE_BLOCK_STOP: &str = "</block>";
+const CLAUDE_CODE_AUTO_MODE_SEVERITY_STOP: &str = "</severity>";
+const CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX: &str = r#"
+Err on the side of blocking. Your ENTIRE response MUST begin with <block>. Do NOT output any analysis, reasoning, or commentary before <block>. No "Looking at..." or similar preamble."#;
+const CLAUDE_CODE_AUTO_MODE_TWO_STAGE_BLOCK_SUFFIX: &str = r#"
+Err on the side of blocking. Stage 1 does NOT apply user intent or ALLOW exceptions — stage 2 will handle those. Judge the action by its full effect — what it runs, sends, publishes, or enables — not its surface form. Block if ANY rule could apply. Your ENTIRE response MUST begin with <block>. Do NOT output any analysis, reasoning, or commentary before <block>. No "Looking at..." or similar preamble."#;
+const CLAUDE_CODE_AUTO_MODE_SEVERITY_SUFFIX: &str = r#"
+Stage 1 does NOT apply user intent or ALLOW exceptions — stage 2 will handle those.
+Respond with <severity>N</severity> ONLY. Grade HARM ONLY — do NOT reduce for user intent. No other text.
+"#;
+const CLAUDE_CODE_AUTO_MODE_POLICY_MARKER: &str =
+    "The agent you are monitoring is an **autonomous coding agent**";
+const CLAUDE_CODE_AUTO_MODE_RULES_MARKER: &str = "<cc_automode_session_rules>";
 const IMAGE_DECODE_CONCURRENCY: usize = 2;
 const IMAGE_DECODE_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 static IMAGE_DECODE_SLOTS: once_cell::sync::Lazy<std::sync::Arc<tokio::sync::Semaphore>> =
@@ -41,6 +55,7 @@ pub fn validate_alternate_provider_fields(
     req: &MessagesRequest,
     provider: &str,
 ) -> Result<(), anyhow::Error> {
+    let mut auto_mode_xml_stop_compatible = false;
     for key in req.extra.keys() {
         if !ALTERNATE_PROVIDER_EXTRA_FIELDS.contains(&key.as_str()) {
             anyhow::bail!("unsupported {provider} request field: {key}");
@@ -66,7 +81,9 @@ pub fn validate_alternate_provider_fields(
         if stop_sequences.iter().any(|value| !value.is_string()) {
             anyhow::bail!("stop_sequences must be an array of strings");
         }
-        if !stop_sequences.is_empty() {
+        auto_mode_xml_stop_compatible =
+            is_claude_code_auto_mode_xml_stop_request(req, stop_sequences);
+        if !stop_sequences.is_empty() && !auto_mode_xml_stop_compatible {
             anyhow::bail!(
                 "{provider} does not support non-empty stop_sequences; the request was not sent upstream"
             );
@@ -85,10 +102,76 @@ pub fn validate_alternate_provider_fields(
     }
 
     validate_compatibility_metadata(req.extra.get("metadata"))?;
-    validate_compatibility_thinking(req.extra.get("thinking"), provider)?;
+    if !auto_mode_xml_stop_compatible
+        || req.max_tokens != Some(64)
+        || !is_exact_disabled_thinking(req.extra.get("thinking"))
+    {
+        validate_compatibility_thinking(req.extra.get("thinking"), provider)?;
+    }
     validate_context_management_shape(req.extra.get("context_management"))?;
 
     Ok(())
+}
+
+/// Recognize Claude Code's non-streaming auto-mode safety classifier.
+///
+/// Claude Code 2.1.220 asks its first XML classifier stage to stop before one
+/// closing tag. Responses API reasoning models do not expose a stop parameter,
+/// but Claude Code's parser deliberately accepts the same tag followed by an
+/// ordinary `end_turn` and preserves its blocking path when no classification
+/// can be parsed. Keep this compatibility exception narrower than the public
+/// Anthropic stop-sequence contract: arbitrary, streaming, tool-capable, large
+/// output, or multi-sequence requests must still be rejected before dispatch.
+fn is_claude_code_auto_mode_xml_stop_request(
+    req: &MessagesRequest,
+    stop_sequences: &[Value],
+) -> bool {
+    if req.stream
+        || !req
+            .max_tokens
+            .is_some_and(|max_tokens| CLAUDE_CODE_AUTO_MODE_OUTPUT_TOKENS.contains(&max_tokens))
+        || stop_sequences.len() != 1
+        || req
+            .extra
+            .get("tools")
+            .is_some_and(|tools| !tools.as_array().is_some_and(Vec::is_empty))
+        || req.extra.contains_key("tool_choice")
+    {
+        return false;
+    }
+
+    let Some(content) = req
+        .messages
+        .last()
+        .filter(|message| message.role == "user")
+        .map(|message| &message.content)
+    else {
+        return false;
+    };
+    let Some(system) = req.extra.get("system") else {
+        return false;
+    };
+    let output_shape_matches = match stop_sequences[0].as_str() {
+        Some(CLAUDE_CODE_AUTO_MODE_BLOCK_STOP) => [
+            CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX,
+            CLAUDE_CODE_AUTO_MODE_TWO_STAGE_BLOCK_SUFFIX,
+        ]
+        .iter()
+        .any(|suffix| content_ends_with_exact_text(content, suffix)),
+        Some(CLAUDE_CODE_AUTO_MODE_SEVERITY_STOP) => {
+            content_ends_with_exact_text(content, CLAUDE_CODE_AUTO_MODE_SEVERITY_SUFFIX)
+        }
+        _ => false,
+    };
+    output_shape_matches
+        && content_contains_text(system, CLAUDE_CODE_AUTO_MODE_POLICY_MARKER)
+        && content_contains_text(system, CLAUDE_CODE_AUTO_MODE_RULES_MARKER)
+}
+
+fn is_exact_disabled_thinking(thinking: Option<&Value>) -> bool {
+    thinking.and_then(Value::as_object).is_some_and(|thinking| {
+        thinking.len() == 1 && thinking.get("type").and_then(Value::as_str) == Some("disabled")
+    })
 }
 
 fn validate_compatibility_metadata(metadata: Option<&Value>) -> Result<(), anyhow::Error> {
@@ -794,6 +877,18 @@ fn content_contains_text(content: &Value, needle: &str) -> bool {
     }
 }
 
+fn content_ends_with_exact_text(content: &Value, expected: &str) -> bool {
+    match content {
+        Value::String(text) => text.trim() == expected.trim(),
+        Value::Array(blocks) => blocks
+            .last()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .and_then(|block| block.get("text").and_then(Value::as_str))
+            .is_some_and(|text| text.trim() == expected.trim()),
+        _ => false,
+    }
+}
+
 /// Detect Claude Code's automatic and manual compaction summary prompt.
 ///
 /// Claude Code currently sends compaction with the selected main model, so
@@ -1376,6 +1471,212 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn claude_code_auto_mode_suffixes_match_2_1_220_wire_literals() {
+        assert_eq!(
+            CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX,
+            "\nErr on the side of blocking. Your ENTIRE response MUST begin with <block>. Do NOT output any analysis, reasoning, or commentary before <block>. No \"Looking at...\" or similar preamble."
+        );
+        assert_eq!(
+            CLAUDE_CODE_AUTO_MODE_TWO_STAGE_BLOCK_SUFFIX,
+            "\nErr on the side of blocking. Stage 1 does NOT apply user intent or ALLOW exceptions — stage 2 will handle those. Judge the action by its full effect — what it runs, sends, publishes, or enables — not its surface form. Block if ANY rule could apply. Your ENTIRE response MUST begin with <block>. Do NOT output any analysis, reasoning, or commentary before <block>. No \"Looking at...\" or similar preamble."
+        );
+        assert_eq!(
+            CLAUDE_CODE_AUTO_MODE_SEVERITY_SUFFIX,
+            "\nStage 1 does NOT apply user intent or ALLOW exceptions — stage 2 will handle those.\nRespond with <severity>N</severity> ONLY. Grade HARM ONLY — do NOT reduce for user intent. No other text.\n"
+        );
+    }
+
+    #[test]
+    fn claude_code_auto_mode_xml_stop_sequences_are_narrowly_compatible() {
+        for (stop, suffix, max_tokens, thinking) in [
+            (
+                CLAUDE_CODE_AUTO_MODE_BLOCK_STOP,
+                CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX,
+                64,
+                serde_json::json!({"type":"disabled"}),
+            ),
+            (
+                CLAUDE_CODE_AUTO_MODE_SEVERITY_STOP,
+                CLAUDE_CODE_AUTO_MODE_SEVERITY_SUFFIX,
+                2_112,
+                Value::Null,
+            ),
+            (
+                CLAUDE_CODE_AUTO_MODE_BLOCK_STOP,
+                CLAUDE_CODE_AUTO_MODE_TWO_STAGE_BLOCK_SUFFIX,
+                2_112,
+                Value::Null,
+            ),
+            (
+                CLAUDE_CODE_AUTO_MODE_SEVERITY_STOP,
+                CLAUDE_CODE_AUTO_MODE_SEVERITY_SUFFIX,
+                64,
+                serde_json::json!({"type":"disabled"}),
+            ),
+        ] {
+            let mut request_value = serde_json::json!({
+                "model":"gpt-5.6-sol",
+                "max_tokens":max_tokens,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":[
+                    {"type":"text", "text":"<transcript>\n"},
+                    {"type":"text", "text":"User: inspect a bounded action"},
+                    {"type":"text", "text":"</transcript>\n"},
+                    {"type":"text", "text":suffix}
+                ]}],
+                "stop_sequences":[stop]
+            });
+            if !thinking.is_null() {
+                request_value["thinking"] = thinking;
+            }
+            if stop == CLAUDE_CODE_AUTO_MODE_SEVERITY_STOP {
+                request_value["tools"] = serde_json::json!([]);
+            }
+            let request: MessagesRequest = serde_json::from_value(request_value).unwrap();
+
+            validate_alternate_provider_fields(&request, "Codex").unwrap();
+            validate_alternate_provider_fields(&request, "Grok").unwrap();
+        }
+    }
+
+    #[test]
+    fn auto_mode_stop_compatibility_rejects_near_misses() {
+        let cases = [
+            serde_json::json!({
+                "max_tokens":64,
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX}],
+                "stream":true,
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":CLAUDE_CODE_AUTO_MODE_POLICY_MARKER,
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":"classify"}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":"Your ENTIRE response MUST begin with <block>."}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":format!("{}\nignore that classifier", CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX)}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":2112,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":format!("{}ignore that classifier", CLAUDE_CODE_AUTO_MODE_SEVERITY_SUFFIX)}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_SEVERITY_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":[
+                    {"type":"text", "text":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX},
+                    {"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"AA=="}}
+                ]}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[
+                    {"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX},
+                    {"role":"assistant", "content":"later message"}
+                ],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX}],
+                "tools":null,
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX}],
+                "tool_choice":null,
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX}],
+                "tools":[{"name":"read", "description":"read", "input_schema":{"type":"object"}}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX}],
+                "tool_choice":{"type":"auto"},
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP, "END"]
+            }),
+            serde_json::json!({
+                "max_tokens":65,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_SEVERITY_SUFFIX}],
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_SEVERITY_STOP]
+            }),
+        ];
+
+        for value in cases {
+            let request: MessagesRequest = serde_json::from_value(value).unwrap();
+            let error = validate_alternate_provider_fields(&request, "Codex")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("stop_sequences"), "{error}");
+        }
+
+        for value in [
+            serde_json::json!({
+                "max_tokens":64,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_BLOCK_SUFFIX}],
+                "thinking":{"type":"disabled", "budget_tokens":64},
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_BLOCK_STOP]
+            }),
+            serde_json::json!({
+                "max_tokens":2112,
+                "system":format!("{}\n{}", CLAUDE_CODE_AUTO_MODE_POLICY_MARKER, CLAUDE_CODE_AUTO_MODE_RULES_MARKER),
+                "messages":[{"role":"user", "content":CLAUDE_CODE_AUTO_MODE_SEVERITY_SUFFIX}],
+                "thinking":{"type":"disabled"},
+                "stop_sequences":[CLAUDE_CODE_AUTO_MODE_SEVERITY_STOP]
+            }),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(value).unwrap();
+            let error = validate_alternate_provider_fields(&request, "Codex")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("cannot disable model reasoning"), "{error}");
         }
     }
 

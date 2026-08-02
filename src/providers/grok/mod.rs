@@ -1081,7 +1081,7 @@ impl GrokStreamState {
                         .downcast_ref::<translate::reducer::GrokUpstreamFailure>()
                         .cloned()
                     else {
-                        let detail = error.to_string();
+                        let detail = safe_grok_error_message(&error.to_string());
                         crate::logging::create_logger("grok").info(
                             "stream_reducer_error",
                             Some(serde_json::Map::from_iter([
@@ -1363,12 +1363,15 @@ impl GrokStreamState {
             }
         }
         let (error_type, stream_message) = match error {
-            Some(error) => (grok_error_type(error.status), error.message.as_str()),
-            None => ("api_error", "Grok stream is invalid"),
+            Some(error) => (
+                grok_error_type(error.status),
+                safe_grok_error_message(&error.message),
+            ),
+            None => ("api_error", "Grok stream is invalid".to_string()),
         };
         let bytes = self
             .translator
-            .render_typed_error(error_type, stream_message);
+            .render_typed_error(error_type, &stream_message);
         if let Some(capture) = self.stream_capture.as_mut() {
             capture.malformed(stage, kind);
         }
@@ -1395,7 +1398,7 @@ impl GrokStreamState {
                     "error_stage".into(),
                     serde_json::json!(client::stage_name(error.stage)),
                 );
-                fields.insert("message".into(), serde_json::json!(error.message));
+                fields.insert("message".into(), serde_json::json!(stream_message));
                 if let Some(retry_after) = error.retry_after.as_ref() {
                     fields.insert("retry_after".into(), serde_json::json!(retry_after));
                 }
@@ -1615,12 +1618,17 @@ fn map_error(error: client::GrokError) -> Response {
         StatusCode::BAD_GATEWAY
     };
     let kind = grok_error_type(status);
-    let response = json_error(mapped_status, kind, error.message);
+    let response = json_error(mapped_status, kind, safe_grok_error_message(&error.message));
     if let Some(retry_after) = error.retry_after {
         ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
     } else {
         response
     }
+}
+
+fn safe_grok_error_message(message: &str) -> String {
+    crate::providers::translate_shared::sanitize_external_error_detail(message)
+        .unwrap_or_else(|| "Grok upstream error".to_string())
 }
 
 fn grok_error_type(status: StatusCode) -> &'static str {
@@ -2610,6 +2618,22 @@ mod tests {
             assert_eq!(body["error"]["type"], expected_kind);
             assert_eq!(body["error"]["message"], "tool schema is invalid");
         }
+    }
+
+    #[tokio::test]
+    async fn map_error_redacts_sensitive_upstream_detail() {
+        let response = map_error(client::GrokError::http(
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+            "Bearer provider-secret at /home/customer/private.txt",
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "[redacted upstream error detail]");
+        assert!(!body.to_string().contains("provider-secret"));
+        assert!(!body.to_string().contains("/home/customer"));
     }
 
     #[tokio::test]

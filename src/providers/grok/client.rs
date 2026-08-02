@@ -1407,6 +1407,7 @@ pub(super) fn log_retry(
     error: &GrokError,
     context: &GrokRetryLogContext,
 ) {
+    let message = safe_retry_log_message(&error.message);
     crate::logging::create_logger("grok").info(
         "upstream_retry",
         Some(serde_json::Map::from_iter([
@@ -1431,12 +1432,13 @@ pub(super) fn log_retry(
                 serde_json::json!(origin_name(error.origin)),
             ),
             ("stage".into(), serde_json::json!(stage_name(error.stage))),
-            ("message".into(), serde_json::json!(error.message)),
+            ("message".into(), serde_json::json!(message)),
         ])),
     );
 }
 
 fn log_retry_exhausted(attempt: u8, error: &GrokError, context: &GrokRetryLogContext) {
+    let message = safe_retry_log_message(&error.message);
     crate::logging::create_logger("grok").info(
         "upstream_retry_exhausted",
         Some(serde_json::Map::from_iter([
@@ -1456,9 +1458,14 @@ fn log_retry_exhausted(attempt: u8, error: &GrokError, context: &GrokRetryLogCon
                 serde_json::json!(origin_name(error.origin)),
             ),
             ("stage".into(), serde_json::json!(stage_name(error.stage))),
-            ("message".into(), serde_json::json!(error.message)),
+            ("message".into(), serde_json::json!(message)),
         ])),
     );
+}
+
+fn safe_retry_log_message(message: &str) -> String {
+    crate::providers::translate_shared::sanitize_external_error_detail(message)
+        .unwrap_or_else(|| "Grok upstream error".to_string())
 }
 
 pub(super) fn origin_name(origin: GrokErrorOrigin) -> &'static str {
@@ -1561,6 +1568,15 @@ fn auth_error_kind_name(kind: GrokAuthErrorKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_log_message_redacts_sensitive_provider_detail() {
+        let message =
+            safe_retry_log_message("Bearer provider-secret at /home/customer/private.txt");
+        assert_eq!(message, "[redacted upstream error detail]");
+        assert!(!message.contains("provider-secret"));
+        assert!(!message.contains("/home/customer"));
+    }
 
     #[test]
     fn retry_schedule_uses_one_terminal_policy_for_budget_and_deadline() {

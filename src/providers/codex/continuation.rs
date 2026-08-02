@@ -24,7 +24,59 @@ const MAX_RESPONSE_ID_BYTES: usize = 512;
 pub(super) const MAX_SESSION_TRANSCRIPT_BYTES: u64 = 2_000_000;
 pub(super) const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
 
-type PromptSignature = [u8; 32];
+const PROMPT_CHANGE_FIELDS: [&str; 12] = [
+    "model",
+    "instructions",
+    "store",
+    "stream",
+    "parallel_tool_calls",
+    "include",
+    "client_metadata",
+    "service_tier",
+    "prompt_cache_key",
+    "text_format",
+    "reasoning",
+    "unattributed",
+];
+const PROMPT_SIGNATURE_FIELD_COUNT: usize = PROMPT_CHANGE_FIELDS.len() - 1;
+const PROMPT_CHANGE_UNATTRIBUTED_BIT: u16 = 1 << PROMPT_SIGNATURE_FIELD_COUNT;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptSignature {
+    safety_digest: [u8; 32],
+    diagnostic_fields: [u64; PROMPT_SIGNATURE_FIELD_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PromptChangeMask(u16);
+
+impl PromptChangeMask {
+    fn between(previous: &PromptSignature, current: &PromptSignature) -> Self {
+        let mut mask = 0_u16;
+        for (index, (previous, current)) in previous
+            .diagnostic_fields
+            .iter()
+            .zip(&current.diagnostic_fields)
+            .enumerate()
+        {
+            if previous != current {
+                mask |= 1 << index;
+            }
+        }
+        if previous.safety_digest != current.safety_digest && mask == 0 {
+            mask |= PROMPT_CHANGE_UNATTRIBUTED_BIT;
+        }
+        Self(mask)
+    }
+
+    fn names(self) -> Vec<&'static str> {
+        PROMPT_CHANGE_FIELDS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| (self.0 & (1 << index) != 0).then_some(*name))
+            .collect()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParallelBatchRange {
@@ -107,6 +159,7 @@ pub struct ContinuationCandidate {
 struct CandidateEvaluation {
     candidate: ContinuationCandidate,
     parallel_batches: Vec<ParallelBatchRange>,
+    prompt_change_mask: PromptChangeMask,
 }
 
 struct PrefixMatch {
@@ -114,37 +167,56 @@ struct PrefixMatch {
     parallel_batches: Vec<ParallelBatchRange>,
 }
 
+pub struct ContinuationDecision {
+    pub candidate: ContinuationCandidate,
+    pub prompt_changed_fields: Vec<&'static str>,
+}
+
 pub fn continuation_candidate(
     lane_key: Option<&RequestLaneKey>,
     body: &ResponsesRequest,
     enabled: bool,
 ) -> ContinuationCandidate {
+    continuation_candidate_with_diagnostics(lane_key, body, enabled).candidate
+}
+
+pub fn continuation_candidate_with_diagnostics(
+    lane_key: Option<&RequestLaneKey>,
+    body: &ResponsesRequest,
+    enabled: bool,
+) -> ContinuationDecision {
     if !enabled {
         clear_continuation(lane_key);
-        return ContinuationCandidate {
-            turn_id: None,
-            previous_response_id: None,
-            previous_response_owner_turn_id: None,
-            matched_candidate_rank: None,
-            candidate_count: 0,
-            response_affine_fork: false,
-            input_delta: None,
-            input_delta_count: body.input.len(),
-            disabled_reason: Some("disabled".to_string()),
+        return ContinuationDecision {
+            candidate: ContinuationCandidate {
+                turn_id: None,
+                previous_response_id: None,
+                previous_response_owner_turn_id: None,
+                matched_candidate_rank: None,
+                candidate_count: 0,
+                response_affine_fork: false,
+                input_delta: None,
+                input_delta_count: body.input.len(),
+                disabled_reason: Some("disabled".to_string()),
+            },
+            prompt_changed_fields: Vec::new(),
         };
     }
 
     let Some(lane_key) = lane_key else {
-        return ContinuationCandidate {
-            turn_id: None,
-            previous_response_id: None,
-            previous_response_owner_turn_id: None,
-            matched_candidate_rank: None,
-            candidate_count: 0,
-            response_affine_fork: false,
-            input_delta: None,
-            input_delta_count: body.input.len(),
-            disabled_reason: Some("missing_session".to_string()),
+        return ContinuationDecision {
+            candidate: ContinuationCandidate {
+                turn_id: None,
+                previous_response_id: None,
+                previous_response_owner_turn_id: None,
+                matched_candidate_rank: None,
+                candidate_count: 0,
+                response_affine_fork: false,
+                input_delta: None,
+                input_delta_count: body.input.len(),
+                disabled_reason: Some("missing_session".to_string()),
+            },
+            prompt_changed_fields: Vec::new(),
         };
     };
 
@@ -275,7 +347,10 @@ pub fn continuation_candidate(
             registry.total_retained_bytes.saturating_add(fallback_bytes);
         evict_oldest(registry);
     }
-    evaluation.candidate
+    ContinuationDecision {
+        candidate: evaluation.candidate,
+        prompt_changed_fields: evaluation.prompt_change_mask.names(),
+    }
 }
 
 fn continuation_candidate_from_state(
@@ -322,17 +397,21 @@ fn continuation_candidate_from_state(
         });
     };
     if signature != state.prompt_signature {
-        return CandidateEvaluation::without_batches(ContinuationCandidate {
-            turn_id: Some(turn_id),
-            previous_response_id: None,
-            previous_response_owner_turn_id: None,
-            matched_candidate_rank: None,
-            candidate_count,
-            response_affine_fork: false,
-            input_delta: None,
-            input_delta_count: body.input.len(),
-            disabled_reason: Some("prompt_changed".to_string()),
-        });
+        let prompt_change_mask = PromptChangeMask::between(&state.prompt_signature, &signature);
+        return CandidateEvaluation::with_prompt_changes(
+            ContinuationCandidate {
+                turn_id: Some(turn_id),
+                previous_response_id: None,
+                previous_response_owner_turn_id: None,
+                matched_candidate_rank: None,
+                candidate_count,
+                response_affine_fork: false,
+                input_delta: None,
+                input_delta_count: body.input.len(),
+                disabled_reason: Some("prompt_changed".to_string()),
+            },
+            prompt_change_mask,
+        );
     }
 
     let Some(prefix_match) = input_suffix_after_prefix(
@@ -382,6 +461,7 @@ fn continuation_candidate_from_state(
             disabled_reason: None,
         },
         parallel_batches: prefix_match.parallel_batches,
+        prompt_change_mask: PromptChangeMask::default(),
     }
 }
 
@@ -390,6 +470,18 @@ impl CandidateEvaluation {
         Self {
             candidate,
             parallel_batches: Vec::new(),
+            prompt_change_mask: PromptChangeMask::default(),
+        }
+    }
+
+    fn with_prompt_changes(
+        candidate: ContinuationCandidate,
+        prompt_change_mask: PromptChangeMask,
+    ) -> Self {
+        Self {
+            candidate,
+            parallel_batches: Vec::new(),
+            prompt_change_mask,
         }
     }
 }
@@ -456,6 +548,7 @@ fn continuation_retained_bytes(state: &ContinuationState) -> Option<u64> {
         state.response_id.len(),
         size_of::<RequestLaneKey>(),
         size_of::<SessionState>(),
+        size_of::<PromptSignature>(),
     ] {
         bytes = bytes.checked_add(u64::try_from(value).ok()?)?;
     }
@@ -1664,39 +1757,67 @@ impl Write for DigestWriter<'_> {
     }
 }
 
+fn prompt_field_digest<T: Serialize + ?Sized>(name: &str, value: &T) -> Option<[u8; 32]> {
+    let mut digest = Sha256::new();
+    digest.update(b"ccproxy-codex-prompt-signature-field-v3\0");
+    digest.update(name.as_bytes());
+    digest.update([0]);
+    serde_json::to_writer(&mut DigestWriter(&mut digest), value).ok()?;
+    Some(digest.finalize().into())
+}
+
 fn prompt_signature(body: &ResponsesRequest) -> Option<PromptSignature> {
     // The input transcript is intentionally absent: continuation validates it independently as
     // an append-only prefix. Tools and tool_choice are also intentionally absent: Claude Code
     // expands and contracts its deferred tool set between otherwise compatible turns, and the
     // WebSocket request is built from the complete current body before only its input is replaced
     // with the delta. The current turn's tools and choice therefore still go upstream. The
-    // remaining borrowed fields are hashed in a fixed positional schema. serde_json::Value maps
-    // are key-sorted in this build, and the only HashMap field is normalized explicitly below, so
-    // the digest is deterministic without materializing the request or copying large
-    // instructions into a signature String.
+    // remaining borrowed fields are hashed in a fixed tagged schema. serde_json::Value maps are
+    // key-sorted in this build, and the only HashMap field is normalized explicitly below. Each
+    // field is serialized once: the complete field digests form the safety gate, while truncated
+    // in-memory fingerprints only identify which fixed fields changed for bounded diagnostics.
+    // Neither digest nor field content is ever logged.
     let client_metadata = body.client_metadata.as_ref().map(|metadata| {
         metadata
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect::<BTreeMap<_, _>>()
     });
-    let fields = (
-        body.model.as_str(),
-        body.instructions.as_deref(),
-        body.store,
-        body.stream,
-        body.parallel_tool_calls,
-        body.include.as_deref(),
-        client_metadata.as_ref(),
-        body.service_tier.as_ref(),
-        body.prompt_cache_key.as_deref(),
-        &body.text,
-        body.reasoning.as_ref(),
-    );
-    let mut digest = Sha256::new();
-    digest.update(b"ccproxy-codex-prompt-signature-v2\0");
-    serde_json::to_writer(&mut DigestWriter(&mut digest), &fields).ok()?;
-    Some(digest.finalize().into())
+    let field_hashes = [
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[0], body.model.as_str())?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[1], &body.instructions)?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[2], &body.store)?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[3], &body.stream)?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[4], &body.parallel_tool_calls)?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[5], &body.include)?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[6], &client_metadata)?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[7], &body.service_tier)?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[8], &body.prompt_cache_key)?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[9], &body.text)?,
+        prompt_field_digest(PROMPT_CHANGE_FIELDS[10], &body.reasoning)?,
+    ];
+    let diagnostic_fields = field_hashes.map(|hash| {
+        u64::from_be_bytes(
+            hash[..size_of::<u64>()]
+                .try_into()
+                .expect("SHA-256 digest contains a u64 prefix"),
+        )
+    });
+    let mut safety_digest = Sha256::new();
+    safety_digest.update(b"ccproxy-codex-prompt-signature-v3\0");
+    for (name, hash) in PROMPT_CHANGE_FIELDS
+        .iter()
+        .take(PROMPT_SIGNATURE_FIELD_COUNT)
+        .zip(field_hashes)
+    {
+        safety_digest.update(name.as_bytes());
+        safety_digest.update([0]);
+        safety_digest.update(hash);
+    }
+    Some(PromptSignature {
+        safety_digest: safety_digest.finalize().into(),
+        diagnostic_fields,
+    })
 }
 
 fn evict_oldest(registry: &mut ContinuationRegistry) {
@@ -2093,7 +2214,7 @@ mod tests {
         let first_signature = prompt_signature(&first).unwrap();
         let second_signature = prompt_signature(&second).unwrap();
 
-        assert_eq!(first_signature.len(), 32);
+        assert_eq!(first_signature.safety_digest.len(), 32);
         assert_eq!(first_signature, second_signature);
 
         second.parallel_tool_calls = false;
@@ -2102,6 +2223,103 @@ mod tests {
         second.parallel_tool_calls = true;
         second.instructions = Some("changed instructions".to_string());
         assert_ne!(first_signature, prompt_signature(&second).unwrap());
+    }
+
+    #[test]
+    fn prompt_signature_diagnostics_report_only_fixed_changed_fields() {
+        fn changed_fields(
+            base: &ResponsesRequest,
+            mutate: impl FnOnce(&mut ResponsesRequest),
+        ) -> Vec<&'static str> {
+            let previous = prompt_signature(base).unwrap();
+            let mut current = base.clone();
+            mutate(&mut current);
+            let current = prompt_signature(&current).unwrap();
+            assert_ne!(previous.safety_digest, current.safety_digest);
+            PromptChangeMask::between(&previous, &current).names()
+        }
+
+        let base = request_with_input(vec![user_message("history")], None);
+        assert_eq!(
+            changed_fields(&base, |request| request.model = "gpt-5.6-sol".into()),
+            ["model"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| request.instructions = Some("new".into())),
+            ["instructions"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| request.store = !request.store),
+            ["store"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| request.stream = !request.stream),
+            ["stream"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| {
+                request.parallel_tool_calls = !request.parallel_tool_calls
+            }),
+            ["parallel_tool_calls"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| request.include =
+                Some(vec!["usage".into()])),
+            ["include"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| {
+                request.client_metadata = Some(HashMap::from([("kind".into(), "resume".into())]))
+            }),
+            ["client_metadata"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| {
+                request.service_tier = Some(super::super::translate::request::ServiceTier::Priority)
+            }),
+            ["service_tier"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| {
+                request.prompt_cache_key = Some("cache-lane".into())
+            }),
+            ["prompt_cache_key"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| request.text.verbosity =
+                Some("high".into())),
+            ["text_format"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| {
+                request.reasoning = Some(super::super::translate::request::ResponsesReasoning {
+                    effort: None,
+                    summary: Some("auto".into()),
+                    context: None,
+                })
+            }),
+            ["reasoning"]
+        );
+        assert_eq!(
+            changed_fields(&base, |request| {
+                request.instructions = Some("new".into());
+                request.text.verbosity = Some("high".into());
+                request.reasoning = Some(super::super::translate::request::ResponsesReasoning {
+                    effort: None,
+                    summary: Some("auto".into()),
+                    context: None,
+                });
+            }),
+            ["instructions", "text_format", "reasoning"]
+        );
+
+        let previous = prompt_signature(&base).unwrap();
+        let mut unattributed = previous.clone();
+        unattributed.safety_digest[0] ^= 1;
+        assert_eq!(
+            PromptChangeMask::between(&previous, &unattributed).names(),
+            ["unattributed"]
+        );
     }
 
     #[test]
@@ -3792,7 +4010,10 @@ mod tests {
         start_and_record("s1", &req, Some("resp_1"));
 
         let req2 = request_with_input(input, Some(json!({"service_tier": "flex"})));
-        let result = continuation_candidate(Some("s1"), &req2, true);
+        let lane_key = test_lane_key("s1");
+        let decision = continuation_candidate_with_diagnostics(Some(&lane_key), &req2, true);
+        assert_eq!(decision.prompt_changed_fields, ["service_tier"]);
+        let result = decision.candidate;
         assert_eq!(result.disabled_reason, Some("prompt_changed".to_string()));
         assert!(!has_continuation_for_tests("s1"));
 

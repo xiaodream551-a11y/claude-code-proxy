@@ -999,10 +999,11 @@ impl CodexHttpClient {
                     // selected entry has already been detached by the WebSocket layer, so retry
                     // once on a fresh socket with the same physical-dispatch reservation. Auto
                     // must not turn a routine stale idle socket into a slower HTTP fallback.
-                    prepare_local_pool_reconnect_continuation(
+                    let continuation_action = prepare_local_pool_reconnect_continuation(
                         &mut active_continuation,
                         ctx.lane_key.as_ref(),
                     );
+                    log_local_pool_reconnect_scheduled(ctx, continuation_action);
                     local_pool_reconnect_attempted = true;
                     fresh_pool_reconnect_pending = true;
                     reserved_model_replay = Some(reservation);
@@ -1209,10 +1210,11 @@ impl CodexHttpClient {
                         if is_local_websocket_pool_predispatch_failure(&err)
                             && !local_pool_reconnect_attempted =>
                     {
-                        prepare_local_pool_reconnect_continuation(
+                        let continuation_action = prepare_local_pool_reconnect_continuation(
                             &mut continuation,
                             ctx.lane_key.as_ref(),
                         );
+                        log_local_pool_reconnect_scheduled(&ctx, continuation_action);
                         continuation_retry_available = false;
                         local_pool_reconnect_attempted = true;
                         fresh_pool_reconnect_pending = true;
@@ -1369,10 +1371,11 @@ impl CodexHttpClient {
                     && !replay_window_closed
                     && !local_pool_reconnect_attempted
                 {
-                    prepare_local_pool_reconnect_continuation(
+                    let continuation_action = prepare_local_pool_reconnect_continuation(
                         &mut continuation,
                         ctx.lane_key.as_ref(),
                     );
+                    log_local_pool_reconnect_scheduled(&ctx, continuation_action);
                     continuation_retry_available = false;
                     local_pool_reconnect_attempted = true;
                     fresh_pool_reconnect_pending = true;
@@ -2930,12 +2933,12 @@ fn full_context_continuation(
 fn prepare_local_pool_reconnect_continuation(
     continuation: &mut Option<super::continuation::ContinuationCandidate>,
     lane_key: Option<&RequestLaneKey>,
-) {
+) -> &'static str {
     let Some(candidate) = continuation.as_mut() else {
-        return;
+        return "full_context_retry";
     };
     if candidate.previous_response_id.is_none() {
-        return;
+        return "full_context_retry";
     }
 
     if candidate.response_affine_fork {
@@ -2948,9 +2951,23 @@ fn prepare_local_pool_reconnect_continuation(
         candidate.candidate_count = candidate.candidate_count.saturating_sub(1).max(1);
         candidate.input_delta = None;
         candidate.disabled_reason = Some("full_context_retry".to_string());
+        "preserve_fallback"
     } else {
         *continuation = full_context_continuation(continuation.as_ref(), lane_key);
+        "full_context_retry"
     }
+}
+
+fn log_local_pool_reconnect_scheduled(ctx: &RequestContext, continuation_action: &'static str) {
+    let fields = serde_json::Map::from_iter([
+        ("reqId".into(), serde_json::json!(ctx.req_id)),
+        (
+            "continuationAction".into(),
+            serde_json::json!(continuation_action),
+        ),
+        ("dispatchReservationReused".into(), serde_json::json!(true)),
+    ]);
+    crate::logging::create_logger("codex").info("websocket_pool_reconnect_scheduled", Some(fields));
 }
 
 fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
@@ -7489,7 +7506,10 @@ mod tests {
             input_delta_count: 3,
             disabled_reason: None,
         });
-        prepare_local_pool_reconnect_continuation(&mut fork, None);
+        assert_eq!(
+            prepare_local_pool_reconnect_continuation(&mut fork, None),
+            "preserve_fallback"
+        );
         let fork = fork.unwrap();
         assert!(fork.previous_response_id.is_none());
         assert_eq!(fork.previous_response_owner_turn_id, None);
@@ -7510,7 +7530,10 @@ mod tests {
             input_delta_count: 1,
             disabled_reason: None,
         });
-        prepare_local_pool_reconnect_continuation(&mut ordinary, None);
+        assert_eq!(
+            prepare_local_pool_reconnect_continuation(&mut ordinary, None),
+            "full_context_retry"
+        );
         let ordinary = ordinary.unwrap();
         assert!(ordinary.previous_response_id.is_none());
         assert_eq!(ordinary.candidate_count, 0);

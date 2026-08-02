@@ -1207,7 +1207,7 @@ pub fn sanitize_path_part(input: &str) -> String {
     }
 }
 
-fn traffic_session_path_part(session_id: Option<&str>) -> String {
+pub(crate) fn traffic_session_fingerprint(session_id: Option<&str>) -> String {
     let mut digest = Sha256::new();
     digest.update(TRAFFIC_SESSION_FINGERPRINT_DOMAIN);
     match session_id {
@@ -1219,10 +1219,11 @@ fn traffic_session_path_part(session_id: Option<&str>) -> String {
         None => digest.update([0]),
     }
     let digest = digest.finalize();
-    format!(
-        "session-{}",
-        hex::encode(&digest[..TRAFFIC_SESSION_FINGERPRINT_BYTES])
-    )
+    hex::encode(&digest[..TRAFFIC_SESSION_FINGERPRINT_BYTES])
+}
+
+fn traffic_session_path_part(session_id: Option<&str>) -> String {
+    format!("session-{}", traffic_session_fingerprint(session_id))
 }
 
 pub fn redact_traffic(value: &Value) -> Value {

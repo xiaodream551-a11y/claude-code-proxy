@@ -4,7 +4,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::stream::SseDecoder;
-use crate::providers::translate_shared::{JsonObjectError, parse_json_object};
+use crate::providers::translate_shared::{
+    JsonObjectError, parse_json_object, sanitize_external_error_detail,
+};
 
 use super::tool_policy::ToolCallPolicy;
 
@@ -1469,13 +1471,13 @@ fn parse_upstream_failure(value: &Value, event_type: &str) -> GrokUpstreamFailur
         .get("error")
         .or_else(|| value.get("error"))
         .unwrap_or(response);
-    let message = failure_message(value, response, error);
+    let raw_message = failure_message(value, response, error);
     let explicit_status = [error, response, value]
         .into_iter()
         .find_map(failure_status);
     let classification = failure_code(error, response, value)
         .and_then(classify_failure_code)
-        .or_else(|| classify_failure_message(&message));
+        .or_else(|| classify_failure_message(&raw_message));
     let (status, classified) = explicit_status
         .map(|status| (status, true))
         .or_else(|| classification.map(|status| (status, true)))
@@ -1488,7 +1490,8 @@ fn parse_upstream_failure(value: &Value, event_type: &str) -> GrokUpstreamFailur
         event_type: event_type.to_owned(),
         status,
         retry_after,
-        message,
+        message: sanitize_external_error_detail(&raw_message)
+            .unwrap_or_else(|| "Grok upstream stream failed".to_string()),
         retryable: classified && matches!(status, 429 | 500 | 502 | 503 | 504 | 529),
     }
 }
@@ -3803,6 +3806,21 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(9));
         assert_eq!(usage.output_tokens, Some(1));
         assert_eq!(error.upstream_failure().unwrap().status, 503);
+    }
+
+    #[test]
+    fn upstream_failure_classifies_before_redacting_sensitive_detail() {
+        let error = reduce_upstream_bytes(
+            b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Bearer provider-secret at /home/customer/private.txt\"}}}\n\n",
+        )
+        .unwrap_err();
+
+        let failure = error.upstream_failure().unwrap();
+        assert_eq!(failure.status, 429);
+        assert!(failure.retryable);
+        assert_eq!(failure.message, "[redacted upstream error detail]");
+        assert!(!failure.message.contains("provider-secret"));
+        assert!(!failure.message.contains("/home/customer"));
     }
 
     #[test]

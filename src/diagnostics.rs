@@ -763,6 +763,7 @@ fn allowed_event(event: &str) -> bool {
             | "websocket_circuit_opened"
             | "websocket_pool_checkout"
             | "websocket_pool_refresh"
+            | "websocket_pool_reconnect_scheduled"
             | "websocket_terminal_pool_probe_failed"
             | "upstream_retry"
             | "upstream_retry_exhausted"
@@ -830,8 +831,11 @@ fn sanitize_field(event: &str, key: &str, value: &Value) -> Option<(String, Valu
             sanitize_continuation_metadata(value).map(|continuation| (key.into(), continuation))
         }
         "usage" => sanitize_grok_usage_metadata(value).map(|usage| (key.into(), usage)),
-        "toolName" => sanitize_tool_name_metadata(value.as_str()?)
+        "toolName" => tool_name_metadata(value.as_str()?)
             .map(|metadata| ("toolNameMetadata".into(), metadata)),
+        "toolNameMetadata" => {
+            sanitize_tool_name_metadata(value).map(|metadata| ("toolNameMetadata".into(), metadata))
+        }
         "toolKind" => enum_string(value, &["tool_use", "server_tool_use"]).map(|v| (key.into(), v)),
         "downstreamEvent" => enum_string(value, &["ping"]).map(|v| (key.into(), v)),
         "interruptReason" => enum_string(
@@ -864,6 +868,10 @@ fn sanitize_field(event: &str, key: &str, value: &Value) -> Option<(String, Valu
             ],
         )
         .map(|value| (key.into(), value)),
+        "continuationAction" if event == "websocket_pool_reconnect_scheduled" => {
+            enum_string(value, &["full_context_retry", "preserve_fallback"])
+                .map(|value| (key.into(), value))
+        }
         _ => sanitize_scalar_field(key, value).map(|value| (key.into(), value)),
     }
 }
@@ -919,6 +927,42 @@ fn sanitize_continuation_metadata(value: &Value) -> Option<Value> {
     }
     if let Some(value) = object.get("responseAffineFork") {
         sanitized.insert("responseAffineFork".into(), Value::Bool(value.as_bool()?));
+    }
+    if let Some(value) = object.get("promptChangedFields") {
+        const ALLOWED: [&str; 12] = [
+            "model",
+            "instructions",
+            "store",
+            "stream",
+            "parallel_tool_calls",
+            "include",
+            "client_metadata",
+            "service_tier",
+            "prompt_cache_key",
+            "text_format",
+            "reasoning",
+            "unattributed",
+        ];
+        let fields = value
+            .as_array()
+            .filter(|fields| fields.len() <= ALLOWED.len())?;
+        let mut previous_index = None;
+        let mut sanitized_fields = Vec::with_capacity(fields.len());
+        for field in fields {
+            let field = field.as_str()?;
+            let index = ALLOWED.iter().position(|allowed| *allowed == field)?;
+            if previous_index.is_some_and(|previous| index <= previous) {
+                return None;
+            }
+            previous_index = Some(index);
+            sanitized_fields.push(json!(field));
+        }
+        if object.get("disabledReason").and_then(Value::as_str) != Some("prompt_changed")
+            && !sanitized_fields.is_empty()
+        {
+            return None;
+        }
+        sanitized.insert("promptChangedFields".into(), Value::Array(sanitized_fields));
     }
 
     Some(Value::Object(sanitized))
@@ -995,6 +1039,7 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
             | "pooled"
             | "responseAffineFork"
             | "hydrationAmbiguous"
+            | "dispatchReservationReused"
     ) {
         return value.as_bool().map(Value::Bool);
     }
@@ -1192,6 +1237,7 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "index",
             "toolKind",
             "toolName",
+            "toolNameMetadata",
             "callIdHash",
             "elapsedMs",
             "interruptReason",
@@ -1283,6 +1329,9 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "responseAffineFork",
         ],
         "websocket_pool_refresh" => &["reqId", "reason"],
+        "websocket_pool_reconnect_scheduled" => {
+            &["reqId", "continuationAction", "dispatchReservationReused"]
+        }
         "websocket_terminal_pool_probe_failed" => &["reason", "detail"],
         "upstream_retry" => &[
             "reqId",
@@ -1363,7 +1412,7 @@ fn diagnostic_model(value: &str) -> &'static str {
         .unwrap_or("other")
 }
 
-fn sanitize_tool_name_metadata(value: &str) -> Option<Value> {
+pub(crate) fn tool_name_metadata(value: &str) -> Option<Value> {
     let value = value.trim();
     if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
         return None;
@@ -1390,6 +1439,25 @@ fn sanitize_tool_name_metadata(value: &str) -> Option<Value> {
     digest.update(value.as_bytes());
     let fingerprint = hex::encode(digest.finalize())[..16].to_string();
     Some(json!({"category": category, "fingerprint": fingerprint}))
+}
+
+fn sanitize_tool_name_metadata(value: &Value) -> Option<Value> {
+    let metadata = value.as_object()?;
+    if metadata.len() != 2 {
+        return None;
+    }
+    let category = metadata.get("category")?.as_str()?;
+    if !matches!(
+        category,
+        "read" | "bash" | "agent" | "tool_search" | "hosted_search" | "mcp" | "function" | "other"
+    ) {
+        return None;
+    }
+    let fingerprint = metadata.get("fingerprint")?.as_str()?;
+    if fingerprint.len() != 16 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(value.clone())
 }
 
 fn matches_ignore_ascii_case(value: &str, choices: &[&str]) -> bool {
@@ -2110,6 +2178,10 @@ fn sanitized_field_value(event: &str, key: &str, value: &Value) -> bool {
                     | "fresh_connect"
             )
         ),
+        "continuationAction" if event == "websocket_pool_reconnect_scheduled" => matches!(
+            value.as_str(),
+            Some("full_context_retry" | "preserve_fallback")
+        ),
         _ => sanitize_scalar_field(key, value).as_ref() == Some(value),
     }
 }
@@ -2449,14 +2521,68 @@ mod tests {
 
     #[test]
     fn tool_name_metadata_is_stable_without_preserving_dynamic_identifiers() {
-        let first = sanitize_tool_name_metadata("mcp__customer_alpha__lookup").unwrap();
-        let repeated = sanitize_tool_name_metadata("mcp__customer_alpha__lookup").unwrap();
-        let other = sanitize_tool_name_metadata("mcp__customer_beta__lookup").unwrap();
+        let first = tool_name_metadata("mcp__customer_alpha__lookup").unwrap();
+        let repeated = tool_name_metadata("mcp__customer_alpha__lookup").unwrap();
+        let other = tool_name_metadata("mcp__customer_beta__lookup").unwrap();
 
         assert_eq!(first, repeated);
         assert_ne!(first["fingerprint"], other["fingerprint"]);
         assert_eq!(first["category"], "mcp");
         assert!(!first.to_string().contains("customer_alpha"));
+    }
+
+    #[test]
+    fn tool_block_accepts_new_metadata_for_every_lifecycle_event() {
+        let metadata = tool_name_metadata("mcp__customer_alpha__lookup").unwrap();
+        for (event_name, interrupt_reason) in [
+            ("tool_block_started", None),
+            ("tool_block_completed", None),
+            ("tool_block_interrupted", Some("downstream_dropped")),
+        ] {
+            let mut fields = json!({
+                "reqId":"request-1",
+                "provider":"codex",
+                "model":"gpt-5.6-sol",
+                "toolKind":"tool_use",
+                "toolNameMetadata":metadata,
+            });
+            if let Some(reason) = interrupt_reason {
+                fields["interruptReason"] = json!(reason);
+            }
+            let event =
+                sanitize_event(&serde_json::from_str(&log(event_name, fields)).unwrap()).unwrap();
+
+            assert_eq!(
+                event["fields"]["toolNameMetadata"], metadata,
+                "{event_name}"
+            );
+            assert!(event["fields"].get("toolName").is_none(), "{event_name}");
+            assert!(
+                !event.to_string().contains("customer_alpha"),
+                "{event_name}"
+            );
+            assert!(is_sanitized_event(&event), "{event_name}");
+        }
+
+        let malformed = sanitize_event(
+            &serde_json::from_str(&log(
+                "tool_block_started",
+                json!({
+                    "reqId":"request-1",
+                    "provider":"codex",
+                    "model":"gpt-5.6-sol",
+                    "toolKind":"tool_use",
+                    "toolNameMetadata":{
+                        "category":"secret-category",
+                        "fingerprint":"not-hex"
+                    }
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(malformed["fields"].get("toolNameMetadata").is_none());
+        assert!(is_sanitized_event(&malformed));
     }
 
     #[test]
@@ -2479,6 +2605,7 @@ mod tests {
                         "responseAffineFork": false,
                         "inputDeltaCount": 3,
                         "disabledReason": null,
+                        "promptChangedFields": [],
                         "previousResponseId": "resp_secret_identifier",
                         "sessionId": "session_secret_identifier",
                         "input": "secret prompt"
@@ -2498,6 +2625,7 @@ mod tests {
                 "responseAffineFork": false,
                 "inputDeltaCount": 3,
                 "disabledReason": null,
+                "promptChangedFields": [],
             })
         );
         assert_eq!(codex["fields"]["hydrationLoadedGroupCount"], 1);
@@ -2536,6 +2664,22 @@ mod tests {
         signature_error["fields"]["continuation"]["disabledReason"] =
             json!("prompt_signature_error");
         assert!(is_sanitized_event(&signature_error));
+
+        let mut prompt_change = codex.clone();
+        prompt_change["fields"]["continuation"]["disabledReason"] = json!("prompt_changed");
+        prompt_change["fields"]["continuation"]["promptChangedFields"] =
+            json!(["instructions", "text_format"]);
+        assert!(is_sanitized_event(&prompt_change));
+
+        let mut forged_prompt_change = prompt_change.clone();
+        forged_prompt_change["fields"]["continuation"]["promptChangedFields"] =
+            json!(["text_format", "instructions"]);
+        assert!(!is_sanitized_event(&forged_prompt_change));
+
+        let mut dynamic_prompt_change = prompt_change;
+        dynamic_prompt_change["fields"]["continuation"]["promptChangedFields"] =
+            json!(["secret-field"]);
+        assert!(!is_sanitized_event(&dynamic_prompt_change));
 
         let mut forged_fingerprint = grok;
         forged_fingerprint["fields"]["promptCacheKeyFingerprint"] = json!("not-a-short-hash");
@@ -2606,6 +2750,32 @@ mod tests {
         .unwrap();
         assert_eq!(fresh_fork["fields"]["candidateRank"], Value::Null);
         assert!(is_sanitized_event(&fresh_fork));
+    }
+
+    #[test]
+    fn websocket_pool_reconnect_exposes_the_actual_bounded_retry_action() {
+        let event = sanitize_event(
+            &serde_json::from_str(&log(
+                "websocket_pool_reconnect_scheduled",
+                json!({
+                    "reqId":"request-1",
+                    "continuationAction":"full_context_retry",
+                    "dispatchReservationReused":true,
+                    "previousResponseId":"resp_secret_identifier"
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(event["fields"]["continuationAction"], "full_context_retry");
+        assert_eq!(event["fields"]["dispatchReservationReused"], true);
+        assert!(!event.to_string().contains("secret_identifier"));
+        assert!(is_sanitized_event(&event));
+
+        let mut forged_action = event;
+        forged_action["fields"]["continuationAction"] = json!("secret_branch");
+        assert!(!is_sanitized_event(&forged_action));
     }
 
     #[test]

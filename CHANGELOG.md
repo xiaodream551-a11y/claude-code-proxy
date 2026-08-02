@@ -139,6 +139,19 @@
   Codex output budgets stay accepted for Claude Code compatibility but are
   omitted because the private gateway rejects every supported Responses
   output-budget field.
+- Restore Claude Code Ultracode Workflow classification without weakening the
+  public stop-sequence boundary: only its non-streaming, tool-free, bounded XML
+  auto-mode requests using `</block>` or `</severity>` and exact generated
+  final-text suffixes are accepted, while marker lookalikes and all other
+  non-empty stop sequences still fail before provider dispatch.
+- Make continuation misses and stale pooled-socket recovery measurable without
+  identifiers: prompt-shape misses report only fixed changed-field categories,
+  and pre-dispatch reconnects state whether they rebuilt full context or retained
+  a fallback while reusing the same dispatch reservation.
+- Remove raw session headers and dynamic tool names from traffic/default logs,
+  and sanitize provider error text before it reaches proxy logs, the monitor, or
+  automatic error captures while leaving intact bounded provider response bytes
+  untouched on their way back to Claude Code.
 - Let incoming `service_tier: "standard_only"` suppress local Codex priority,
   reject incompatible explicit strict schemas instead of silently downgrading
   them, and treat null `output_config`, effort, and format values as omitted.

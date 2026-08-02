@@ -7,7 +7,7 @@ use crate::{
     registry::{Registry, normalize_incoming_model},
     session,
     timeutil::now_ms,
-    traffic::{TrafficCaptureOptions, create_traffic_capture_async},
+    traffic::{TrafficCaptureOptions, create_traffic_capture_async, traffic_session_fingerprint},
 };
 use axum::{
     Json, Router,
@@ -49,6 +49,7 @@ const MAX_ERROR_CAPTURE_FILES: usize = 128;
 const MAX_ERROR_REDACTION_DEPTH: u16 = 100;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPACTION_MODEL_HEADER: &str = "x-ccproxy-compaction-model";
+const CLAUDE_CODE_SESSION_ID_HEADER: &str = "x-claude-code-session-id";
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const CLAUDE_CODE_PARENT_AGENT_ID_HEADER: &str = "x-claude-code-parent-agent-id";
 const REQUEST_LANE_KEY_DOMAIN: &[u8] = b"ccproxy-request-lane-key-v1\0";
@@ -633,7 +634,7 @@ pub fn version_info() -> Value {
             "codexZeroMaxTokens": "rejected_before_dispatch",
             "codexStructuredOutput": "validated_against_original_schema",
             "codexUnconfirmedToolCall": "fail_closed_by_default",
-            "nonEmptyStopSequences": "rejected_before_dispatch",
+            "nonEmptyStopSequences": "rejected_except_claude_code_auto_mode_xml",
             "samplingControls": "rejected_before_dispatch",
         },
     })
@@ -1295,7 +1296,9 @@ async fn dispatch_request_with_id(
             "000-metadata",
             &json!({
                 "reqId": &req_id,
-                "sessionId": &session_id,
+                "sessionFingerprint": session_id
+                    .as_deref()
+                    .map(|session_id| traffic_session_fingerprint(Some(session_id))),
                 "sessionSeq": current.as_ref().map(|s| s.seq),
                 "kind": if count_tokens { "count_tokens" } else { "messages" },
                 "provider": provider.name(),
@@ -1401,7 +1404,7 @@ enum AgentIdError {
 }
 
 fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, SessionIdError> {
-    let Some(value) = headers.get("x-claude-code-session-id") else {
+    let Some(value) = headers.get(CLAUDE_CODE_SESSION_ID_HEADER) else {
         return Ok(None);
     };
     let session_id = value
@@ -1689,6 +1692,7 @@ impl ResponseBodyLifecycle {
         } else {
             "response_body_error"
         });
+        let error = sanitized_external_error(&error);
         self.guard.failed(self.status, error.clone());
         log_stream_failed(&self.log_context, self.status, &error, in_band_sse);
     }
@@ -1758,7 +1762,7 @@ impl Drop for ResponseBodyLifecycle {
 struct ToolBlockTrace {
     index: u64,
     tool_kind: String,
-    tool_name: Option<String>,
+    tool_name_metadata: Option<Value>,
     call_id_hash: Option<String>,
 }
 
@@ -1779,39 +1783,40 @@ fn log_tool_block_event(
         ("reqId".to_string(), json!(ctx.req_id)),
         ("provider".to_string(), json!(ctx.provider)),
         ("model".to_string(), json!(ctx.model)),
-        ("index".to_string(), json!(tool.index)),
-        ("toolKind".to_string(), json!(tool.tool_kind)),
-        ("toolName".to_string(), json!(tool.tool_name)),
-        ("callIdHash".to_string(), json!(tool.call_id_hash)),
         (
             "elapsedMs".to_string(),
             json!(ctx.started_at.elapsed().as_millis()),
         ),
     ]);
-    if let Some(reason) = reason {
-        fields.insert("interruptReason".to_string(), json!(reason));
-    }
+    fields.extend(tool_block_metadata_fields(tool, reason));
     ctx.log.info(message, Some(fields));
 }
 
-fn safe_tool_name(value: &str) -> Option<String> {
+fn tool_block_metadata_fields(
+    tool: &ToolBlockTrace,
+    reason: Option<&'static str>,
+) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::from_iter([
+        ("index".to_string(), json!(tool.index)),
+        ("toolKind".to_string(), json!(tool.tool_kind)),
+        (
+            "toolNameMetadata".to_string(),
+            json!(tool.tool_name_metadata),
+        ),
+        ("callIdHash".to_string(), json!(tool.call_id_hash)),
+    ]);
+    if let Some(reason) = reason {
+        fields.insert("interruptReason".to_string(), json!(reason));
+    }
+    fields
+}
+
+fn safe_tool_name_metadata(value: &str) -> Option<Value> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
-    Some(
-        value
-            .chars()
-            .take(128)
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':') {
-                    character
-                } else {
-                    '_'
-                }
-            })
-            .collect(),
-    )
+    crate::diagnostics::tool_name_metadata(value)
 }
 
 fn diagnostic_identifier_hash(value: &str) -> Option<String> {
@@ -1905,10 +1910,10 @@ fn sse_tool_event(payload: &Value) -> Option<SseToolEvent> {
             Some(SseToolEvent::Started(ToolBlockTrace {
                 index,
                 tool_kind: tool_kind.to_string(),
-                tool_name: block
+                tool_name_metadata: block
                     .get("name")
                     .and_then(Value::as_str)
-                    .and_then(safe_tool_name),
+                    .and_then(safe_tool_name_metadata),
                 call_id_hash: block
                     .get("id")
                     .and_then(Value::as_str)
@@ -2160,6 +2165,8 @@ async fn record_failed_response(
             format!("HTTP {}", status.as_u16())
         }
     });
+    let message = sanitized_external_error(&message);
+    let body_read_error = read.error.as_deref().map(sanitized_external_error);
     let document = json!({
         "reqId": ctx.req_id,
         "provider": ctx.provider,
@@ -2171,7 +2178,7 @@ async fn record_failed_response(
         "response": response_body,
         "bodyTruncated": read.truncated,
         "bodyTimedOut": read.timed_out,
-        "bodyReadError": read.error.as_deref(),
+        "bodyReadError": body_read_error,
     });
     let error_file = if should_capture_error_response(ctx.provider, status) {
         match write_error_capture(ctx.req_id, redact_error_value(document)).await {
@@ -2207,7 +2214,7 @@ async fn record_failed_response(
         ("bodyTruncated".to_string(), json!(read.truncated)),
         ("bodyTimedOut".to_string(), json!(read.timed_out)),
     ]);
-    if let Some(error) = read.error.as_deref() {
+    if let Some(error) = body_read_error.as_deref() {
         fields.insert("bodyReadError".to_string(), json!(error));
     }
     if let Some(file_name) = error_file
@@ -2332,6 +2339,11 @@ fn error_message_from_response(response_body: &Value) -> Option<String> {
                 .filter(|text| !text.is_empty())
         })
         .map(std::string::ToString::to_string)
+}
+
+fn sanitized_external_error(value: &str) -> String {
+    crate::providers::translate_shared::sanitize_external_error_detail(value)
+        .unwrap_or_else(|| "Upstream error".to_string())
 }
 
 fn should_capture_error_response(provider: Option<&str>, status: StatusCode) -> bool {
@@ -2468,6 +2480,7 @@ fn redact_error_value_with_depth(value: Value, depth: u16) -> Value {
             }
             Value::Object(out)
         }
+        Value::String(value) => Value::String(sanitized_external_error(&value)),
         value => value,
     }
 }
@@ -2564,8 +2577,23 @@ fn headers_to_record(headers: &http::HeaderMap) -> Value {
     let mut out = Map::new();
     for (key, value) in headers {
         let name = key.as_str();
+        if name.eq_ignore_ascii_case(CLAUDE_CODE_SESSION_ID_HEADER) {
+            let fingerprint = value
+                .to_str()
+                .ok()
+                .map(|session_id| traffic_session_fingerprint(Some(session_id)));
+            out.insert(
+                name.to_string(),
+                fingerprint.map_or_else(
+                    || Value::String("[redacted invalid header]".to_string()),
+                    |fingerprint| Value::String(format!("[fingerprint={fingerprint}]")),
+                ),
+            );
+            continue;
+        }
         if name.eq_ignore_ascii_case(CLAUDE_CODE_AGENT_ID_HEADER)
             || name.eq_ignore_ascii_case(CLAUDE_CODE_PARENT_AGENT_ID_HEADER)
+            || is_sensitive_payload_key(name)
         {
             out.insert(
                 name.to_string(),
@@ -2945,6 +2973,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_band_sse_error_keeps_client_bytes_but_redacts_monitor_detail() {
+        let req_id = "stream-secret-error";
+        let monitor = started_monitor(req_id);
+        let secret = "Bearer upstream-secret at /home/customer/private.txt";
+        let payload = format!(
+            "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":{}}}}}\n\n",
+            serde_json::to_string(secret).unwrap()
+        );
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(payload))
+            .unwrap();
+        let response = monitor_response_body(
+            response,
+            request_guard(monitor.clone(), req_id),
+            response_log_context(req_id),
+            RequestPermits::default(),
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains(secret));
+        let state = monitor.snapshot();
+        assert_eq!(state.recent.len(), 1);
+        assert_eq!(
+            state.recent[0].error.as_deref(),
+            Some("[redacted upstream error detail]")
+        );
+        assert!(!state.recent[0].error.as_deref().unwrap().contains(secret));
+    }
+
+    #[tokio::test]
+    async fn failed_response_detail_is_redacted_without_rewriting_bounded_client_body() {
+        let secret = "Bearer upstream-secret at /home/customer/private.txt";
+        let body = serde_json::to_vec(&json!({
+            "type":"error",
+            "error":{"type":"api_error", "message":secret}
+        }))
+        .unwrap();
+        let response = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let log = create_logger("server");
+        let (response, details) = record_failed_response(
+            &log,
+            FailedResponseLogContext {
+                req_id: "failed-secret-response",
+                provider: None,
+                model: None,
+                count_tokens: false,
+                started_at: Instant::now(),
+            },
+            response,
+        )
+        .await;
+
+        assert_eq!(details.unwrap().message, "[redacted upstream error detail]");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            Bytes::from(body)
+        );
+    }
+
+    #[tokio::test]
     async fn non_sse_error_shaped_json_remains_a_successful_body() {
         let req_id = "json-success";
         let monitor = started_monitor(req_id);
@@ -3004,10 +3102,25 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
         };
         assert_eq!(tool.index, 2);
         assert_eq!(tool.tool_kind, "tool_use");
-        assert_eq!(tool.tool_name.as_deref(), Some("Brave_Search__bad"));
+        assert_eq!(
+            tool.tool_name_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("category"))
+                .and_then(Value::as_str),
+            Some("function")
+        );
+        assert_eq!(
+            tool.tool_name_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("fingerprint"))
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(16)
+        );
         assert_eq!(tool.call_id_hash.as_deref().map(str::len), Some(16));
         assert_ne!(tool.call_id_hash.as_deref(), Some("call-secret-123"));
         let serialized = serde_json::to_string(&format!("{tool:?}")).unwrap();
+        assert!(!serialized.contains("Brave_Search__bad"));
         assert!(!serialized.contains("CANARY_PROMPT"));
 
         assert!(
@@ -3062,7 +3175,7 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
         let tool = ToolBlockTrace {
             index: 2,
             tool_kind: "tool_use".to_string(),
-            tool_name: Some("brave_search".to_string()),
+            tool_name_metadata: safe_tool_name_metadata("brave_search"),
             call_id_hash: Some("1234abcd".to_string()),
         };
 
@@ -3081,6 +3194,41 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
         assert!(completed.open_tool_blocks.is_empty());
         assert!(completed.provisionally_closed_tool_blocks.is_empty());
         completed.completed();
+    }
+
+    #[test]
+    fn tool_block_log_schema_never_keeps_the_dynamic_name() {
+        let dynamic_name = "mcp__customer_alpha__lookup";
+        let tool = ToolBlockTrace {
+            index: 7,
+            tool_kind: "tool_use".to_string(),
+            tool_name_metadata: safe_tool_name_metadata(dynamic_name),
+            call_id_hash: Some("1234abcd5678ef90".to_string()),
+        };
+
+        for (event, reason) in [
+            ("tool_block_started", None),
+            ("tool_block_completed", None),
+            ("tool_block_interrupted", Some("downstream_dropped")),
+        ] {
+            let fields = tool_block_metadata_fields(&tool, reason);
+            assert!(fields.get("toolName").is_none(), "{event}");
+            assert_eq!(fields["toolNameMetadata"]["category"], "mcp", "{event}");
+            let fingerprint = fields["toolNameMetadata"]["fingerprint"]
+                .as_str()
+                .expect("tool-name fingerprint");
+            assert_eq!(fingerprint.len(), 16, "{event}");
+            assert!(
+                fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{event}"
+            );
+            assert_eq!(
+                fields.get("interruptReason").and_then(Value::as_str),
+                reason,
+                "{event}"
+            );
+            assert!(!Value::Object(fields).to_string().contains(dynamic_name));
+        }
     }
 
     #[test]
@@ -3246,10 +3394,15 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
     }
 
     #[test]
-    fn traffic_headers_redact_agent_identity() {
+    fn traffic_headers_redact_identity_and_credentials() {
+        let session_id = "session-raw-canary-46c956c91e29";
         let agent_id = "agent-raw-canary-ae50bd4cae9d19761";
         let parent_agent_id = "parent-agent-raw-canary";
         let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_SESSION_ID_HEADER,
+            http::HeaderValue::from_str(session_id).unwrap(),
+        );
         headers.insert(
             CLAUDE_CODE_AGENT_ID_HEADER,
             http::HeaderValue::from_str(agent_id).unwrap(),
@@ -3262,8 +3415,23 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
             "x-safe-header",
             http::HeaderValue::from_static("safe-value"),
         );
+        headers.insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer traffic-secret"),
+        );
+        headers.insert(
+            "x-api-key",
+            http::HeaderValue::from_static("traffic-api-secret"),
+        );
 
         let recorded = headers_to_record(&headers);
+        assert_eq!(
+            recorded[CLAUDE_CODE_SESSION_ID_HEADER],
+            format!(
+                "[fingerprint={}]",
+                traffic_session_fingerprint(Some(session_id))
+            )
+        );
         assert_eq!(
             recorded[CLAUDE_CODE_AGENT_ID_HEADER],
             format!("[redacted len={}]", agent_id.len())
@@ -3272,10 +3440,15 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
             recorded[CLAUDE_CODE_PARENT_AGENT_ID_HEADER],
             format!("[redacted len={}]", parent_agent_id.len())
         );
+        assert_eq!(recorded["authorization"], "[redacted len=21]");
+        assert_eq!(recorded["x-api-key"], "[redacted len=18]");
         assert_eq!(recorded["x-safe-header"], "safe-value");
         let serialized = serde_json::to_string(&recorded).unwrap();
+        assert!(!serialized.contains(session_id));
         assert!(!serialized.contains(agent_id));
         assert!(!serialized.contains(parent_agent_id));
+        assert!(!serialized.contains("traffic-secret"));
+        assert!(!serialized.contains("traffic-api-secret"));
     }
 
     #[tokio::test]
@@ -3431,6 +3604,10 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
             "safe_field".to_string(),
             Value::String("safe-value".to_string()),
         );
+        details.insert(
+            "message".to_string(),
+            Value::String("Bearer adjacent-secret at /home/customer/private.txt".to_string()),
+        );
         let redacted = redact_error_value(json!({
             "response": {
                 "json": {
@@ -3453,6 +3630,7 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
         assert_eq!(details["access_token"], "[redacted len=11]");
         assert_eq!(details["ClIeNt_SeCrEt"], "[redacted len=17]");
         assert_eq!(details["safe_field"], "safe-value");
+        assert_eq!(details["message"], "[redacted upstream error detail]");
 
         let serialized = serde_json::to_string(&redacted).unwrap();
         for canary in canaries {
@@ -3460,6 +3638,8 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
         }
         assert!(!serialized.contains("BASE_SECRET"));
         assert!(!serialized.contains("MIXED_CASE_SECRET"));
+        assert!(!serialized.contains("adjacent-secret"));
+        assert!(!serialized.contains("/home/customer"));
     }
 
     #[test]
