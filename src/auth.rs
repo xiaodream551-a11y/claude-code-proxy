@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::to_string_pretty;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 
@@ -116,14 +116,17 @@ where
         }
     }
 
-    fn load_with_source(&self) -> Option<(T, String)> {
-        if let Some(parsed) = load_auth_file::<T>(&self.file) {
-            return Some((parsed, self.file.clone()));
+    fn load_with_source(&self) -> Result<Option<(T, String)>> {
+        if let Some(parsed) = load_auth_file_checked::<T>(&self.file, "primary auth file")? {
+            return Ok(Some((parsed, self.file.clone())));
         }
         if self.file == self.legacy_file {
-            return None;
+            return Ok(None);
         }
-        load_auth_file::<T>(&self.legacy_file).map(|parsed| (parsed, self.legacy_file.clone()))
+        Ok(
+            load_auth_file_checked::<T>(&self.legacy_file, "legacy auth file")?
+                .map(|parsed| (parsed, self.legacy_file.clone())),
+        )
     }
 
     fn clear_legacy_then_primary(&self) -> Result<()> {
@@ -147,7 +150,7 @@ where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
     fn load(&self) -> Result<Option<T>> {
-        Ok(self.load_with_source().map(|(parsed, _path)| parsed))
+        Ok(self.load_with_source()?.map(|(parsed, _path)| parsed))
     }
 
     fn save(&self, value: T) -> Result<()> {
@@ -255,7 +258,7 @@ where
         if !self.use_keychain {
             return Ok(false);
         }
-        let Some((value, _source)) = self.file_store.load_with_source() else {
+        let Some((value, _source)) = self.file_store.load_with_source()? else {
             return Ok(false);
         };
 
@@ -279,7 +282,7 @@ where
     K: Keychain,
 {
     fn load(&self) -> Result<Option<T>> {
-        if let Some((parsed, path)) = self.file_store.load_with_source() {
+        if let Some((parsed, path)) = self.file_store.load_with_source()? {
             self.set_active_backend(if self.use_keychain {
                 KeychainFileBackend::FileFallback {
                     path,
@@ -308,7 +311,7 @@ where
             // A readable file is authoritative on load. Keep updating that
             // backend instead of writing a newer value only to Keychain and
             // leaving the next process to load stale file credentials.
-            if self.file_store.load_with_source().is_some() {
+            if self.file_store.load_with_source()?.is_some() {
                 self.file_store.save(value)?;
                 self.set_active_backend(KeychainFileBackend::FileFallback {
                     path: self.file_store.path(),
@@ -394,30 +397,106 @@ where
 }
 
 pub fn load_auth_file<T: DeserializeOwned>(path: &str) -> Option<T> {
-    let mut file = File::open(path).ok()?;
+    load_auth_file_checked(path, "auth file").ok().flatten()
+}
+
+fn load_auth_file_checked<T: DeserializeOwned>(
+    path: &str,
+    label: &'static str,
+) -> Result<Option<T>> {
+    load_auth_path_checked(std::path::Path::new(path), label)
+}
+
+fn load_auth_path_checked<T: DeserializeOwned>(
+    path: &std::path::Path,
+    label: &'static str,
+) -> Result<Option<T>> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => anyhow::bail!("{label} presence could not be checked ({:?})", error.kind()),
+    };
+    if !auth_metadata_is_regular_file(&before) {
+        anyhow::bail!("{label} must be a regular non-symlink file");
+    }
+
+    let mut file = open_auth_file_no_follow(path)
+        .map_err(|error| anyhow::anyhow!("{label} could not be opened ({:?})", error.kind()))?;
+    let opened = file.metadata().map_err(|error| {
+        anyhow::anyhow!("{label} metadata could not be read ({:?})", error.kind())
+    })?;
+    let after = fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!("{label} changed while it was opened ({:?})", error.kind())
+    })?;
+    if !auth_metadata_is_regular_file(&opened) || !auth_metadata_is_regular_file(&after) {
+        anyhow::bail!("{label} changed to a non-regular file while it was opened");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != opened.dev()
+            || before.ino() != opened.ino()
+            || opened.dev() != after.dev()
+            || opened.ino() != after.ino()
+        {
+            anyhow::bail!("{label} changed while it was opened");
+        }
+    }
+
     let mut raw = String::new();
-    file.read_to_string(&mut raw).ok()?;
-    serde_json::from_str::<T>(&raw).ok()
+    file.read_to_string(&mut raw)
+        .map_err(|error| anyhow::anyhow!("{label} could not be read ({:?})", error.kind()))?;
+    serde_json::from_str::<T>(&raw)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("{label} contains invalid credentials JSON"))
+}
+
+fn auth_metadata_is_regular_file(metadata: &fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn open_auth_file_no_follow(path: &std::path::Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
 }
 
 pub fn load_auth_file_value(path: &std::path::Path) -> Option<serde_json::Value> {
-    let mut file = File::open(path).ok()?;
-    let mut raw = String::new();
-    file.read_to_string(&mut raw).ok()?;
-    serde_json::from_str::<serde_json::Value>(&raw).ok()
+    load_auth_path_checked(path, "auth file").ok().flatten()
 }
 
 pub fn load_auth_file_with_legacy<T: DeserializeOwned>(
     primary: &std::path::Path,
     legacy: &std::path::Path,
 ) -> Option<T> {
-    if let Some(value) = load_auth_file_value(primary) {
-        return serde_json::from_value(value).ok();
-    }
-    if primary == legacy {
-        None
-    } else {
-        load_auth_file_value(legacy).and_then(|value| serde_json::from_value(value).ok())
+    match load_auth_path_checked(primary, "primary auth file") {
+        Ok(Some(value)) => Some(value),
+        Ok(None) if primary != legacy => load_auth_path_checked(legacy, "legacy auth file")
+            .ok()
+            .flatten(),
+        Ok(None) | Err(_) => None,
     }
 }
 
@@ -765,6 +844,165 @@ mod tests {
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded["source"], json!("file"));
         assert_eq!(store.path(), format!("File fallback: {file}"));
+    }
+
+    #[test]
+    fn corrupted_primary_auth_does_not_fall_back_to_legacy() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        fs::write(&file, r#"{"credential":"primary-super-secret""#).unwrap();
+        write_atomically(&legacy, &json!({"source": "legacy"})).unwrap();
+        let store: FileAuthStore<serde_json::Value> = FileAuthStore::new(file, legacy);
+
+        let error = store
+            .load()
+            .expect_err("corrupted primary must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("primary auth file"));
+        assert!(!message.contains("primary-super-secret"));
+    }
+
+    #[test]
+    fn corrupted_primary_auth_does_not_fall_back_to_keychain() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        fs::write(&file, r#"{"credential":"primary-super-secret""#).unwrap();
+        let keychain = MockKeychain::default();
+        keychain.set_raw("svc", "acct", json!({"source": "keychain"}));
+        let store: KeychainFileAuthStore<serde_json::Value, _> =
+            KeychainFileAuthStore::new(file, legacy, "svc", "acct", true, keychain);
+
+        let error = store
+            .load()
+            .expect_err("corrupted primary must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("primary auth file"));
+        assert!(!message.contains("primary-super-secret"));
+    }
+
+    #[test]
+    fn corrupted_primary_auth_prevents_keychain_save_fallback() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        let corrupted = r#"{"credential":"primary-super-secret""#;
+        fs::write(&file, corrupted).unwrap();
+        let keychain = MockKeychain::default();
+        let store: KeychainFileAuthStore<serde_json::Value, _> =
+            KeychainFileAuthStore::new(file.clone(), legacy, "svc", "acct", true, keychain.clone());
+
+        let error = store
+            .save(json!({"source": "new"}))
+            .expect_err("corrupted primary must block backend switching on save");
+        assert!(!error.to_string().contains("primary-super-secret"));
+        assert!(keychain.raw("svc", "acct").is_none());
+        assert_eq!(fs::read_to_string(file).unwrap(), corrupted);
+    }
+
+    #[test]
+    fn legacy_helper_does_not_fall_back_after_corrupted_primary_auth() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("auth.json");
+        let legacy = temp.path().join("legacy.json");
+        fs::write(&file, r#"{"credential":"primary-super-secret""#).unwrap();
+        write_atomically(legacy.to_str().unwrap(), &json!({"source": "legacy"})).unwrap();
+
+        let loaded: Option<serde_json::Value> = load_auth_file_with_legacy(&file, &legacy);
+        assert!(loaded.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_primary_auth_link_does_not_fall_back_to_legacy() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        symlink(temp.path().join("missing-target"), &file).unwrap();
+        write_atomically(&legacy, &json!({"source": "legacy"})).unwrap();
+        let store: FileAuthStore<serde_json::Value> =
+            FileAuthStore::new(file.to_string_lossy().into_owned(), legacy);
+
+        let error = store
+            .load()
+            .expect_err("dangling primary link must fail closed");
+        assert!(error.to_string().contains("primary auth file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_primary_auth_link_does_not_load_external_file_or_legacy() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("auth.json");
+        let external = temp.path().join("external.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        write_atomically(
+            external.to_str().unwrap(),
+            &json!({"credential": "external-super-secret"}),
+        )
+        .unwrap();
+        symlink(&external, &file).unwrap();
+        write_atomically(&legacy, &json!({"source": "legacy"})).unwrap();
+        let store: FileAuthStore<serde_json::Value> =
+            FileAuthStore::new(file.to_string_lossy().into_owned(), legacy);
+
+        let error = store.load().expect_err("primary symlink must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("regular non-symlink file"));
+        assert!(!message.contains("external-super-secret"));
+    }
+
+    #[test]
+    fn primary_auth_directory_does_not_fall_back_to_legacy() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        fs::create_dir(&file).unwrap();
+        write_atomically(&legacy, &json!({"source": "legacy"})).unwrap();
+        let store: FileAuthStore<serde_json::Value> =
+            FileAuthStore::new(file.to_string_lossy().into_owned(), legacy);
+
+        let error = store
+            .load()
+            .expect_err("primary directory must fail closed");
+        assert!(error.to_string().contains("regular non-symlink file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn primary_auth_unix_socket_is_rejected_as_non_regular() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        let _listener = UnixListener::bind(&file).unwrap();
+        write_atomically(&legacy, &json!({"source": "legacy"})).unwrap();
+        let store: FileAuthStore<serde_json::Value> =
+            FileAuthStore::new(file.to_string_lossy().into_owned(), legacy);
+
+        let error = store.load().expect_err("primary socket must fail closed");
+        assert!(error.to_string().contains("regular non-symlink file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_auth_open_does_not_follow_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("target.json");
+        let link = temp.path().join("auth.json");
+        write_atomically(target.to_str().unwrap(), &json!({"source": "target"})).unwrap();
+        symlink(target, &link).unwrap();
+
+        let error = open_auth_file_no_follow(&link).expect_err("O_NOFOLLOW must reject symlink");
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
     }
 
     #[test]

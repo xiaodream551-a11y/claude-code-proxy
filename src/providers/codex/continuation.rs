@@ -88,6 +88,10 @@ static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
 pub struct ContinuationCandidate {
     pub turn_id: Option<u64>,
     pub previous_response_id: Option<String>,
+    /// Producing turn of `previous_response_id`. Together these fields form the exact
+    /// `store:false` WebSocket affinity; response ids alone are not sufficient under delayed
+    /// eviction or synthetic/id-reuse tests.
+    pub previous_response_owner_turn_id: Option<u64>,
     pub matched_candidate_rank: Option<u8>,
     pub candidate_count: u8,
     /// This turn belongs to a strictly proven deferred-tool hydration fork
@@ -120,6 +124,7 @@ pub fn continuation_candidate(
         return ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 0,
             response_affine_fork: false,
@@ -133,6 +138,7 @@ pub fn continuation_candidate(
         return ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 0,
             response_affine_fork: false,
@@ -287,6 +293,7 @@ fn continuation_candidate_from_state(
             return CandidateEvaluation::without_batches(ContinuationCandidate {
                 turn_id: Some(turn_id),
                 previous_response_id: None,
+                previous_response_owner_turn_id: None,
                 matched_candidate_rank: None,
                 candidate_count,
                 response_affine_fork: false,
@@ -305,6 +312,7 @@ fn continuation_candidate_from_state(
         return CandidateEvaluation::without_batches(ContinuationCandidate {
             turn_id: Some(turn_id),
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count,
             response_affine_fork: false,
@@ -317,6 +325,7 @@ fn continuation_candidate_from_state(
         return CandidateEvaluation::without_batches(ContinuationCandidate {
             turn_id: Some(turn_id),
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count,
             response_affine_fork: false,
@@ -336,6 +345,7 @@ fn continuation_candidate_from_state(
         return CandidateEvaluation::without_batches(ContinuationCandidate {
             turn_id: Some(turn_id),
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count,
             response_affine_fork: false,
@@ -349,6 +359,7 @@ fn continuation_candidate_from_state(
         return CandidateEvaluation::without_batches(ContinuationCandidate {
             turn_id: Some(turn_id),
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count,
             response_affine_fork: false,
@@ -362,6 +373,7 @@ fn continuation_candidate_from_state(
         candidate: ContinuationCandidate {
             turn_id: Some(turn_id),
             previous_response_id: Some(state.response_id.clone()),
+            previous_response_owner_turn_id: Some(state.owner_turn_id),
             matched_candidate_rank: candidate_rank,
             candidate_count,
             response_affine_fork: false,
@@ -621,6 +633,58 @@ pub fn abort_continuation(lane_key: Option<&RequestLaneKey>, turn_id: Option<u64
     }
 }
 
+/// Stop a pending response publication while keeping its independently reachable exact fallback.
+///
+/// This is narrower than [`abort_continuation`]: a `store:false` response can lose its newly
+/// bound socket between the terminal event and `record_continuation`, while an older hydration
+/// branch still owns a healthy socket. Publishing the new response would be unsafe, but deleting
+/// the fallback would throw away a valid continuation. Resetting `current_turn` to the fallback's
+/// producing turn also makes late abort/record callbacks for the abandoned turn harmless.
+pub fn abandon_pending_response_preserving_fallback(
+    lane_key: Option<&RequestLaneKey>,
+    turn_id: Option<u64>,
+) {
+    let (Some(lane_key), Some(turn_id)) = (lane_key, turn_id) else {
+        return;
+    };
+    let mut guard = REGISTRY.lock().unwrap();
+    let Some(registry) = guard.as_mut() else {
+        return;
+    };
+    let is_pending_owner = registry
+        .lanes
+        .get(lane_key)
+        .is_some_and(|session| session.pending && session.current_turn == turn_id);
+    if !is_pending_owner {
+        return;
+    }
+
+    let mut session = registry
+        .lanes
+        .remove(lane_key)
+        .expect("pending continuation disappeared while registry was locked");
+    subtract_session_retained_bytes(registry, &session);
+    let now = now_ms();
+    let Some(fallback) = session
+        .pending_fallback
+        .take()
+        .filter(|fallback| now.saturating_sub(fallback.updated_at) <= TTL_MS)
+    else {
+        return;
+    };
+
+    session.current_turn = fallback.owner_turn_id;
+    session.candidates = vec![fallback];
+    session.pending_parallel_batches.clear();
+    session.pending = false;
+    session.updated_at = now;
+    registry.total_retained_bytes = registry
+        .total_retained_bytes
+        .saturating_add(session_retained_bytes(&session));
+    registry.lanes.insert(*lane_key, session);
+    evict_oldest(registry);
+}
+
 /// Drop a hidden exact fallback when this turn stops using its selected response id and retries
 /// with full context. The turn itself remains current so a successful retry can publish a fresh
 /// continuation state.
@@ -652,9 +716,9 @@ pub fn invalidate_response_affinity(lane_key: &RequestLaneKey, response_id: &str
 ///
 /// An idle socket can be evicted after its terminal response has been bound to the socket but
 /// before `record_continuation` publishes that response id. In that window there is no id in the
-/// registry to remove, so affinity invalidation must also abort the still-pending owning turn.
-/// Once the turn has recorded (or a newer turn owns the lane), normal exact-id removal preserves
-/// any unrelated alternate branch.
+/// registry to remove, so affinity invalidation must reject that pending publication while
+/// restoring an independently reachable fallback. Once the turn has recorded (or a newer turn
+/// owns the lane), normal composite-affinity removal preserves every unrelated branch.
 pub fn invalidate_response_affinity_for_turn(
     lane_key: &RequestLaneKey,
     response_id: &str,
@@ -684,8 +748,25 @@ fn invalidate_response_affinity_inner(
     if owner_turn_id
         .is_some_and(|owner_turn_id| session.pending && session.current_turn == owner_turn_id)
     {
-        // The socket disappeared before this turn could publish its response id. Dropping the
-        // pending session is the only way to prevent a later record from publishing a dead id.
+        // The socket disappeared before this turn could publish its response id. Reject a late
+        // record, but restore an independently reachable exact fallback when one exists.
+        let now = now_ms();
+        if let Some(fallback) = session
+            .pending_fallback
+            .take()
+            .filter(|fallback| now.saturating_sub(fallback.updated_at) <= TTL_MS)
+        {
+            session.current_turn = fallback.owner_turn_id;
+            session.candidates = vec![fallback];
+            session.pending_parallel_batches.clear();
+            session.pending = false;
+            session.updated_at = now;
+            registry.total_retained_bytes = registry
+                .total_retained_bytes
+                .saturating_add(session_retained_bytes(&session));
+            registry.lanes.insert(*lane_key, session);
+            evict_oldest(registry);
+        }
         return;
     }
 
@@ -3421,7 +3502,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_affinity_eviction_aborts_only_its_still_pending_owner_turn() {
+    fn websocket_affinity_eviction_rejects_late_record_and_restores_live_fallback() {
         let _state_guard = super::super::CODEX_STATE_TEST_LOCK.blocking_lock();
         clear_all_continuations_for_tests();
 
@@ -3453,7 +3534,9 @@ mod tests {
             Some(&test_lane_key(session)),
             Some(turn_id)
         ));
-        assert_eq!(total_retained_bytes(), 0);
+        assert_eq!(ready_response_ids(session), ["resp_original"]);
+        assert_eq!(pending_fallback_response_id(session), None);
+        assert!(total_retained_bytes() > 0);
 
         record_continuation(
             Some(session),
@@ -3462,7 +3545,29 @@ mod tests {
             Some("resp_dead_socket"),
             &[],
         );
-        assert!(!has_continuation_for_tests(session));
+        assert_eq!(ready_response_ids(session), ["resp_original"]);
+    }
+
+    #[test]
+    fn unreachable_success_without_affinity_restores_fallback_and_blocks_late_record() {
+        let _state_guard = super::super::CODEX_STATE_TEST_LOCK.blocking_lock();
+        clear_all_continuations_for_tests();
+
+        let session = "pending-success-without-affinity";
+        let (request, pending) = start_pending_not_append(session);
+        let turn_id = pending.turn_id.expect("continuation turn");
+        abandon_pending_response_preserving_fallback(Some(&test_lane_key(session)), Some(turn_id));
+
+        assert_eq!(ready_response_ids(session), ["resp_original"]);
+        assert_eq!(pending_fallback_response_id(session), None);
+        record_continuation(
+            Some(session),
+            Some(turn_id),
+            &request,
+            Some("resp_late_unbound"),
+            &[],
+        );
+        assert_eq!(ready_response_ids(session), ["resp_original"]);
     }
 
     #[test]
@@ -3486,6 +3591,11 @@ mod tests {
             request_with_input(vec![user_message("first"), user_message("second")], None);
         let second = continuation_candidate(Some(session), &second_request, true);
         assert_eq!(second.previous_response_id.as_deref(), Some("resp_reused"));
+        assert_eq!(
+            second.previous_response_owner_turn_id,
+            Some(first_turn),
+            "a continuation candidate must carry the producing turn, not only the response id"
+        );
         let second_turn = second.turn_id.expect("second continuation turn");
         record_continuation(
             Some(session),

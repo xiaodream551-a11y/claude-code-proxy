@@ -202,12 +202,14 @@ impl PoolEntry {
             .clone()
     }
 
-    fn response_affinity_matches(&self, response_id: &str) -> bool {
+    fn response_affinity_matches(&self, response_id: &str, owner_turn_id: u64) -> bool {
         self.response_affinity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .is_some_and(|affinity| affinity.as_str() == response_id)
+            .is_some_and(|affinity| {
+                affinity.as_str() == response_id && affinity.owner_turn_id == owner_turn_id
+            })
     }
 
     fn replace_response_affinity(
@@ -618,55 +620,70 @@ fn pool_take_for_turn(
     };
 
     let idle_ttl_ms = WebSocketPoolConfig::configured().idle_ttl_ms;
-    let previous_response_id = continuation
-        .and_then(|candidate| candidate.previous_response_id.as_deref())
-        .map(str::to_owned);
-    let outcome = super::continuation::if_current_turn(Some(key), turn_id, || {
-        let mut invalidated = Vec::new();
-        let mut selected = None;
-        let mut guard = match WS_POOL.lock() {
-            Ok(guard) => guard,
-            Err(_) => return (selected, invalidated),
-        };
-
-        if let Some(entries) = guard.get_mut(key) {
-            let now = now_ms();
-            let mut index = 0;
-            while index < entries.len() {
-                let unusable = idle_pool_entry_expired(&entries[index], now, idle_ttl_ms)
-                    || !entries[index].connection.is_valid()
-                    || entries[index].connection.identity != expected_identity;
-                if unusable {
-                    let idle = entries.remove(index);
-                    invalidate_idle_entry(*key, idle, &mut invalidated);
-                } else {
-                    index += 1;
-                }
-            }
-
-            let selected_index = match previous_response_id.as_deref() {
-                Some(response_id) => entries
-                    .iter()
-                    .position(|idle| idle.connection.response_affinity_matches(response_id)),
-                None => (!entries.is_empty()).then_some(0),
-            };
-            if let Some(selected_index) = selected_index {
-                selected = Some(entries.remove(selected_index).connection);
-            }
-
-            // A non-continuation request follows the newest transport branch only. Any alternate
-            // is now stale (normal reset reasons were already pre-cleared by the client).
-            if previous_response_id.is_none() {
-                for idle in entries.drain(..) {
-                    invalidate_idle_entry(*key, idle, &mut invalidated);
-                }
-            }
-            if entries.is_empty() {
-                guard.remove(key);
-            }
-        }
-        (selected, invalidated)
+    let previous_response_affinity = continuation.and_then(|candidate| {
+        candidate
+            .previous_response_id
+            .as_deref()
+            .zip(candidate.previous_response_owner_turn_id)
+            .map(|(response_id, owner_turn_id)| (response_id.to_owned(), owner_turn_id))
     });
+    let outcome =
+        super::continuation::if_current_turn(Some(key), turn_id, || {
+            let mut invalidated = Vec::new();
+            let mut selected = None;
+            let mut guard = match WS_POOL.lock() {
+                Ok(guard) => guard,
+                Err(_) => return (selected, invalidated),
+            };
+
+            if let Some(entries) = guard.get_mut(key) {
+                let now = now_ms();
+                let mut index = 0;
+                while index < entries.len() {
+                    let unusable = idle_pool_entry_expired(&entries[index], now, idle_ttl_ms)
+                        || !entries[index].connection.is_valid()
+                        || entries[index].connection.identity != expected_identity;
+                    if unusable {
+                        let idle = entries.remove(index);
+                        invalidate_idle_entry(*key, idle, &mut invalidated);
+                    } else {
+                        index += 1;
+                    }
+                }
+
+                let selected_index = match continuation
+                    .and_then(|candidate| candidate.previous_response_id.as_deref())
+                {
+                    Some(_) => previous_response_affinity.as_ref().and_then(
+                        |(response_id, owner_turn_id)| {
+                            entries.iter().position(|idle| {
+                                idle.connection
+                                    .response_affinity_matches(response_id, *owner_turn_id)
+                            })
+                        },
+                    ),
+                    None => (!entries.is_empty()).then_some(0),
+                };
+                if let Some(selected_index) = selected_index {
+                    selected = Some(entries.remove(selected_index).connection);
+                }
+
+                // A non-continuation request follows the newest transport branch only. Any alternate
+                // is now stale (normal reset reasons were already pre-cleared by the client).
+                if continuation
+                    .and_then(|candidate| candidate.previous_response_id.as_deref())
+                    .is_none()
+                {
+                    for idle in entries.drain(..) {
+                        invalidate_idle_entry(*key, idle, &mut invalidated);
+                    }
+                }
+                if entries.is_empty() {
+                    guard.remove(key);
+                }
+            }
+            (selected, invalidated)
+        });
 
     let Some((selected, invalidated)) = outcome else {
         log_websocket_pool_checkout(ctx, continuation, false);
@@ -716,7 +733,7 @@ fn pool_insert_for_turn(
         // A zero/tiny configured pool or global eviction can make the just-produced store:false
         // response unreachable. A reusable transport without a bounded terminal response ID is
         // equally unsuitable for payload continuation. Do not publish a dead candidate.
-        super::continuation::abort_continuation(Some(&key), turn_id);
+        super::continuation::abandon_pending_response_preserving_fallback(Some(&key), turn_id);
     }
 }
 
@@ -1191,7 +1208,7 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
                 PoolInsertPolicy::from_continuation(continuation),
             );
         } else if terminal_success {
-            super::continuation::abort_continuation(
+            super::continuation::abandon_pending_response_preserving_fallback(
                 pool_key,
                 continuation.and_then(|candidate| candidate.turn_id),
             );
@@ -1265,7 +1282,7 @@ pub(super) async fn codex_websocket_request_with_pool_mode(
                 PoolInsertPolicy::from_continuation(continuation),
             );
         } else if terminal_success {
-            super::continuation::abort_continuation(
+            super::continuation::abandon_pending_response_preserving_fallback(
                 pool_key,
                 continuation.and_then(|candidate| candidate.turn_id),
             );
@@ -3083,6 +3100,7 @@ mod tests {
         let mut candidate = ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 1,
             response_affine_fork: true,
@@ -3096,6 +3114,7 @@ mod tests {
         );
 
         candidate.previous_response_id = Some("bounded-test-affinity".to_string());
+        candidate.previous_response_owner_turn_id = Some(1);
         candidate.matched_candidate_rank = Some(0);
         assert_eq!(
             websocket_pool_checkout_outcome(Some(&candidate), true),
@@ -3138,6 +3157,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_checkout_matches_composite_response_affinity_not_id_alone() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+
+        let lane_key = test_lane_key("composite-response-affinity");
+        let older = Arc::new(PoolEntry::new(
+            create_dummy_stream_async().await,
+            PoolIdentity::TEST,
+        ));
+        older
+            .replace_response_affinity(ResponseAffinity::from_response_id("resp_reused", Some(10)));
+        let newer = Arc::new(PoolEntry::new(
+            create_dummy_stream_async().await,
+            PoolIdentity::TEST,
+        ));
+        newer
+            .replace_response_affinity(ResponseAffinity::from_response_id("resp_reused", Some(20)));
+        WS_POOL.lock().unwrap().insert(
+            lane_key,
+            vec![
+                IdlePoolEntry {
+                    connection: newer.clone(),
+                    idle_since_ms: now_ms(),
+                },
+                IdlePoolEntry {
+                    connection: older.clone(),
+                    idle_since_ms: now_ms(),
+                },
+            ],
+        );
+
+        let mut candidate = ContinuationCandidate {
+            turn_id: None,
+            previous_response_id: Some("resp_reused".to_string()),
+            previous_response_owner_turn_id: Some(10),
+            matched_candidate_rank: Some(1),
+            candidate_count: 2,
+            response_affine_fork: false,
+            input_delta: Some(Vec::new()),
+            input_delta_count: 0,
+            disabled_reason: None,
+        };
+        let selected = pool_take_for_turn(
+            Some(&lane_key),
+            None,
+            PoolIdentity::TEST,
+            Some(&candidate),
+            None,
+            false,
+        )
+        .expect("the exact producing turn must select its own socket");
+        assert!(Arc::ptr_eq(&selected, &older));
+        assert_eq!(codex_websocket_pool_len_for_tests(), 1);
+        assert!(newer.is_valid());
+
+        // A missing owner is an invalid continuation affinity and must not silently consume the
+        // remaining same-id socket as ordinary transport reuse.
+        candidate.previous_response_owner_turn_id = None;
+        assert!(
+            pool_take_for_turn(
+                Some(&lane_key),
+                None,
+                PoolIdentity::TEST,
+                Some(&candidate),
+                None,
+                false,
+            )
+            .is_none()
+        );
+        assert_eq!(codex_websocket_pool_len_for_tests(), 1);
+        assert!(newer.is_valid());
+
+        selected.invalidate();
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
     async fn pool_miss_rejects_socket_bound_continuation_before_connecting() {
         let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
         clear_codex_websocket_pool_for_tests();
@@ -3146,6 +3242,7 @@ mod tests {
         let continuation = ContinuationCandidate {
             turn_id: None,
             previous_response_id: Some("resp_socket_bound".to_string()),
+            previous_response_owner_turn_id: Some(1),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,
@@ -3708,6 +3805,100 @@ mod tests {
             &lane_key
         ));
 
+        clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
+    }
+
+    #[tokio::test]
+    async fn pending_fork_eviction_preserves_and_checks_out_live_fallback() {
+        let _pool_guard = super::super::CODEX_STATE_TEST_LOCK.lock().await;
+        clear_codex_websocket_pool_for_tests();
+        super::super::continuation::clear_all_continuations_for_tests();
+
+        let lane_key = test_lane_key("pending-fork-eviction");
+        let loaded_request = loaded_hydration_request(&[]);
+        let loaded = super::super::continuation::continuation_candidate(
+            Some(&lane_key),
+            &loaded_request,
+            true,
+        );
+        let loaded_turn = loaded.turn_id.expect("loaded turn");
+        let loaded_entry = Arc::new(PoolEntry::new(
+            create_dummy_stream_async().await,
+            PoolIdentity::TEST,
+        ));
+        pool_insert_for_turn(
+            lane_key,
+            loaded_entry.clone(),
+            Some(loaded_turn),
+            ResponseAffinity::from_response_id("resp_loaded", Some(loaded_turn)),
+            PoolInsertPolicy::from_continuation(Some(&loaded)),
+        );
+        super::super::continuation::record_continuation(
+            Some(&lane_key),
+            Some(loaded_turn),
+            &loaded_request,
+            Some("resp_loaded"),
+            &[],
+        );
+
+        let unavailable_request = unavailable_hydration_request(&["resume while unavailable"]);
+        let unavailable = super::super::continuation::continuation_candidate(
+            Some(&lane_key),
+            &unavailable_request,
+            true,
+        );
+        assert!(unavailable.response_affine_fork);
+        let unavailable_turn = unavailable.turn_id.expect("fork turn");
+        let unavailable_entry = Arc::new(PoolEntry::new(
+            create_dummy_stream_async().await,
+            PoolIdentity::TEST,
+        ));
+        pool_insert_for_turn(
+            lane_key,
+            unavailable_entry.clone(),
+            Some(unavailable_turn),
+            ResponseAffinity::from_response_id("resp_unavailable", Some(unavailable_turn)),
+            PoolInsertPolicy::from_continuation(Some(&unavailable)),
+        );
+        assert_eq!(codex_websocket_pool_len_for_tests(), 2);
+
+        // Simulate the new branch being evicted after terminal binding but before the outer
+        // accumulator records it. The loaded fallback has a different live socket.
+        invalidate_pool_entry(&lane_key, &unavailable_entry);
+        assert_eq!(codex_websocket_pool_len_for_tests(), 1);
+        assert!(loaded_entry.is_valid());
+        super::super::continuation::record_continuation(
+            Some(&lane_key),
+            Some(unavailable_turn),
+            &unavailable_request,
+            Some("resp_unavailable"),
+            &[],
+        );
+
+        let hydrated_request = loaded_hydration_request(&["hydrated after fork eviction"]);
+        let hydrated = super::super::continuation::continuation_candidate(
+            Some(&lane_key),
+            &hydrated_request,
+            true,
+        );
+        assert_eq!(
+            hydrated.previous_response_id.as_deref(),
+            Some("resp_loaded")
+        );
+        assert_eq!(hydrated.previous_response_owner_turn_id, Some(loaded_turn));
+        let selected = pool_take_for_turn(
+            Some(&lane_key),
+            hydrated.turn_id,
+            PoolIdentity::TEST,
+            Some(&hydrated),
+            None,
+            false,
+        )
+        .expect("the independently live fallback must remain selectable");
+        assert!(Arc::ptr_eq(&selected, &loaded_entry));
+
+        selected.invalidate();
         clear_codex_websocket_pool_for_tests();
         super::super::continuation::clear_all_continuations_for_tests();
     }
@@ -4657,6 +4848,7 @@ mod tests {
         let continuation = ContinuationCandidate {
             turn_id: None,
             previous_response_id: Some("resp_previous".to_string()),
+            previous_response_owner_turn_id: Some(1),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,

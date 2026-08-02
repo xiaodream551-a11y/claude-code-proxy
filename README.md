@@ -744,8 +744,9 @@ Code received or executed the tool.
 The bundle excludes prompts, message content, tool arguments and results, raw
 error text, session ids, credentials, configuration, `traffic/`, `errors/`, and
 the original `proxy.log`. Dynamic upstream error text is reduced to a bounded
-classification and fingerprint. There is deliberately no option to add raw
-traffic or error captures to a diagnostic bundle.
+classification and fingerprint; dynamic tool names are reduced to a bounded
+category and short correlation fingerprint. There is deliberately no option to
+add raw traffic or error captures to a diagnostic bundle.
 
 ccproxy can observe API tool blocks and the `tool_result` that Claude Code later
 sends back. It cannot see a Brave Search MCP process's own TCP connection,
@@ -1238,9 +1239,12 @@ but remains available. Windows relies on the profile directories' ACLs.
   validation/load-shed failures and provider 4xx responses are log-only so an
   error storm cannot turn this diagnostic path into disk exhaustion.
 - `traffic/` — per-request captures written when `CCP_TRAFFIC_LOG=1` is set.
-  Captures live under the state directory, grouped by Claude Code session and
-  request sequence. They include inbound Anthropic requests, translated upstream
-  requests, upstream headers, upstream events, and downstream events. Stream
+  Captures live under the state directory, grouped by a stable opaque session
+  fingerprint and request sequence; raw session IDs are never used as path
+  components. Existing symbolic-link or reparse-point path components are
+  rejected so artifacts remain beneath the configured traffic root. Captures
+  include inbound Anthropic requests, translated upstream requests, upstream
+  headers, upstream events, and downstream events. Stream
   events are written under each request's `events/` directory with monotonic
   sequence numbers so sorted filenames preserve emission order. Token and
   account headers are redacted, but prompt and tool content are intentionally
@@ -1279,8 +1283,9 @@ CCP_TRAFFIC_LOG=1`.
   `${XDG_CONFIG_HOME:-$HOME/.config}/claude-code-proxy/grok/auth.json`, and
   Windows uses `%APPDATA%\claude-code-proxy\grok\auth.json`.
   On macOS and Windows, provider auth also reads the historical generic path
-  described above when it differs from the primary path; new writes stay on
-  the primary path.
+  described above when the primary path is absent and differs from it; a
+  present-but-unreadable or malformed primary credential file fails closed
+  instead of switching identity. New writes stay on the primary path.
 
 ## Switching models and backends
 

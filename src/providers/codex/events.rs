@@ -123,6 +123,27 @@ fn is_known_retry_prescan_event(payload: &Value) -> bool {
     )
 }
 
+/// Return whether a successfully validated, non-failure event permanently closes whole-request
+/// model replay even when it produces no immediate Anthropic bytes.
+///
+/// The three response lifecycle acknowledgements are deliberately neutral, and rate-limit
+/// snapshots plus exact metadata events remain retry policy/control data. Every other understood
+/// response event may prove generation or otherwise advance semantic response state, so replaying
+/// the physical request after it is unsafe. Callers must classify failure envelopes before using
+/// this predicate: an explicit retryable failure is itself the authority that may permit replay.
+pub(crate) fn validated_nonfailure_event_closes_replay_window(payload: &Value) -> bool {
+    !is_ignorable_control_event(payload)
+        && !matches!(
+            payload.get("type").and_then(Value::as_str),
+            Some(
+                "codex.rate_limits"
+                    | "response.created"
+                    | "response.in_progress"
+                    | "response.queued"
+            )
+        )
+}
+
 /// Validate an optional terminal response snapshot status against the event that carries it.
 ///
 /// Codex has emitted both full Responses events and the Lite `response.done` success alias.
@@ -565,12 +586,23 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
             // response or a valid truncated response into a whole-request replay.
             return None;
         }
-        if let Some(failure) = classify_event_failure(&payload)
-            && failure.retryable()
-            && !hosted_side_effect_started
-            && first_failure.is_none()
-        {
-            first_failure = Some(failure);
+        if let Some(failure) = classify_event_failure(&payload) {
+            if !failure.retryable() || hosted_side_effect_started {
+                // A permanent/context failure is authoritative and no later envelope may
+                // resurrect replay eligibility. Likewise, explicit failure cannot undo an
+                // already-observed hosted side effect.
+                return None;
+            }
+            if first_failure.is_none() {
+                first_failure = Some(failure);
+            }
+            // The explicit failure/rate-limit envelope is the replay authority. Do not treat that
+            // same event as prior model progress; any later validated response event still closes
+            // the gate below on its own iteration.
+            continue;
+        }
+        if validated_nonfailure_event_closes_replay_window(&payload) {
+            return None;
         }
     }
     (!hosted_side_effect_started)
@@ -1046,15 +1078,55 @@ mod tests {
     }
 
     #[test]
-    fn known_generated_output_keeps_buffered_retry_eligible() {
+    fn known_generated_output_closes_buffered_retry_prescan() {
         for item_type in ["message", "reasoning", "function_call"] {
             let body = format!(
                 "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_1\"}}}}\n\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"{item_type}\",\"call_id\":\"call_1\",\"name\":\"Read\"}}}}\n\ndata: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"status\":503,\"message\":\"busy\"}}}}}}\n\n"
             );
+            assert!(
+                first_retryable_failure(body.as_bytes()).is_none(),
+                "known output item {item_type:?} allowed a duplicate model dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn response_created_without_generation_keeps_buffered_retry_eligible() {
+        let body = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"status\":503,\"message\":\"busy\"}}}\n\n";
+
+        assert_eq!(
+            first_retryable_failure(body).map(|failure| failure.status),
+            Some(503)
+        );
+    }
+
+    #[test]
+    fn lifecycle_progress_without_generation_keeps_buffered_retry_eligible() {
+        for lifecycle in ["response.queued", "response.in_progress"] {
+            let body = format!(
+                "data: {{\"type\":\"{lifecycle}\",\"response\":{{\"id\":\"resp_1\"}}}}\n\ndata: {{\"type\":\"response.failed\",\"response\":{{\"status\":\"failed\",\"error\":{{\"status\":503,\"message\":\"busy\"}}}}}}\n\n"
+            );
+
             assert_eq!(
                 first_retryable_failure(body.as_bytes()).map(|failure| failure.status),
                 Some(503),
-                "known output item {item_type:?} unexpectedly disabled replay"
+                "lifecycle event {lifecycle} unexpectedly closed pre-generation replay"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_failure_cannot_lose_or_regain_replay_authority() {
+        let permanent = r#"{"type":"response.failed","response":{"status":"failed","error":{"status":400,"message":"invalid request"}}}"#;
+        let retryable = r#"{"type":"response.failed","response":{"status":"failed","error":{"status":503,"message":"busy"}}}"#;
+
+        for body in [
+            format!("data: {permanent}\n\ndata: {retryable}\n\n"),
+            format!("data: {retryable}\n\ndata: {permanent}\n\n"),
+        ] {
+            assert!(
+                first_retryable_failure(body.as_bytes()).is_none(),
+                "a permanent failure must dominate every failure ordering"
             );
         }
     }

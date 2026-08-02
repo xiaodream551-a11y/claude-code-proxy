@@ -1121,7 +1121,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
         let payload = match item {
             Ok(payload) => payload,
             Err(err) => {
-                if !hosted_side_effect_started
+                if replay_state.is_some()
                     && (retryable_live_start_codex_error(&err)
                         || err.origin == client::CodexErrorOrigin::WebSocketHandshake)
                 {
@@ -1160,7 +1160,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                                 state.active_transport
                             }),
                     );
-                    if !hosted_side_effect_started {
+                    if replay_state.is_some() {
                         return LiveStreamStart::Retry {
                             error,
                             replay_state,
@@ -1175,6 +1175,13 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
                 ));
             }
         };
+        // A reducer-validated event can prove model work or advance response state without
+        // yielding Anthropic bytes (reasoning-only and structured-output buffering are common
+        // examples). Close replay independently of downstream commitment. Response lifecycle
+        // acknowledgements remain intentional pre-generation exceptions.
+        if events::validated_nonfailure_event_closes_replay_window(&payload) {
+            replay_state = None;
+        }
         // Record generation only after the reducer has validated the event. Lifecycle
         // acknowledgements such as response.created establish transport readiness, not TTFT.
         record_codex_generation_start(&ctx, &payload, provider_started_at, &mut generation_started);
@@ -1249,7 +1256,7 @@ async fn live_stream_response_once_with_schema_and_tool_policy(
         retry_after: None,
         origin: client::CodexErrorOrigin::WebSocket,
     };
-    if hosted_side_effect_started {
+    if replay_state.is_none() {
         abort_continuation(ctx.lane_key.as_ref(), turn_id);
         LiveStreamStart::Response(map_codex_error_to_response(&error))
     } else {
@@ -1289,14 +1296,6 @@ fn codex_generation_event(payload: &serde_json::Value) -> bool {
 
 fn codex_response_created(payload: &serde_json::Value) -> bool {
     payload.get("type").and_then(serde_json::Value::as_str) == Some("response.created")
-}
-
-fn live_payload_closes_replay_window(payload: &serde_json::Value) -> bool {
-    !events::is_ignorable_control_event(payload)
-        && !matches!(
-            payload.get("type").and_then(serde_json::Value::as_str),
-            Some("codex.rate_limits" | "response.created")
-        )
 }
 
 fn record_codex_generation_start(
@@ -2224,10 +2223,10 @@ fn remaining_live_stream_response_with_replay(
                         provider_started_at,
                         &mut generation_started,
                     );
-                    // Only a transport ping has been committed so far. `response.created` remains
-                    // non-semantic and preserves the same explicit-failure recovery contract as
-                    // buffered mode; any other classified response event closes the replay gate.
-                    if live_payload_closes_replay_window(&payload) {
+                    // Only a transport ping has been committed so far. Response lifecycle
+                    // acknowledgements remain non-semantic and preserve the same explicit-failure
+                    // recovery contract as buffered mode; semantic events close the replay gate.
+                    if events::validated_nonfailure_event_closes_replay_window(&payload) {
                         replay_state = None;
                     }
                     if !chunk.is_empty() {
@@ -2428,6 +2427,7 @@ fn drop_live_continuation_for_retry(
     if let Some(candidate) = continuation.as_mut() {
         discard_pending_fallback(lane_key, candidate.turn_id);
         candidate.previous_response_id = None;
+        candidate.previous_response_owner_turn_id = None;
         candidate.matched_candidate_rank = None;
         candidate.candidate_count = 0;
         candidate.response_affine_fork = false;
@@ -3774,6 +3774,7 @@ mod tests {
         let continuation = continuation::ContinuationCandidate {
             turn_id: Some(42),
             previous_response_id: Some("resp_secret_identifier".to_string()),
+            previous_response_owner_turn_id: Some(41),
             matched_candidate_rank: Some(1),
             candidate_count: 2,
             response_affine_fork: false,
@@ -3868,20 +3869,35 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         tx.send(Err(heartbeat_test_error())).await.unwrap();
         drop(tx);
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let (state, _, _) =
+            scripted_replay_state(request, continuation, std::collections::VecDeque::new());
+        let turn_id = state.turn_id();
+        let message_id = state.message_id.clone();
+        let model = state.model.clone();
+        let schema_bridge = state.schema_bridge.clone();
+        let tool_policy = state.tool_policy.clone();
         assert!(matches!(
-            live_stream_response_once(
+            live_stream_response_once_with_schema_and_tool_policy(
                 rx,
-                "msg_before".to_string(),
-                "gpt-5.6-sol",
+                message_id,
+                &model,
                 ctx.clone(),
-                None,
+                turn_id,
                 None,
                 Instant::now(),
                 client::CodexRequestDeadline::from_timeout_ms(10_000),
                 DEFAULT_STREAM_HEARTBEAT,
+                schema_bridge,
+                tool_policy,
+                Some(Box::new(state)),
             )
             .await,
-            LiveStreamStart::Retry { .. }
+            LiveStreamStart::Retry {
+                replay_state: Some(_),
+                ..
+            }
         ));
 
         let (tx, rx) = tokio::sync::mpsc::channel(3);
@@ -3901,16 +3917,31 @@ mod tests {
         .unwrap();
         tx.send(Err(heartbeat_test_error())).await.unwrap();
         drop(tx);
-        let response = match live_stream_response_once(
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not be replayed",
+            "resp_forbidden_transport_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let turn_id = state.turn_id();
+        let message_id = state.message_id.clone();
+        let model = state.model.clone();
+        let schema_bridge = state.schema_bridge.clone();
+        let tool_policy = state.tool_policy.clone();
+        let response = match live_stream_response_once_with_schema_and_tool_policy(
             rx,
-            "msg_after".to_string(),
-            "gpt-5.6-sol",
+            message_id,
+            &model,
             ctx,
-            None,
+            turn_id,
             None,
             Instant::now(),
             client::CodexRequestDeadline::from_timeout_ms(10_000),
             DEFAULT_STREAM_HEARTBEAT,
+            schema_bridge,
+            tool_policy,
+            Some(Box::new(state)),
         )
         .await
         {
@@ -3923,6 +3954,15 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("hello"));
         assert!(body.contains("heartbeat timed out"));
+        assert!(!body.contains("must not be replayed"));
+        assert_eq!(budget.snapshot().model, 1);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -4103,6 +4143,184 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
+    #[tokio::test]
+    async fn structured_output_generation_before_first_chunk_blocks_outer_retry() {
+        let request = structured_continuation_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not be replayed",
+            "resp_forbidden_structured_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let turn_id = state.turn_id();
+        let continuation_capture = state.fresh_continuation_capture();
+        let message_id = state.message_id.clone();
+        let model = state.model.clone();
+        let schema_bridge = state.schema_bridge.clone();
+        let tool_policy = state.tool_policy.clone();
+        let upstream = scripted_event_receiver([
+            Ok(serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_structured_partial"}
+            })),
+            Ok(retryable_failure_payload()),
+        ]);
+
+        let start = live_stream_response_once_with_schema_and_tool_policy(
+            upstream,
+            message_id,
+            &model,
+            live_test_context(),
+            turn_id,
+            continuation_capture,
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(3_000),
+            Duration::from_secs(1),
+            schema_bridge,
+            tool_policy,
+            Some(Box::new(state)),
+        )
+        .await;
+
+        let LiveStreamStart::Response(response) = start else {
+            panic!("validated structured generation must close the outer replay gate");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(budget.snapshot().model, 1);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1,
+            "no second physical model dispatch may be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_generation_before_first_chunk_blocks_outer_retry() {
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not be replayed",
+            "resp_forbidden_reasoning_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let turn_id = state.turn_id();
+        let continuation_capture = state.fresh_continuation_capture();
+        let message_id = state.message_id.clone();
+        let model = state.model.clone();
+        let schema_bridge = state.schema_bridge.clone();
+        let tool_policy = state.tool_policy.clone();
+        let upstream = scripted_event_receiver([
+            Ok(serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{
+                    "type":"reasoning",
+                    "id":"rs_partial",
+                    "summary":[],
+                    "encrypted_content":"opaque"
+                }
+            })),
+            Ok(retryable_failure_payload()),
+        ]);
+
+        let start = live_stream_response_once_with_schema_and_tool_policy(
+            upstream,
+            message_id,
+            &model,
+            live_test_context(),
+            turn_id,
+            continuation_capture,
+            Instant::now(),
+            client::CodexRequestDeadline::from_timeout_ms(3_000),
+            Duration::from_secs(1),
+            schema_bridge,
+            tool_policy,
+            Some(Box::new(state)),
+        )
+        .await;
+
+        let LiveStreamStart::Response(response) = start else {
+            panic!("validated reasoning generation must close the outer replay gate");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(budget.snapshot().model, 1);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_chunk_generation_never_returns_retry_without_state_on_close() {
+        for transport_error in [false, true] {
+            let request = structured_continuation_test_request();
+            let continuation = continuation_candidate(None, &request, true);
+            let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+                "must not be replayed",
+                "resp_forbidden_close_replay",
+            ))]);
+            let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+            let turn_id = state.turn_id();
+            let continuation_capture = state.fresh_continuation_capture();
+            let message_id = state.message_id.clone();
+            let model = state.model.clone();
+            let schema_bridge = state.schema_bridge.clone();
+            let tool_policy = state.tool_policy.clone();
+            let mut events = vec![Ok(serde_json::json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"message","id":"msg_structured_before_close"}
+            }))];
+            if transport_error {
+                events.push(Err(heartbeat_test_error()));
+            }
+
+            let start = live_stream_response_once_with_schema_and_tool_policy(
+                scripted_event_receiver(events),
+                message_id,
+                &model,
+                live_test_context(),
+                turn_id,
+                continuation_capture,
+                Instant::now(),
+                client::CodexRequestDeadline::from_timeout_ms(3_000),
+                Duration::from_secs(1),
+                schema_bridge,
+                tool_policy,
+                Some(Box::new(state)),
+            )
+            .await;
+
+            let LiveStreamStart::Response(response) = start else {
+                panic!(
+                    "empty-chunk generation followed by {} must not return Retry(None)",
+                    if transport_error {
+                        "a transport error"
+                    } else {
+                        "EOF"
+                    }
+                );
+            };
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(budget.snapshot().model, 1);
+            assert_eq!(
+                attempts
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .len(),
+                1,
+                "closed replay gate must leave the scripted redispatch unused"
+            );
+        }
+    }
+
     #[test]
     fn live_retry_budget_exhaustion_preserves_the_original_upstream_error() {
         let request = live_test_request();
@@ -4149,6 +4367,7 @@ mod tests {
         let continuation = ContinuationCandidate {
             turn_id: Some(42),
             previous_response_id: Some("resp_failed_attempt".to_string()),
+            previous_response_owner_turn_id: Some(41),
             matched_candidate_rank: Some(0),
             candidate_count: 2,
             response_affine_fork: true,
@@ -4361,6 +4580,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_progress_after_created_preserves_explicit_503_replay() {
+        let request = live_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "recovered after lifecycle progress",
+            "resp_lifecycle_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let upstream = scripted_event_receiver([
+            Ok(serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_lifecycle", "status": "in_progress"}
+            })),
+            Ok(serde_json::json!({
+                "type": "response.queued",
+                "response": {"id": "resp_lifecycle", "status": "queued"}
+            })),
+            Ok(serde_json::json!({
+                "type": "response.in_progress",
+                "response": {"id": "resp_lifecycle", "status": "in_progress"}
+            })),
+            Ok(retryable_failure_payload()),
+        ]);
+        let response = start_scripted_heartbeat_response(
+            upstream,
+            state,
+            live_test_context(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("lifecycle-only progress should retain explicit-failure recovery")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: ping"), "{body}");
+        assert!(
+            body.contains("recovered after lifecycle progress"),
+            "{body}"
+        );
+        assert!(!body.contains("event: error"), "{body}");
+        assert_eq!(budget.snapshot().model, 2);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            0,
+            "the one authorized physical replay must be consumed"
+        );
+    }
+
+    #[tokio::test]
     async fn response_created_before_heartbeat_commits_ping_and_preserves_explicit_503_replay() {
         let request = live_test_request();
         let continuation = continuation_candidate(None, &request, true);
@@ -4469,6 +4746,66 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_empty_chunk_after_created_closes_committed_replay_gate() {
+        let request = structured_continuation_test_request();
+        let continuation = continuation_candidate(None, &request, true);
+        let attempts = std::collections::VecDeque::from([Ok(successful_text_receiver(
+            "must not appear",
+            "resp_forbidden_committed_structured_replay",
+        ))]);
+        let (state, budget, attempts) = scripted_replay_state(request, continuation, attempts);
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::channel(3);
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_structured_committed", "status": "in_progress"}
+            })))
+            .await
+            .unwrap();
+        let response = start_scripted_heartbeat_response(
+            upstream_rx,
+            state,
+            live_test_context(),
+            Duration::from_secs(1),
+        )
+        .await;
+        upstream_tx
+            .send(Ok(serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type":"message", "id":"msg_structured_committed"}
+            })))
+            .await
+            .unwrap();
+        upstream_tx
+            .send(Ok(retryable_failure_payload()))
+            .await
+            .unwrap();
+        drop(upstream_tx);
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("closed structured stream should resolve without redispatch")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("event: ping"), "{body}");
+        assert!(body.contains("event: error"), "{body}");
+        assert!(!body.contains("must not appear"), "{body}");
+        assert_eq!(budget.snapshot().model, 1);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1,
+            "empty structured progress must leave the redispatch unused"
         );
     }
 

@@ -830,7 +830,8 @@ fn sanitize_field(event: &str, key: &str, value: &Value) -> Option<(String, Valu
             sanitize_continuation_metadata(value).map(|continuation| (key.into(), continuation))
         }
         "usage" => sanitize_grok_usage_metadata(value).map(|usage| (key.into(), usage)),
-        "toolName" => sanitize_tool_name(value.as_str()?).map(|name| (key.into(), json!(name))),
+        "toolName" => sanitize_tool_name_metadata(value.as_str()?)
+            .map(|metadata| ("toolNameMetadata".into(), metadata)),
         "toolKind" => enum_string(value, &["tool_use", "server_tool_use"]).map(|v| (key.into(), v)),
         "downstreamEvent" => enum_string(value, &["ping"]).map(|v| (key.into(), v)),
         "interruptReason" => enum_string(
@@ -1362,17 +1363,39 @@ fn diagnostic_model(value: &str) -> &'static str {
         .unwrap_or("other")
 }
 
-fn sanitize_tool_name(value: &str) -> Option<String> {
+fn sanitize_tool_name_metadata(value: &str) -> Option<Value> {
     let value = value.trim();
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
-    {
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
         return None;
     }
-    Some(value.to_ascii_lowercase())
+    let category = if value.eq_ignore_ascii_case("read") {
+        "read"
+    } else if value.eq_ignore_ascii_case("bash") {
+        "bash"
+    } else if matches_ignore_ascii_case(value, &["agent", "task", "explore"]) {
+        "agent"
+    } else if value.eq_ignore_ascii_case("toolsearch") {
+        "tool_search"
+    } else if matches_ignore_ascii_case(value, &["websearch", "web_search", "x_search"]) {
+        "hosted_search"
+    } else if value.to_ascii_lowercase().starts_with("mcp__") || value.contains(':') {
+        "mcp"
+    } else if value.is_ascii() {
+        "function"
+    } else {
+        "other"
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"ccproxy:diagnostics:tool-name:v1\0");
+    digest.update(value.as_bytes());
+    let fingerprint = hex::encode(digest.finalize())[..16].to_string();
+    Some(json!({"category": category, "fingerprint": fingerprint}))
+}
+
+fn matches_ignore_ascii_case(value: &str, choices: &[&str]) -> bool {
+    choices
+        .iter()
+        .any(|choice| value.eq_ignore_ascii_case(choice))
 }
 
 fn tool_choice_category(value: &Value) -> &'static str {
@@ -1962,6 +1985,8 @@ fn is_sanitized_event(value: &Value) -> bool {
                 "model".into()
             } else if *key == "toolChoice" {
                 "toolChoiceCategory".into()
+            } else if *key == "toolName" {
+                "toolNameMetadata".into()
             } else if matches!(*key, "message" | "reason" | "detail" | "bodyReadError") {
                 format!("{key}Diagnostic")
             } else {
@@ -2020,8 +2045,28 @@ fn sanitized_field_value(event: &str, key: &str, value: &Value) -> bool {
         "model" => value
             .as_str()
             .is_some_and(|model| diagnostic_model(model) == model),
-        "toolName" => value.as_str().is_some_and(|name| {
-            sanitize_tool_name(name).as_deref() == Some(name) && name.len() <= 128
+        "toolNameMetadata" => value.as_object().is_some_and(|metadata| {
+            metadata.len() == 2
+                && metadata
+                    .get("category")
+                    .and_then(Value::as_str)
+                    .is_some_and(|category| {
+                        matches!(
+                            category,
+                            "read"
+                                | "bash"
+                                | "agent"
+                                | "tool_search"
+                                | "hosted_search"
+                                | "mcp"
+                                | "function"
+                                | "other"
+                        )
+                    })
+                && metadata
+                    .get("fingerprint")
+                    .and_then(Value::as_str)
+                    .is_some_and(|fingerprint| fingerprint.len() == 16 && is_short_hex(fingerprint))
         }),
         "interruptReason" => matches!(
             value.as_str(),
@@ -2373,7 +2418,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_block_keeps_safe_lowercase_name_and_fixed_interrupt_reason() {
+    fn tool_block_replaces_dynamic_name_with_bounded_metadata() {
         let event = sanitize_event(
             &serde_json::from_str(&log(
                 "tool_block_interrupted",
@@ -2390,9 +2435,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(event["fields"]["model"], "gpt-5.6-sol");
-        assert_eq!(event["fields"]["toolName"], "brave_search:query");
+        assert_eq!(event["fields"]["toolNameMetadata"]["category"], "mcp");
+        let fingerprint = event["fields"]["toolNameMetadata"]["fingerprint"]
+            .as_str()
+            .unwrap();
+        assert_eq!(fingerprint.len(), 16);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!event.to_string().contains("Brave_Search:Query"));
+        assert!(event["fields"].get("toolName").is_none());
         assert_eq!(event["fields"]["interruptReason"], "downstream_dropped");
         assert!(is_sanitized_event(&event));
+    }
+
+    #[test]
+    fn tool_name_metadata_is_stable_without_preserving_dynamic_identifiers() {
+        let first = sanitize_tool_name_metadata("mcp__customer_alpha__lookup").unwrap();
+        let repeated = sanitize_tool_name_metadata("mcp__customer_alpha__lookup").unwrap();
+        let other = sanitize_tool_name_metadata("mcp__customer_beta__lookup").unwrap();
+
+        assert_eq!(first, repeated);
+        assert_ne!(first["fingerprint"], other["fingerprint"]);
+        assert_eq!(first["category"], "mcp");
+        assert!(!first.to_string().contains("customer_alpha"));
     }
 
     #[test]

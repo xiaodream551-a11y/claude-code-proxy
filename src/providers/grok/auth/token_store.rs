@@ -86,10 +86,16 @@ pub fn file_store_with_migration() -> GrokTokenStore<DefaultGrokAuthStore> {
     if let Err(error) = store.migrate_auth_exclusive() {
         crate::logging::create_logger("grok").warn(
             "auth_keychain_migration_failed",
-            Some(serde_json::Map::from_iter([(
-                "message".to_string(),
-                serde_json::json!(error.to_string()),
-            )])),
+            Some(serde_json::Map::from_iter([
+                (
+                    "stage".to_string(),
+                    serde_json::json!("migrate_to_keychain"),
+                ),
+                (
+                    "errorKind".to_string(),
+                    serde_json::json!(crate::logging::safe_persistence_error_kind(&error)),
+                ),
+            ])),
         );
     }
     store

@@ -2176,14 +2176,14 @@ async fn record_failed_response(
     let error_file = if should_capture_error_response(ctx.provider, status) {
         match write_error_capture(ctx.req_id, redact_error_value(document)).await {
             Ok(path) => path,
-            Err(error) => {
+            Err(_) => {
                 log.warn(
                     "error_capture_failed",
                     Some(serde_json::Map::from_iter([
                         ("reqId".to_string(), json!(ctx.req_id)),
                         ("provider".to_string(), json!(ctx.provider)),
                         ("status".to_string(), json!(status.as_u16())),
-                        ("error".to_string(), json!(error)),
+                        ("errorKind".to_string(), json!("capture_write")),
                     ])),
                 );
                 None
@@ -2210,8 +2210,12 @@ async fn record_failed_response(
     if let Some(error) = read.error.as_deref() {
         fields.insert("bodyReadError".to_string(), json!(error));
     }
-    if let Some(path) = error_file.as_ref() {
-        fields.insert("errorFile".to_string(), json!(path.display().to_string()));
+    if let Some(file_name) = error_file
+        .as_deref()
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+    {
+        fields.insert("errorFileName".to_string(), json!(file_name));
     }
     log.info("request_failed", Some(fields));
 

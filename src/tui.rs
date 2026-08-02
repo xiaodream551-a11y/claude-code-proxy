@@ -10,6 +10,7 @@ use layout::{
 use std::{
     collections::HashMap,
     io::{self, Stdout},
+    path::Path,
     sync::mpsc,
     time::{Duration, SystemTime},
 };
@@ -28,6 +29,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::{
@@ -563,16 +565,33 @@ fn ellipsize(value: &str, width: usize) -> String {
         .collect()
 }
 
-fn display_session_id(session_id: Option<&str>) -> &str {
+fn display_session_id(session_id: Option<&str>) -> String {
     let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
-        return "no-session";
+        return "no-session".to_string();
     };
-    if uuid::Uuid::parse_str(session_id).is_ok() {
-        return session_id
-            .split_once('-')
-            .map_or(session_id, |(first, _)| first);
+    let mut digest = Sha256::new();
+    digest.update(b"ccproxy:tui:session:v1\0");
+    digest.update(session_id.as_bytes());
+    hex::encode(digest.finalize())[..8].to_string()
+}
+
+fn display_capture_path(path: &Path) -> String {
+    let traffic_root = paths::state_dir().join("traffic");
+    match path.strip_prefix(&traffic_root) {
+        Ok(relative) => Path::new("traffic")
+            .join(relative)
+            .to_string_lossy()
+            .into_owned(),
+        Err(_) => path.file_name().map_or_else(
+            || "traffic/capture".to_string(),
+            |file_name| {
+                Path::new("traffic")
+                    .join(file_name)
+                    .to_string_lossy()
+                    .into_owned()
+            },
+        ),
     }
-    session_id
 }
 
 fn number_cell(value: impl Into<String>) -> Cell<'static> {
@@ -1437,7 +1456,7 @@ fn render_request_detail(
         if let Some(path) = &request.traffic_capture_path {
             lines.push(detail_line(
                 "capture",
-                path.to_string_lossy().into_owned(),
+                display_capture_path(path),
                 DIM_WHITE,
             ));
         }
@@ -2049,18 +2068,43 @@ mod tests {
     }
 
     #[test]
-    fn display_session_id_shortens_uuids() {
-        assert_eq!(
-            display_session_id(Some("57c7c914-ada4-4f40-9672-985f950fbb66")),
-            "57c7c914"
-        );
+    fn display_session_id_fingerprints_uuids() {
+        let session = "57c7c914-ada4-4f40-9672-985f950fbb66";
+        let displayed = display_session_id(Some(session));
+        assert_eq!(displayed.len(), 8);
+        assert!(displayed.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!displayed.contains("57c7c914"));
+        assert_eq!(displayed, display_session_id(Some(session)));
     }
 
     #[test]
-    fn display_session_id_handles_atypical_ids() {
-        assert_eq!(display_session_id(Some("custom-session")), "custom-session");
+    fn display_session_id_fingerprints_atypical_ids() {
+        let displayed = display_session_id(Some("customer-production-session"));
+        assert_eq!(displayed.len(), 8);
+        assert!(displayed.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!displayed.contains("customer"));
+        assert_ne!(displayed, display_session_id(Some("another-session")));
         assert_eq!(display_session_id(Some("")), "no-session");
         assert_eq!(display_session_id(None), "no-session");
+    }
+
+    #[test]
+    fn display_capture_path_never_shows_an_absolute_path() {
+        let traffic_root = paths::state_dir().join("traffic");
+        let captured = traffic_root.join("session-abcd").join("request-1");
+        assert_eq!(
+            display_capture_path(&captured),
+            Path::new("traffic")
+                .join("session-abcd")
+                .join("request-1")
+                .to_string_lossy()
+        );
+
+        let outside = Path::new("/home/alice/private/traffic/request-2");
+        assert_eq!(
+            display_capture_path(outside),
+            Path::new("traffic").join("request-2").to_string_lossy()
+        );
     }
 
     #[test]
@@ -2234,7 +2278,7 @@ mod tests {
         assert!(sessions_text.contains("Provider"));
         assert!(sessions_text.contains("Project"));
         assert!(sessions_text.contains("example-project"));
-        assert!(sessions_text.contains("sess-1"));
+        assert!(sessions_text.contains(&display_session_id(Some("sess-1"))));
         assert!(!sessions_text.contains("No sessions"));
 
         let active = draw(120, 8, |frame| {
@@ -2275,8 +2319,14 @@ mod tests {
             render_sessions(frame, frame.area(), &sessions, 11, true)
         });
         let session_text = buffer_text(&session_buffer);
-        assert!(session_text.contains("row-0011"), "{session_text}");
-        assert!(!session_text.contains("row-0000"), "{session_text}");
+        assert!(
+            session_text.contains(&display_session_id(Some("row-0011"))),
+            "{session_text}"
+        );
+        assert!(
+            !session_text.contains(&display_session_id(Some("row-0000"))),
+            "{session_text}"
+        );
 
         let recent = (0..12)
             .map(|index| {
@@ -2406,7 +2456,10 @@ mod tests {
 
         assert!(detail_text.contains("Request detail"), "{detail_text}");
         assert!(detail_text.contains("request-1"), "{detail_text}");
-        assert!(detail_text.contains("sess-1"), "{detail_text}");
+        assert!(
+            detail_text.contains(&display_session_id(Some("sess-1"))),
+            "{detail_text}"
+        );
         assert!(
             detail_text.contains("upstream unavailable"),
             "{detail_text}"

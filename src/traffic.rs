@@ -1,17 +1,20 @@
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
+#[cfg(not(unix))]
 use crate::fsutil;
 use crate::logging::is_sensitive_payload_key;
 use crate::paths;
 
 #[derive(Debug)]
 pub struct TrafficCapture {
+    traffic_root: PathBuf,
     root: PathBuf,
     quota: Arc<TrafficQuota>,
     captured_charged_bytes: AtomicU64,
@@ -30,6 +33,8 @@ const MAX_TRAFFIC_MAX_CAPTURE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_TRAFFIC_MAX_TOTAL_FILES: u64 = 1_048_576;
 const MAX_TRAFFIC_MAX_CAPTURE_FILES: u64 = 65_536;
 const TRAFFIC_FILE_CHARGE_BYTES: u64 = 4 * 1024;
+const TRAFFIC_SESSION_FINGERPRINT_DOMAIN: &[u8] = b"ccproxy.traffic.session-path.v1\0";
+const TRAFFIC_SESSION_FINGERPRINT_BYTES: usize = 16;
 
 pub const MAX_SSE_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STREAM_CAPTURE_EVENT_BYTES: usize = 8 * 1024 * 1024;
@@ -513,9 +518,7 @@ fn create_traffic_capture_with_quota(
     }
 
     let state_root = traffic_root
-        .join(sanitize_path_part(
-            opts.session_id.as_deref().unwrap_or("no-session"),
-        ))
+        .join(traffic_session_path_part(opts.session_id.as_deref()))
         .join(format!(
             "{:06}-{}-{}",
             opts.session_seq.unwrap_or(0),
@@ -524,6 +527,7 @@ fn create_traffic_capture_with_quota(
         ));
 
     Some(TrafficCapture {
+        traffic_root,
         root: state_root,
         quota,
         captured_charged_bytes: AtomicU64::new(0),
@@ -595,7 +599,7 @@ impl TrafficCapture {
             }
         };
 
-        match write_file_bytes(path, value) {
+        match write_file_bytes(&self.traffic_root, path, value) {
             Ok(()) => reservation.commit(),
             Err(error) => {
                 reservation.retain_partial(error.residual_bytes, error.file_created);
@@ -654,6 +658,7 @@ pub(crate) fn test_capture(root: PathBuf) -> TrafficCapture {
         },
     ));
     TrafficCapture {
+        traffic_root: root.clone(),
         root,
         quota,
         captured_charged_bytes: AtomicU64::new(0),
@@ -670,27 +675,17 @@ struct TrafficWriteFailure {
     file_created: bool,
 }
 
-fn write_file_bytes(path: PathBuf, value: &[u8]) -> Result<(), TrafficWriteFailure> {
-    if let Some(parent) = path.parent() {
-        fsutil::create_dir_all_with_mode(parent, 0o700).map_err(|error| TrafficWriteFailure {
+fn write_file_bytes(
+    traffic_root: &Path,
+    path: PathBuf,
+    value: &[u8],
+) -> Result<(), TrafficWriteFailure> {
+    let mut out =
+        open_traffic_artifact(traffic_root, &path).map_err(|error| TrafficWriteFailure {
             error,
             residual_bytes: 0,
             file_created: false,
         })?;
-    }
-
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut out = options.open(&path).map_err(|error| TrafficWriteFailure {
-        error,
-        residual_bytes: 0,
-        file_created: false,
-    })?;
     let result = out.write_all(value);
     if result.is_ok() {
         return Ok(());
@@ -711,6 +706,323 @@ fn write_file_bytes(path: PathBuf, value: &[u8]) -> Result<(), TrafficWriteFailu
         residual_bytes,
         file_created: true,
     })
+}
+
+fn open_traffic_artifact(traffic_root: &Path, path: &Path) -> io::Result<File> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "traffic artifact has no parent",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "traffic artifact has no file name",
+        )
+    })?;
+    let relative_parent = parent.strip_prefix(traffic_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "traffic artifact is outside its root",
+        )
+    })?;
+    validate_normal_components(relative_parent)?;
+
+    ensure_traffic_root(traffic_root)?;
+
+    #[cfg(unix)]
+    {
+        open_traffic_artifact_unix(traffic_root, relative_parent, file_name)
+    }
+    #[cfg(not(unix))]
+    {
+        open_traffic_artifact_portable(traffic_root, relative_parent, file_name)
+    }
+}
+
+fn validate_normal_components(path: &Path) -> io::Result<()> {
+    if path
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "traffic path contains a non-normal component",
+        ))
+    }
+}
+
+fn ensure_traffic_root(traffic_root: &Path) -> io::Result<()> {
+    if let Some(parent) = traffic_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_missing_parent_directories(parent)?;
+    }
+    ensure_private_directory(traffic_root)
+}
+
+fn create_missing_parent_directories(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let created = create_private_directory(path);
+            if let Err(error) = created
+                && error.kind() != io::ErrorKind::AlreadyExists
+            {
+                return Err(error);
+            }
+            fs::symlink_metadata(path)?
+        }
+        Err(error) => return Err(error),
+    };
+    if !traffic_metadata_is_directory(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "traffic directory must be a non-symlink directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fsutil::set_mode_checked(path, 0o700)
+    }
+}
+
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
+}
+
+fn traffic_metadata_is_directory(metadata: &fs::Metadata) -> bool {
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_canonical_containment(traffic_root: &Path, parent: &Path) -> io::Result<()> {
+    let canonical_root = fs::canonicalize(traffic_root)?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    if canonical_parent.starts_with(&canonical_root) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "traffic directory resolves outside its root",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn open_traffic_artifact_unix(
+    traffic_root: &Path,
+    relative_parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fn component_name(value: &std::ffi::OsStr) -> io::Result<CString> {
+        CString::new(value.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "traffic path component contains a null byte",
+            )
+        })
+    }
+
+    let mut root_options = OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut directory = root_options.open(traffic_root)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "traffic root is not a directory",
+        ));
+    }
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    for component in relative_parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "traffic path contains a non-normal component",
+            ));
+        };
+        let component = component_name(component)?;
+        let created = unsafe { libc::mkdirat(directory.as_raw_fd(), component.as_ptr(), 0o700) };
+        if created != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let next = unsafe { File::from_raw_fd(descriptor) };
+        if unsafe { libc::fchmod(next.as_raw_fd(), 0o700) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        directory = next;
+    }
+
+    let parent = traffic_root.join(relative_parent);
+    validate_canonical_containment(traffic_root, &parent)?;
+
+    let file_name = component_name(file_name)?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(windows)]
+fn open_traffic_artifact_portable(
+    traffic_root: &Path,
+    relative_parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    let mut directory_guards = vec![open_windows_traffic_directory(traffic_root)?];
+    let mut parent = traffic_root.to_path_buf();
+    for component in relative_parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "traffic path contains a non-normal component",
+            ));
+        };
+        parent.push(component);
+        ensure_private_directory(&parent)?;
+        directory_guards.push(open_windows_traffic_directory(&parent)?);
+    }
+    validate_canonical_containment(traffic_root, &parent)?;
+
+    let path = parent.join(file_name);
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let artifact = options.open(path);
+    drop(directory_guards);
+    artifact
+}
+
+#[cfg(windows)]
+fn open_windows_traffic_directory(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let directory = options.open(path)?;
+    if !traffic_metadata_is_directory(&directory.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "traffic directory handle refers to a reparse point or non-directory",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn open_traffic_artifact_portable(
+    traffic_root: &Path,
+    relative_parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    let mut parent = traffic_root.to_path_buf();
+    for component in relative_parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "traffic path contains a non-normal component",
+            ));
+        };
+        parent.push(component);
+        ensure_private_directory(&parent)?;
+    }
+    validate_canonical_containment(traffic_root, &parent)?;
+
+    let path = parent.join(file_name);
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 fn warn_traffic_write_failure(error: &io::Error) {
@@ -888,11 +1200,29 @@ pub fn sanitize_path_part(input: &str) -> String {
         .collect();
 
     cleaned.truncate(160);
-    if cleaned.is_empty() {
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
         "unknown".to_string()
     } else {
         cleaned
     }
+}
+
+fn traffic_session_path_part(session_id: Option<&str>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(TRAFFIC_SESSION_FINGERPRINT_DOMAIN);
+    match session_id {
+        Some(session_id) => {
+            digest.update([1]);
+            digest.update((session_id.len() as u128).to_be_bytes());
+            digest.update(session_id.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    let digest = digest.finalize();
+    format!(
+        "session-{}",
+        hex::encode(&digest[..TRAFFIC_SESSION_FINGERPRINT_BYTES])
+    )
 }
 
 pub fn redact_traffic(value: &Value) -> Value {
@@ -976,7 +1306,12 @@ mod quota_tests {
     }
 
     fn capture(root: PathBuf, quota: Arc<TrafficQuota>) -> TrafficCapture {
+        let traffic_root = root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
         TrafficCapture {
+            traffic_root,
             root,
             quota,
             captured_charged_bytes: AtomicU64::new(0),
@@ -1000,6 +1335,268 @@ mod quota_tests {
         assert_eq!(redacted["nested"][0]["PaSsWoRd"], "[redacted len=14]");
         assert_eq!(redacted["nested"][0]["client_secret"], "[redacted len=13]");
         assert_eq!(redacted["nested"][0]["safe_field"], "safe-value");
+    }
+
+    #[test]
+    fn parent_directory_session_id_cannot_escape_traffic_root() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let traffic_root = state_root.join("traffic");
+        let capture = create_traffic_capture_with_quota(
+            TrafficCaptureOptions {
+                req_id: "request".to_string(),
+                session_id: Some("..".to_string()),
+                session_seq: Some(1),
+                provider: Some("codex".to_string()),
+                state_dir_override: Some(state_root.clone()),
+            },
+            traffic_root.clone(),
+            quota(
+                &traffic_root,
+                10 * TRAFFIC_FILE_CHARGE_BYTES,
+                10 * TRAFFIC_FILE_CHARGE_BYTES,
+            ),
+        )
+        .expect("capture should be created");
+
+        capture.write_bytes("artifact.bin", b"sensitive");
+
+        let canonical_traffic_root = fs::canonicalize(&traffic_root).unwrap();
+        let canonical_capture_root = fs::canonicalize(capture.root()).unwrap();
+        assert!(canonical_capture_root.starts_with(canonical_traffic_root));
+    }
+
+    #[test]
+    fn traffic_session_directories_use_stable_domain_separated_fingerprints() {
+        let first = traffic_session_path_part(Some("same-session"));
+        let repeated = traffic_session_path_part(Some("same-session"));
+        let absent = traffic_session_path_part(None);
+        let literal_fallback = traffic_session_path_part(Some("no-session"));
+
+        assert_eq!(first, repeated);
+        assert_ne!(absent, literal_fallback);
+        assert!(first.starts_with("session-"));
+        assert_eq!(first.len(), "session-".len() + 32);
+        assert!(
+            first["session-".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert!(!first.contains("same-session"));
+    }
+
+    #[test]
+    fn traffic_session_fingerprints_avoid_platform_names_and_sanitizer_collisions() {
+        let long_prefix = "a".repeat(160);
+        let first_long = format!("{long_prefix}-first");
+        let second_long = format!("{long_prefix}-second");
+        assert_eq!(
+            sanitize_path_part(&first_long),
+            sanitize_path_part(&second_long),
+            "the legacy truncated path representation collides"
+        );
+
+        let inputs = [
+            "..",
+            ".",
+            "CON",
+            "NUL",
+            "\u{7528}\u{6237}/\u{4f1a}\u{8bdd}",
+            &first_long,
+            &second_long,
+        ];
+        let fingerprints: Vec<_> = inputs
+            .iter()
+            .map(|input| traffic_session_path_part(Some(input)))
+            .collect();
+
+        assert_eq!(
+            fingerprints
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            inputs.len()
+        );
+        for (input, fingerprint) in inputs.iter().zip(&fingerprints) {
+            assert!(!fingerprint.contains(input));
+            assert!(fingerprint.strip_prefix("session-").is_some_and(
+                |value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_session_directory_symlink_cannot_escape_traffic_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let traffic_root = temp.path().join("traffic");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&traffic_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"outside-must-not-change").unwrap();
+        let session_id = "session-symlink-probe";
+        symlink(
+            &outside,
+            traffic_root.join(traffic_session_path_part(Some(session_id))),
+        )
+        .unwrap();
+        let quota = quota(
+            &traffic_root,
+            10 * TRAFFIC_FILE_CHARGE_BYTES,
+            10 * TRAFFIC_FILE_CHARGE_BYTES,
+        );
+        let capture = create_traffic_capture_with_quota(
+            TrafficCaptureOptions {
+                req_id: "request".to_string(),
+                session_id: Some(session_id.to_string()),
+                session_seq: Some(1),
+                provider: Some("codex".to_string()),
+                state_dir_override: None,
+            },
+            traffic_root,
+            quota.clone(),
+        )
+        .unwrap();
+
+        capture.write_bytes("artifact.bin", b"must-stay-inside");
+
+        assert!(capture.disabled.load(Ordering::Acquire));
+        assert_eq!(quota.used_files.load(Ordering::Acquire), 0);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-must-not-change");
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_request_directory_symlink_cannot_escape_traffic_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let traffic_root = temp.path().join("traffic");
+        let outside = temp.path().join("outside");
+        let session_id = "request-symlink-probe";
+        let session_root = traffic_root.join(traffic_session_path_part(Some(session_id)));
+        let request_name = format!("{:06}-{}-{}", 2, "codex", "request");
+        fs::create_dir_all(&session_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"outside-must-not-change").unwrap();
+        symlink(&outside, session_root.join(request_name)).unwrap();
+        let quota = quota(
+            &traffic_root,
+            10 * TRAFFIC_FILE_CHARGE_BYTES,
+            10 * TRAFFIC_FILE_CHARGE_BYTES,
+        );
+        let capture = create_traffic_capture_with_quota(
+            TrafficCaptureOptions {
+                req_id: "request".to_string(),
+                session_id: Some(session_id.to_string()),
+                session_seq: Some(2),
+                provider: Some("codex".to_string()),
+                state_dir_override: None,
+            },
+            traffic_root,
+            quota.clone(),
+        )
+        .unwrap();
+
+        capture.write_bytes("artifact.bin", b"must-stay-inside");
+
+        assert!(capture.disabled.load(Ordering::Acquire));
+        assert_eq!(quota.used_files.load(Ordering::Acquire), 0);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-must-not-change");
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_events_directory_symlink_cannot_escape_traffic_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let traffic_root = temp.path().join("traffic");
+        let outside = temp.path().join("outside");
+        let session_id = "events-symlink-probe";
+        let request_root = traffic_root
+            .join(traffic_session_path_part(Some(session_id)))
+            .join(format!("{:06}-{}-{}", 3, "codex", "request"));
+        fs::create_dir_all(&request_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"outside-must-not-change").unwrap();
+        symlink(&outside, request_root.join("events")).unwrap();
+        let quota = quota(
+            &traffic_root,
+            10 * TRAFFIC_FILE_CHARGE_BYTES,
+            10 * TRAFFIC_FILE_CHARGE_BYTES,
+        );
+        let capture = create_traffic_capture_with_quota(
+            TrafficCaptureOptions {
+                req_id: "request".to_string(),
+                session_id: Some(session_id.to_string()),
+                session_seq: Some(3),
+                provider: Some("codex".to_string()),
+                state_dir_override: None,
+            },
+            traffic_root,
+            quota.clone(),
+        )
+        .unwrap();
+
+        capture.write_json_event("event", &serde_json::json!({"safe": true}));
+
+        assert!(capture.disabled.load(Ordering::Acquire));
+        assert_eq!(quota.used_files.load(Ordering::Acquire), 0);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-must-not-change");
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_guard_blocks_rename_until_released() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("guarded");
+        let renamed = temp.path().join("renamed");
+        fs::create_dir(&directory).unwrap();
+
+        let guard = open_windows_traffic_directory(&directory).unwrap();
+        assert!(fs::rename(&directory, &renamed).is_err());
+        assert!(directory.is_dir());
+
+        drop(guard);
+        fs::rename(&directory, &renamed).unwrap();
+        assert!(renamed.is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_reparse_point_cannot_escape_traffic_root() {
+        use std::ffi::OsStr;
+        use std::os::windows::fs::symlink_dir;
+
+        let temp = TempDir::new().unwrap();
+        let traffic_root = temp.path().join("traffic");
+        let outside = temp.path().join("outside");
+        let linked = traffic_root.join("linked");
+        fs::create_dir_all(&traffic_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        if symlink_dir(&outside, &linked).is_err() {
+            return;
+        }
+
+        assert!(open_windows_traffic_directory(&linked).is_err());
+        assert!(
+            open_traffic_artifact_portable(
+                &traffic_root,
+                Path::new("linked"),
+                OsStr::new("artifact.bin"),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

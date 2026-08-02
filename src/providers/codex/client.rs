@@ -2912,6 +2912,7 @@ fn full_context_continuation(
         super::continuation::ContinuationCandidate {
             turn_id: candidate.turn_id,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: if discarded_selected_response {
                 0
@@ -2942,6 +2943,7 @@ fn prepare_local_pool_reconnect_continuation(
         // selected socket was detached before dispatch, so preserve that alternate and open a
         // fresh full-context branch instead of collapsing both candidates.
         candidate.previous_response_id = None;
+        candidate.previous_response_owner_turn_id = None;
         candidate.matched_candidate_rank = None;
         candidate.candidate_count = candidate.candidate_count.saturating_sub(1).max(1);
         candidate.input_delta = None;
@@ -2952,13 +2954,10 @@ fn prepare_local_pool_reconnect_continuation(
 }
 
 fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
-    // `response.created` now commits only a transport-level downstream Ping. Keep recovery open
-    // until an event can commit Anthropic semantic output such as text or tool use.
-    !super::events::is_ignorable_control_event(payload)
-        && !matches!(
-            payload.get("type").and_then(|value| value.as_str()),
-            Some("codex.rate_limits" | "response.created")
-        )
+    // Keep the inner auth/continuation/pool recovery gate identical to the outer live and
+    // buffered replay policy. Exact control and response lifecycle acknowledgements are neutral;
+    // semantic and unknown events fail closed even when they emit no downstream bytes.
+    super::events::validated_nonfailure_event_closes_replay_window(payload)
 }
 
 fn is_continuation_retry_error(err: &CodexError) -> bool {
@@ -3128,6 +3127,7 @@ mod tests {
         let continuation = super::super::continuation::ContinuationCandidate {
             turn_id: Some(41),
             previous_response_id: Some("resp_unreachable".into()),
+            previous_response_owner_turn_id: Some(40),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,
@@ -3186,6 +3186,7 @@ mod tests {
         let continuation = super::super::continuation::ContinuationCandidate {
             turn_id: Some(42),
             previous_response_id: Some("resp_unreachable".into()),
+            previous_response_owner_turn_id: Some(41),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,
@@ -4367,6 +4368,7 @@ mod tests {
         let continuation = super::super::continuation::ContinuationCandidate {
             turn_id: Some(7),
             previous_response_id: Some("resp_prev".into()),
+            previous_response_owner_turn_id: Some(6),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,
@@ -4391,7 +4393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_websocket_401_after_response_created_refreshes_before_semantic_output() {
+    async fn live_websocket_401_after_lifecycle_progress_refreshes_before_semantic_output() {
         use super::super::translate::request::{ResponsesContentPart, ResponsesInputItem};
         use tokio_tungstenite::tungstenite::Message;
 
@@ -4422,6 +4424,14 @@ mod tests {
             )
             .await
             .unwrap();
+            for lifecycle in [
+                r#"{"type":"response.queued","response":{"id":"resp_started","status":"queued"}}"#,
+                r#"{"type":"response.in_progress","response":{"id":"resp_started","status":"in_progress"}}"#,
+            ] {
+                futures_util::SinkExt::send(&mut websocket, Message::Text(lifecycle.to_string()))
+                    .await
+                    .unwrap();
+            }
             futures_util::SinkExt::send(
                 &mut websocket,
                 Message::Text(
@@ -4452,89 +4462,94 @@ mod tests {
             }
             drop(websocket);
 
-            if !event_closes_live_retry_window(&serde_json::json!({
-                "type": "response.created"
-            })) {
-                let (mut oauth, _) = listener.accept().await.unwrap();
-                oauth_hits += 1;
-                let refresh_request = read_complete_http_request(&mut oauth).await;
-                assert!(refresh_request.starts_with("POST /oauth/token "));
-                assert!(refresh_request.contains("refresh_token=r0"));
-                write_test_http_response(
-                    &mut oauth,
-                    "200 OK",
-                    "application/json",
-                    "",
-                    br#"{"access_token":"a1","refresh_token":"r1","expires_in":3600}"#,
-                )
-                .await;
+            for lifecycle in [
+                "response.created",
+                "response.queued",
+                "response.in_progress",
+            ] {
+                assert!(!event_closes_live_retry_window(&serde_json::json!({
+                    "type": lifecycle
+                })));
+            }
+            let (mut oauth, _) = listener.accept().await.unwrap();
+            oauth_hits += 1;
+            let refresh_request = read_complete_http_request(&mut oauth).await;
+            assert!(refresh_request.starts_with("POST /oauth/token "));
+            assert!(refresh_request.contains("refresh_token=r0"));
+            write_test_http_response(
+                &mut oauth,
+                "200 OK",
+                "application/json",
+                "",
+                br#"{"access_token":"a1","refresh_token":"r1","expires_in":3600}"#,
+            )
+            .await;
 
-                let (stream, _) = listener.accept().await.unwrap();
-                model_hits += 1;
-                let mut retried_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let retried = futures_util::StreamExt::next(&mut retried_websocket)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .into_text()
-                    .unwrap();
-                assert!(!retried.contains("previous_response_id"));
-                assert!(retried.contains("full context"));
-                assert!(!retried.contains("delta only"));
-                futures_util::SinkExt::send(
-                    &mut retried_websocket,
-                    Message::Text(
-                        r#"{"type":"response.completed","response":{"id":"resp_ok","usage":{}}}"#
-                            .into(),
-                    ),
-                )
+            let (stream, _) = listener.accept().await.unwrap();
+            model_hits += 1;
+            let mut retried_websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let retried = futures_util::StreamExt::next(&mut retried_websocket)
                 .await
+                .unwrap()
+                .unwrap()
+                .into_text()
                 .unwrap();
-                let barrier_deadline = tokio::time::sleep(Duration::from_secs(4));
-                tokio::pin!(barrier_deadline);
-                let mut saw_barrier_ping = false;
-                loop {
-                    tokio::select! {
-                        accepted = listener.accept() => {
-                            accepted.unwrap();
-                            panic!("response.created followed by 401 must not trigger an extra replay");
-                        }
-                        frame = futures_util::StreamExt::next(&mut retried_websocket) => {
-                            match frame {
-                                Some(Ok(Message::Ping(payload))) => {
-                                    futures_util::SinkExt::send(
-                                        &mut retried_websocket,
-                                        Message::Pong(payload),
-                                    )
-                                    .await
-                                    .unwrap();
-                                    saw_barrier_ping = true;
-                                    barrier_deadline.as_mut().reset(
-                                        tokio::time::Instant::now() + Duration::from_millis(300),
-                                    );
-                                }
-                                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
-                                Some(Ok(other)) => {
-                                    panic!("unexpected frame after terminal response: {other:?}");
-                                }
-                                Some(Err(_)) | None if saw_barrier_ping => break,
-                                Some(Err(error)) => panic!("terminal barrier stream failed: {error}"),
-                                None => panic!("terminal barrier connection closed"),
+            assert!(!retried.contains("previous_response_id"));
+            assert!(retried.contains("full context"));
+            assert!(!retried.contains("delta only"));
+            futures_util::SinkExt::send(
+                &mut retried_websocket,
+                Message::Text(
+                    r#"{"type":"response.completed","response":{"id":"resp_ok","usage":{}}}"#
+                        .into(),
+                ),
+            )
+            .await
+            .unwrap();
+            let barrier_deadline = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(barrier_deadline);
+            let mut saw_barrier_ping = false;
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        accepted.unwrap();
+                        panic!("lifecycle progress followed by 401 must not trigger an extra replay");
+                    }
+                    frame = futures_util::StreamExt::next(&mut retried_websocket) => {
+                        match frame {
+                            Some(Ok(Message::Ping(payload))) => {
+                                futures_util::SinkExt::send(
+                                    &mut retried_websocket,
+                                    Message::Pong(payload),
+                                )
+                                .await
+                                .unwrap();
+                                saw_barrier_ping = true;
+                                barrier_deadline.as_mut().reset(
+                                    tokio::time::Instant::now() + Duration::from_millis(300),
+                                );
                             }
-                        }
-                        () = &mut barrier_deadline => {
-                            assert!(saw_barrier_ping, "terminal ordering barrier Ping should arrive");
-                            break;
+                            Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                            Some(Ok(other)) => {
+                                panic!("unexpected frame after terminal response: {other:?}");
+                            }
+                            Some(Err(_)) | None if saw_barrier_ping => break,
+                            Some(Err(error)) => panic!("terminal barrier stream failed: {error}"),
+                            None => panic!("terminal barrier connection closed"),
                         }
                     }
+                    () = &mut barrier_deadline => {
+                        assert!(saw_barrier_ping, "terminal ordering barrier Ping should arrive");
+                        break;
+                    }
                 }
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
-                        .await
-                        .is_err(),
-                    "response.created followed by 401 must not trigger an extra replay"
-                );
             }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err(),
+                "lifecycle progress followed by 401 must not trigger an extra replay"
+            );
             (model_hits, oauth_hits)
         });
 
@@ -4549,6 +4564,7 @@ mod tests {
         let continuation = super::super::continuation::ContinuationCandidate {
             turn_id: Some(7),
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 0,
             response_affine_fork: false,
@@ -4569,21 +4585,28 @@ mod tests {
             },
         ));
 
+        let budget = CodexDispatchBudget::new();
         let mut events = client
             .stream_codex_websocket_events(
                 &request,
                 &http_test_context(),
                 Some(&continuation),
-                CodexDispatchBudget::new(),
+                budget.clone(),
             )
             .await
             .unwrap();
-        let created = tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await
-            .expect("response.created should be forwarded as the acceptance barrier")
-            .unwrap()
-            .unwrap();
-        assert_eq!(created["type"], "response.created");
+        for expected in [
+            "response.created",
+            "response.queued",
+            "response.in_progress",
+        ] {
+            let lifecycle = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("lifecycle progress should be forwarded before auth recovery")
+                .unwrap()
+                .unwrap();
+            assert_eq!(lifecycle["type"], expected);
+        }
 
         let completed = tokio::time::timeout(Duration::from_secs(2), events.recv())
             .await
@@ -4593,6 +4616,9 @@ mod tests {
 
         assert_eq!(completed["type"], "response.completed");
         assert_eq!(server.await.unwrap(), (2, 1));
+        assert_eq!(budget.snapshot().model, 2);
+        assert_eq!(budget.snapshot().oauth, 1);
+        assert_eq!(budget.snapshot().total, 3);
     }
 
     #[tokio::test]
@@ -4770,6 +4796,7 @@ mod tests {
         let continuation = super::super::continuation::ContinuationCandidate {
             turn_id: Some(8),
             previous_response_id: Some("resp_prev".into()),
+            previous_response_owner_turn_id: Some(7),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,
@@ -4989,6 +5016,50 @@ mod tests {
             server.await.unwrap(),
             1,
             "completed response must not replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_generation_before_retryable_failure_never_redispatches() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let generated_then_failed = b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_partial\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_partial\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"status\":503,\"message\":\"busy after generation\",\"retry_after\":0}}}\n\n".to_vec();
+        let expected_body = generated_then_failed.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_complete_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /responses "));
+            write_test_http_response(
+                &mut stream,
+                "200 OK",
+                "text/event-stream",
+                "",
+                &generated_then_failed,
+            )
+            .await;
+
+            // `retry_after: 0` selects the policy's deterministic 100 ms minimum. A generous
+            // window makes this a physical-dispatch assertion rather than a backoff race.
+            tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, expected_body);
+        assert!(
+            !server.await.unwrap(),
+            "semantic generation followed by an explicit failure must not dispatch twice"
         );
     }
 
@@ -6760,6 +6831,7 @@ mod tests {
         let continuation = super::super::continuation::ContinuationCandidate {
             turn_id: Some(7),
             previous_response_id: Some("resp_previous".to_string()),
+            previous_response_owner_turn_id: Some(6),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,
@@ -6887,6 +6959,7 @@ mod tests {
         let disabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 0,
             response_affine_fork: false,
@@ -6897,6 +6970,7 @@ mod tests {
         let first_enabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 0,
             response_affine_fork: false,
@@ -6907,6 +6981,7 @@ mod tests {
         let append = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: Some("resp_1".into()),
+            previous_response_owner_turn_id: Some(1),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,
@@ -6940,6 +7015,7 @@ mod tests {
         let missing_state = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 0,
             response_affine_fork: false,
@@ -6950,6 +7026,7 @@ mod tests {
         let disabled = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 0,
             response_affine_fork: false,
@@ -6960,6 +7037,7 @@ mod tests {
         let prompt_changed = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 0,
             response_affine_fork: false,
@@ -6970,6 +7048,7 @@ mod tests {
         let not_append_only = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 1,
             response_affine_fork: false,
@@ -7300,8 +7379,17 @@ mod tests {
         assert!(!event_closes_live_retry_window(&serde_json::json!({
             "type": "response.created"
         })));
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.queued"
+        })));
+        assert!(!event_closes_live_retry_window(&serde_json::json!({
+            "type": "response.in_progress"
+        })));
         assert!(event_closes_live_retry_window(&serde_json::json!({
             "type": "response.metadata.v2"
+        })));
+        assert!(event_closes_live_retry_window(&serde_json::json!({
+            "value": "missing type"
         })));
         assert!(event_closes_live_retry_window(&serde_json::json!({
             "type": "response.output_text.delta",
@@ -7318,6 +7406,7 @@ mod tests {
         let append = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: Some("resp_1".into()),
+            previous_response_owner_turn_id: Some(1),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,
@@ -7328,6 +7417,7 @@ mod tests {
         let initial = super::super::continuation::ContinuationCandidate {
             turn_id: None,
             previous_response_id: None,
+            previous_response_owner_turn_id: None,
             matched_candidate_rank: None,
             candidate_count: 0,
             response_affine_fork: false,
@@ -7391,6 +7481,7 @@ mod tests {
         let mut fork = Some(super::super::continuation::ContinuationCandidate {
             turn_id: Some(42),
             previous_response_id: Some("resp_unavailable_branch".to_string()),
+            previous_response_owner_turn_id: Some(41),
             matched_candidate_rank: Some(0),
             candidate_count: 2,
             response_affine_fork: true,
@@ -7401,6 +7492,7 @@ mod tests {
         prepare_local_pool_reconnect_continuation(&mut fork, None);
         let fork = fork.unwrap();
         assert!(fork.previous_response_id.is_none());
+        assert_eq!(fork.previous_response_owner_turn_id, None);
         assert_eq!(fork.matched_candidate_rank, None);
         assert_eq!(fork.candidate_count, 1);
         assert!(fork.response_affine_fork);
@@ -7410,6 +7502,7 @@ mod tests {
         let mut ordinary = Some(super::super::continuation::ContinuationCandidate {
             turn_id: Some(43),
             previous_response_id: Some("resp_ordinary".to_string()),
+            previous_response_owner_turn_id: Some(42),
             matched_candidate_rank: Some(0),
             candidate_count: 1,
             response_affine_fork: false,

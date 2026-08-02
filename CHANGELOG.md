@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Close Codex buffered and live whole-request replay as soon as a validated semantic response
+  event advances generation, including events that temporarily render no Anthropic bytes, while
+  keeping `response.created`, `response.in_progress`, and `response.queued` lifecycle frames
+  eligible for pre-generation recovery.
+- Bind Codex continuation checkout to the complete `(response_id, owner_turn_id)` WebSocket
+  affinity and preserve an independently reachable hydration fallback when a pending new branch
+  is evicted before publication.
+- Keep traffic captures under their configured root with opaque session-directory fingerprints
+  and no-follow directory traversal, and fail closed on corrupt or unreadable primary credentials
+  instead of silently switching to a legacy file or Keychain identity.
+- Replace dynamic diagnostic tool names, TUI session IDs, authentication-persistence log paths,
+  and absolute capture paths with bounded categories, short fingerprints, or relative artifact
+  names.
+- Treat silent Grok message, reasoning, and content lifecycle events as irreversible generation
+  barriers, and test the declared Rust 1.88 MSRV in both pull-request and release workflows.
 - Include translated structured-output schemas in Codex and Grok
   `/count_tokens` estimates so large schemas can trigger Claude Code compaction
   before the provider rejects the request.

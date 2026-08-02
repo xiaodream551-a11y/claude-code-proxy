@@ -220,12 +220,7 @@ fn isolate_state_dir(state_dir: &Path) -> EnvGuard {
 }
 
 fn traffic_files(state_dir: &Path) -> Vec<PathBuf> {
-    collect_files(
-        &state_dir
-            .join("claude-code-proxy")
-            .join("traffic")
-            .join("smoke-session"),
-    )
+    collect_files(&state_dir.join("claude-code-proxy").join("traffic"))
 }
 
 fn traffic_file<'a>(files: &'a [PathBuf], suffix: &str) -> &'a Path {

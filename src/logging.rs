@@ -420,6 +420,30 @@ fn warn_log_permission_error(emitted: &AtomicBool, target: &str, path: &Path, er
     }
 }
 
+/// Return a bounded error category suitable for ordinary structured logs.
+///
+/// Persistence errors can contain credential paths or backend-specific text in their Display
+/// representation. Callers that only need an operational category should log this value instead
+/// of the raw error.
+pub fn safe_persistence_error_kind(error: &anyhow::Error) -> &'static str {
+    if let Some(error) = error.downcast_ref::<io::Error>() {
+        return match error.kind() {
+            io::ErrorKind::NotFound => "not_found",
+            io::ErrorKind::PermissionDenied => "permission_denied",
+            io::ErrorKind::AlreadyExists => "already_exists",
+            io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => "invalid_data",
+            io::ErrorKind::WriteZero => "write_zero",
+            io::ErrorKind::OutOfMemory => "out_of_memory",
+            _ => "io",
+        };
+    }
+    if error.downcast_ref::<serde_json::Error>().is_some() {
+        "serialization"
+    } else {
+        "storage"
+    }
+}
+
 fn now_iso8601() -> String {
     let now = time::OffsetDateTime::now_utc();
     let format = time::format_description::parse_borrowed::<3>(
@@ -582,6 +606,24 @@ mod tests {
             assert!(text.contains("…["));
             assert!(serde_json::to_string(&text).is_ok());
         }
+    }
+
+    #[test]
+    fn persistence_errors_are_reduced_to_bounded_categories() {
+        let permission = anyhow::Error::from(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "/home/alice/private/auth.json",
+        ));
+        let malformed =
+            anyhow::Error::from(serde_json::from_str::<serde_json::Value>("{").unwrap_err());
+        let backend = anyhow::anyhow!("Keychain failed at /Users/alice/Library/Keychains");
+
+        assert_eq!(
+            safe_persistence_error_kind(&permission),
+            "permission_denied"
+        );
+        assert_eq!(safe_persistence_error_kind(&malformed), "serialization");
+        assert_eq!(safe_persistence_error_kind(&backend), "storage");
     }
 
     #[test]

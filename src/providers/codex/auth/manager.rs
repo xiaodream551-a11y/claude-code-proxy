@@ -381,10 +381,13 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
                 crate::logging::create_logger("codex").warn(
                     "auth_persistence_degraded",
                     Some(serde_json::Map::from_iter([
-                        ("message".to_string(), serde_json::json!(error.to_string())),
                         (
-                            "authPath".to_string(),
-                            serde_json::json!(self.store.auth_path()),
+                            "stage".to_string(),
+                            serde_json::json!("save_rotated_credentials"),
+                        ),
+                        (
+                            "errorKind".to_string(),
+                            serde_json::json!(crate::logging::safe_persistence_error_kind(&error)),
                         ),
                     ])),
                 );

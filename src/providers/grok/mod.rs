@@ -817,6 +817,12 @@ fn grok_event_starts_generation(value: &serde_json::Value) -> bool {
     match event_type {
         "response.reasoning_summary_text.delta"
         | "response.reasoning_text.delta"
+        | "response.reasoning_summary_part.added"
+        | "response.reasoning_summary_part.done"
+        | "response.reasoning_summary_text.done"
+        | "response.reasoning_text.done"
+        | "response.content_part.added"
+        | "response.content_part.done"
         | "response.output_text.delta"
         | "response.output_text.done"
         | "response.output_text.annotation.added"
@@ -839,7 +845,12 @@ fn grok_event_starts_generation(value: &serde_json::Value) -> bool {
             .is_some_and(|kind| {
                 matches!(
                     kind,
-                    "function_call" | "custom_tool_call" | "web_search_call" | "x_search_call"
+                    "message"
+                        | "reasoning"
+                        | "function_call"
+                        | "custom_tool_call"
+                        | "web_search_call"
+                        | "x_search_call"
                 )
             }),
         _ => false,
@@ -1717,10 +1728,21 @@ mod tests {
     fn generation_classifier_ignores_transport_and_failure_envelopes() {
         for value in [
             serde_json::json!({"type":"response.reasoning_text.delta","delta":"reason"}),
+            serde_json::json!({"type":"response.reasoning_text.done"}),
+            serde_json::json!({"type":"response.reasoning_summary_text.done"}),
+            serde_json::json!({"type":"response.reasoning_summary_part.added"}),
+            serde_json::json!({"type":"response.reasoning_summary_part.done"}),
+            serde_json::json!({"type":"response.output_item.added","item":{"type":"reasoning"}}),
+            serde_json::json!({"type":"response.output_item.done","item":{"type":"message"}}),
+            serde_json::json!({"type":"response.content_part.added"}),
+            serde_json::json!({"type":"response.content_part.done"}),
             serde_json::json!({"type":"response.output_text.delta","delta":"answer"}),
+            serde_json::json!({"type":"response.output_text.done","text":"answer"}),
             serde_json::json!({"type":"response.output_text.annotation.added","annotation":{"type":"url_citation"}}),
             serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call"}}),
+            serde_json::json!({"type":"response.function_call_arguments.done","arguments":"{}"}),
             serde_json::json!({"type":"response.completed","response":{}}),
+            serde_json::json!({"type":"response.incomplete","response":{}}),
         ] {
             assert!(grok_event_starts_generation(&value), "{value}");
         }
@@ -3676,6 +3698,100 @@ mod tests {
         assert!(body.contains("capacity after generation"), "{body}");
         assert!(!body.contains("partial output"), "{body}");
         assert!(!body.contains("incorrect replay"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn same_batch_silent_generation_events_and_retryable_failure_never_rebuild() {
+        for (label, event) in [
+            (
+                "message_item",
+                r#"{"type":"response.output_item.added","item":{"type":"message"}}"#,
+            ),
+            (
+                "reasoning_part",
+                r#"{"type":"response.reasoning_summary_part.added"}"#,
+            ),
+            ("content_part", r#"{"type":"response.content_part.added"}"#),
+            (
+                "reasoning_done",
+                r#"{"type":"response.reasoning_text.done"}"#,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let Ok(Ok((mut stream, _))) =
+                    tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+                else {
+                    return false;
+                };
+                let _ = read_complete_http_request(&mut stream).await;
+                let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"incorrect replay\"}\n\ndata: {\"type\":\"response.output_text.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{}}}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+                true
+            });
+
+            let (client, _temp) = test_client(
+                &format!("http://{addr}/v1"),
+                GrokTimeouts {
+                    connect_ms: 500,
+                    header_ms: 500,
+                    first_byte_ms: 500,
+                    body_idle_ms: 500,
+                },
+            )
+            .await;
+            let deadline = GrokRequestDeadline::after(Duration::from_secs(2));
+            let retry = Arc::new(Mutex::new(GrokRetryState::with_deadline(deadline)));
+            let retry_observer = retry.clone();
+            let reconnect = Some(GrokReconnectContext::new(
+                Arc::new(client),
+                prepared_request(false),
+                None,
+                retry,
+                1,
+            ));
+            let upstream = futures_util::stream::iter(vec![Ok(Bytes::from(format!(
+                "data: {event}\n\ndata: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"type\":\"overloaded_error\",\"message\":\"capacity after silent generation\"}},\"retry_after\":0}}}}\n\n"
+            )))]);
+
+            let body = stream_body_with_policy(
+                upstream,
+                format!("msg_silent_generation_barrier_{label}"),
+                "grok-4.5".into(),
+                None,
+                format!("req_silent_generation_barrier_{label}"),
+                None,
+                reconnect,
+                deadline,
+                Duration::from_millis(20),
+            )
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+            let body = String::from_utf8_lossy(&body);
+
+            assert_eq!(retry_observer.lock().await.wire_attempt(), 0, "{label}");
+            assert_eq!(
+                retry_observer.lock().await.transient_failures(),
+                0,
+                "{label}"
+            );
+            assert!(!server.await.unwrap(), "{label} must close replay material");
+            assert!(body.contains("event: error"), "{label}: {body}");
+            assert!(
+                body.contains("capacity after silent generation"),
+                "{label}: {body}"
+            );
+            assert!(!body.contains("incorrect replay"), "{label}: {body}");
+        }
     }
 
     #[tokio::test]
