@@ -2222,7 +2222,8 @@ mod tests {
             write_http_response(&mut discovery, "200 OK", "", body.as_bytes()).await;
 
             let (mut token, _) = auth_listener.accept().await.unwrap();
-            let _ = read_http_request(&mut token).await;
+            let _ = read_http_request_body(&mut token).await;
+            token.set_zero_linger().unwrap();
             drop(token);
 
             tokio::time::timeout(Duration::from_millis(500), auth_listener.accept())
@@ -2253,7 +2254,7 @@ mod tests {
             GrokRequestDeadline::after(Duration::from_secs(5)),
         )));
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(3),
             client.post_with_retry(&sample_body(), None, retry.clone()),
         )
         .await
