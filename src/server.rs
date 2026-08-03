@@ -28,6 +28,7 @@ use std::fs::{self, File};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -48,7 +49,7 @@ const ERROR_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_RESPONSE_BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_CAPTURE_FILES: usize = 128;
 const MAX_ERROR_REDACTION_DEPTH: u16 = 100;
-const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS: u64 = 600_000;
 const COMPACTION_MODEL_HEADER: &str = "x-ccproxy-compaction-model";
 const CLAUDE_CODE_SESSION_ID_HEADER: &str = "x-claude-code-session-id";
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
@@ -83,6 +84,7 @@ pub struct ServerLimits {
     pub max_concurrent_per_session: usize,
     pub request_body_idle_timeout: Duration,
     pub request_body_total_timeout: Duration,
+    pub graceful_shutdown_timeout: Duration,
 }
 
 impl ServerLimits {
@@ -109,6 +111,9 @@ impl ServerLimits {
             request_body_total_timeout: Duration::from_millis(
                 crate::config::request_body_total_timeout_ms(DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS),
             ),
+            graceful_shutdown_timeout: Duration::from_millis(
+                crate::config::graceful_shutdown_timeout_ms(DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS),
+            ),
         }
     }
 }
@@ -125,6 +130,7 @@ impl Default for ServerLimits {
             request_body_total_timeout: Duration::from_millis(
                 DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS,
             ),
+            graceful_shutdown_timeout: Duration::from_millis(DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MS),
         }
     }
 }
@@ -208,7 +214,9 @@ pub async fn serve_listener(
     monitor: Option<MonitorHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    serve_listener_with_timeout(listener, monitor, shutdown, GRACEFUL_SHUTDOWN_TIMEOUT).await
+    let limits = ServerLimits::configured();
+    let graceful_timeout = limits.graceful_shutdown_timeout;
+    serve_listener_with_timeout(listener, monitor, shutdown, graceful_timeout, limits).await
 }
 
 async fn serve_listener_with_timeout(
@@ -216,6 +224,7 @@ async fn serve_listener_with_timeout(
     monitor: Option<MonitorHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
     graceful_timeout: Duration,
+    limits: ServerLimits,
 ) -> anyhow::Result<()> {
     initialize_process_identity();
     let local_addr = listener.local_addr()?;
@@ -223,16 +232,33 @@ async fn serve_listener_with_timeout(
         "server listening",
         Some(server_listening_fields(local_addr)),
     );
-    let limits = ServerLimits::configured();
     initialize_config_fingerprint(
         &limits,
         Some(&local_addr.ip().to_string()),
         Some(local_addr.port()),
     );
-    let app = app_with_limits(Arc::new(Registry::with_default_alias()), monitor, limits);
+    let (app, state) =
+        app_with_limits_and_state(Arc::new(Registry::with_default_alias()), monitor, limits);
     let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+    let shutdown_observed = Arc::new(AtomicBool::new(false));
+    let shutdown_observed_by_server = Arc::clone(&shutdown_observed);
+    let shutdown_state = Arc::clone(&state);
     let graceful_shutdown = async move {
         shutdown.await;
+        shutdown_observed_by_server.store(true, Ordering::Release);
+        create_logger("server").info(
+            "server_shutdown_started",
+            Some(Map::from_iter([
+                (
+                    "activeRequests".to_string(),
+                    json!(shutdown_state.active_requests()),
+                ),
+                (
+                    "gracefulTimeoutMs".to_string(),
+                    json!(graceful_timeout.as_millis()),
+                ),
+            ])),
+        );
         let _ = shutdown_started_tx.send(());
     };
     let server = axum::serve(listener, app).with_graceful_shutdown(graceful_shutdown);
@@ -242,6 +268,15 @@ async fn serve_listener_with_timeout(
         graceful_timeout,
     )
     .await;
+    if result.is_ok() && shutdown_observed.load(Ordering::Acquire) {
+        create_logger("server").info(
+            "server_shutdown_completed",
+            Some(Map::from_iter([(
+                "activeRequests".to_string(),
+                json!(state.active_requests()),
+            )])),
+        );
+    }
     let _ = crate::logging::flush(Duration::from_secs(2));
     result
 }
@@ -273,10 +308,19 @@ async fn await_server_with_grace_timeout(
     tokio::select! {
         biased;
         result = &mut server => result.map_err(anyhow::Error::from),
-        () = &mut timeout_after_shutdown => Err(anyhow::anyhow!(
-            "server graceful shutdown exceeded {} ms",
-            graceful_timeout.as_millis()
-        )),
+        () = &mut timeout_after_shutdown => {
+            create_logger("server").warn(
+                "server_shutdown_forced",
+                Some(Map::from_iter([(
+                    "gracefulTimeoutMs".to_string(),
+                    json!(graceful_timeout.as_millis()),
+                )])),
+            );
+            Err(anyhow::anyhow!(
+                "server graceful shutdown exceeded {} ms",
+                graceful_timeout.as_millis()
+            ))
+        },
     }
 }
 
@@ -293,6 +337,14 @@ pub fn app_with_limits(
     monitor: Option<MonitorHandle>,
     limits: ServerLimits,
 ) -> Router {
+    app_with_limits_and_state(registry, monitor, limits).0
+}
+
+fn app_with_limits_and_state(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    limits: ServerLimits,
+) -> (Router, Arc<AppState>) {
     initialize_process_identity();
     initialize_config_fingerprint(&limits, None, None);
     let provider_construction_config_generation = registry.construction_config_generation();
@@ -312,14 +364,15 @@ pub fn app_with_limits(
             provider_construction_config_snapshot_stable,
         ),
     });
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/version", get(version))
         .route("/v1/models", get(models))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .fallback(fallback_handler)
-        .with_state(state)
+        .with_state(Arc::clone(&state));
+    (app, state)
 }
 
 struct AppState {
@@ -413,6 +466,10 @@ impl AdmissionState {
     fn acquire(&self, semaphore: Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
         semaphore.try_acquire_owned().ok()
     }
+
+    fn active_requests(&self, maximum: usize) -> usize {
+        maximum.saturating_sub(self.global.available_permits())
+    }
 }
 
 #[derive(Default)]
@@ -433,6 +490,13 @@ enum ProviderRouteSelection {
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
+}
+
+impl AppState {
+    fn active_requests(&self) -> usize {
+        self.admission
+            .active_requests(self.limits.max_concurrent_requests)
+    }
 }
 
 async fn version(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -467,12 +531,16 @@ async fn version(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> 
             ])),
         );
     }
-    Json(version_info_with_config_generations(
+    let mut info = version_info_with_config_generations(
         state.provider_construction_config_generation,
         state.provider_construction_config_generation_end,
         state.provider_construction_config_snapshot_stable,
         current_config_generation,
-    ))
+    );
+    info.as_object_mut()
+        .expect("version metadata is a JSON object")
+        .insert("activeRequests".to_string(), json!(state.active_requests()));
+    Json(info)
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -598,6 +666,10 @@ fn effective_config_fingerprint(limits: &ServerLimits, bind_address: &str, port:
         format!(
             "requestBodyTotalTimeoutMs={}",
             limits.request_body_total_timeout.as_millis()
+        ),
+        format!(
+            "gracefulShutdownTimeoutMs={}",
+            limits.graceful_shutdown_timeout.as_millis()
         ),
     ];
     hex::encode(Sha256::digest(values.join("\n").as_bytes()))
@@ -2924,7 +2996,7 @@ async fn fallback_handler(method: axum::http::Method, uri: axum::http::Uri) -> R
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
 
     #[test]
     fn server_listening_log_keeps_only_bounded_network_metadata() {
@@ -4503,6 +4575,13 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
             effective_config_fingerprint(&first, "127.0.0.1", 18765),
             effective_config_fingerprint(&second, "127.0.0.1", 18765)
         );
+
+        let mut third = first.clone();
+        third.graceful_shutdown_timeout += Duration::from_millis(1);
+        assert_ne!(
+            effective_config_fingerprint(&first, "127.0.0.1", 18765),
+            effective_config_fingerprint(&third, "127.0.0.1", 18765)
+        );
     }
 
     #[tokio::test]
@@ -4533,6 +4612,88 @@ data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_an_existing_stream_before_server_exit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let app = Router::new().route(
+            "/stream",
+            get(move || {
+                let release_rx = Arc::clone(&release_rx);
+                async move {
+                    let release_rx = release_rx
+                        .lock()
+                        .await
+                        .take()
+                        .expect("the test stream is requested once");
+                    Body::from_stream(stream::unfold(
+                        (0_u8, Some(release_rx)),
+                        |(phase, mut release_rx)| async move {
+                            match phase {
+                                0 => Some((
+                                    Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                                        b"first",
+                                    )),
+                                    (1, release_rx),
+                                )),
+                                1 => {
+                                    let _ = release_rx
+                                        .take()
+                                        .expect("release receiver remains available")
+                                        .await;
+                                    Some((Ok(Bytes::from_static(b"second")), (2, release_rx)))
+                                }
+                                _ => None,
+                            }
+                        },
+                    ))
+                }
+            }),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_observed_tx, shutdown_observed_rx) = tokio::sync::oneshot::channel();
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+            let _ = shutdown_started_tx.send(());
+            let _ = shutdown_observed_tx.send(());
+        });
+        let server_task = tokio::spawn(await_server_with_grace_timeout(
+            server.into_future(),
+            shutdown_started_rx,
+            Duration::from_secs(1),
+        ));
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let mut body = response.bytes_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"first")
+        );
+
+        shutdown_tx.send(()).unwrap();
+        shutdown_observed_rx.await.unwrap();
+        assert!(
+            !server_task.is_finished(),
+            "graceful shutdown must wait for the active response body"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"second")
+        );
+        assert!(body.next().await.is_none());
+        server_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

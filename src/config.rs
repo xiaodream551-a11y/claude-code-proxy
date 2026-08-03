@@ -77,6 +77,8 @@ struct ServerResourceConfig {
     pub request_body_idle_timeout_ms: Option<u64>,
     #[serde(rename = "requestBodyTotalTimeoutMs")]
     pub request_body_total_timeout_ms: Option<u64>,
+    #[serde(rename = "gracefulShutdownTimeoutMs")]
+    pub graceful_shutdown_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -564,6 +566,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS") {
         out.push("CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS (env)".to_string());
     }
+    if env.contains_key("CCP_GRACEFUL_SHUTDOWN_TIMEOUT_MS") {
+        out.push("CCP_GRACEFUL_SHUTDOWN_TIMEOUT_MS (env)".to_string());
+    }
     if env.contains_key("CCP_ALLOW_REMOTE_UNAUTHENTICATED") {
         out.push("CCP_ALLOW_REMOTE_UNAUTHENTICATED (env)".to_string());
     }
@@ -724,6 +729,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             if let Some(value) = server.request_body_total_timeout_ms {
                 out.push(format!("server.requestBodyTotalTimeoutMs: {value}"));
             }
+            if let Some(value) = server.graceful_shutdown_timeout_ms {
+                out.push(format!("server.gracefulShutdownTimeoutMs: {value}"));
+            }
         }
     }
     out
@@ -841,6 +849,15 @@ pub fn request_body_total_timeout_ms(default: u64) -> u64 {
         |server| server.request_body_total_timeout_ms,
         default,
         300_000,
+    )
+}
+
+pub fn graceful_shutdown_timeout_ms(default: u64) -> u64 {
+    server_positive_u64(
+        "CCP_GRACEFUL_SHUTDOWN_TIMEOUT_MS",
+        |server| server.graceful_shutdown_timeout_ms,
+        default,
+        60 * 60 * 1_000,
     )
 }
 
@@ -1422,6 +1439,7 @@ mod tests {
         "CCP_MAX_CONCURRENT_PER_SESSION",
         "CCP_REQUEST_BODY_IDLE_TIMEOUT_MS",
         "CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS",
+        "CCP_GRACEFUL_SHUTDOWN_TIMEOUT_MS",
         "PORT",
     ];
 
@@ -2479,7 +2497,7 @@ mod tests {
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
-            r#"{"server":{"maxRequestBodyBytes":1048576,"maxBufferedRequestBytes":8388608,"maxConcurrentRequests":64,"maxConcurrentPerProvider":32,"maxConcurrentPerSession":8,"requestBodyIdleTimeoutMs":1500,"requestBodyTotalTimeoutMs":5000}}"#,
+            r#"{"server":{"maxRequestBodyBytes":1048576,"maxBufferedRequestBytes":8388608,"maxConcurrentRequests":64,"maxConcurrentPerProvider":32,"maxConcurrentPerSession":8,"requestBodyIdleTimeoutMs":1500,"requestBodyTotalTimeoutMs":5000,"gracefulShutdownTimeoutMs":600000}}"#,
         )
         .unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -2491,10 +2509,13 @@ mod tests {
         assert_eq!(max_concurrent_per_session(1), 8);
         assert_eq!(request_body_idle_timeout_ms(1), 1_500);
         assert_eq!(request_body_total_timeout_ms(1), 5_000);
+        assert_eq!(graceful_shutdown_timeout_ms(1), 600_000);
 
         let _global = EnvGuard::set("CCP_MAX_CONCURRENT_REQUESTS", "999999");
         let _wait = EnvGuard::set("CCP_REQUEST_BODY_IDLE_TIMEOUT_MS", "999999");
+        let _shutdown = EnvGuard::set("CCP_GRACEFUL_SHUTDOWN_TIMEOUT_MS", "999999999");
         assert_eq!(max_concurrent_requests(1), 4096);
         assert_eq!(request_body_idle_timeout_ms(1), 120_000);
+        assert_eq!(graceful_shutdown_timeout_ms(1), 3_600_000);
     }
 }

@@ -888,6 +888,8 @@ The proxy speaks enough of the Anthropic API for Claude Code:
   retryable HTTP 503 overload.
 - `GET /v1/models`: the active Codex and Grok model catalog
 - `GET /healthz`: liveness check
+- `GET /version`: build/config identity plus the current admitted
+  `activeRequests` count, which can be polled before a planned restart
 - `GET /version`: build SHA, binary SHA-256, PID, executable path, startup time,
   a non-secret configuration fingerprint, current/provider-construction config
   generations, and the live-versus-restart-required reload contract
@@ -923,7 +925,8 @@ or delete the old file. `CCP_CONFIG_DIR` disables the fallback.
     "maxConcurrentPerProvider": 48,
     "maxConcurrentPerSession": 24,
     "requestBodyIdleTimeoutMs": 5000,
-    "requestBodyTotalTimeoutMs": 30000
+    "requestBodyTotalTimeoutMs": 30000,
+    "gracefulShutdownTimeoutMs": 600000
   },
   "codex": {
     "originator": "claude-code-proxy",
@@ -986,6 +989,7 @@ or delete the old file. `CCP_CONFIG_DIR` disables the fallback.
 | `CCP_MAX_CONCURRENT_PER_SESSION` | `server.maxConcurrentPerSession` | `24`                                            | Per-session in-flight limit; checked before the global limit so one child-agent wave cannot occupy every global slot                                                              |
 | `CCP_REQUEST_BODY_IDLE_TIMEOUT_MS` | `server.requestBodyIdleTimeoutMs` | `5000`                                       | Maximum pause while reading a local request body                                                                                                                                  |
 | `CCP_REQUEST_BODY_TOTAL_TIMEOUT_MS` | `server.requestBodyTotalTimeoutMs` | `30000`                                    | Absolute request-body read budget; timeout returns 408 and releases all reservations                                                                                              |
+| `CCP_GRACEFUL_SHUTDOWN_TIMEOUT_MS` | `server.gracefulShutdownTimeoutMs` | `600000`                                   | Maximum drain time after SIGINT/SIGTERM; the listener stops accepting new connections while existing responses finish, and the service manager stop timeout must be slightly larger |
 | `CCP_CODEX_MODEL`                | `codex.model`              | unset                                             | Force all Codex requests to this model (`gpt-5.2`, `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`) |
 | `CCP_CODEX_EFFORT`               | `codex.effort`             | unset                                             | Force all Codex requests to this reasoning effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`)                                                                                |
 | `CCP_CODEX_REASONING_SUMMARY`    | `codex.reasoningSummary`   | unset                                             | Request Codex reasoning summaries when reasoning effort is enabled; `off` and `none` suppress summaries                                                                           |
@@ -1018,6 +1022,12 @@ or delete the old file. `CCP_CONFIG_DIR` disables the fallback.
 | `CCP_GROK_STREAM_HEARTBEAT_MS`   | `grok.streamHeartbeatMs`   | `5000`                                            | Emit Anthropic `ping` events during downstream silence; configured values are clamped to 1 through 60 seconds and do not extend the total deadline                                 |
 | `CCP_ORIGINATOR`                 | —                          | `claude-code-proxy`                               | Fallback for `CCP_CODEX_ORIGINATOR`                                                                                                                                               |
 | `CCP_USER_AGENT`                 | —                          | unset                                             | Fallback for `CCP_CODEX_USER_AGENT`                                                                                                                                               |
+
+When ccproxy runs under a service manager, its stop timeout must be longer than
+`server.gracefulShutdownTimeoutMs` (for example, `TimeoutStopSec=620s` for the
+600-second default). If a provider total timeout is raised substantially, raise
+both drain limits as well; otherwise a restart can terminate an active model
+generation before its request deadline.
 
 A malformed or unreadable `config.json` is reported on stderr. At startup it is
 ignored and defaults are used; during hot reload ccproxy keeps the last valid

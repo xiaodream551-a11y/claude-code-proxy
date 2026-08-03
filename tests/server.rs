@@ -28,6 +28,7 @@ fn test_limits() -> ServerLimits {
         max_concurrent_per_session: 8,
         request_body_idle_timeout: Duration::from_millis(100),
         request_body_total_timeout: Duration::from_millis(500),
+        graceful_shutdown_timeout: Duration::from_secs(1),
     }
 }
 
@@ -132,6 +133,7 @@ async fn version_reports_build_and_runtime_identity() {
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert!(body["gitSha"].as_str().is_some_and(|sha| !sha.is_empty()));
     assert_eq!(body["pid"], std::process::id());
+    assert_eq!(body["activeRequests"], 0);
     assert!(body["configGeneration"].as_u64().is_some());
     assert_eq!(
         body["providerConstructionConfigGeneration"],
@@ -392,6 +394,25 @@ async fn global_admission_permit_is_held_until_response_body_drop() {
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
+    let active: Value = axum::body::to_bytes(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+        usize::MAX,
+    )
+    .await
+    .ok()
+    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    .unwrap();
+    assert_eq!(active["activeRequests"], 1);
     let saturated = app
         .clone()
         .oneshot(count_tokens_request(None))
@@ -401,6 +422,25 @@ async fn global_admission_permit_is_held_until_response_body_drop() {
     assert_eq!(saturated.headers()["retry-after"], "1");
 
     drop(first);
+    let drained: Value = axum::body::to_bytes(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+        usize::MAX,
+    )
+    .await
+    .ok()
+    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    .unwrap();
+    assert_eq!(drained["activeRequests"], 0);
     let recovered = app.oneshot(count_tokens_request(None)).await.unwrap();
     assert_eq!(recovered.status(), StatusCode::OK);
 }
