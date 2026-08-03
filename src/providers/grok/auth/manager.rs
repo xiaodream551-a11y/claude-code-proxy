@@ -12,8 +12,8 @@ use crate::oauth_http::{MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_a
 #[cfg(test)]
 use crate::oauth_rotation::refresh_pending_path;
 use crate::oauth_rotation::{
-    AuthMutationLock, clear_refresh_pending, generation_fingerprint, read_refresh_pending,
-    write_refresh_pending,
+    AuthMutationLock, DEFAULT_AUTH_MUTATION_LOCK_WAIT, auth_mutation_lock_wait_timeout,
+    clear_refresh_pending, generation_fingerprint, read_refresh_pending, write_refresh_pending,
 };
 use crate::timeutil::now_ms;
 
@@ -491,13 +491,12 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
 
     async fn acquire_refresh_file_lock(&self) -> Result<AuthMutationLock, GrokAuthError> {
         let coordination_path = self.store.coordination_path();
-        AuthMutationLock::acquire_async(coordination_path.as_deref())
+        let lock_wait = auth_mutation_lock_wait_timeout(Duration::from_millis(
+            crate::config::grok_total_timeout_ms(DEFAULT_AUTH_MUTATION_LOCK_WAIT.as_millis() as u64),
+        ));
+        AuthMutationLock::acquire_async_with_timeout(coordination_path.as_deref(), lock_wait)
             .await
-            .map_err(|error| {
-                GrokAuthError::temporary(format!(
-                    "failed to acquire the OAuth refresh lock: {error}"
-                ))
-            })
+            .map_err(grok_auth_lock_error)
     }
 
     async fn has_unpersisted_rotation(&self, auth: &StoredAuth) -> bool {
@@ -541,6 +540,16 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
     }
 }
 
+fn grok_auth_lock_error(error: std::io::Error) -> GrokAuthError {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        GrokAuthError::temporary(
+            "timed out waiting for another process to finish rotating Grok OAuth credentials",
+        )
+    } else {
+        GrokAuthError::temporary("failed to coordinate Grok OAuth credential rotation")
+    }
+}
+
 fn auth_generation_fingerprint(auth: &StoredAuth) -> [u8; 32] {
     generation_fingerprint(auth).expect("StoredAuth is serializable")
 }
@@ -577,6 +586,19 @@ mod tests {
             issuer: CANONICAL_ISSUER.into(),
             client_id: "synthetic-client".into(),
         }
+    }
+
+    #[test]
+    fn auth_lock_timeout_is_explicitly_temporary_without_repeating_the_lock_wait() {
+        let error = grok_auth_lock_error(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "/private/auth.json contains credentials",
+        ));
+
+        assert_eq!(error.kind(), GrokAuthErrorKind::Temporary);
+        assert!(!error.safe_to_retry());
+        assert!(error.to_string().contains("timed out waiting"));
+        assert!(!error.to_string().contains("/private/auth.json"));
     }
 
     fn read_request(stream: &mut TcpStream) {

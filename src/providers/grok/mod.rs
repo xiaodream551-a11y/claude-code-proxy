@@ -109,6 +109,7 @@ impl Provider for GrokProvider {
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let provider_started_at = Instant::now();
         let deadline = GrokRequestDeadline::configured();
+        let stream_heartbeat = configured_stream_heartbeat();
         let requested = body.model.clone().unwrap_or_else(|| "grok-4.5".into());
         let stream = body.stream;
         let resolved = resolve_model_request(&requested);
@@ -193,6 +194,14 @@ impl Provider for GrokProvider {
             Some(serde_json::Map::from_iter([
                 ("reqId".into(), serde_json::json!(ctx.req_id)),
                 ("translateMs".into(), serde_json::json!(translate_ms)),
+                (
+                    "totalTimeoutMs".into(),
+                    serde_json::json!(deadline.timeout_ms()),
+                ),
+                (
+                    "heartbeatIntervalMs".into(),
+                    serde_json::json!(stream_heartbeat.as_millis()),
+                ),
                 ("model".into(), serde_json::json!(resolved.model)),
                 (
                     "reasoningEffort".into(),
@@ -260,7 +269,7 @@ impl Provider for GrokProvider {
                 reconnect,
                 tool_policy,
                 deadline,
-                configured_stream_heartbeat(),
+                stream_heartbeat,
                 provider_started_at,
             )
         } else {
@@ -2546,6 +2555,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_upstream_dispatch_still_records_request_configuration() {
+        let expected_total_timeout_ms = GrokRequestDeadline::configured().timeout_ms();
+        let expected_heartbeat_interval_ms =
+            u64::try_from(configured_stream_heartbeat().as_millis()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (request_seen_tx, request_seen_rx) = oneshot::channel();
@@ -2620,6 +2632,14 @@ mod tests {
         assert_eq!(record["fields"]["transport"], "http");
         assert_eq!(record["fields"]["promptCacheKeyPresent"], true);
         assert!(record["fields"]["translateMs"].as_u64().is_some());
+        assert_eq!(
+            record["fields"]["totalTimeoutMs"],
+            expected_total_timeout_ms
+        );
+        assert_eq!(
+            record["fields"]["heartbeatIntervalMs"],
+            expected_heartbeat_interval_ms
+        );
 
         release_response_tx.send(()).unwrap();
         let response = tokio::time::timeout(Duration::from_secs(3), request_task)

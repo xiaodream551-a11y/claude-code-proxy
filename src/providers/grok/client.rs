@@ -281,6 +281,7 @@ impl PreparedGrokRequest {
 #[derive(Debug, Clone, Copy)]
 pub struct GrokRequestDeadline {
     at: TokioInstant,
+    timeout_ms: u64,
 }
 
 impl GrokRequestDeadline {
@@ -297,11 +298,16 @@ impl GrokRequestDeadline {
             at: now
                 .checked_add(timeout)
                 .expect("the capped Grok request deadline must fit in Instant"),
+            timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
         }
     }
 
     pub fn at(self) -> TokioInstant {
         self.at
+    }
+
+    pub fn timeout_ms(self) -> u64 {
+        self.timeout_ms
     }
 
     pub fn is_expired(self) -> bool {
@@ -2025,6 +2031,10 @@ mod tests {
 
         assert!(remaining <= MAX_TOTAL_TIMEOUT + Duration::from_secs(1));
         assert!(remaining >= MAX_TOTAL_TIMEOUT - Duration::from_secs(1));
+        assert_eq!(
+            deadline.timeout_ms(),
+            u64::try_from(MAX_TOTAL_TIMEOUT.as_millis()).unwrap()
+        );
     }
 
     #[test]
@@ -2098,6 +2108,14 @@ mod tests {
         assert_eq!(temporary.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(temporary.origin, GrokErrorOrigin::Auth);
         assert!(temporary.is_retryable());
+
+        let terminal_temporary = auth_error(GrokAuthError::Temporary {
+            message: "another process kept the credential lock past its deadline".into(),
+            safe_to_retry: false,
+        });
+        assert_eq!(terminal_temporary.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(terminal_temporary.origin, GrokErrorOrigin::Auth);
+        assert!(!terminal_temporary.is_retryable());
 
         let limited = auth_error(GrokAuthError::RateLimited {
             message: "slow down".into(),

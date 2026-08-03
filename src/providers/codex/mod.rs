@@ -229,6 +229,8 @@ impl Provider for CodexProvider {
             previous_response_id_enabled,
         );
         let continuation = continuation_decision.candidate;
+        let deadline = client::CodexRequestDeadline::configured_from(provider_started_at);
+        let stream_heartbeat = configured_stream_heartbeat();
         log_codex_request_configuration(
             &ctx,
             &translated,
@@ -236,15 +238,16 @@ impl Provider for CodexProvider {
             native_web_search,
             transport_decision,
             requested_max_tokens,
-            CodexContinuationLog {
+            CodexRequestLog {
                 enabled: previous_response_id_enabled,
                 candidate: &continuation,
                 prompt_changed_fields: &continuation_decision.prompt_changed_fields,
                 translate_ms,
+                total_timeout_ms: deadline.timeout_ms(),
+                heartbeat_interval: stream_heartbeat,
             },
         );
         let turn_id = continuation.turn_id;
-        let deadline = client::CodexRequestDeadline::configured_from(provider_started_at);
 
         // Post to upstream with continuation
         let client = self.client.clone();
@@ -252,7 +255,6 @@ impl Provider for CodexProvider {
             monitor.upstream_started(&ctx.req_id);
         }
         if want_stream {
-            let stream_heartbeat = configured_stream_heartbeat();
             return live_stream_response(
                 client,
                 message_id,
@@ -1343,11 +1345,13 @@ fn record_codex_generation_start(
     *generation_started = true;
 }
 
-struct CodexContinuationLog<'a> {
+struct CodexRequestLog<'a> {
     enabled: bool,
     candidate: &'a continuation::ContinuationCandidate,
     prompt_changed_fields: &'a [&'static str],
     translate_ms: u128,
+    total_timeout_ms: u64,
+    heartbeat_interval: Duration,
 }
 
 fn log_codex_request_configuration(
@@ -1357,7 +1361,7 @@ fn log_codex_request_configuration(
     native_web_search: bool,
     transport: config::CodexTransportDecision,
     requested_max_tokens: u32,
-    continuation: CodexContinuationLog<'_>,
+    request_log: CodexRequestLog<'_>,
 ) {
     let service_tier = request.service_tier.as_ref().map(|tier| match tier {
         ServiceTier::Priority => "priority",
@@ -1420,7 +1424,15 @@ fn log_codex_request_configuration(
             ("reqId".to_string(), serde_json::json!(ctx.req_id)),
             (
                 "translateMs".to_string(),
-                serde_json::json!(continuation.translate_ms),
+                serde_json::json!(request_log.translate_ms),
+            ),
+            (
+                "totalTimeoutMs".to_string(),
+                serde_json::json!(request_log.total_timeout_ms),
+            ),
+            (
+                "heartbeatIntervalMs".to_string(),
+                serde_json::json!(request_log.heartbeat_interval.as_millis()),
             ),
             ("model".to_string(), serde_json::json!(request.model)),
             ("serviceTier".to_string(), serde_json::json!(service_tier)),
@@ -1500,9 +1512,9 @@ fn log_codex_request_configuration(
             (
                 "continuation".to_string(),
                 codex_continuation_log_fields(
-                    continuation.enabled,
-                    continuation.candidate,
-                    continuation.prompt_changed_fields,
+                    request_log.enabled,
+                    request_log.candidate,
+                    request_log.prompt_changed_fields,
                 ),
             ),
             (
@@ -2760,7 +2772,8 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
         status @ (500 | 502 | 503 | 504 | 529)
             if matches!(
                 err.origin,
-                client::CodexErrorOrigin::BufferedHttp
+                client::CodexErrorOrigin::Auth
+                    | client::CodexErrorOrigin::BufferedHttp
                     | client::CodexErrorOrigin::BufferedWebSocket
             ) =>
         {
@@ -5786,6 +5799,23 @@ mod tests {
 
     #[tokio::test]
     async fn codex_error_detail_is_redacted_before_downstream_response() {
+        let auth_temporary = client::CodexError {
+            status: 503,
+            message: "Authentication temporarily unavailable".to_string(),
+            detail: Some(
+                "timed out waiting for another process to finish rotating credentials".to_string(),
+            ),
+            retry_after: None,
+            origin: client::CodexErrorOrigin::Auth,
+        };
+        let response = map_codex_error_to_response(&auth_temporary);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "api_error");
+
         let auth_conflict = client::CodexError {
             status: 401,
             message: "Unauthorized".to_string(),

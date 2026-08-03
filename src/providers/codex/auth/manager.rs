@@ -12,8 +12,8 @@ use crate::oauth_http::{
     MAX_OAUTH_ERROR_BYTES, MAX_OAUTH_JSON_BYTES, read_json_async, read_text_async,
 };
 use crate::oauth_rotation::{
-    AuthMutationLock, clear_refresh_pending, generation_fingerprint, read_refresh_pending,
-    write_refresh_pending,
+    AuthMutationLock, DEFAULT_AUTH_MUTATION_LOCK_WAIT, auth_mutation_lock_wait_timeout,
+    clear_refresh_pending, generation_fingerprint, read_refresh_pending, write_refresh_pending,
 };
 use crate::providers::codex::dispatch_budget::CodexDispatchBudget;
 use crate::timeutil::now_ms;
@@ -260,7 +260,15 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     ) -> Result<StoredAuth, anyhow::Error> {
         let _refresh_guard = self.refresh_lock.lock().await;
         let coordination_path = self.store.coordination_path();
-        let _mutation_guard = AuthMutationLock::acquire_async(coordination_path.as_deref()).await?;
+        let lock_wait = auth_mutation_lock_wait_timeout(Duration::from_millis(
+            crate::config::codex_total_timeout_ms(
+                DEFAULT_AUTH_MUTATION_LOCK_WAIT.as_millis() as u64
+            ),
+        ));
+        let _mutation_guard =
+            AuthMutationLock::acquire_async_with_timeout(coordination_path.as_deref(), lock_wait)
+                .await
+                .map_err(codex_auth_lock_error)?;
 
         let current = self
             .load_current_auth(true)
@@ -451,6 +459,16 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     }
 }
 
+fn codex_auth_lock_error(error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        CodexAuthError::temporary(
+            "timed out waiting for another process to finish rotating Codex OAuth credentials",
+        )
+    } else {
+        CodexAuthError::temporary("failed to coordinate Codex OAuth credential rotation")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +484,18 @@ mod tests {
 
     fn test_store() -> CodexTokenStore<InMemoryAuthStore<StoredAuth>> {
         CodexTokenStore::new(InMemoryAuthStore::new())
+    }
+
+    #[test]
+    fn auth_lock_timeout_is_an_explicit_temporary_error() {
+        let error = codex_auth_lock_error(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "/private/auth.json contains credentials",
+        ));
+
+        assert_eq!(codex_auth_error_kind(&error), CodexAuthErrorKind::Temporary);
+        assert!(error.to_string().contains("timed out waiting"));
+        assert!(!error.to_string().contains("/private/auth.json"));
     }
 
     fn expired_auth() -> StoredAuth {

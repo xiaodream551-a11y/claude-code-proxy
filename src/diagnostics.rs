@@ -1050,13 +1050,11 @@ fn sanitize_scalar_field(key: &str, value: &Value) -> Option<Value> {
 
     let numeric_limit = match key {
         "status" => 999,
-        "ms"
-        | "elapsedMs"
-        | "delayMs"
-        | "cooldownMs"
-        | "waitMs"
-        | "deadlineRemainingMs"
-        | "heartbeatIntervalMs" => 7 * 24 * 60 * 60 * 1_000,
+        "ms" | "elapsedMs" | "delayMs" | "cooldownMs" | "waitMs" | "deadlineRemainingMs" => {
+            7 * 24 * 60 * 60 * 1_000
+        }
+        "heartbeatIntervalMs" => 60 * 1_000,
+        "totalTimeoutMs" => 10 * 365 * 24 * 60 * 60 * 1_000,
         "translateMs" => 7 * 24 * 60 * 60 * 1_000,
         "bytes" | "contentBytes" | "downstreamBytes" => 1_u64 << 40,
         "anthropicMaxTokens" | "estimatedInputTokens" => 1_000_000_000,
@@ -1304,6 +1302,8 @@ fn allowed_fields(event: &str) -> &'static [&'static str] {
             "outputBudgetEnforcement",
             "estimatedInputTokens",
             "translateMs",
+            "totalTimeoutMs",
+            "heartbeatIntervalMs",
         ],
         "native_web_search_phase" => &["reqId", "phase", "elapsedMs"],
         "upstream_first_event" => &["reqId", "event", "elapsedMs"],
@@ -2699,6 +2699,8 @@ mod tests {
                     "serviceTier":"priority",
                     "serviceTierSource":"fast_suffix",
                     "translateMs":17,
+                    "totalTimeoutMs":540000,
+                    "heartbeatIntervalMs":5000,
                     "hydrationLoadedGroupCount":1,
                     "hydrationLoadedResultCount":2,
                     "hydrationUnavailableResultCount":0,
@@ -2739,6 +2741,8 @@ mod tests {
         assert_eq!(codex["fields"]["hydrationUnavailableResultCount"], 0);
         assert_eq!(codex["fields"]["hydrationAmbiguous"], false);
         assert_eq!(codex["fields"]["translateMs"], 17);
+        assert_eq!(codex["fields"]["totalTimeoutMs"], 540_000);
+        assert_eq!(codex["fields"]["heartbeatIntervalMs"], 5_000);
         assert_eq!(codex["fields"]["serviceTier"], "priority");
         assert_eq!(codex["fields"]["serviceTierSource"], "fast_suffix");
         assert!(!codex.to_string().contains("secret_identifier"));
@@ -2754,6 +2758,8 @@ mod tests {
                 "reqId":"request-2",
                 "model":"grok-4.5",
                 "translateMs":23,
+                "totalTimeoutMs":540000,
+                "heartbeatIntervalMs":5000,
                 "promptCacheKeyPresent":true,
                 "promptCacheKeyFingerprint":"abcdef012345",
                 "promptCacheKey":"full-secret-cache-key"
@@ -2763,6 +2769,8 @@ mod tests {
         assert_eq!(grok["fields"]["promptCacheKeyPresent"], true);
         assert_eq!(grok["fields"]["promptCacheKeyFingerprint"], "abcdef012345");
         assert_eq!(grok["fields"]["translateMs"], 23);
+        assert_eq!(grok["fields"]["totalTimeoutMs"], 540_000);
+        assert_eq!(grok["fields"]["heartbeatIntervalMs"], 5_000);
         assert!(!grok.to_string().contains("full-secret-cache-key"));
         assert!(is_sanitized_event(&grok));
 
@@ -2795,6 +2803,40 @@ mod tests {
         let mut forged_fingerprint = grok;
         forged_fingerprint["fields"]["promptCacheKeyFingerprint"] = json!("not-a-short-hash");
         assert!(!is_sanitized_event(&forged_fingerprint));
+    }
+
+    #[test]
+    fn request_configuration_timing_fields_are_bounded_unsigned_integers() {
+        const MAX_TOTAL_TIMEOUT_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1_000;
+
+        let valid = sanitize_event(
+            &serde_json::from_str(&log(
+                "request_configuration",
+                json!({
+                    "totalTimeoutMs":MAX_TOTAL_TIMEOUT_MS,
+                    "heartbeatIntervalMs":60_000
+                }),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(valid["fields"]["totalTimeoutMs"], MAX_TOTAL_TIMEOUT_MS);
+        assert_eq!(valid["fields"]["heartbeatIntervalMs"], 60_000);
+        assert!(is_sanitized_event(&valid));
+
+        for fields in [
+            json!({"totalTimeoutMs":MAX_TOTAL_TIMEOUT_MS + 1}),
+            json!({"heartbeatIntervalMs":60_001}),
+            json!({"totalTimeoutMs":-1}),
+            json!({"heartbeatIntervalMs":"5000"}),
+        ] {
+            let event = sanitize_event(
+                &serde_json::from_str(&log("request_configuration", fields)).unwrap(),
+            )
+            .unwrap();
+            assert!(event["fields"].as_object().unwrap().is_empty());
+            assert!(is_sanitized_event(&event));
+        }
     }
 
     #[test]
