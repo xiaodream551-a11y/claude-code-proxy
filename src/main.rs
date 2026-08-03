@@ -33,6 +33,11 @@ const CLAUDE_PROFILE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const CLAUDE_PROFILE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const CLAUDE_PROFILE_INITIALIZED_FILE: &str = ".ccproxy-profile-initialized";
 const CLAUDE_PROFILE_MANAGED_ENV: &str = "CCP_CLAUDE_PROFILE_MANAGED";
+// A live 2.1.220 canary reached Claude Code's 300-second event watchdog while ccproxy continued
+// recording five-second transport heartbeats during hidden reasoning. Both providers have a
+// 540-second default total deadline, so keep managed clients alive long enough for the proxy's
+// explicit deadline (or its upstream body-idle guard) to own the authoritative cutoff.
+const MANAGED_CLAUDE_STREAM_IDLE_TIMEOUT_MS: u64 = 600_000;
 const CLAUDE_SHARED_CONFIG_ENTRIES: &[&str] = &[
     "CLAUDE.md",
     "agents",
@@ -1739,6 +1744,10 @@ fn claude_profile_environment(
         ("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH", "1".to_string()),
         ("CLAUDE_CODE_MAX_RETRIES", "1".to_string()),
         ("CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY", "10".to_string()),
+        (
+            "CLAUDE_STREAM_IDLE_TIMEOUT_MS",
+            MANAGED_CLAUDE_STREAM_IDLE_TIMEOUT_MS.to_string(),
+        ),
         ("ENABLE_TOOL_SEARCH", "true".to_string()),
     ];
     if let Some(model) = profile.compaction_model {
@@ -2780,6 +2789,14 @@ mod tests {
             settings["env"]["ANTHROPIC_CUSTOM_HEADERS"],
             "x-ccproxy-compaction-model: gpt-5.6-terra"
         );
+        assert_eq!(
+            command_env(&command, "CLAUDE_STREAM_IDLE_TIMEOUT_MS"),
+            MANAGED_CLAUDE_STREAM_IDLE_TIMEOUT_MS.to_string()
+        );
+        assert_eq!(
+            settings["env"]["CLAUDE_STREAM_IDLE_TIMEOUT_MS"],
+            MANAGED_CLAUDE_STREAM_IDLE_TIMEOUT_MS.to_string()
+        );
     }
 
     #[test]
@@ -2846,6 +2863,14 @@ mod tests {
         assert_eq!(
             command_env(&command, "CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
             "272000"
+        );
+        assert_eq!(
+            command_env(&command, "CLAUDE_STREAM_IDLE_TIMEOUT_MS"),
+            MANAGED_CLAUDE_STREAM_IDLE_TIMEOUT_MS.to_string()
+        );
+        assert_eq!(
+            settings["env"]["CLAUDE_STREAM_IDLE_TIMEOUT_MS"],
+            MANAGED_CLAUDE_STREAM_IDLE_TIMEOUT_MS.to_string()
         );
         assert_eq!(command_env(&command, "CLAUDE_CODE_DISABLE_1M_CONTEXT"), "1");
         assert_eq!(

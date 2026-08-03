@@ -11,10 +11,11 @@ use claude_code_proxy::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -283,6 +284,36 @@ where
                     .unwrap()
             }
         }
+    });
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    addr_str
+}
+
+/// Spawn a real TCP Grok SSE server that flushes response headers immediately,
+/// stays body-silent for `delay`, then emits a complete text response.
+async fn spawn_delayed_grok_sse_upstream(delay: Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    let app = axum::Router::new().fallback(move || async move {
+        let stream = futures_util::stream::once(async move {
+            tokio::time::sleep(delay).await;
+            Ok::<_, Infallible>(bytes::Bytes::from_static(concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"heartbeat terminal ok\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\n"
+            ).as_bytes()))
+        });
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
     });
 
     tokio::spawn(async move {
@@ -1330,6 +1361,105 @@ async fn smoke_grok_zero_max_tokens_is_rejected_without_upstream_dispatch() {
         0,
         "max_tokens=0 must fail before Grok dispatch"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_grok_tcp_stream_emits_heartbeats_while_upstream_body_is_silent() {
+    let _guard = env_lock().await;
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "grok");
+    let upstream = spawn_delayed_grok_sse_upstream(Duration::from_millis(3_200)).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_GROK_BASE_URL", &upstream);
+    let _heartbeat_env = EnvGuard::set("CCP_GROK_STREAM_HEARTBEAT_MS", "1000");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let proxy = tokio::spawn(async move {
+        axum::serve(listener, app(Arc::new(Registry::with_default_alias())))
+            .await
+            .unwrap();
+    });
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "smoke-grok-tcp-heartbeat")
+        .json(&json!({
+            "model": "grok-4.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response_started = Instant::now();
+    let mut stream = response.bytes_stream();
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut pending = String::new();
+        let mut events = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap_or_else(|error| {
+                panic!("downstream TCP body failed after events {events:?}: {error}")
+            });
+            pending.push_str(std::str::from_utf8(&chunk).unwrap());
+            while let Some(end) = pending.find("\n\n") {
+                let event = pending[..end].to_string();
+                pending.drain(..end + 2);
+                events.push((event.clone(), response_started.elapsed()));
+                if event.lines().any(|line| line == "event: message_stop") {
+                    return events;
+                }
+            }
+        }
+        events
+    })
+    .await
+    .expect("Grok TCP stream should finish after the delayed terminal event");
+    proxy.abort();
+
+    let pings = events
+        .iter()
+        .filter(|(event, _)| {
+            event.lines().any(|line| line == "event: ping")
+                && event.lines().any(|line| line == r#"data: {"type":"ping"}"#)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        pings.len() >= 2,
+        "expected at least two complete heartbeat events before terminal; events={events:?}"
+    );
+    assert!(
+        pings[0].1 <= Duration::from_millis(1_800),
+        "first heartbeat arrived too late: {:?}",
+        pings[0].1
+    );
+    for pair in pings.windows(2) {
+        let spacing = pair[1].1.saturating_sub(pair[0].1);
+        assert!(
+            (Duration::from_millis(600)..=Duration::from_millis(1_500)).contains(&spacing),
+            "heartbeat spacing was outside the expected range: {spacing:?}; pings={pings:?}"
+        );
+    }
+
+    let terminal_index = events
+        .iter()
+        .position(|(event, _)| event.lines().any(|line| line == "event: message_stop"))
+        .expect("delayed Grok terminal must produce message_stop");
+    let last_ping_index = events
+        .iter()
+        .rposition(|(event, _)| event.lines().any(|line| line == "event: ping"))
+        .unwrap();
+    assert!(last_ping_index < terminal_index, "events={events:?}");
 }
 
 #[tokio::test]

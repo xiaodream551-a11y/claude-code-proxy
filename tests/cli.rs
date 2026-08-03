@@ -270,6 +270,7 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .env("PORT", "19876")
         .env("CCP_BIND_ADDRESS", "0.0.0.0")
         .env("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "25000")
+        .env("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "300000")
         .env(
             "ANTHROPIC_CUSTOM_HEADERS",
             "x-existing: keep\nX-CCPROXY-COMPACTION-MODEL: stale",
@@ -295,6 +296,7 @@ fn co_execs_claude_with_gpt_profile_and_forwards_arguments()
         .stdout(contains("subagent_depth=1"))
         .stdout(contains("max_retries=1"))
         .stdout(contains("tool_concurrency=10"))
+        .stdout(contains("stream_idle=600000"))
         .stdout(contains("file_read_cap=8000"))
         .stdout(contains("tool_search=true"))
         .stdout(contains(
@@ -365,6 +367,7 @@ fn cg_clears_inherited_custom_headers_and_preserves_exit_code()
         .env("HOME", &fixture.home_dir)
         .env("PORT", "19877")
         .env("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "25000")
+        .env("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "300000")
         .env("ANTHROPIC_CUSTOM_HEADERS", "x-existing: keep")
         .env("FAKE_CLAUDE_EXIT_CODE", "37");
 
@@ -390,6 +393,7 @@ fn cg_clears_inherited_custom_headers_and_preserves_exit_code()
         .stdout(contains("subagent_depth=1"))
         .stdout(contains("max_retries=1"))
         .stdout(contains("tool_concurrency=10"))
+        .stdout(contains("stream_idle=600000"))
         .stdout(contains("file_read_cap=8000"))
         .stdout(contains("tool_search=true"))
         .stdout(contains("custom_headers=\n"))
@@ -592,6 +596,7 @@ printf 'disable_1m=%s\n' "$CLAUDE_CODE_DISABLE_1M_CONTEXT"
 printf 'subagent_depth=%s\n' "$CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"
 printf 'max_retries=%s\n' "$CLAUDE_CODE_MAX_RETRIES"
 printf 'tool_concurrency=%s\n' "$CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"
+printf 'stream_idle=%s\n' "$CLAUDE_STREAM_IDLE_TIMEOUT_MS"
 printf 'file_read_cap=%s\n' "$CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"
 printf 'tool_search=%s\n' "$ENABLE_TOOL_SEARCH"
 printf 'custom_headers=%s\n' "$ANTHROPIC_CUSTOM_HEADERS"

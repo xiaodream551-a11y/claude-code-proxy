@@ -8,6 +8,10 @@
   explicit `-fast`, config, or environment choice.
 - Bound managed `co`/`cg` profile-initialization lock waits to 30 seconds so a stalled launcher
   cannot make every later same-profile invocation block forever before reaching the proxy.
+- Set managed `co`/`cg` Claude Code stream-idle watchdogs to 600 seconds. This keeps long hidden
+  reasoning from being abandoned at the client's 300-second boundary while the proxy is still
+  healthy, and leaves the providers' default 540-second total deadline and 300-second upstream
+  body-idle guard responsible for explicit terminal failures.
 - Release cancelled Codex HTTP and Grok upstream work plus Grok replay byte reservations before
   synchronous traffic-capture finalization. Codex live and buffered WebSocket capture now also
   releases and, when reusable, publishes the socket before writing event artifacts, so a slow
